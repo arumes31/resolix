@@ -101,6 +101,12 @@ services:
 - **View dnsmasq config**:
   - `docker exec -it dns-tailscale-1 cat /etc/dnsmasq.conf`
 
+## Security & CI/CD
+
+The repository utilizes GitHub Actions to automatically build, push Docker images, and scan for vulnerabilities:
+- **Trivy Vulnerability Scanner**: Runs daily to scan the Docker image for OS and library vulnerabilities.
+- **Docker Publish**: Automatically builds and pushes the image to GitHub Container Registry (`ghcr.io/arumes31/tailscale-dnsrewrite`) upon pushes to the main branch.
+
 ## Contributing
 
 Contributions are welcome! Please:

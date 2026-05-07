@@ -9,7 +9,8 @@ HEALTHCHECK_DOMAIN=${HEALTHCHECK_DOMAIN:-"google.com"}
 # Cleanup function for graceful shutdown
 cleanup() {
     echo "Shutting down..."
-    kill "$DNSMASQ_PID" "$TAILSCALED_PID" 2>/dev/null
+    kill "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" "$HEALTHCHECK_PID" 2>/dev/null
+    wait "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" "$HEALTHCHECK_PID" 2>/dev/null
     exit 0
 }
 
@@ -80,6 +81,8 @@ listen-address=$TAILSCALE_IP
 port=53
 cache-size=25000
 strict-order
+log-queries
+log-facility=-
 EOL
 
     # Add healthy upstream DNS servers
@@ -132,9 +135,14 @@ fi
 # Generate initial dnsmasq.conf
 generate_dnsmasq_conf "${HEALTHY_UPSTREAMS[@]}"
 
+# Create named pipe for in-memory logging
+mkfifo /tmp/dnsmasq.log
+# Keep the pipe open to prevent blocking
+exec 3<> /tmp/dnsmasq.log
+
 # Start dnsmasq
 echo "Starting dnsmasq"
-/usr/sbin/dnsmasq -k &
+/usr/sbin/dnsmasq -k 2>&1 > /tmp/dnsmasq.log &
 DNSMASQ_PID=$!
 
 # Verify dnsmasq is running
@@ -144,6 +152,11 @@ if ! kill -0 $DNSMASQ_PID > /dev/null 2>&1; then
     exit 1
 fi
 echo "dnsmasq started successfully (PID: $DNSMASQ_PID)"
+
+# Start Web GUI
+echo "Starting Web GUI (In-Memory Mode)"
+/usr/bin/webgui < /tmp/dnsmasq.log &
+WEBGUI_PID=$!
 
 # Continuous health check loop
 (
@@ -178,6 +191,7 @@ echo "dnsmasq started successfully (PID: $DNSMASQ_PID)"
         sleep 15
     done
 ) &
+HEALTHCHECK_PID=$!
 
 # Keep the container running
 wait

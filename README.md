@@ -11,6 +11,7 @@ Example: mail.example.com resolves to 192.168.3.100 on AdGuard but should resolv
 - **Custom DNS Mappings**: Supports user-defined domain-to-IP mappings via the `DOMAINS` environment variable (e.g., `domain1:ip1,domain2:ip2`).
 - **Continuous Health Checks**: Monitors upstream DNS servers every 15 seconds, dynamically updating the `dnsmasq` configuration to use only healthy servers.
 - **Sequential Failover**: Uses `dnsmasq` with `strict-order` to query upstream servers in sequence, ensuring fallback if a server is down. And Override Server Priority if upstream is completly down for faster query failover.
+- **Web GUI Monitor**: Real-time dashboard to monitor DNS queries and identify source hosts, accessible on port `35353`.
 - **Configurable**: Environment variables for upstream DNS servers (`UPSTREAM_DNS`), Tailscale authentication (`TS_AUTHKEY`), and custom domains.
 
 ## Requirements

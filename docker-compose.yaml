@@ -1,9 +1,11 @@
 services:
   dns-tailscale-1:
-    image: registry.reitetschlaeger.com/tailscale-dnsrewrite:latest
+    build: .
     container_name: dns-tailscale-1
     environment:
       - DOMAINS=.overridedomain.local:100.77.35.105,override1.example.com:100.83.17.42
       - UPSTREAM_DNS=100.77.35.105 100.68.143.42
-      - TS_AUTHKEY=tskey-auth-xxxxx
+      - TS_AUTHKEY=${TS_AUTHKEY}
+    ports:
+      - "127.0.0.1:35353:35353"
     restart: unless-stopped

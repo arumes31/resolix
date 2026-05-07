@@ -9,7 +9,8 @@ HEALTHCHECK_DOMAIN=${HEALTHCHECK_DOMAIN:-"google.com"}
 # Cleanup function for graceful shutdown
 cleanup() {
     echo "Shutting down..."
-    kill "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" 2>/dev/null
+    kill "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" "$HEALTHCHECK_PID" 2>/dev/null
+    wait "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" "$HEALTHCHECK_PID" 2>/dev/null
     exit 0
 }
 
@@ -81,7 +82,7 @@ port=53
 cache-size=25000
 strict-order
 log-queries
-log-facility=/var/log/dnsmasq.log
+log-facility=-
 EOL
 
     # Add healthy upstream DNS servers
@@ -136,7 +137,7 @@ generate_dnsmasq_conf "${HEALTHY_UPSTREAMS[@]}"
 
 # Start dnsmasq
 echo "Starting dnsmasq"
-/usr/sbin/dnsmasq -k &
+/usr/sbin/dnsmasq -k 2>&1 | tee /var/log/dnsmasq.log &
 DNSMASQ_PID=$!
 
 # Verify dnsmasq is running
@@ -185,6 +186,7 @@ WEBGUI_PID=$!
         sleep 15
     done
 ) &
+HEALTHCHECK_PID=$!
 
 # Keep the container running
 wait

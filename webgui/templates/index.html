@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:;">
     <title>Tailscale DNS Monitor</title>
     <style>
         :root {
@@ -207,6 +208,18 @@
             color: var(--text-secondary);
         }
 
+        .sr-only {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            padding: 0;
+            margin: -1px;
+            overflow: hidden;
+            clip: rect(0, 0, 0, 0);
+            white-space: nowrap;
+            border-width: 0;
+        }
+
         /* Tooltips for buttons without text */
         [data-tooltip] {
             position: relative;
@@ -259,7 +272,7 @@
             </div>
             <div class="search-container">
                 <svg class="search-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
-                <input type="text" id="searchInput" class="search-input" placeholder="Search domain or client IP...">
+                <input type="text" id="searchInput" class="search-input" placeholder="Search domain or client IP..." aria-label="Search domain or client IP">
             </div>
             <button class="refresh-btn" onclick="fetchEvents()" data-tooltip="Reload latest events">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"></path><path d="M1 20v-6h6"></path><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
@@ -267,7 +280,7 @@
             </button>
         </header>
 
-        <div class="stats">
+        <div class="stats" aria-live="polite">
             <div class="stat-card">
                 <div class="stat-label">Total Events</div>
                 <div id="totalEvents" class="stat-value">0</div>
@@ -284,19 +297,20 @@
 
         <div class="table-container">
             <table>
+                <caption class="sr-only">List of recent DNS query events including timestamp, query type, domain, and client IP</caption>
                 <thead>
                     <tr>
-                        <th>Timestamp</th>
-                        <th>Type</th>
-                        <th>Domain</th>
-                        <th>Client IP</th>
+                        <th scope="col">Timestamp</th>
+                        <th scope="col">Type</th>
+                        <th scope="col">Domain</th>
+                        <th scope="col">Client IP</th>
                     </tr>
                 </thead>
                 <tbody id="eventTable">
                     <!-- Events will be populated here -->
                 </tbody>
             </table>
-            <div id="noResults" class="no-results" style="display: none;">
+            <div id="noResults" class="no-results" style="display: none;" role="alert">
                 No events found matching your search.
             </div>
         </div>
@@ -308,11 +322,22 @@
         async function fetchEvents() {
             try {
                 const response = await fetch('/api/events');
-                allEvents = await response.json();
-                renderEvents();
-                updateStats();
+                if (!response.ok) {
+                    console.error('Fetch failed:', response.status, response.statusText);
+                    return;
+                }
+                const data = await response.json();
+                if (Array.isArray(data)) {
+                    allEvents = data;
+                    renderEvents();
+                    updateStats();
+                } else {
+                    console.error('Invalid data structure received');
+                    allEvents = [];
+                }
             } catch (error) {
                 console.error('Error fetching events:', error);
+                allEvents = [];
             }
         }
 
@@ -322,9 +347,9 @@
             const noResults = document.getElementById('noResults');
             
             const filteredEvents = allEvents.filter(event => 
-                event.domain.toLowerCase().includes(searchTerm) || 
-                event.client_ip.toLowerCase().includes(searchTerm) ||
-                event.type.toLowerCase().includes(searchTerm)
+                (event.domain || '').toLowerCase().includes(searchTerm) || 
+                (event.client_ip || '').toLowerCase().includes(searchTerm) ||
+                (event.type || '').toLowerCase().includes(searchTerm)
             );
 
             tableBody.innerHTML = '';
@@ -335,12 +360,32 @@
                 noResults.style.display = 'none';
                 filteredEvents.forEach(event => {
                     const row = document.createElement('tr');
-                    row.innerHTML = `
-                        <td class="timestamp">${event.timestamp}</td>
-                        <td><span class="badge badge-type">${event.type}</span></td>
-                        <td class="domain">${event.domain}</td>
-                        <td><span class="badge badge-ip">${event.client_ip}</span></td>
-                    `;
+                    
+                    const tdTimestamp = document.createElement('td');
+                    tdTimestamp.className = 'timestamp';
+                    tdTimestamp.textContent = event.timestamp;
+                    
+                    const tdType = document.createElement('td');
+                    const spanType = document.createElement('span');
+                    spanType.className = 'badge badge-type';
+                    spanType.textContent = event.type;
+                    tdType.appendChild(spanType);
+                    
+                    const tdDomain = document.createElement('td');
+                    tdDomain.className = 'domain';
+                    tdDomain.textContent = event.domain;
+                    
+                    const tdIP = document.createElement('td');
+                    const spanIP = document.createElement('span');
+                    spanIP.className = 'badge badge-ip';
+                    spanIP.textContent = event.client_ip;
+                    tdIP.appendChild(spanIP);
+                    
+                    row.appendChild(tdTimestamp);
+                    row.appendChild(tdType);
+                    row.appendChild(tdDomain);
+                    row.appendChild(tdIP);
+                    
                     tableBody.appendChild(row);
                 });
             }

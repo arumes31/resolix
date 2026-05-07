@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"embed"
 	"encoding/json"
 	"html/template"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 )
 
 //go:embed templates/*
@@ -39,7 +41,12 @@ func parseLogLine(line string) *QueryEvent {
 }
 
 func getLastEvents(n string) []QueryEvent {
-	cmd := exec.Command("tail", "-n", n, "/var/log/dnsmasq.log")
+	logPath := os.Getenv("LOG_PATH")
+	if logPath == "" {
+		logPath = "/var/log/dnsmasq.log"
+	}
+
+	cmd := exec.Command("tail", "-n", n, logPath)
 	output, err := cmd.Output()
 	if err != nil {
 		log.Printf("Error reading log: %v", err)
@@ -52,6 +59,10 @@ func getLastEvents(n string) []QueryEvent {
 		if event := parseLogLine(scanner.Text()); event != nil {
 			events = append(events, *event)
 		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.Printf("Scanner error: %v", err)
 	}
 
 	// Reverse to show latest first
@@ -68,26 +79,37 @@ func main() {
 		log.Fatal(err)
 	}
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		events := getLastEvents("2000") // Get more to ensure we have 1000 valid events
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		events := getLastEvents("2000")
 		if len(events) > 1000 {
 			events = events[:1000]
 		}
-		if err := tmpl.Execute(w, map[string]interface{}{
+
+		var buf bytes.Buffer
+		if err := tmpl.Execute(&buf, map[string]interface{}{
 			"Events": events,
 		}); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			log.Printf("Template execution error: %v", err)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if _, err := buf.WriteTo(w); err != nil {
+			log.Printf("Error writing response: %v", err)
 		}
 	})
 
-	http.HandleFunc("/api/events", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/events", func(w http.ResponseWriter, r *http.Request) {
 		events := getLastEvents("2000")
 		if len(events) > 1000 {
 			events = events[:1000]
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(events); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Printf("JSON encoding error: %v", err)
 		}
 	})
 
@@ -96,8 +118,16 @@ func main() {
 		port = "35353"
 	}
 
-	log.Printf("Starting Web GUI on :%s", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
+	server := &http.Server{
+		Addr:         ":" + port,
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	log.Printf("Starting Web GUI on %s", server.Addr)
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
 }

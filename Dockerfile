@@ -3,7 +3,7 @@ FROM golang:1.22-alpine AS builder
 
 WORKDIR /app
 COPY webgui/ .
-RUN go build -o webgui main.go
+RUN go build -o webgui .
 
 # Final stage
 FROM alpine:latest
@@ -12,10 +12,12 @@ FROM alpine:latest
 RUN apk add --no-cache \
     dnsmasq \
     curl \
+    ca-certificates \
     bind-tools \
     iputils \
     bash \
-    tailscale
+    tailscale && \
+    update-ca-certificates
 
 # Copy webgui binary
 COPY --from=builder /app/webgui /usr/bin/webgui

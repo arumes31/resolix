@@ -5,13 +5,13 @@ import (
 	"bytes"
 	"embed"
 	"encoding/json"
+	"fmt"
 	"html/template"
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"regexp"
-	"strings"
+	"sync"
 	"time"
 )
 
@@ -25,7 +25,12 @@ type QueryEvent struct {
 	ClientIP  string `json:"client_ip"`
 }
 
-var logRegex = regexp.MustCompile(`^(\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+dnsmasq\[\d+\]:\s+query\[(\w+)\]\s+([\w\.-]+)\s+from\s+([\d\.:a-fA-F]+)$`)
+var (
+	events    []QueryEvent
+	eventsMu  sync.RWMutex
+	maxEvents = 1000
+	logRegex  = regexp.MustCompile(`^(\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+dnsmasq\[\d+\]:\s+query\[(\w+)\]\s+([\w\.-]+)\s+from\s+([\d\.:a-fA-F]+)$`)
+)
 
 func parseLogLine(line string) *QueryEvent {
 	matches := logRegex.FindStringSubmatch(line)
@@ -40,37 +45,25 @@ func parseLogLine(line string) *QueryEvent {
 	return nil
 }
 
-func getLastEvents(n string) []QueryEvent {
-	logPath := os.Getenv("LOG_PATH")
-	if logPath == "" {
-		logPath = "/var/log/dnsmasq.log"
-	}
-
-	cmd := exec.Command("tail", "-n", n, logPath)
-	output, err := cmd.Output()
-	if err != nil {
-		log.Printf("Error reading log: %v", err)
-		return nil
-	}
-
-	var events []QueryEvent
-	scanner := bufio.NewScanner(strings.NewReader(string(output)))
+func startLogIngestion() {
+	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
-		if event := parseLogLine(scanner.Text()); event != nil {
-			events = append(events, *event)
+		line := scanner.Text()
+		// Always print to stdout so Docker logs are still available
+		fmt.Println(line)
+
+		if event := parseLogLine(line); event != nil {
+			eventsMu.Lock()
+			events = append([]QueryEvent{*event}, events...) // Newest first
+			if len(events) > maxEvents {
+				events = events[:maxEvents]
+			}
+			eventsMu.Unlock()
 		}
 	}
-
 	if err := scanner.Err(); err != nil {
 		log.Printf("Scanner error: %v", err)
 	}
-
-	// Reverse to show latest first
-	for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
-		events[i], events[j] = events[j], events[i]
-	}
-
-	return events
 }
 
 func main() {
@@ -79,17 +72,20 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Start reading logs from stdin in a background goroutine
+	go startLogIngestion()
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		events := getLastEvents("2000")
-		if len(events) > 1000 {
-			events = events[:1000]
-		}
+		eventsMu.RLock()
+		currentEvents := make([]QueryEvent, len(events))
+		copy(currentEvents, events)
+		eventsMu.RUnlock()
 
 		var buf bytes.Buffer
 		if err := tmpl.Execute(&buf, map[string]interface{}{
-			"Events": events,
+			"Events": currentEvents,
 		}); err != nil {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			log.Printf("Template execution error: %v", err)
@@ -103,12 +99,13 @@ func main() {
 	})
 
 	mux.HandleFunc("/api/events", func(w http.ResponseWriter, r *http.Request) {
-		events := getLastEvents("2000")
-		if len(events) > 1000 {
-			events = events[:1000]
-		}
+		eventsMu.RLock()
+		currentEvents := make([]QueryEvent, len(events))
+		copy(currentEvents, events)
+		eventsMu.RUnlock()
+
 		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(events); err != nil {
+		if err := json.NewEncoder(w).Encode(currentEvents); err != nil {
 			log.Printf("JSON encoding error: %v", err)
 		}
 	})
@@ -126,7 +123,7 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	log.Printf("Starting Web GUI on %s", server.Addr)
+	log.Printf("Starting Web GUI on %s (Memory Mode)", server.Addr)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}

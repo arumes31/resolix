@@ -2,6 +2,20 @@
 
 A high-performance Tailscale DNS server that provides custom DNS overrides and intelligent upstream forwarding with a premium real-time monitoring dashboard.
 
+## 🔄 DNS Flow
+
+```mermaid
+graph LR
+    Client([💻 Client])
+    MagicDNS[🪄 Tailscale MagicDNS]
+    Docker[🐳 Docker: Tailscale-Rewrite]
+    Backend[🛡️ Backend DNS: Adguard/Pihole]
+
+    Client --> MagicDNS
+    MagicDNS --> Docker
+    Docker --> Backend
+```
+
 ## ✨ Features
 
 - **🚀 Tailscale Native**: Seamlessly integrates with your Tailscale network, serving DNS queries over secure Tailscale IPs.

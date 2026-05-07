@@ -29,14 +29,18 @@ var (
 	events    []QueryEvent
 	eventsMu  sync.RWMutex
 	maxEvents = 1000
-	logRegex  = regexp.MustCompile(`^(\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+dnsmasq\[\d+\]:\s+query\[(\w+)\]\s+([\w\.-]+)\s+from\s+([\d\.:a-fA-F]+)$`)
+	logRegex  = regexp.MustCompile(`(?:(\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+)?dnsmasq\[\d+\]:\s+query\[(\w+)\]\s+([\w\.-]+)\s+from\s+([\d\.:a-fA-F]+)`)
 )
 
 func parseLogLine(line string) *QueryEvent {
 	matches := logRegex.FindStringSubmatch(line)
 	if len(matches) == 5 {
+		ts := matches[1]
+		if ts == "" {
+			ts = time.Now().Format("Jan _2 15:04:05")
+		}
 		return &QueryEvent{
-			Timestamp: matches[1],
+			Timestamp: ts,
 			Type:      matches[2],
 			Domain:    matches[3],
 			ClientIP:  matches[4],

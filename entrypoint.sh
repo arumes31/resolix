@@ -81,7 +81,7 @@ listen-address=$TAILSCALE_IP
 port=53
 cache-size=25000
 dns-forward-max=150
-all-servers
+strict-order
 log-queries
 log-async=25
 log-facility=-

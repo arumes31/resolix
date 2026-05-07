@@ -3,14 +3,17 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"embed"
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 )
@@ -33,6 +36,30 @@ var (
 	logRegex  = regexp.MustCompile(`(?:(\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+)?dnsmasq\[\d+\]:\s+query\[(\w+)\]\s+([\w\.-]+)\s+from\s+([\d\.:a-fA-F]+)`)
 )
 
+// Gzip middleware
+type gzipResponseWriter struct {
+	io.Writer
+	http.ResponseWriter
+}
+
+func (w gzipResponseWriter) Write(b []byte) (int, error) {
+	return w.Writer.Write(b)
+}
+
+func gzipMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Content-Encoding", "gzip")
+		gz := gzip.NewWriter(w)
+		defer gz.Close()
+		gzw := gzipResponseWriter{Writer: gz, ResponseWriter: w}
+		next.ServeHTTP(gzw, r)
+	})
+}
+
 func parseLogLine(line string) *QueryEvent {
 	matches := logRegex.FindStringSubmatch(line)
 	if len(matches) == 5 {
@@ -44,11 +71,8 @@ func parseLogLine(line string) *QueryEvent {
 			tsStr = now.Format("Jan _2 15:04:05")
 			unixTime = now.Unix()
 		} else {
-			// Try to parse syslog format (Mmm DD HH:MM:SS)
-			// Syslog doesn't have a year, so we assume current year
 			t, err := time.Parse("Jan _2 15:04:05", tsStr)
 			if err == nil {
-				// Set year to current year
 				t = t.AddDate(now.Year(), 0, 0)
 				unixTime = t.Unix()
 			} else {
@@ -71,12 +95,11 @@ func startLogIngestion() {
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		line := scanner.Text()
-		// Always print to stdout so Docker logs are still available
 		fmt.Println(line)
 
 		if event := parseLogLine(line); event != nil {
 			eventsMu.Lock()
-			events = append([]QueryEvent{*event}, events...) // Newest first
+			events = append([]QueryEvent{*event}, events...)
 			if len(events) > maxEvents {
 				events = events[:maxEvents]
 			}
@@ -94,7 +117,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Start reading logs from stdin in a background goroutine
 	go startLogIngestion()
 
 	mux := http.NewServeMux()
@@ -139,13 +161,13 @@ func main() {
 
 	server := &http.Server{
 		Addr:         ":" + port,
-		Handler:      mux,
+		Handler:      gzipMiddleware(mux),
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 
-	log.Printf("Starting Web GUI on %s (Memory Mode)", server.Addr) // #nosec G706
+	log.Printf("Starting Web GUI on %s (Memory Mode + Gzip)", server.Addr) // #nosec G706
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}

@@ -420,7 +420,11 @@
             document.getElementById('rph').textContent = rph;
         }
 
-        document.getElementById('searchInput').addEventListener('input', renderEvents);
+        let searchTimeout;
+        document.getElementById('searchInput').addEventListener('input', () => {
+            clearTimeout(searchTimeout);
+            searchTimeout = setTimeout(renderEvents, 250);
+        });
 
         // Initial fetch
         fetchEvents();

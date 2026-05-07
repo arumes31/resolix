@@ -300,10 +300,17 @@
         async function fetchEvents() {
             try {
                 const response = await fetch('/api/events');
+                if (!response.ok) throw new Error('API down');
                 allEvents = await response.json();
                 renderEvents();
                 updateMainStats();
-            } catch (e) { console.error(e); }
+                document.getElementById('systemStatus').style.color = 'var(--success)';
+                document.getElementById('systemStatus').textContent = '● System Online';
+            } catch (e) { 
+                console.error(e); 
+                document.getElementById('systemStatus').style.color = 'var(--danger)';
+                document.getElementById('systemStatus').textContent = '● System Offline';
+            }
         }
 
         async function fetchStats() {

@@ -114,6 +114,9 @@ EOL
     fi
 
     echo "Generated dnsmasq.conf:"
+    cat /etc/dnsmasq.conf
+}
+
 # Initial health check
 IFS=' ' read -r -a UPSTREAMS <<< "$UPSTREAM_DNS"
 HEALTHY_UPSTREAMS=()

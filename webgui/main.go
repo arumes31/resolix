@@ -12,7 +12,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -30,10 +29,11 @@ type QueryEvent struct {
 }
 
 var (
-	events    []QueryEvent
-	eventsMu  sync.RWMutex
 	maxEvents = 1000
-	logRegex  = regexp.MustCompile(`(?:(\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+)?dnsmasq\[\d+\]:\s+query\[(\w+)\]\s+([\w\.-]+)\s+from\s+([\d\.:a-fA-F]+)`)
+	events    = make([]QueryEvent, maxEvents)
+	head      = 0 // index for next insertion
+	count     = 0 // total items currently in buffer
+	eventsMu  sync.RWMutex
 )
 
 // Gzip middleware
@@ -60,35 +60,67 @@ func gzipMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// Fast parsing without regex
 func parseLogLine(line string) *QueryEvent {
-	matches := logRegex.FindStringSubmatch(line)
-	if len(matches) == 5 {
-		tsStr := matches[1]
-		var unixTime int64
-		now := time.Now()
+	// Look for query marker
+	queryIdx := strings.Index(line, "query[")
+	if queryIdx == -1 {
+		return nil
+	}
 
-		if tsStr == "" {
-			tsStr = now.Format("Jan _2 15:04:05")
-			unixTime = now.Unix()
-		} else {
-			t, err := time.Parse("Jan _2 15:04:05", tsStr)
-			if err == nil {
-				t = t.AddDate(now.Year(), 0, 0)
-				unixTime = t.Unix()
-			} else {
-				unixTime = now.Unix()
-			}
-		}
+	// Extract Type
+	typeStart := queryIdx + 6
+	typeEnd := strings.Index(line[typeStart:], "]")
+	if typeEnd == -1 {
+		return nil
+	}
+	qType := line[typeStart : typeStart+typeEnd]
 
-		return &QueryEvent{
-			Timestamp: tsStr,
-			UnixTime:  unixTime,
-			Type:      matches[2],
-			Domain:    matches[3],
-			ClientIP:  matches[4],
+	// Extract Domain
+	domainPart := line[typeStart+typeEnd+2:]
+	domainEnd := strings.Index(domainPart, " ")
+	if domainEnd == -1 {
+		return nil
+	}
+	domain := domainPart[:domainEnd]
+
+	// Extract Client IP
+	fromIdx := strings.Index(domainPart, "from ")
+	if fromIdx == -1 {
+		return nil
+	}
+	clientIP := strings.TrimSpace(domainPart[fromIdx+5:])
+
+	// Handle Timestamp
+	var tsStr string
+	now := time.Now()
+	if queryIdx > 16 {
+		// Potential timestamp at the beginning (e.g., "Jan  1 12:00:00 ")
+		tsCandidate := line[:15]
+		if _, err := time.Parse("Jan _2 15:04:05", tsCandidate); err == nil {
+			tsStr = tsCandidate
 		}
 	}
-	return nil
+
+	unixTime := now.Unix()
+	if tsStr == "" {
+		tsStr = now.Format("Jan _2 15:04:05")
+	} else {
+		t, err := time.Parse("Jan _2 15:04:05", tsStr)
+		if err == nil {
+			// Syslog doesn't have a year, use current year
+			t = t.AddDate(now.Year(), 0, 0)
+			unixTime = t.Unix()
+		}
+	}
+
+	return &QueryEvent{
+		Timestamp: tsStr,
+		UnixTime:  unixTime,
+		Type:      qType,
+		Domain:    domain,
+		ClientIP:  clientIP,
+	}
 }
 
 func startLogIngestion() {
@@ -99,9 +131,10 @@ func startLogIngestion() {
 
 		if event := parseLogLine(line); event != nil {
 			eventsMu.Lock()
-			events = append([]QueryEvent{*event}, events...)
-			if len(events) > maxEvents {
-				events = events[:maxEvents]
+			events[head] = *event
+			head = (head + 1) % maxEvents
+			if count < maxEvents {
+				count++
 			}
 			eventsMu.Unlock()
 		}
@@ -109,6 +142,19 @@ func startLogIngestion() {
 	if err := scanner.Err(); err != nil {
 		log.Printf("Scanner error: %v", err)
 	}
+}
+
+// getOrderedEvents returns events from newest to oldest
+func getOrderedEvents() []QueryEvent {
+	eventsMu.RLock()
+	defer eventsMu.RUnlock()
+
+	result := make([]QueryEvent, 0, count)
+	for i := 0; i < count; i++ {
+		idx := (head - 1 - i + maxEvents) % maxEvents
+		result = append(result, events[idx])
+	}
+	return result
 }
 
 func main() {
@@ -122,10 +168,7 @@ func main() {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		eventsMu.RLock()
-		currentEvents := make([]QueryEvent, len(events))
-		copy(currentEvents, events)
-		eventsMu.RUnlock()
+		currentEvents := getOrderedEvents()
 
 		var buf bytes.Buffer
 		if err := tmpl.Execute(&buf, map[string]interface{}{
@@ -143,10 +186,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/api/events", func(w http.ResponseWriter, r *http.Request) {
-		eventsMu.RLock()
-		currentEvents := make([]QueryEvent, len(events))
-		copy(currentEvents, events)
-		eventsMu.RUnlock()
+		currentEvents := getOrderedEvents()
 
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(currentEvents); err != nil {
@@ -167,7 +207,7 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	log.Printf("Starting Web GUI on %s (Memory Mode + Gzip)", server.Addr) // #nosec G706
+	log.Printf("Starting Web GUI on %s (Extreme Perf Mode)", server.Addr) // #nosec G706
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}

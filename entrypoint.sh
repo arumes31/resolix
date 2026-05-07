@@ -81,10 +81,11 @@ listen-address=$TAILSCALE_IP
 port=53
 cache-size=25000
 dns-forward-max=150
-strict-order
+all-servers
 log-queries
 log-async=25
 log-facility=-
+local-ttl=60
 EOL
 
     # Add healthy upstream DNS servers

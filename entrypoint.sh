@@ -86,6 +86,7 @@ log-queries
 log-async=25
 log-facility=-
 local-ttl=60
+max-ttl=600
 EOL
 
     # Add healthy upstream DNS servers

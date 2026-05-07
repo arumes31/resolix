@@ -9,7 +9,7 @@ HEALTHCHECK_DOMAIN=${HEALTHCHECK_DOMAIN:-"google.com"}
 # Cleanup function for graceful shutdown
 cleanup() {
     echo "Shutting down..."
-    kill "$DNSMASQ_PID" "$TAILSCALED_PID" 2>/dev/null
+    kill "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" 2>/dev/null
     exit 0
 }
 
@@ -80,6 +80,8 @@ listen-address=$TAILSCALE_IP
 port=53
 cache-size=25000
 strict-order
+log-queries
+log-facility=/var/log/dnsmasq.log
 EOL
 
     # Add healthy upstream DNS servers
@@ -144,6 +146,11 @@ if ! kill -0 $DNSMASQ_PID > /dev/null 2>&1; then
     exit 1
 fi
 echo "dnsmasq started successfully (PID: $DNSMASQ_PID)"
+
+# Start Web GUI
+echo "Starting Web GUI"
+/usr/bin/webgui &
+WEBGUI_PID=$!
 
 # Continuous health check loop
 (

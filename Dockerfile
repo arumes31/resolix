@@ -1,3 +1,11 @@
+# Builder stage
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /app
+COPY webgui/ .
+RUN go build -o webgui main.go
+
+# Final stage
 FROM alpine:latest
 
 # Install dependencies
@@ -9,6 +17,9 @@ RUN apk add --no-cache \
     bash \
     tailscale
 
+# Copy webgui binary
+COPY --from=builder /app/webgui /usr/bin/webgui
+
 # Copy configuration and scripts
 COPY entrypoint.sh /entrypoint.sh
 
@@ -18,8 +29,9 @@ RUN chmod +x /entrypoint.sh
 # Create Tailscale socket directory
 RUN mkdir -p /var/run/tailscale
 
-# Expose DNS port
+# Expose DNS and Web GUI ports
 EXPOSE 53/udp
+EXPOSE 8080
 
 # Set up Tailscale state directory
 VOLUME /var/lib/tailscale

@@ -20,6 +20,7 @@ var templates embed.FS
 
 type QueryEvent struct {
 	Timestamp string `json:"timestamp"`
+	UnixTime  int64  `json:"unix_time"`
 	Type      string `json:"type"`
 	Domain    string `json:"domain"`
 	ClientIP  string `json:"client_ip"`
@@ -35,12 +36,29 @@ var (
 func parseLogLine(line string) *QueryEvent {
 	matches := logRegex.FindStringSubmatch(line)
 	if len(matches) == 5 {
-		ts := matches[1]
-		if ts == "" {
-			ts = time.Now().Format("Jan _2 15:04:05")
+		tsStr := matches[1]
+		var unixTime int64
+		now := time.Now()
+
+		if tsStr == "" {
+			tsStr = now.Format("Jan _2 15:04:05")
+			unixTime = now.Unix()
+		} else {
+			// Try to parse syslog format (Mmm DD HH:MM:SS)
+			// Syslog doesn't have a year, so we assume current year
+			t, err := time.Parse("Jan _2 15:04:05", tsStr)
+			if err == nil {
+				// Set year to current year
+				t = t.AddDate(now.Year(), 0, 0)
+				unixTime = t.Unix()
+			} else {
+				unixTime = now.Unix()
+			}
 		}
+
 		return &QueryEvent{
-			Timestamp: ts,
+			Timestamp: tsStr,
+			UnixTime:  unixTime,
 			Type:      matches[2],
 			Domain:    matches[3],
 			ClientIP:  matches[4],

@@ -294,6 +294,14 @@
                 <div class="stat-label">Unique Clients</div>
                 <div id="uniqueClients" class="stat-value">0</div>
             </div>
+            <div class="stat-card">
+                <div class="stat-label">Requests / Min</div>
+                <div id="rpm" class="stat-value">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Requests / Hour</div>
+                <div id="rph" class="stat-value">0</div>
+            </div>
         </div>
 
         <div class="table-container">
@@ -400,6 +408,16 @@
             
             const uniqueClients = new Set(allEvents.map(e => e.client_ip)).size;
             document.getElementById('uniqueClients').textContent = uniqueClients;
+
+            const now = Math.floor(Date.now() / 1000);
+            const oneMinAgo = now - 60;
+            const oneHourAgo = now - 3600;
+
+            const rpm = allEvents.filter(e => e.unix_time >= oneMinAgo).length;
+            const rph = allEvents.filter(e => e.unix_time >= oneHourAgo).length;
+
+            document.getElementById('rpm').textContent = rpm;
+            document.getElementById('rph').textContent = rph;
         }
 
         document.getElementById('searchInput').addEventListener('input', renderEvents);

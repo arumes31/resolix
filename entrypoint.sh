@@ -114,21 +114,38 @@ EOL
     fi
 
     echo "Generated dnsmasq.conf:"
-    cat /etc/dnsmasq.conf
-}
-
 # Initial health check
 IFS=' ' read -r -a UPSTREAMS <<< "$UPSTREAM_DNS"
 HEALTHY_UPSTREAMS=()
-for ups in "${UPSTREAMS[@]}"; do
-    echo "Checking upstream DNS server: $ups using domain: $HEALTHCHECK_DOMAIN"
-    if check_upstream "$ups"; then
-        echo "Upstream $ups is healthy"
-        HEALTHY_UPSTREAMS+=("$ups")
-    else
-        echo "Warning: Upstream $ups is down, skipping"
-    fi
-done
+
+check_all_upstreams() {
+    local results=()
+    local pids=()
+    for ups in "${UPSTREAMS[@]}"; do
+        (
+            if check_upstream "$ups"; then
+                exit 0
+            else
+                exit 1
+            fi
+        ) &
+        pids+=($!)
+    done
+
+    local i=0
+    for pid in "${pids[@]}"; do
+        wait "$pid"
+        if [ $? -eq 0 ]; then
+            results+=("${UPSTREAMS[$i]}")
+        fi
+        i=$((i+1))
+    done
+    echo "${results[@]}"
+}
+
+echo "Performing initial parallel health checks..."
+HEALTHY_STR=$(check_all_upstreams)
+read -r -a HEALTHY_UPSTREAMS <<< "$HEALTHY_STR"
 
 # Ensure at least one healthy upstream
 if [ ${#HEALTHY_UPSTREAMS[@]} -eq 0 ]; then
@@ -165,15 +182,8 @@ WEBGUI_PID=$!
 # Continuous health check loop
 (
     while true; do
-        NEW_HEALTHY_UPSTREAMS=()
-        for ups in "${UPSTREAMS[@]}"; do
-            if check_upstream "$ups"; then
-                echo "Upstream $ups is healthy"
-                NEW_HEALTHY_UPSTREAMS+=("$ups")
-            else
-                echo "Warning: Upstream $ups is down"
-            fi
-        done
+        NEW_HEALTHY_STR=$(check_all_upstreams)
+        read -r -a NEW_HEALTHY_UPSTREAMS <<< "$NEW_HEALTHY_STR"
 
         # Check if healthy upstreams have changed
         if [ "${NEW_HEALTHY_UPSTREAMS[*]}" != "${HEALTHY_UPSTREAMS[*]}" ]; then

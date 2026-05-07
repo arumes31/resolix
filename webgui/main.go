@@ -73,37 +73,46 @@ func gzipMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// Robust parsing using fields
 func parseLogLine(line string) {
 	now := time.Now()
+	parts := strings.Fields(line)
+	if len(parts) < 2 {
+		return
+	}
 
-	// 1. Handle "query[" lines
-	if idx := strings.Index(line, "query["); idx != -1 {
-		typeStart := idx + 6
-		typeEnd := strings.Index(line[typeStart:], "]")
-		if typeEnd == -1 {
+	// Identify the action (query, forwarded, reply, etc.)
+	// We look for the part that contains the action, usually after "dnsmasq[pid]:"
+	actionIdx := -1
+	for i, p := range parts {
+		if strings.HasPrefix(p, "query[") || p == "forwarded" || p == "reply" || p == "config" || p == "cached" {
+			actionIdx = i
+			break
+		}
+	}
+
+	if actionIdx == -1 {
+		return
+	}
+
+	action := parts[actionIdx]
+
+	// 1. Handle Queries
+	if strings.HasPrefix(action, "query[") {
+		// query[A] domain from IP
+		qType := action[6 : len(action)-1]
+		if len(parts) < actionIdx+4 {
 			return
 		}
-		qType := line[typeStart : typeStart+typeEnd]
+		domain := parts[actionIdx+1]
+		// Skip "from" at actionIdx+2
+		clientIP := parts[actionIdx+3]
 
-		domainPart := line[typeStart+typeEnd+2:]
-		domainEnd := strings.Index(domainPart, " ")
-		if domainEnd == -1 {
-			return
-		}
-		domain := domainPart[:domainEnd]
-
-		fromIdx := strings.Index(domainPart, "from ")
-		if fromIdx == -1 {
-			return
-		}
-		clientIP := strings.TrimSpace(domainPart[fromIdx+5:])
-
+		// Extract timestamp from the beginning if possible
 		tsStr := now.Format("Jan _2 15:04:05")
-		if idx > 16 {
-			tsCandidate := line[:15]
-			if _, err := time.Parse("Jan _2 15:04:05", tsCandidate); err == nil {
-				tsStr = tsCandidate
-			}
+		if actionIdx >= 3 {
+			// Likely syslog format: Mmm DD HH:MM:SS
+			tsStr = strings.Join(parts[:3], " ")
 		}
 
 		event := QueryEvent{
@@ -114,7 +123,6 @@ func parseLogLine(line string) {
 			ClientIP:  clientIP,
 		}
 
-		// Store in pending to wait for reply/latency
 		pendingMu.Lock()
 		pendingQueries[domain] = now
 		pendingMu.Unlock()
@@ -129,12 +137,12 @@ func parseLogLine(line string) {
 		return
 	}
 
-	// 2. Handle "forwarded" lines (to track upstream)
-	if idx := strings.Index(line, "forwarded "); idx != -1 {
-		parts := strings.Fields(line[idx:])
-		if len(parts) >= 4 {
-			domain := parts[1]
-			upstream := parts[3]
+	// 2. Handle Forwarded (Track Upstream)
+	if action == "forwarded" {
+		// forwarded domain to IP
+		if len(parts) >= actionIdx+4 {
+			domain := parts[actionIdx+1]
+			upstream := parts[actionIdx+3]
 			pendingMu.Lock()
 			pendingUpstreams[domain] = upstream
 			pendingMu.Unlock()
@@ -142,21 +150,26 @@ func parseLogLine(line string) {
 		return
 	}
 
-	// 3. Handle "reply" lines (to calculate latency)
-	if idx := strings.Index(line, "reply "); idx != -1 {
-		parts := strings.Fields(line[idx:])
-		if len(parts) >= 2 {
-			domain := parts[1]
+	// 3. Handle Replies / Cached / Config (Latency)
+	if action == "reply" || action == "cached" || action == "config" {
+		// action domain is IP/NODATA/etc
+		if len(parts) >= actionIdx+2 {
+			domain := parts[actionIdx+1]
 			pendingMu.Lock()
 			startTime, ok := pendingQueries[domain]
-			upstream := pendingUpstreams[domain]
+			upstream := ""
+			if action == "reply" {
+				upstream = pendingUpstreams[domain]
+			} else {
+				upstream = action // "cached" or "config"
+			}
+
 			if ok {
 				latency := float64(now.Sub(startTime).Microseconds()) / 1000.0
 				delete(pendingQueries, domain)
 				delete(pendingUpstreams, domain)
 				pendingMu.Unlock()
 
-				// Update the latest event for this domain if found
 				eventsMu.Lock()
 				for i := 0; i < count; i++ {
 					idx := (head - 1 - i + maxEvents) % maxEvents
@@ -176,14 +189,21 @@ func parseLogLine(line string) {
 }
 
 func startLogIngestion() {
+	// Use a larger buffer for the scanner
 	scanner := bufio.NewScanner(os.Stdin)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024) // 1MB max line length
+
+	log.Println("Log ingestion started, waiting for dnsmasq input...")
 	for scanner.Scan() {
 		line := scanner.Text()
-		fmt.Println(line)
+		fmt.Println(line) // Still print to stdout for docker logs
 		parseLogLine(line)
 	}
 	if err := scanner.Err(); err != nil {
-		log.Printf("Scanner error: %v", err)
+		log.Printf("Scanner FATAL error: %v", err)
+	} else {
+		log.Println("Scanner closed normally")
 	}
 }
 
@@ -274,6 +294,7 @@ func main() {
 
 		ips, err := net.LookupIP(domain)
 		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
 			if err := json.NewEncoder(w).Encode(map[string]interface{}{
 				"status": "error",
 				"error":  err.Error(),

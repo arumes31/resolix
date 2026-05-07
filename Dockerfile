@@ -1,9 +1,11 @@
 # Builder stage
-FROM golang:1.26-alpine AS builder
+FROM golang:1.26.3-alpine AS builder
 
 WORKDIR /app
 COPY webgui/ .
-RUN go build -o webgui .
+ARG TARGETOS
+ARG TARGETARCH
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o webgui .
 
 # Final stage
 FROM alpine:latest

@@ -80,9 +80,13 @@ generate_dnsmasq_conf() {
 listen-address=$TAILSCALE_IP
 port=53
 cache-size=25000
+dns-forward-max=150
 strict-order
 log-queries
+log-async=25
 log-facility=-
+local-ttl=60
+max-ttl=600
 EOL
 
     # Add healthy upstream DNS servers

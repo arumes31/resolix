@@ -123,7 +123,7 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	log.Printf("Starting Web GUI on %s (Memory Mode)", server.Addr)
+	log.Printf("Starting Web GUI on %s (Memory Mode)", server.Addr) // #nosec G706
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}

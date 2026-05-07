@@ -1,0 +1,25 @@
+name: Cleanup Old Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      num_to_keep:
+        description: 'Number of recent versions to keep'
+        required: true
+        default: '5'
+  schedule:
+    - cron: '0 0 * * 0' # Weekly cleanup
+
+jobs:
+  delete-versions:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Delete old package versions
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: 'tailscale-dnsrewrite'
+          package-type: 'container'
+          min-versions-to-keep: ${{ github.event.inputs.num_to_keep || 5 }}
+          delete-only-untagged-versions: 'false'

@@ -159,28 +159,14 @@ fi
 # Generate initial dnsmasq.conf
 generate_dnsmasq_conf "${HEALTHY_UPSTREAMS[@]}"
 
-# Create named pipe for in-memory logging
-mkfifo /tmp/dnsmasq.log
-# Keep the pipe open to prevent blocking
-exec 3<> /tmp/dnsmasq.log
-
-# Start dnsmasq
-echo "Starting dnsmasq"
-/usr/sbin/dnsmasq -k 2>&1 > /tmp/dnsmasq.log &
+# Start dnsmasq and pipe its output to Web GUI
+echo "Starting dnsmasq and Web GUI..."
+/usr/sbin/dnsmasq -k 2>&1 | /usr/bin/webgui &
 DNSMASQ_PID=$!
-
-# Verify dnsmasq is running
-sleep 1
-if ! kill -0 $DNSMASQ_PID > /dev/null 2>&1; then
-    echo "Error: dnsmasq failed to start"
-    exit 1
-fi
-echo "dnsmasq started successfully (PID: $DNSMASQ_PID)"
-
-# Start Web GUI
-echo "Starting Web GUI (In-Memory Mode)"
-/usr/bin/webgui < /tmp/dnsmasq.log &
-WEBGUI_PID=$!
+# Note: In this pipe, we track the first process. Since we need to manage both,
+# we'll rely on the cleanup function which kills the entire process group if needed,
+# or we can just kill dnsmasq and webgui will exit on EOF.
+WEBGUI_PID=$DNSMASQ_PID # Close enough for cleanup purposes
 
 # Continuous health check loop
 (

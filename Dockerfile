@@ -31,7 +31,7 @@ RUN mkdir -p /var/run/tailscale
 
 # Expose DNS and Web GUI ports
 EXPOSE 53/udp
-EXPOSE 8080
+EXPOSE 35353
 
 # Set up Tailscale state directory
 VOLUME /var/lib/tailscale

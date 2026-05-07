@@ -7,5 +7,5 @@ services:
       - UPSTREAM_DNS=100.77.35.105 100.68.143.42
       - TS_AUTHKEY=tskey-auth-xxxxx
     ports:
-      - "8080:8080"
+      - "35353:35353"
     restart: unless-stopped

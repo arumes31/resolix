@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:;">
-    <title>Tailscale DNS Monitor</title>
+    <title>Tailscale DNS Monitor - Advanced</title>
     <style>
         :root {
             --bg-color: #0f172a;
@@ -30,14 +30,14 @@
             background-color: var(--bg-color);
             color: var(--text-primary);
             min-height: 100vh;
-            padding: 2rem;
+            padding: 1rem;
             background-image: 
                 radial-gradient(circle at 0% 0%, rgba(56, 189, 248, 0.15) 0%, transparent 50%),
                 radial-gradient(circle at 100% 100%, rgba(139, 92, 246, 0.15) 0%, transparent 50%);
         }
 
         .container {
-            max-width: 1200px;
+            max-width: 1400px;
             margin: 0 auto;
         }
 
@@ -46,6 +46,8 @@
             justify-content: space-between;
             align-items: center;
             margin-bottom: 2rem;
+            flex-wrap: wrap;
+            gap: 1rem;
         }
 
         h1 {
@@ -59,7 +61,7 @@
 
         .search-container {
             position: relative;
-            width: 100%;
+            flex: 1;
             max-width: 400px;
         }
 
@@ -72,12 +74,6 @@
             color: var(--text-primary);
             backdrop-filter: blur(12px);
             outline: none;
-            transition: all 0.2s;
-        }
-
-        .search-input:focus {
-            border-color: var(--accent-color);
-            box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2);
         }
 
         .search-icon {
@@ -88,178 +84,148 @@
             color: var(--text-secondary);
         }
 
-        .stats {
+        .dashboard-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
             gap: 1rem;
             margin-bottom: 2rem;
         }
 
-        .stat-card {
+        .card {
             background: var(--glass-bg);
             border: 1px solid var(--glass-border);
-            padding: 1.25rem;
+            padding: 1.5rem;
             border-radius: 1rem;
             backdrop-filter: blur(12px);
         }
 
-        .stat-label {
+        .stat-header {
             font-size: 0.875rem;
             color: var(--text-secondary);
-            margin-bottom: 0.5rem;
+            margin-bottom: 1rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            display: flex;
+            justify-content: space-between;
         }
 
         .stat-value {
-            font-size: 1.5rem;
+            font-size: 2rem;
             font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        .top-list {
+            list-style: none;
+        }
+
+        .top-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 0.5rem 0;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            font-size: 0.9rem;
+        }
+
+        .top-item:last-child {
+            border-bottom: none;
+        }
+
+        .top-count {
+            background: rgba(56, 189, 248, 0.1);
+            color: var(--accent-color);
+            padding: 0.1rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
         }
 
         .table-container {
             background: var(--glass-bg);
             border: 1px solid var(--glass-border);
             border-radius: 1rem;
-            backdrop-filter: blur(12px);
             overflow: hidden;
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            margin-bottom: 2rem;
         }
 
         table {
             width: 100%;
             border-collapse: collapse;
-            text-align: left;
+            font-size: 0.875rem;
         }
 
         th {
             background: rgba(255, 255, 255, 0.05);
-            padding: 1rem;
-            font-size: 0.875rem;
-            font-weight: 600;
+            padding: 0.75rem 1rem;
             color: var(--text-secondary);
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
+            text-align: left;
         }
 
         td {
-            padding: 1rem;
+            padding: 0.75rem 1rem;
             border-top: 1px solid var(--glass-border);
-            font-size: 0.9375rem;
         }
 
-        tr:hover td {
-            background: rgba(255, 255, 255, 0.02);
-        }
-
-        .badge {
-            display: inline-flex;
-            align-items: center;
-            padding: 0.25rem 0.625rem;
-            border-radius: 9999px;
-            font-size: 0.75rem;
-            font-weight: 600;
-            line-height: 1;
-        }
-
-        .badge-type {
-            background: rgba(56, 189, 248, 0.1);
-            color: var(--accent-color);
-        }
-
-        .badge-ip {
-            background: rgba(148, 163, 184, 0.1);
-            color: var(--text-secondary);
+        .latency-cell {
             font-family: monospace;
-        }
-
-        .domain {
-            font-weight: 500;
-            color: var(--text-primary);
-        }
-
-        .timestamp {
-            color: var(--text-secondary);
-            white-space: nowrap;
-        }
-
-        .refresh-btn {
-            background: var(--accent-color);
-            color: var(--bg-color);
-            border: none;
-            padding: 0.625rem 1.25rem;
-            border-radius: 0.75rem;
             font-weight: 600;
-            cursor: pointer;
-            transition: all 0.2s;
+        }
+
+        .latency-low { color: var(--success); }
+        .latency-mid { color: var(--warning); }
+        .latency-high { color: var(--danger); }
+
+        .simulator-box {
             display: flex;
-            align-items: center;
             gap: 0.5rem;
         }
 
-        .refresh-btn:hover {
-            background: var(--accent-hover);
-            transform: translateY(-1px);
-        }
-
-        .refresh-btn:active {
-            transform: translateY(0);
-        }
-
-        .no-results {
-            padding: 3rem;
-            text-align: center;
-            color: var(--text-secondary);
-        }
-
-        .sr-only {
-            position: absolute;
-            width: 1px;
-            height: 1px;
-            padding: 0;
-            margin: -1px;
-            overflow: hidden;
-            clip: rect(0, 0, 0, 0);
-            white-space: nowrap;
-            border-width: 0;
-        }
-
-        /* Tooltips for buttons without text */
-        [data-tooltip] {
-            position: relative;
-        }
-
-        [data-tooltip]::after {
-            content: attr(data-tooltip);
-            position: absolute;
-            bottom: 100%;
-            left: 50%;
-            transform: translateX(-50%);
+        .simulator-input {
+            flex: 1;
             padding: 0.5rem;
-            background: #000;
+            background: rgba(0,0,0,0.2);
+            border: 1px solid var(--glass-border);
+            border-radius: 0.5rem;
             color: #fff;
-            border-radius: 0.25rem;
-            font-size: 0.75rem;
-            white-space: nowrap;
-            opacity: 0;
-            visibility: hidden;
-            transition: opacity 0.2s;
-            z-index: 10;
         }
 
-        [data-tooltip]:hover::after {
-            opacity: 1;
-            visibility: visible;
+        .btn {
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
+            border: none;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.2s;
         }
 
-        @media (max-width: 768px) {
-            header {
-                flex-direction: column;
-                gap: 1rem;
-                align-items: flex-start;
-            }
-            .search-container {
-                max-width: 100%;
-            }
-            .stats {
-                grid-template-columns: 1fr 1fr;
+        .btn-primary {
+            background: var(--accent-color);
+            color: var(--bg-color);
+        }
+
+        .btn-primary:hover {
+            background: var(--accent-hover);
+        }
+
+        #simulatorResult {
+            margin-top: 1rem;
+            font-size: 0.8rem;
+            padding: 0.5rem;
+            background: rgba(0,0,0,0.3);
+            border-radius: 0.5rem;
+            display: none;
+        }
+
+        .upstream-badge {
+            font-size: 0.7rem;
+            background: rgba(139, 92, 246, 0.1);
+            color: #a78bfa;
+            padding: 0.1rem 0.4rem;
+            border-radius: 4px;
+        }
+
+        @media (max-width: 1024px) {
+            .dashboard-grid {
+                grid-template-columns: 1fr;
             }
         }
     </style>
@@ -269,168 +235,166 @@
         <header>
             <div>
                 <h1>Tailscale DNS Monitor</h1>
-                <p style="color: var(--text-secondary); font-size: 0.875rem;">Monitoring last 1000 queries</p>
+                <p id="systemStatus" style="color: var(--success); font-size: 0.8rem;">● System Online</p>
             </div>
             <div class="search-container">
                 <svg class="search-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
-                <input type="text" id="searchInput" class="search-input" placeholder="Search domain or client IP..." aria-label="Search domain or client IP">
+                <input type="text" id="searchInput" class="search-input" placeholder="Quick Filter...">
             </div>
-            <button class="refresh-btn" onclick="fetchEvents()" data-tooltip="Reload latest events">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"></path><path d="M1 20v-6h6"></path><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
-                <span>Refresh</span>
-            </button>
+            <div class="simulator-box card" style="padding: 0.75rem; margin-bottom: 0;">
+                <input type="text" id="simDomain" class="simulator-input" placeholder="Test domain...">
+                <button class="btn btn-primary" onclick="simulateQuery()">Test</button>
+            </div>
         </header>
 
-        <div class="stats" aria-live="polite">
-            <div class="stat-card">
-                <div class="stat-label">Total Events</div>
-                <div id="totalEvents" class="stat-value">0</div>
+        <div id="simulatorResult"></div>
+
+        <div class="dashboard-grid">
+            <div class="card">
+                <div class="stat-header"><span>Traffic Stats</span> <span id="rpm_val" style="color: var(--accent-color)">0 RPM</span></div>
+                <div style="display: flex; justify-content: space-between; align-items: flex-end; height: 60px; gap: 4px;" id="miniChart">
+                    <!-- Simple bar chart will be here -->
+                </div>
+                <div style="margin-top: 1rem; display: flex; justify-content: space-between;">
+                    <div><span class="stat-label">Hour:</span> <span id="rph_val" style="font-weight:bold">0</span></div>
+                    <div><span class="stat-label">Total:</span> <span id="total_val" style="font-weight:bold">0</span></div>
+                </div>
             </div>
-            <div class="stat-card">
-                <div class="stat-label">Unique Domains</div>
-                <div id="uniqueDomains" class="stat-value">0</div>
+
+            <div class="card">
+                <div class="stat-header">Top Domains</div>
+                <ul class="top-list" id="topDomains"></ul>
             </div>
-            <div class="stat-card">
-                <div class="stat-label">Unique Clients</div>
-                <div id="uniqueClients" class="stat-value">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Requests / Min</div>
-                <div id="rpm" class="stat-value">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Requests / Hour</div>
-                <div id="rph" class="stat-value">0</div>
+
+            <div class="card">
+                <div class="stat-header">Top Clients</div>
+                <ul class="top-list" id="topClients"></ul>
             </div>
         </div>
 
         <div class="table-container">
             <table>
-                <caption class="sr-only">List of recent DNS query events including timestamp, query type, domain, and client IP</caption>
                 <thead>
                     <tr>
-                        <th scope="col">Timestamp</th>
-                        <th scope="col">Type</th>
-                        <th scope="col">Domain</th>
-                        <th scope="col">Client IP</th>
+                        <th>Time</th>
+                        <th>Type</th>
+                        <th>Domain</th>
+                        <th>Client</th>
+                        <th>Upstream</th>
+                        <th>Latency</th>
                     </tr>
                 </thead>
-                <tbody id="eventTable">
-                    <!-- Events will be populated here -->
-                </tbody>
+                <tbody id="eventTable"></tbody>
             </table>
-            <div id="noResults" class="no-results" style="display: none;" role="alert">
-                No events found matching your search.
-            </div>
         </div>
     </div>
 
     <script>
         let allEvents = [];
+        let rpmHistory = Array(20).fill(0);
+
+        async function fetchAll() {
+            await Promise.all([fetchEvents(), fetchStats()]);
+        }
 
         async function fetchEvents() {
             try {
                 const response = await fetch('/api/events');
-                if (!response.ok) {
-                    console.error('Fetch failed:', response.status, response.statusText);
-                    return;
-                }
+                allEvents = await response.json();
+                renderEvents();
+                updateMainStats();
+            } catch (e) { console.error(e); }
+        }
+
+        async function fetchStats() {
+            try {
+                const response = await fetch('/api/stats');
+                const stats = await response.json();
+                renderTopList('topDomains', stats.top_domains);
+                renderTopList('topClients', stats.top_clients);
+            } catch (e) { console.error(e); }
+        }
+
+        async function simulateQuery() {
+            const domain = document.getElementById('simDomain').value;
+            const resBox = document.getElementById('simulatorResult');
+            resBox.style.display = 'block';
+            resBox.textContent = 'Querying...';
+            try {
+                const response = await fetch(`/api/simulate?domain=${domain}`);
                 const data = await response.json();
-                if (Array.isArray(data)) {
-                    allEvents = data;
-                    renderEvents();
-                    updateStats();
+                if (data.status === 'success') {
+                    resBox.innerHTML = `<strong>Results:</strong> ${data.ips.join(', ')}`;
                 } else {
-                    console.error('Invalid data structure received');
-                    allEvents = [];
+                    resBox.innerHTML = `<span style="color: var(--danger)">Error: ${data.error}</span>`;
                 }
-            } catch (error) {
-                console.error('Error fetching events:', error);
-                allEvents = [];
-            }
+            } catch (e) { resBox.textContent = 'Error: ' + e.message; }
         }
 
         function renderEvents() {
             const searchTerm = document.getElementById('searchInput').value.toLowerCase();
             const tableBody = document.getElementById('eventTable');
-            const noResults = document.getElementById('noResults');
             
-            const filteredEvents = allEvents.filter(event => 
-                (event.domain || '').toLowerCase().includes(searchTerm) || 
-                (event.client_ip || '').toLowerCase().includes(searchTerm) ||
-                (event.type || '').toLowerCase().includes(searchTerm)
-            );
+            const filtered = allEvents.filter(e => 
+                e.domain.toLowerCase().includes(searchTerm) || 
+                e.client_ip.toLowerCase().includes(searchTerm)
+            ).slice(0, 100); // Only show first 100 for perf
 
-            tableBody.innerHTML = '';
-            
-            if (filteredEvents.length === 0) {
-                noResults.style.display = 'block';
-            } else {
-                noResults.style.display = 'none';
-                filteredEvents.forEach(event => {
-                    const row = document.createElement('tr');
-                    
-                    const tdTimestamp = document.createElement('td');
-                    tdTimestamp.className = 'timestamp';
-                    tdTimestamp.textContent = event.timestamp;
-                    
-                    const tdType = document.createElement('td');
-                    const spanType = document.createElement('span');
-                    spanType.className = 'badge badge-type';
-                    spanType.textContent = event.type;
-                    tdType.appendChild(spanType);
-                    
-                    const tdDomain = document.createElement('td');
-                    tdDomain.className = 'domain';
-                    tdDomain.textContent = event.domain;
-                    
-                    const tdIP = document.createElement('td');
-                    const spanIP = document.createElement('span');
-                    spanIP.className = 'badge badge-ip';
-                    spanIP.textContent = event.client_ip;
-                    tdIP.appendChild(spanIP);
-                    
-                    row.appendChild(tdTimestamp);
-                    row.appendChild(tdType);
-                    row.appendChild(tdDomain);
-                    row.appendChild(tdIP);
-                    
-                    tableBody.appendChild(row);
-                });
-            }
+            tableBody.innerHTML = filtered.map(e => {
+                let latencyClass = 'latency-low';
+                if (e.latency_ms > 50) latencyClass = 'latency-mid';
+                if (e.latency_ms > 150) latencyClass = 'latency-high';
+
+                return `
+                    <tr>
+                        <td class="timestamp">${e.timestamp}</td>
+                        <td><span class="badge badge-type">${e.type}</span></td>
+                        <td class="domain">${e.domain}</td>
+                        <td><span class="badge badge-ip">${e.client_ip}</span></td>
+                        <td>${e.upstream ? `<span class="upstream-badge">${e.upstream}</span>` : '-'}</td>
+                        <td class="latency-cell ${latencyClass}">${e.latency_ms ? e.latency_ms.toFixed(1) + 'ms' : '-'}</td>
+                    </tr>
+                `;
+            }).join('');
         }
 
-        function updateStats() {
-            document.getElementById('totalEvents').textContent = allEvents.length;
-            
-            const uniqueDomains = new Set(allEvents.map(e => e.domain)).size;
-            document.getElementById('uniqueDomains').textContent = uniqueDomains;
-            
-            const uniqueClients = new Set(allEvents.map(e => e.client_ip)).size;
-            document.getElementById('uniqueClients').textContent = uniqueClients;
+        function renderTopList(id, list) {
+            const el = document.getElementById(id);
+            el.innerHTML = list.map(item => `
+                <li class="top-item">
+                    <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px;">${item.key}</span>
+                    <span class="top-count">${item.count}</span>
+                </li>
+            `).join('');
+        }
 
+        function updateMainStats() {
             const now = Math.floor(Date.now() / 1000);
-            const oneMinAgo = now - 60;
-            const oneHourAgo = now - 3600;
+            const rpm = allEvents.filter(e => e.unix_time >= now - 60).length;
+            const rph = allEvents.filter(e => e.unix_time >= now - 3600).length;
 
-            const rpm = allEvents.filter(e => e.unix_time >= oneMinAgo).length;
-            const rph = allEvents.filter(e => e.unix_time >= oneHourAgo).length;
+            document.getElementById('rpm_val').textContent = rpm + ' RPM';
+            document.getElementById('rph_val').textContent = rph;
+            document.getElementById('total_val').textContent = allEvents.length;
 
-            document.getElementById('rpm').textContent = rpm;
-            document.getElementById('rph').textContent = rph;
+            rpmHistory.push(rpm);
+            rpmHistory.shift();
+            renderMiniChart();
         }
 
-        let searchTimeout;
-        document.getElementById('searchInput').addEventListener('input', () => {
-            clearTimeout(searchTimeout);
-            searchTimeout = setTimeout(renderEvents, 250);
-        });
+        function renderMiniChart() {
+            const chart = document.getElementById('miniChart');
+            const max = Math.max(...rpmHistory, 1);
+            chart.innerHTML = rpmHistory.map(h => {
+                const height = (h / max) * 100;
+                return `<div style="flex: 1; background: var(--accent-color); height: ${height}%; border-radius: 2px; opacity: 0.6"></div>`;
+            }).join('');
+        }
 
-        // Initial fetch
-        fetchEvents();
+        document.getElementById('searchInput').addEventListener('input', renderEvents);
 
-        // Auto refresh every 30 seconds
-        setInterval(fetchEvents, 30000);
+        setInterval(fetchAll, 5000);
+        fetchAll();
     </script>
 </body>
 </html>

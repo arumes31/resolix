@@ -354,7 +354,7 @@
 
                 return `
                     <tr>
-                        <td class="timestamp">${e.timestamp}</td>
+                        <td class="timestamp">${new Date(e.unix_time * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false})}</td>
                         <td><span class="badge badge-type">${e.type}</span></td>
                         <td class="domain">${e.domain}</td>
                         <td><span class="badge badge-ip">${e.client_ip}</span></td>

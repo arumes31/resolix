@@ -60,6 +60,10 @@ var (
 	// History config
 	historyDir       = "/var/lib/tailscale-dnsrewrite"
 	lastArchivedTime int64
+
+	// Bucketized stats: unix hour -> count
+	hourlyStats = make(map[int64]int)
+	statsMu     sync.RWMutex
 )
 
 func init() {
@@ -70,6 +74,40 @@ func init() {
 		mode = "master"
 	}
 	os.MkdirAll(historyDir, 0755)
+	loadStatsFromHistory()
+}
+
+func loadStatsFromHistory() {
+	files, err := os.ReadDir(historyDir)
+	if err != nil {
+		return
+	}
+	now := time.Now().Unix()
+	cutoff := now - 72*3600
+
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), "history-") && strings.HasSuffix(f.Name(), ".jsonl") {
+			path := historyDir + "/" + f.Name()
+			file, err := os.Open(path)
+			if err != nil {
+				continue
+			}
+			scanner := bufio.NewScanner(file)
+			for scanner.Scan() {
+				var e QueryEvent
+				if err := json.Unmarshal(scanner.Bytes(), &e); err == nil {
+					if e.UnixTime >= cutoff {
+						hour := e.UnixTime / 3600
+						statsMu.Lock()
+						hourlyStats[hour]++
+						statsMu.Unlock()
+					}
+				}
+			}
+			file.Close()
+		}
+	}
+	log.Printf("Warmed up stats: %d buckets loaded", len(hourlyStats))
 }
 
 func startHistoryArchiver() {
@@ -134,6 +172,16 @@ func startHistoryArchiver() {
 				}
 			}
 		}
+
+		// Also cleanup hourly stats older than 72h
+		statsMu.Lock()
+		cutoffHour := now.Unix()/3600 - 72
+		for h := range hourlyStats {
+			if h < cutoffHour {
+				delete(hourlyStats, h)
+			}
+		}
+		statsMu.Unlock()
 	}
 }
 
@@ -233,6 +281,12 @@ func parseLogLine(line string, node string) {
 			ClientIP:  clientIP,
 			Node:      node,
 		}
+
+		// Update bucketed stats
+		hourBucket := now.Unix() / 3600
+		statsMu.Lock()
+		hourlyStats[hourBucket]++
+		statsMu.Unlock()
 
 		pendingMu.Lock()
 		if pendingQueries[node] == nil {
@@ -468,11 +522,16 @@ func main() {
 				rph++
 				nodeRPH[nodeName]++
 			}
-			if e.UnixTime >= now-86400 {
-				rpd++
-			}
 		}
 		eventsMu.RUnlock()
+
+		// Calculate RPD (Day) from bucketed stats for accuracy
+		currentHour := now / 3600
+		statsMu.RLock()
+		for h := currentHour - 23; h <= currentHour; h++ {
+			rpd += hourlyStats[h]
+		}
+		statsMu.RUnlock()
 
 		toStats := func(m map[string]int) []StatEntry {
 			s := make([]StatEntry, 0, len(m))

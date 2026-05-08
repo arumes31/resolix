@@ -38,7 +38,7 @@ type StatEntry struct {
 }
 
 var (
-	maxEvents = 1000
+	maxEvents = 50000
 	events    = make([]QueryEvent, maxEvents)
 	head      = 0
 	count     = 0
@@ -160,8 +160,12 @@ func parseLogLine(line string) {
 			upstream := ""
 			if action == "reply" {
 				upstream = pendingUpstreams[domain]
+			} else if action == "cached" {
+				upstream = "System Cache"
+			} else if action == "config" {
+				upstream = "Local Config"
 			} else {
-				upstream = action // "cached" or "config"
+				upstream = action
 			}
 
 			if ok {

@@ -32,6 +32,7 @@ type QueryEvent struct {
 	ClientIP  string  `json:"client_ip"`
 	Latency   float64 `json:"latency_ms,omitempty"`
 	Upstream  string  `json:"upstream,omitempty"`
+	Node      string  `json:"node,omitempty"`
 }
 
 type StatEntry struct {
@@ -46,10 +47,25 @@ var (
 	count     = 0
 	eventsMu  sync.RWMutex
 
-	pendingQueries   = make(map[string]time.Time)
-	pendingUpstreams = make(map[string]string)
+	// pending maps: node -> domain -> data
+	pendingQueries   = make(map[string]map[string]time.Time)
+	pendingUpstreams = make(map[string]map[string]string)
 	pendingMu        sync.Mutex
+
+	// Mode config
+	mode      = strings.ToLower(os.Getenv("MODE"))       // "master" or "slave"
+	masterURL = os.Getenv("MASTER_URL")                  // e.g. http://100.x.y.z:35353
+	nodeName  = os.Getenv("NODE_NAME")                   // Identifier
 )
+
+func init() {
+	if nodeName == "" {
+		nodeName, _ = os.Hostname()
+	}
+	if mode == "" {
+		mode = "master"
+	}
+}
 
 // Periodically clean up stale pending queries (older than 10s)
 func startPendingCleanup() {
@@ -57,10 +73,16 @@ func startPendingCleanup() {
 	for range ticker.C {
 		pendingMu.Lock()
 		now := time.Now()
-		for dom, start := range pendingQueries {
-			if now.Sub(start) > 10*time.Second {
-				delete(pendingQueries, dom)
-				delete(pendingUpstreams, dom)
+		for node, queries := range pendingQueries {
+			for dom, start := range queries {
+				if now.Sub(start) > 10*time.Second {
+					delete(queries, dom)
+					delete(pendingUpstreams[node], dom)
+				}
+			}
+			if len(queries) == 0 {
+				delete(pendingQueries, node)
+				delete(pendingUpstreams, node)
 			}
 		}
 		pendingMu.Unlock()
@@ -92,7 +114,7 @@ func gzipMiddleware(next http.Handler) http.Handler {
 }
 
 // Robust parsing using fields
-func parseLogLine(line string) {
+func parseLogLine(line string, node string) {
 	now := time.Now()
 	parts := strings.Fields(line)
 	if len(parts) < 2 {
@@ -139,10 +161,14 @@ func parseLogLine(line string) {
 			Type:      qType,
 			Domain:    domain,
 			ClientIP:  clientIP,
+			Node:      node,
 		}
 
 		pendingMu.Lock()
-		pendingQueries[domain] = now
+		if pendingQueries[node] == nil {
+			pendingQueries[node] = make(map[string]time.Time)
+		}
+		pendingQueries[node][domain] = now
 		pendingMu.Unlock()
 
 		eventsMu.Lock()
@@ -162,7 +188,10 @@ func parseLogLine(line string) {
 			domain := parts[actionIdx+1]
 			upstream := parts[actionIdx+3]
 			pendingMu.Lock()
-			pendingUpstreams[domain] = upstream
+			if pendingUpstreams[node] == nil {
+				pendingUpstreams[node] = make(map[string]string)
+			}
+			pendingUpstreams[node][domain] = upstream
 			pendingMu.Unlock()
 		}
 		return
@@ -174,10 +203,10 @@ func parseLogLine(line string) {
 		if len(parts) >= actionIdx+2 {
 			domain := parts[actionIdx+1]
 			pendingMu.Lock()
-			startTime, ok := pendingQueries[domain]
+			startTime, ok := pendingQueries[node][domain]
 			upstream := ""
 			if action == "reply" {
-				upstream = pendingUpstreams[domain]
+				upstream = pendingUpstreams[node][domain]
 			} else if action == "cached" {
 				upstream = "System Cache"
 			} else if action == "config" {
@@ -188,8 +217,8 @@ func parseLogLine(line string) {
 
 			if ok {
 				latency := float64(now.Sub(startTime).Microseconds()) / 1000.0
-				delete(pendingQueries, domain)
-				delete(pendingUpstreams, domain)
+				delete(pendingQueries[node], domain)
+				delete(pendingUpstreams[node], domain)
 				pendingMu.Unlock()
 
 				eventsMu.Lock()
@@ -200,7 +229,7 @@ func parseLogLine(line string) {
 				}
 				for i := 0; i < scanLimit; i++ {
 					idx := (head - 1 - i + maxEvents) % maxEvents
-					if events[idx].Domain == domain && events[idx].Latency == 0 {
+					if events[idx].Domain == domain && events[idx].Node == node && events[idx].Latency == 0 {
 						events[idx].Latency = latency
 						events[idx].Upstream = upstream
 						break
@@ -222,10 +251,26 @@ func startLogIngestion() {
 	scanner.Buffer(buf, 1024*1024) // 1MB max line length
 
 	log.Println("Log ingestion started, waiting for dnsmasq input...")
+	client := &http.Client{Timeout: 2 * time.Second}
+
 	for scanner.Scan() {
 		line := scanner.Text()
 		fmt.Println(line) // Still print to stdout for docker logs
-		parseLogLine(line)
+		
+		// In slave mode, forward raw logs to master
+		if mode == "slave" && masterURL != "" {
+			go func(l string) {
+				data, _ := json.Marshal(map[string]string{"node": nodeName, "line": l})
+				req, _ := http.NewRequest("POST", masterURL+"/api/ingest", bytes.NewBuffer(data))
+				req.Header.Set("Content-Type", "application/json")
+				resp, err := client.Do(req)
+				if err == nil {
+					resp.Body.Close()
+				}
+			}(line)
+		}
+
+		parseLogLine(line, nodeName)
 	}
 	if err := scanner.Err(); err != nil {
 		log.Printf("Scanner FATAL error: %v", err)
@@ -276,6 +321,26 @@ func main() {
 	}()
 
 	mux := http.NewServeMux()
+
+	// Slave log ingestion endpoint (Master only)
+	mux.HandleFunc("/api/ingest", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var payload struct {
+			Node string `json:"node"`
+			Line string `json:"line"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "Bad request", http.StatusBadRequest)
+			return
+		}
+		if payload.Line != "" {
+			parseLogLine(payload.Line, payload.Node)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		currentEvents := getOrderedEvents(1000) // Only send last 1000 to template

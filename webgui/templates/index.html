@@ -277,6 +277,7 @@
                 <thead>
                     <tr>
                         <th>Time</th>
+                        <th>Node</th>
                         <th>Type</th>
                         <th>Domain</th>
                         <th>Client</th>
@@ -355,6 +356,7 @@
                 return `
                     <tr>
                         <td class="timestamp">${new Date(e.unix_time * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false})}</td>
+                        <td><span class="badge" style="background: rgba(255,255,255,0.1); font-size: 0.7rem;">${e.node || 'local'}</span></td>
                         <td><span class="badge badge-type">${e.type}</span></td>
                         <td class="domain">${e.domain}</td>
                         <td><span class="badge badge-ip">${e.client_ip}</span></td>

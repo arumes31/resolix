@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:;">
     <title>Tailscale DNS Monitor - Advanced</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🛡️</text></svg>">
     <style>
         :root {
             --bg-color: #0f172a;
@@ -258,6 +259,7 @@
                 <div style="margin-top: 1rem; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
                     <div><span class="stat-label">Hour:</span> <span id="rph_val" style="font-weight:bold">0</span></div>
                     <div><span class="stat-label">Day:</span> <span id="rpd_val" style="font-weight:bold">0</span></div>
+                    <div><span class="stat-label">Cache Hit:</span> <span id="cache_ratio" style="font-weight:bold; color: var(--success);">0%</span></div>
                     <div><span class="stat-label">Total:</span> <span id="total_val" style="font-weight:bold">0</span></div>
                 </div>
             </div>
@@ -313,20 +315,31 @@
         let rpmHistory = Array(20).fill(0);
         let lastEventTimestamp = 0;
 
+        // Initialize SSE (Improvement 78)
+        function startStream() {
+            const eventSource = new EventSource('/api/stream');
+            eventSource.onmessage = (event) => {
+                const newEvent = JSON.parse(event.data);
+                allEvents = [newEvent, ...allEvents].slice(0, 1000);
+                renderEvents();
+            };
+            eventSource.onerror = () => {
+                console.error("SSE connection lost. Reconnecting...");
+            };
+        }
+
         async function fetchAll() {
             await Promise.all([fetchEvents(), fetchStats()]);
         }
 
         async function fetchEvents() {
             try {
-                const response = await fetch(`/api/events?since=${lastEventTimestamp}`);
+                const response = await fetch(`/api/events`);
                 if (!response.ok) throw new Error('API down');
                 const newEvents = await response.json();
                 
                 if (newEvents.length > 0) {
-                    // result is newest first, so first element is the latest
-                    lastEventTimestamp = newEvents[0].unix_time;
-                    allEvents = [...newEvents, ...allEvents].slice(0, 1000);
+                    allEvents = newEvents.slice(0, 1000);
                     renderEvents();
                 }
                 
@@ -351,6 +364,7 @@
                 document.getElementById('rph_val').textContent = stats.rph;
                 document.getElementById('rpd_val').textContent = stats.rpd;
                 document.getElementById('total_val').textContent = stats.total;
+                document.getElementById('cache_ratio').textContent = (stats.cache_hit_ratio || 0).toFixed(1) + '%';
 
                 // Update node list
                 const nodeStats = document.getElementById('nodeStats');
@@ -438,8 +452,9 @@
 
         document.getElementById('searchInput').addEventListener('input', renderEvents);
 
-        setInterval(fetchAll, 5000);
+        setInterval(fetchStats, 5000);
         fetchAll();
+        startStream();
     </script>
 </body>
 </html>

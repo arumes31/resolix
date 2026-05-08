@@ -9,8 +9,8 @@ HEALTHCHECK_DOMAIN=${HEALTHCHECK_DOMAIN:-"google.com"}
 # Cleanup function for graceful shutdown
 cleanup() {
     echo "Shutting down..."
-    kill "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" "$HEALTHCHECK_PID" 2>/dev/null
-    wait "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" "$HEALTHCHECK_PID" 2>/dev/null
+    kill "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" 2>/dev/null
+    wait "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" 2>/dev/null
     exit 0
 }
 
@@ -66,16 +66,8 @@ else
     exit 1
 fi
 
-# Function to check upstream DNS server health
-check_upstream() {
-    local server=$1
-    dig @${server} $HEALTHCHECK_DOMAIN +timeout=2 +tries=1 >/dev/null 2>&1
-    return $?
-}
-
 # Function to generate dnsmasq.conf
 generate_dnsmasq_conf() {
-    local healthy_servers=("$@")
     cat > /etc/dnsmasq.conf <<EOL
 listen-address=$TAILSCALE_IP
 port=53
@@ -89,9 +81,10 @@ local-ttl=60
 max-ttl=600
 EOL
 
-    # Add healthy upstream DNS servers
-    for server in "${healthy_servers[@]}"; do
-        echo "Adding healthy upstream: $server"
+    # Add upstream DNS servers (Go app will handle health updates in future versions via signals)
+    # For now, we add all provided upstreams initially.
+    for server in $UPSTREAM_DNS; do
+        echo "Adding upstream: $server"
         echo "server=$server" >> /etc/dnsmasq.conf
     done
 
@@ -117,47 +110,8 @@ EOL
     cat /etc/dnsmasq.conf
 }
 
-# Initial health check
-IFS=' ' read -r -a UPSTREAMS <<< "$UPSTREAM_DNS"
-HEALTHY_UPSTREAMS=()
-
-check_all_upstreams() {
-    local results=()
-    local pids=()
-    for ups in "${UPSTREAMS[@]}"; do
-        (
-            if check_upstream "$ups"; then
-                exit 0
-            else
-                exit 1
-            fi
-        ) &
-        pids+=($!)
-    done
-
-    local i=0
-    for pid in "${pids[@]}"; do
-        wait "$pid"
-        if [ $? -eq 0 ]; then
-            results+=("${UPSTREAMS[$i]}")
-        fi
-        i=$((i+1))
-    done
-    echo "${results[@]}"
-}
-
-echo "Performing initial parallel health checks..."
-HEALTHY_STR=$(check_all_upstreams)
-read -r -a HEALTHY_UPSTREAMS <<< "$HEALTHY_STR"
-
-# Ensure at least one healthy upstream
-if [ ${#HEALTHY_UPSTREAMS[@]} -eq 0 ]; then
-    echo "Error: No healthy upstream DNS servers available"
-    exit 1
-fi
-
 # Generate initial dnsmasq.conf
-generate_dnsmasq_conf "${HEALTHY_UPSTREAMS[@]}"
+generate_dnsmasq_conf
 
 # Start dnsmasq and Web GUI using a named pipe for reliable PID tracking and stability
 echo "Starting dnsmasq and Web GUI..."
@@ -172,34 +126,6 @@ WEBGUI_PID=$!
 DNSMASQ_PID=$!
 
 echo "Processes started: dnsmasq (PID: $DNSMASQ_PID), Web GUI (PID: $WEBGUI_PID)"
-
-# Continuous health check loop
-(
-    while true; do
-        NEW_HEALTHY_STR=$(check_all_upstreams)
-        read -r -a NEW_HEALTHY_UPSTREAMS <<< "$NEW_HEALTHY_STR"
-
-        # Check if healthy upstreams have changed
-        if [ "${NEW_HEALTHY_UPSTREAMS[*]}" != "${HEALTHY_UPSTREAMS[*]}" ]; then
-            echo "Healthy upstreams changed, updating dnsmasq.conf"
-            HEALTHY_UPSTREAMS=("${NEW_HEALTHY_UPSTREAMS[@]}")
-            if [ ${#HEALTHY_UPSTREAMS[@]} -eq 0 ]; then
-                echo "Error: No healthy upstream DNS servers available, keeping old config"
-            else
-                generate_dnsmasq_conf "${HEALTHY_UPSTREAMS[@]}"
-                # Reload dnsmasq configuration
-                kill -HUP $DNSMASQ_PID
-                if [ $? -eq 0 ]; then
-                    echo "dnsmasq reloaded successfully"
-                else
-                    echo "Warning: Failed to reload dnsmasq"
-                fi
-            fi
-        fi
-        sleep 15
-    done
-) &
-HEALTHCHECK_PID=$!
 
 # Monitor processes and exit if either core process dies
 while true; do

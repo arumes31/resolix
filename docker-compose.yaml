@@ -13,4 +13,10 @@ services:
       - PORT=35353
     ports:
       - "127.0.0.1:${PORT:-35353}:${PORT:-35353}"
+    volumes:
+      - ./history:/var/lib/tailscale-dnsrewrite
+      - ./tailscale:/var/lib/tailscale
+    sysctls:
+      - net.core.somaxconn=1024
+      - net.ipv4.tcp_fastopen=3
     restart: unless-stopped

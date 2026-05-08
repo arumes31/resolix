@@ -18,43 +18,22 @@ graph LR
 
 ## ✨ Features
 
-- **🚀 Tailscale Native**: Seamlessly integrates with your Tailscale network, serving DNS queries over secure Tailscale IPs.
-- **📝 Custom Mappings**: Easily override DNS entries for internal services using the `DOMAINS` variable.
-- **⚡ Real-time Monitor**: A premium, glassmorphism-style web dashboard to track the last 1000 DNS queries, identify source hosts, and view traffic stats.
-- **💾 Diskless Logging**: Optimized for flash storage (SD cards/SSDs) by handling all log ingestion in memory via named pipes.
-- **🏥 Intelligent Health Checks**: Continuous monitoring of upstream DNS servers with automatic failover and configuration reloading.
-- **🛡️ Security First**: Includes Content Security Policy (CSP), XSS protection, and secure environment variable handling.
+- **🚀 Tailscale Native**: Seamlessly integrates with your Tailscale network.
+- **⚡ Real-time Monitor**: **(NEW)** Real-time updates via Server-Sent Events (SSE). No more polling!
+- **📈 Advanced Stats**: **(NEW)** Cache hit ratio tracking and node-specific traffic analytics.
+- **💾 Persistent Logging**: Optimized for storage using JSONL with automatic archiving and 72h retention.
+- **🏥 Parallel Health Checks**: Continuous concurrent monitoring of upstream DNS servers with automatic failover.
+- **🛡️ Security First**: Hardened Content Security Policy (CSP), non-root execution support, and secure file permissions.
 
 ---
 
 ## 🚀 Quick Start
 
-### 1. Prerequisites
-- Docker & Docker Compose installed.
-- A Tailscale [Auth Key](https://login.tailscale.com/admin/settings/keys).
-
-### 2. Setup
-Clone the repository and prepare your environment:
-```bash
-git clone https://github.com/arumes31/tailscale-dnsrewrite.git
-cd tailscale-dnsrewrite
-cp .env.example .env
-```
-Edit `.env` and add your `TS_AUTHKEY`.
-
 ### 3. Deploy
 ```bash
 docker-compose up -d --build
 ```
-
----
-
-## 📊 Web Dashboard
-
-The monitor is accessible via your Tailscale network on port `35353`.
-
-- **URL**: `http://<TAILSCALE_IP>:35353`
-- **Features**: Real-time search, unique domain/client stats, and query type badges.
+*Note: Use `./history` and `./tailscale` volumes for data persistence (Improvement 70).*
 
 ---
 
@@ -62,14 +41,15 @@ The monitor is accessible via your Tailscale network on port `35353`.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `TS_AUTHKEY` | Tailscale Authentication Key (Required) | - |
-| `UPSTREAM_DNS` | Space-separated upstream DNS servers | `8.8.8.8 8.8.4.4` |
-| `DOMAINS` | Comma-separated `domain:ip` mappings | - |
-| `HEALTHCHECK_DOMAIN` | Domain used for upstream health checks | `google.com` |
-| `PORT` | Web GUI listening port | `35353` |
-| `MODE` | Run mode (`master` or `slave`) | `master` |
-| `MASTER_URL` | URL of the Master node (Required for `slave` mode) | - |
+...
 | `NODE_NAME` | Unique identifier for the node in the dashboard | Hostname |
+
+### Performance Optimization (Improvement 75)
+The provided `docker-compose.yaml` includes kernel `sysctls` optimizations:
+- `net.core.somaxconn=1024`: Higher connection backlog for heavy traffic.
+- `net.ipv4.tcp_fastopen=3`: Reduces latency for repeated TCP connections.
+
+---
 
 ### Example Mapping
 `DOMAINS=.internal.net:100.1.2.3,app.example.com:100.4.5.6`

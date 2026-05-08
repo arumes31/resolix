@@ -1,0 +1,27 @@
+linters:
+  enable:
+    - revive
+    - gocritic
+    - gofmt
+    - goimports
+    - errcheck
+    - staticcheck
+    - unused
+    - gosimple
+    - gocyclo
+    - misspell
+    - unparam
+
+linters-settings:
+  gocyclo:
+    min-complexity: 20
+  revive:
+    rules:
+      - name: exported
+      - name: unused-parameter
+      - name: var-naming
+
+issues:
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0

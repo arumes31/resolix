@@ -230,8 +230,10 @@ func startLogIngestion() {
 	if err := scanner.Err(); err != nil {
 		log.Printf("Scanner FATAL error: %v", err)
 	} else {
-		log.Println("Scanner closed normally")
+		log.Println("Scanner closed normally (EOF)")
 	}
+	log.Println("Ingestion stopped, exiting process...")
+	os.Exit(1)
 }
 
 func getOrderedEvents(limit int) []QueryEvent {

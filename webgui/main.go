@@ -12,10 +12,11 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
+	"os/signal"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -48,6 +49,22 @@ var (
 	pendingUpstreams = make(map[string]string)
 	pendingMu        sync.Mutex
 )
+
+// Periodically clean up stale pending queries (older than 10s)
+func startPendingCleanup() {
+	ticker := time.NewTicker(10 * time.Second)
+	for range ticker.C {
+		pendingMu.Lock()
+		now := time.Now()
+		for dom, start := range pendingQueries {
+			if now.Sub(start) > 10*time.Second {
+				delete(pendingQueries, dom)
+				delete(pendingUpstreams, dom)
+			}
+		}
+		pendingMu.Unlock()
+	}
+}
 
 // Gzip middleware
 type gzipResponseWriter struct {
@@ -175,7 +192,12 @@ func parseLogLine(line string) {
 				pendingMu.Unlock()
 
 				eventsMu.Lock()
-				for i := 0; i < count; i++ {
+				// Limit scan to last 1000 events to prevent O(N) bottleneck on high load
+				scanLimit := count
+				if scanLimit > 1000 {
+					scanLimit = 1000
+				}
+				for i := 0; i < scanLimit; i++ {
 					idx := (head - 1 - i + maxEvents) % maxEvents
 					if events[idx].Domain == domain && events[idx].Latency == 0 {
 						events[idx].Latency = latency
@@ -211,12 +233,17 @@ func startLogIngestion() {
 	}
 }
 
-func getOrderedEvents() []QueryEvent {
+func getOrderedEvents(limit int) []QueryEvent {
 	eventsMu.RLock()
 	defer eventsMu.RUnlock()
 
-	result := make([]QueryEvent, 0, count)
-	for i := 0; i < count; i++ {
+	n := count
+	if limit > 0 && n > limit {
+		n = limit
+	}
+
+	result := make([]QueryEvent, 0, n)
+	for i := 0; i < n; i++ {
 		idx := (head - 1 - i + maxEvents) % maxEvents
 		result = append(result, events[idx])
 	}
@@ -230,11 +257,26 @@ func main() {
 	}
 
 	go startLogIngestion()
+	go startPendingCleanup()
+
+	// Handle signals for graceful reload/shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		for sig := range sigChan {
+			if sig == syscall.SIGHUP {
+				log.Println("Received SIGHUP, ignoring (reload is handled by dnsmasq)")
+				continue
+			}
+			log.Printf("Received signal %v, shutting down", sig)
+			os.Exit(0)
+		}
+	}()
 
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		currentEvents := getOrderedEvents()
+		currentEvents := getOrderedEvents(1000) // Only send last 1000 to template
 		var buf bytes.Buffer
 		if err := tmpl.Execute(&buf, map[string]interface{}{
 			"Events": currentEvents,
@@ -250,7 +292,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/api/events", func(w http.ResponseWriter, r *http.Request) {
-		currentEvents := getOrderedEvents()
+		currentEvents := getOrderedEvents(1000) // Limit to 1000 for efficiency
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(currentEvents); err != nil {
 			log.Printf("JSON encoding error: %v", err)
@@ -258,15 +300,29 @@ func main() {
 	})
 
 	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
-		currentEvents := getOrderedEvents()
-		
 		domainCounts := make(map[string]int)
 		clientCounts := make(map[string]int)
 		
-		for _, e := range currentEvents {
+		now := time.Now().Unix()
+		rpm := 0
+		rph := 0
+		total := 0
+
+		eventsMu.RLock()
+		total = count
+		for i := 0; i < count; i++ {
+			idx := (head - 1 - i + maxEvents) % maxEvents
+			e := events[idx]
 			domainCounts[e.Domain]++
 			clientCounts[e.ClientIP]++
+			if e.UnixTime >= now-60 {
+				rpm++
+			}
+			if e.UnixTime >= now-3600 {
+				rph++
+			}
 		}
+		eventsMu.RUnlock()
 
 		toStats := func(m map[string]int) []StatEntry {
 			s := make([]StatEntry, 0, len(m))
@@ -284,6 +340,9 @@ func main() {
 		if err := json.NewEncoder(w).Encode(map[string]interface{}{
 			"top_domains": toStats(domainCounts),
 			"top_clients": toStats(clientCounts),
+			"rpm":         rpm,
+			"rph":         rph,
+			"total":       total,
 		}); err != nil {
 			log.Printf("JSON encoding error: %v", err)
 		}

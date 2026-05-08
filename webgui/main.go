@@ -56,6 +56,10 @@ var (
 	mode      = strings.ToLower(os.Getenv("MODE"))       // "master" or "slave"
 	masterURL = os.Getenv("MASTER_URL")                  // e.g. http://100.x.y.z:35353
 	nodeName  = os.Getenv("NODE_NAME")                   // Identifier
+
+	// History config
+	historyDir       = "/var/lib/tailscale-dnsrewrite"
+	lastArchivedTime int64
 )
 
 func init() {
@@ -64,6 +68,72 @@ func init() {
 	}
 	if mode == "" {
 		mode = "master"
+	}
+	os.MkdirAll(historyDir, 0755)
+}
+
+func startHistoryArchiver() {
+	ticker := time.NewTicker(30 * time.Minute)
+	// Initial lastArchivedTime to now - 1h so we don't dump the whole initial buffer immediately
+	lastArchivedTime = time.Now().Add(-1 * time.Hour).Unix()
+
+	for range ticker.C {
+		now := time.Now()
+		cutoff := now.Add(-1 * time.Hour).Unix()
+		
+		var toArchive []QueryEvent
+		eventsMu.RLock()
+		for i := 0; i < count; i++ {
+			idx := (head - 1 - i + maxEvents) % maxEvents
+			e := events[idx]
+			if e.UnixTime > lastArchivedTime && e.UnixTime <= cutoff {
+				toArchive = append(toArchive, e)
+			}
+		}
+		eventsMu.RUnlock()
+
+		if len(toArchive) > 0 {
+			// Sort toArchive by UnixTime for consistent file output
+			sort.Slice(toArchive, func(i, j int) bool {
+				return toArchive[i].UnixTime < toArchive[j].UnixTime
+			})
+
+			// Group by date for daily files
+			files := make(map[string][]QueryEvent)
+			for _, e := range toArchive {
+				dateStr := time.Unix(e.UnixTime, 0).Format("2006-01-02")
+				files[dateStr] = append(files[dateStr], e)
+			}
+
+			for dateStr, evs := range files {
+				path := fmt.Sprintf("%s/history-%s.jsonl", historyDir, dateStr)
+				f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+				if err != nil {
+					log.Printf("Error opening history file %s: %v", path, err)
+					continue
+				}
+				for _, e := range evs {
+					json.NewEncoder(f).Encode(e)
+				}
+				f.Close()
+			}
+			lastArchivedTime = cutoff
+			log.Printf("Archived %d events to disk", len(toArchive))
+		}
+
+		// Cleanup: delete files older than 72h
+		files, err := os.ReadDir(historyDir)
+		if err == nil {
+			for _, f := range files {
+				if strings.HasPrefix(f.Name(), "history-") && strings.HasSuffix(f.Name(), ".jsonl") {
+					info, err := f.Info()
+					if err == nil && now.Sub(info.ModTime()) > 72*time.Hour {
+						os.Remove(historyDir + "/" + f.Name())
+						log.Printf("Deleted old history file: %s", f.Name())
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -305,6 +375,7 @@ func main() {
 
 	go startLogIngestion()
 	go startPendingCleanup()
+	go startHistoryArchiver()
 
 	// Handle signals for graceful reload/shutdown
 	sigChan := make(chan os.Signal, 1)

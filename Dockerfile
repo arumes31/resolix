@@ -37,8 +37,9 @@ RUN mkdir -p /var/run/tailscale
 EXPOSE 53/udp
 EXPOSE 35353
 
-# Set up Tailscale state directory
+# Set up state directories
 VOLUME /var/lib/tailscale
+VOLUME /var/lib/tailscale-dnsrewrite
 
 # Use entrypoint
 ENTRYPOINT ["/entrypoint.sh"]

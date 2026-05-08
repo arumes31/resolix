@@ -41,7 +41,7 @@ type StatEntry struct {
 }
 
 var (
-	maxEvents = 50000
+	maxEvents = 100000
 	events    = make([]QueryEvent, maxEvents)
 	head      = 0
 	count     = 0
@@ -369,10 +369,13 @@ func main() {
 	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
 		domainCounts := make(map[string]int)
 		clientCounts := make(map[string]int)
+		nodeRPM := make(map[string]int)
+		nodeRPH := make(map[string]int)
 		
 		now := time.Now().Unix()
 		rpm := 0
 		rph := 0
+		rpd := 0 // Day
 		total := 0
 
 		eventsMu.RLock()
@@ -382,11 +385,20 @@ func main() {
 			e := events[idx]
 			domainCounts[e.Domain]++
 			clientCounts[e.ClientIP]++
+			
+			nodeName := e.Node
+			if nodeName == "" { nodeName = "local" }
+
 			if e.UnixTime >= now-60 {
 				rpm++
+				nodeRPM[nodeName]++
 			}
 			if e.UnixTime >= now-3600 {
 				rph++
+				nodeRPH[nodeName]++
+			}
+			if e.UnixTime >= now-86400 {
+				rpd++
 			}
 		}
 		eventsMu.RUnlock()
@@ -403,13 +415,23 @@ func main() {
 			return s
 		}
 
+		nodeList := make(map[string]interface{})
+		for node := range nodeRPH {
+			nodeList[node] = map[string]int{
+				"rpm": nodeRPM[node],
+				"rph": nodeRPH[node],
+			}
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(map[string]interface{}{
 			"top_domains": toStats(domainCounts),
 			"top_clients": toStats(clientCounts),
 			"rpm":         rpm,
 			"rph":         rph,
+			"rpd":         rpd,
 			"total":       total,
+			"nodes":       nodeList,
 		}); err != nil {
 			log.Printf("JSON encoding error: %v", err)
 		}

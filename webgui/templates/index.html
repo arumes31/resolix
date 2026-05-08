@@ -255,10 +255,16 @@
                 <div style="display: flex; justify-content: space-between; align-items: flex-end; height: 60px; gap: 4px;" id="miniChart">
                     <!-- Simple bar chart will be here -->
                 </div>
-                <div style="margin-top: 1rem; display: flex; justify-content: space-between;">
+                <div style="margin-top: 1rem; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
                     <div><span class="stat-label">Hour:</span> <span id="rph_val" style="font-weight:bold">0</span></div>
+                    <div><span class="stat-label">Day:</span> <span id="rpd_val" style="font-weight:bold">0</span></div>
                     <div><span class="stat-label">Total:</span> <span id="total_val" style="font-weight:bold">0</span></div>
                 </div>
+            </div>
+
+            <div class="card">
+                <div class="stat-header">Node Traffic (RPM/RPH)</div>
+                <ul class="top-list" id="nodeStats"></ul>
             </div>
 
             <div class="card">
@@ -320,6 +326,26 @@
                 const stats = await response.json();
                 renderTopList('topDomains', stats.top_domains);
                 renderTopList('topClients', stats.top_clients);
+                
+                // Update global counters from backend (accurate history)
+                document.getElementById('rpm_val').textContent = stats.rpm + ' RPM';
+                document.getElementById('rph_val').textContent = stats.rph;
+                document.getElementById('rpd_val').textContent = stats.rpd;
+                document.getElementById('total_val').textContent = stats.total;
+
+                // Update node list
+                const nodeStats = document.getElementById('nodeStats');
+                nodeStats.innerHTML = Object.entries(stats.nodes).map(([name, s]) => `
+                    <li class="top-item">
+                        <span>${name}</span>
+                        <span><span class="top-count">${s.rpm}</span> <span class="top-count" style="background: rgba(129, 140, 248, 0.1); color: #818cf8;">${s.rph}</span></span>
+                    </li>
+                `).join('');
+
+                // Update chart locally
+                rpmHistory.push(stats.rpm);
+                rpmHistory.shift();
+                renderMiniChart();
             } catch (e) { console.error(e); }
         }
 
@@ -378,17 +404,8 @@
         }
 
         function updateMainStats() {
-            const now = Math.floor(Date.now() / 1000);
-            const rpm = allEvents.filter(e => e.unix_time >= now - 60).length;
-            const rph = allEvents.filter(e => e.unix_time >= now - 3600).length;
-
-            document.getElementById('rpm_val').textContent = rpm + ' RPM';
-            document.getElementById('rph_val').textContent = rph;
-            document.getElementById('total_val').textContent = allEvents.length;
-
-            rpmHistory.push(rpm);
-            rpmHistory.shift();
-            renderMiniChart();
+            // Stats are now pulled from /api/stats for better accuracy
+            // This function is kept for any immediate local UI feedback if needed
         }
 
         function renderMiniChart() {

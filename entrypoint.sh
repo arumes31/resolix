@@ -167,8 +167,8 @@ mkfifo /tmp/dnsmasq_logs 2>/dev/null || true
 /usr/bin/webgui < /tmp/dnsmasq_logs &
 WEBGUI_PID=$!
 
-# Start dnsmasq writing to the pipe
-/usr/sbin/dnsmasq -k 2>&1 > /tmp/dnsmasq_logs &
+# Start dnsmasq writing to the pipe (capture both stdout and stderr)
+/usr/sbin/dnsmasq -k > /tmp/dnsmasq_logs 2>&1 &
 DNSMASQ_PID=$!
 
 echo "Processes started: dnsmasq (PID: $DNSMASQ_PID), Web GUI (PID: $WEBGUI_PID)"

@@ -82,6 +82,22 @@ The monitor is accessible via your Tailscale network on port `35353`.
 
 ---
 
+## 🛠️ Development & Quality Assurance
+
+### Unit Testing
+The project includes a comprehensive suite of unit tests covering log parsing, API endpoints, state management, and slave forwarding.
+```bash
+go test -v ./webgui
+```
+
+### Security & Linting
+We maintain high code quality and security standards using the following tools:
+- **`gosec`**: Security auditing for Go code.
+- **`govulncheck`**: Scans for known vulnerabilities in dependencies.
+- **`golangci-lint`**: Aggregates various linters including `revive` and `gocritic`.
+
+---
+
 ## 🔍 Troubleshooting
 
 - **Check Logs**: `docker logs dns-tailscale-1`

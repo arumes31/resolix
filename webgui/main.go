@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -85,7 +86,9 @@ func init() {
 	if mode == "" {
 		mode = "master"
 	}
-	os.MkdirAll(historyDir, 0755)
+	if err := os.MkdirAll(historyDir, 0750); err != nil {
+		log.Printf("Error creating history directory: %v", err)
+	}
 	loadStatsFromHistory()
 }
 
@@ -99,7 +102,7 @@ func loadStatsFromHistory() {
 
 	for _, f := range files {
 		if strings.HasPrefix(f.Name(), "history-") && strings.HasSuffix(f.Name(), ".jsonl") {
-			path := historyDir + "/" + f.Name()
+			path := filepath.Join(historyDir, filepath.Clean(f.Name()))
 			file, err := os.Open(path)
 			if err != nil {
 				continue
@@ -128,95 +131,126 @@ func startHistoryArchiver() {
 	lastArchivedTime = time.Now().Add(-1 * time.Hour).Unix()
 
 	for range ticker.C {
-		now := time.Now()
-		cutoff := now.Add(-1 * time.Hour).Unix()
-		
-		var toArchive []QueryEvent
-		eventsMu.RLock()
-		for i := 0; i < count; i++ {
-			idx := (head - 1 - i + maxEvents) % maxEvents
-			e := events[idx]
-			if e.UnixTime > lastArchivedTime && e.UnixTime <= cutoff {
-				toArchive = append(toArchive, e)
-			}
-		}
-		eventsMu.RUnlock()
-
-		if len(toArchive) > 0 {
-			// Sort toArchive by UnixTime for consistent file output
-			sort.Slice(toArchive, func(i, j int) bool {
-				return toArchive[i].UnixTime < toArchive[j].UnixTime
-			})
-
-			// Group by date for daily files
-			files := make(map[string][]QueryEvent)
-			for _, e := range toArchive {
-				dateStr := time.Unix(e.UnixTime, 0).Format("2006-01-02")
-				files[dateStr] = append(files[dateStr], e)
-			}
-
-			for dateStr, evs := range files {
-				path := fmt.Sprintf("%s/history-%s.jsonl", historyDir, dateStr)
-				f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-				if err != nil {
-					log.Printf("Error opening history file %s: %v", path, err)
-					continue
-				}
-				for _, e := range evs {
-					json.NewEncoder(f).Encode(e)
-				}
-				_ = f.Close()
-			}
-			lastArchivedTime = cutoff
-			log.Printf("Archived %d events to disk", len(toArchive))
-		}
-
-		// Cleanup: delete files older than 72h
-		files, err := os.ReadDir(historyDir)
-		if err == nil {
-			for _, f := range files {
-				if strings.HasPrefix(f.Name(), "history-") && strings.HasSuffix(f.Name(), ".jsonl") {
-					info, err := f.Info()
-					if err == nil && now.Sub(info.ModTime()) > 72*time.Hour {
-						os.Remove(historyDir + "/" + f.Name())
-						log.Printf("Deleted old history file: %s", f.Name())
-					}
-				}
-			}
-		}
-
-		// Also cleanup hourly stats older than 72h
-		statsMu.Lock()
-		cutoffHour := now.Unix()/3600 - 72
-		for h := range hourlyStats {
-			if h < cutoffHour {
-				delete(hourlyStats, h)
-			}
-		}
-		statsMu.Unlock()
+		archiveStep(time.Now())
 	}
+}
+
+func archiveStep(now time.Time) int {
+	cutoff := now.Add(-1 * time.Hour).Unix()
+	
+	var toArchive []QueryEvent
+	eventsMu.RLock()
+	for i := 0; i < count; i++ {
+		idx := (head - 1 - i + maxEvents) % maxEvents
+		e := events[idx]
+		if e.UnixTime > lastArchivedTime && e.UnixTime <= cutoff {
+			toArchive = append(toArchive, e)
+		}
+	}
+	eventsMu.RUnlock()
+
+	if len(toArchive) > 0 {
+		sort.Slice(toArchive, func(i, j int) bool {
+			return toArchive[i].UnixTime < toArchive[j].UnixTime
+		})
+
+		files := make(map[string][]QueryEvent)
+		for _, e := range toArchive {
+			dateStr := time.Unix(e.UnixTime, 0).Format("2006-01-02")
+			files[dateStr] = append(files[dateStr], e)
+		}
+
+		for dateStr, evs := range files {
+			path := fmt.Sprintf("%s/history-%s.jsonl", historyDir, dateStr)
+			f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600) // #nosec G304
+			if err != nil {
+				log.Printf("Error opening history file %s: %v", path, err)
+				continue
+			}
+			for _, e := range evs {
+				_ = json.NewEncoder(f).Encode(e)
+			}
+			_ = f.Close()
+		}
+		lastArchivedTime = cutoff
+		log.Printf("Archived %d events to disk", len(toArchive))
+	}
+
+	// Cleanup: delete files older than 72h
+	files, err := os.ReadDir(historyDir)
+	if err == nil {
+		for _, f := range files {
+			if strings.HasPrefix(f.Name(), "history-") && strings.HasSuffix(f.Name(), ".jsonl") {
+				info, err := f.Info()
+				if err == nil && now.Sub(info.ModTime()) > 72*time.Hour {
+					_ = os.Remove(historyDir + "/" + f.Name())
+					log.Printf("Deleted old history file: %s", f.Name())
+				}
+			}
+		}
+	}
+
+	// Also cleanup hourly stats older than 72h
+	statsMu.Lock()
+	cutoffHour := now.Unix()/3600 - 72
+	for h := range hourlyStats {
+		if h < cutoffHour {
+			delete(hourlyStats, h)
+		}
+	}
+	statsMu.Unlock()
+	return len(toArchive)
 }
 
 // Periodically clean up stale pending queries (older than 10s)
 func startPendingCleanup() {
 	ticker := time.NewTicker(10 * time.Second)
 	for range ticker.C {
-		pendingMu.Lock()
-		now := time.Now()
-		for node, queries := range pendingQueries {
-			for dom, start := range queries {
-				if now.Sub(start) > 10*time.Second {
-					delete(queries, dom)
-					delete(pendingUpstreams[node], dom)
-				}
-			}
-			if len(queries) == 0 {
-				delete(pendingQueries, node)
-				delete(pendingUpstreams, node)
+		cleanupStep(time.Now())
+	}
+}
+
+func cleanupStep(now time.Time) int {
+	pendingMu.Lock()
+	defer pendingMu.Unlock()
+	cleaned := 0
+	for node, queries := range pendingQueries {
+		for dom, start := range queries {
+			if now.Sub(start) > 10*time.Second {
+				delete(queries, dom)
+				delete(pendingUpstreams[node], dom)
+				cleaned++
 			}
 		}
-		pendingMu.Unlock()
+		if len(queries) == 0 {
+			delete(pendingQueries, node)
+			delete(pendingUpstreams, node)
+		}
 	}
+	return cleaned
+}
+
+func sendBatch(client *http.Client, node string, masterURL string, lines []string) error {
+	data, err := json.Marshal(map[string]interface{}{"node": node, "batch": lines})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", masterURL+"/api/ingest", bytes.NewBuffer(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func startForwardWorker() {
@@ -240,7 +274,8 @@ func startForwardWorker() {
 		} else {
 			backlogMu.Unlock()
 			// Wait for at least one line
-			line := <-forwardChan
+			line, ok := <-forwardChan
+			if !ok { return } // Channel closed
 			lines = []string{line}
 			
 			// Try to grab more from chan if available (non-blocking)
@@ -264,13 +299,8 @@ func startForwardWorker() {
 		}
 
 		// Try to send batch
-		data, _ := json.Marshal(map[string]interface{}{"node": nodeName, "batch": lines})
-		req, _ := http.NewRequest("POST", masterURL+"/api/ingest", bytes.NewBuffer(data))
-		req.Header.Set("Content-Type", "application/json")
-		
-		resp, err := client.Do(req)
-		if err == nil && (resp.StatusCode >= 200 && resp.StatusCode < 300) {
-			_ = resp.Body.Close()
+		err := sendBatch(client, nodeName, masterURL, lines)
+		if err == nil {
 			// Success! Remove batch from backlog
 			backlogMu.Lock()
 			if len(backlog) >= len(lines) {
@@ -282,13 +312,14 @@ func startForwardWorker() {
 			backlogMu.Unlock()
 			backoff = 1 * time.Second
 		} else {
-			if err == nil { _ = resp.Body.Close() }
+			log.Printf("Error sending batch to master: %v", err)
 			time.Sleep(backoff)
 			backoff *= 2
 			if backoff > 30*time.Second { backoff = 30 * time.Second }
 		}
 	}
 }
+
 
 // Gzip middleware
 type gzipResponseWriter struct {
@@ -411,13 +442,14 @@ func parseLogBytes(line []byte, node string) {
 			pendingMu.Lock()
 			startTime, ok := pendingQueries[node][domain]
 			upstream := ""
-			if bytes.Equal(action, []byte("reply")) {
+			switch {
+			case bytes.Equal(action, []byte("reply")):
 				upstream = pendingUpstreams[node][domain]
-			} else if bytes.Equal(action, []byte("cached")) {
+			case bytes.Equal(action, []byte("cached")):
 				upstream = "System Cache"
-			} else if bytes.Equal(action, []byte("config")) {
+			case bytes.Equal(action, []byte("config")):
 				upstream = "Local Override"
-			} else {
+			default:
 				upstream = string(action)
 			}
 
@@ -450,22 +482,23 @@ func parseLogBytes(line []byte, node string) {
 }
 
 func startLogIngestion() {
-	scanner := bufio.NewScanner(os.Stdin)
+	ingestReader(os.Stdin)
+}
+
+func ingestReader(r io.Reader) {
+	scanner := bufio.NewScanner(r)
 	buf := make([]byte, 0, 64*1024)
 	scanner.Buffer(buf, 1024*1024)
 
 	log.Println("Log ingestion started with concurrent worker pool...")
 
-	// Worker pool for parsing
 	ingestChan := make(chan []byte, 5000)
 	for i := 0; i < 4; i++ {
 		go func() {
 			for b := range ingestChan {
-				// We need a copy because scanner.Bytes() is reused
 				lineCopy := make([]byte, len(b))
 				copy(lineCopy, b)
 				
-				// In slave mode, queue for forwarding
 				if mode == "slave" && masterURL != "" {
 					lStr := string(lineCopy)
 					select {
@@ -491,11 +524,12 @@ func startLogIngestion() {
 		fmt.Println(string(b)) 
 		ingestChan <- b
 	}
+	close(ingestChan)
 	if err := scanner.Err(); err != nil {
 		log.Printf("Scanner FATAL error: %v", err)
 		os.Exit(1)
 	}
-	os.Exit(0)
+	log.Println("Ingestion reader closed normally (EOF)")
 }
 
 func getOrderedEvents(limit int) []QueryEvent {
@@ -515,32 +549,14 @@ func getOrderedEvents(limit int) []QueryEvent {
 	return result
 }
 
-func main() {
+func setupMux() http.Handler {
 	tmpl, err := template.ParseFS(templates, "templates/index.html")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	go startLogIngestion()
-	go startPendingCleanup()
-	go startHistoryArchiver()
-	go startForwardWorker()
-
-	// Handle signals for graceful reload/shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		for sig := range sigChan {
-			if sig == syscall.SIGHUP {
-				log.Println("Received SIGHUP, ignoring (reload is handled by dnsmasq)")
-				continue
-			}
-			log.Printf("Received signal %v, shutting down", sig)
-			os.Exit(0)
-		}
-	}()
-
 	mux := http.NewServeMux()
+
 
 	// Slave log ingestion endpoint (Master only)
 	mux.HandleFunc("/api/ingest", func(w http.ResponseWriter, r *http.Request) {
@@ -566,7 +582,7 @@ func main() {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		currentEvents := getOrderedEvents(1000) // Only send last 1000 to template
 		var buf bytes.Buffer
 		if err := tmpl.Execute(&buf, map[string]interface{}{
@@ -586,7 +602,9 @@ func main() {
 		sinceStr := r.URL.Query().Get("since")
 		var since int64
 		if sinceStr != "" {
-			fmt.Sscanf(sinceStr, "%d", &since)
+			if _, err := fmt.Sscanf(sinceStr, "%d", &since); err != nil {
+				log.Printf("Invalid since parameter %q: %v", sinceStr, err) // #nosec G706
+			}
 		}
 
 		eventsMu.RLock()
@@ -612,7 +630,7 @@ func main() {
 		}
 	})
 
-	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, _ *http.Request) {
 		domainCounts := make(map[string]int)
 		clientCounts := make(map[string]int)
 		nodeRPM := make(map[string]int)
@@ -731,6 +749,31 @@ func main() {
 		}
 	})
 
+	return gzipMiddleware(mux)
+}
+
+func main() {
+	go startLogIngestion()
+	go startPendingCleanup()
+	go startHistoryArchiver()
+	go startForwardWorker()
+
+	// Handle signals for graceful reload/shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		for sig := range sigChan {
+			if sig == syscall.SIGHUP {
+				log.Println("Received SIGHUP, ignoring (reload is handled by dnsmasq)")
+				continue
+			}
+			log.Printf("Received signal %v, shutting down", sig)
+			os.Exit(0)
+		}
+	}()
+
+	handler := setupMux()
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "35353"
@@ -738,7 +781,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:         ":" + port,
-		Handler:      gzipMiddleware(mux),
+		Handler:      handler,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  120 * time.Second,
@@ -749,3 +792,4 @@ func main() {
 		log.Fatal(err)
 	}
 }
+

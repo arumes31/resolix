@@ -314,19 +314,21 @@ func gzipMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// Robust parsing using fields
-func parseLogLine(line string, node string) {
+// Optimized parsing using bytes to avoid allocations
+func parseLogBytes(line []byte, node string) {
 	now := time.Now()
-	parts := strings.Fields(line)
+	parts := bytes.Fields(line)
 	if len(parts) < 2 {
 		return
 	}
 
-	// Identify the action (query, forwarded, reply, etc.)
-	// We look for the part that contains the action, usually after "dnsmasq[pid]:"
 	actionIdx := -1
 	for i, p := range parts {
-		if strings.HasPrefix(p, "query[") || p == "forwarded" || p == "reply" || p == "config" || p == "cached" {
+		if bytes.HasPrefix(p, []byte("query[")) || 
+		   bytes.Equal(p, []byte("forwarded")) || 
+		   bytes.Equal(p, []byte("reply")) || 
+		   bytes.Equal(p, []byte("config")) || 
+		   bytes.Equal(p, []byte("cached")) {
 			actionIdx = i
 			break
 		}
@@ -338,22 +340,17 @@ func parseLogLine(line string, node string) {
 
 	action := parts[actionIdx]
 
-	// 1. Handle Queries
-	if strings.HasPrefix(action, "query[") {
-		// query[A] domain from IP
-		qType := action[6 : len(action)-1]
+	if bytes.HasPrefix(action, []byte("query[")) {
+		qType := string(action[6 : len(action)-1])
 		if len(parts) < actionIdx+4 {
 			return
 		}
-		domain := parts[actionIdx+1]
-		// Skip "from" at actionIdx+2
-		clientIP := parts[actionIdx+3]
+		domain := string(parts[actionIdx+1])
+		clientIP := string(parts[actionIdx+3])
 
-		// Extract timestamp from the beginning if possible
 		tsStr := now.Format("Jan _2 15:04:05")
 		if actionIdx >= 3 {
-			// Likely syslog format: Mmm DD HH:MM:SS
-			tsStr = strings.Join(parts[:3], " ")
+			tsStr = string(bytes.Join(parts[:3], []byte(" ")))
 		}
 
 		event := QueryEvent{
@@ -365,7 +362,6 @@ func parseLogLine(line string, node string) {
 			Node:      node,
 		}
 
-		// Update bucketed stats
 		hourBucket := now.Unix() / 3600
 		statsMu.Lock()
 		hourlyStats[hourBucket]++
@@ -380,16 +376,13 @@ func parseLogLine(line string, node string) {
 
 		eventsMu.Lock()
 		if count == maxEvents {
-			// About to overwrite oldest: decrement counters
 			old := events[head]
 			windowDomainCounts[old.Domain]--
 			windowClientCounts[old.ClientIP]--
 		}
-
 		events[head] = event
 		windowDomainCounts[event.Domain]++
 		windowClientCounts[event.ClientIP]++
-
 		head = (head + 1) % maxEvents
 		if count < maxEvents {
 			count++
@@ -398,12 +391,10 @@ func parseLogLine(line string, node string) {
 		return
 	}
 
-	// 2. Handle Forwarded (Track Upstream)
-	if action == "forwarded" {
-		// forwarded domain to IP
+	if bytes.Equal(action, []byte("forwarded")) {
 		if len(parts) >= actionIdx+4 {
-			domain := parts[actionIdx+1]
-			upstream := parts[actionIdx+3]
+			domain := string(parts[actionIdx+1])
+			upstream := string(parts[actionIdx+3])
 			pendingMu.Lock()
 			if pendingUpstreams[node] == nil {
 				pendingUpstreams[node] = make(map[string]string)
@@ -414,22 +405,20 @@ func parseLogLine(line string, node string) {
 		return
 	}
 
-	// 3. Handle Replies / Cached / Config (Latency)
-	if action == "reply" || action == "cached" || action == "config" {
-		// action domain is IP/NODATA/etc
+	if bytes.Equal(action, []byte("reply")) || bytes.Equal(action, []byte("cached")) || bytes.Equal(action, []byte("config")) {
 		if len(parts) >= actionIdx+2 {
-			domain := parts[actionIdx+1]
+			domain := string(parts[actionIdx+1])
 			pendingMu.Lock()
 			startTime, ok := pendingQueries[node][domain]
 			upstream := ""
-			if action == "reply" {
+			if bytes.Equal(action, []byte("reply")) {
 				upstream = pendingUpstreams[node][domain]
-			} else if action == "cached" {
+			} else if bytes.Equal(action, []byte("cached")) {
 				upstream = "System Cache"
-			} else if action == "config" {
+			} else if bytes.Equal(action, []byte("config")) {
 				upstream = "Local Override"
 			} else {
-				upstream = action
+				upstream = string(action)
 			}
 
 			if ok {
@@ -439,7 +428,6 @@ func parseLogLine(line string, node string) {
 				pendingMu.Unlock()
 
 				eventsMu.Lock()
-				// Limit scan to last 1000 events to prevent O(N) bottleneck on high load
 				scanLimit := count
 				if scanLimit > 1000 {
 					scanLimit = 1000
@@ -462,45 +450,51 @@ func parseLogLine(line string, node string) {
 }
 
 func startLogIngestion() {
-	// Use a larger buffer for the scanner
 	scanner := bufio.NewScanner(os.Stdin)
 	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024) // 1MB max line length
+	scanner.Buffer(buf, 1024*1024)
 
-	log.Println("Log ingestion started, waiting for dnsmasq input...")
+	log.Println("Log ingestion started with concurrent worker pool...")
+
+	// Worker pool for parsing
+	ingestChan := make(chan []byte, 5000)
+	for i := 0; i < 4; i++ {
+		go func() {
+			for b := range ingestChan {
+				// We need a copy because scanner.Bytes() is reused
+				lineCopy := make([]byte, len(b))
+				copy(lineCopy, b)
+				
+				// In slave mode, queue for forwarding
+				if mode == "slave" && masterURL != "" {
+					lStr := string(lineCopy)
+					select {
+					case forwardChan <- lStr:
+						backlogMu.Lock()
+						if backlogTotalSize > maxBacklogSize {
+							backlogTotalSize -= int64(len(backlog[0]))
+							backlog = backlog[1:]
+						}
+						backlog = append(backlog, lStr)
+						backlogTotalSize += int64(len(lStr))
+						backlogMu.Unlock()
+					default:
+					}
+				}
+				parseLogBytes(lineCopy, nodeName)
+			}
+		}()
+	}
 
 	for scanner.Scan() {
-		line := scanner.Text()
-		fmt.Println(line) // Still print to stdout for docker logs
-		
-		// In slave mode, queue for forwarding
-		if mode == "slave" && masterURL != "" {
-			select {
-			case forwardChan <- line:
-				// Added to chan, now the forward worker handles backlog size
-				backlogMu.Lock()
-				// Prevent chan from growing indefinitely if worker is slow but not failing
-				if backlogTotalSize > maxBacklogSize {
-					// Drop oldest if we are over limit
-					backlogTotalSize -= int64(len(backlog[0]))
-					backlog = backlog[1:]
-				}
-				backlog = append(backlog, line)
-				backlogTotalSize += int64(len(line))
-				backlogMu.Unlock()
-			default:
-				// Chan full, worker is very behind, drop or handle?
-				// For now we rely on the backlogMu logic inside the worker too
-			}
-		}
-
-		parseLogLine(line, nodeName)
+		b := scanner.Bytes()
+		fmt.Println(string(b)) 
+		ingestChan <- b
 	}
 	if err := scanner.Err(); err != nil {
 		log.Printf("Scanner FATAL error: %v", err)
 		os.Exit(1)
 	}
-	log.Println("Scanner closed normally (EOF), exiting process...")
 	os.Exit(0)
 }
 
@@ -564,10 +558,10 @@ func main() {
 			return
 		}
 		if payload.Line != "" {
-			parseLogLine(payload.Line, payload.Node)
+			parseLogBytes([]byte(payload.Line), payload.Node)
 		}
 		for _, l := range payload.Batch {
-			parseLogLine(l, payload.Node)
+			parseLogBytes([]byte(l), payload.Node)
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
@@ -589,9 +583,31 @@ func main() {
 	})
 
 	mux.HandleFunc("/api/events", func(w http.ResponseWriter, r *http.Request) {
-		currentEvents := getOrderedEvents(1000) // Limit to 1000 for efficiency
+		sinceStr := r.URL.Query().Get("since")
+		var since int64
+		if sinceStr != "" {
+			fmt.Sscanf(sinceStr, "%d", &since)
+		}
+
+		eventsMu.RLock()
+		n := count
+		if n > 1000 { n = 1000 }
+		
+		result := make([]QueryEvent, 0, n)
+		for i := 0; i < n; i++ {
+			idx := (head - 1 - i + maxEvents) % maxEvents
+			e := events[idx]
+			if e.UnixTime > since {
+				result = append(result, e)
+			} else if since > 0 {
+				// Since events are ordered by time, we can stop early
+				break
+			}
+		}
+		eventsMu.RUnlock()
+
 		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(currentEvents); err != nil {
+		if err := json.NewEncoder(w).Encode(result); err != nil {
 			log.Printf("JSON encoding error: %v", err)
 		}
 	})

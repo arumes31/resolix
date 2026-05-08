@@ -299,6 +299,7 @@
     <script>
         let allEvents = [];
         let rpmHistory = Array(20).fill(0);
+        let lastEventTimestamp = 0;
 
         async function fetchAll() {
             await Promise.all([fetchEvents(), fetchStats()]);
@@ -306,11 +307,17 @@
 
         async function fetchEvents() {
             try {
-                const response = await fetch('/api/events');
+                const response = await fetch(`/api/events?since=${lastEventTimestamp}`);
                 if (!response.ok) throw new Error('API down');
-                allEvents = await response.json();
-                renderEvents();
-                updateMainStats();
+                const newEvents = await response.json();
+                
+                if (newEvents.length > 0) {
+                    // result is newest first, so first element is the latest
+                    lastEventTimestamp = newEvents[0].unix_time;
+                    allEvents = [...newEvents, ...allEvents].slice(0, 1000);
+                    renderEvents();
+                }
+                
                 document.getElementById('systemStatus').style.color = 'var(--success)';
                 document.getElementById('systemStatus').textContent = '● System Online';
             } catch (e) { 

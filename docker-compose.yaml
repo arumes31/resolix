@@ -3,9 +3,14 @@ services:
     build: .
     container_name: dns-tailscale-1
     environment:
-      - DOMAINS=.overridedomain.local:100.77.35.105,override1.example.com:100.83.17.42
-      - UPSTREAM_DNS=100.77.35.105 100.68.143.42
       - TS_AUTHKEY=${TS_AUTHKEY}
+      - DOMAINS=.overridedomain.local:100.77.35.105,override1.example.com:100.83.17.42
+      - UPSTREAM_DNS=8.8.8.8 8.8.4.4
+      - HEALTHCHECK_DOMAIN=google.com
+      - MODE=master
+      - MASTER_URL=
+      - NODE_NAME=dns-server-1
+      - PORT=35353
     ports:
-      - "127.0.0.1:35353:35353"
+      - "127.0.0.1:${PORT:-35353}:${PORT:-35353}"
     restart: unless-stopped

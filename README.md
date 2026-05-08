@@ -67,6 +67,9 @@ The monitor is accessible via your Tailscale network on port `35353`.
 | `DOMAINS` | Comma-separated `domain:ip` mappings | - |
 | `HEALTHCHECK_DOMAIN` | Domain used for upstream health checks | `google.com` |
 | `PORT` | Web GUI listening port | `35353` |
+| `MODE` | Run mode (`master` or `slave`) | `master` |
+| `MASTER_URL` | URL of the Master node (Required for `slave` mode) | - |
+| `NODE_NAME` | Unique identifier for the node in the dashboard | Hostname |
 
 ### Example Mapping
 `DOMAINS=.internal.net:100.1.2.3,app.example.com:100.4.5.6`

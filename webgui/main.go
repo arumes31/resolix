@@ -64,6 +64,13 @@ var (
 	// Bucketized stats: unix hour -> count
 	hourlyStats = make(map[int64]int)
 	statsMu     sync.RWMutex
+
+	// Resilient Forwarding for Slaves
+	forwardChan      = make(chan string, 10000) // Buffer for incoming lines
+	backlogMu        sync.Mutex
+	backlog          []string
+	backlogTotalSize int64
+	maxBacklogSize   int64 = 10 * 1024 * 1024 // 10MB
 )
 
 func init() {
@@ -104,7 +111,7 @@ func loadStatsFromHistory() {
 					}
 				}
 			}
-			file.Close()
+			_ = file.Close()
 		}
 	}
 	log.Printf("Warmed up stats: %d buckets loaded", len(hourlyStats))
@@ -153,7 +160,7 @@ func startHistoryArchiver() {
 				for _, e := range evs {
 					json.NewEncoder(f).Encode(e)
 				}
-				f.Close()
+				_ = f.Close()
 			}
 			lastArchivedTime = cutoff
 			log.Printf("Archived %d events to disk", len(toArchive))
@@ -207,6 +214,58 @@ func startPendingCleanup() {
 	}
 }
 
+func startForwardWorker() {
+	if mode != "slave" || masterURL == "" {
+		return
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	backoff := 1 * time.Second
+
+	for {
+		var line string
+		backlogMu.Lock()
+		if len(backlog) > 0 {
+			line = backlog[0]
+			backlogMu.Unlock()
+		} else {
+			backlogMu.Unlock()
+			// Wait for new lines if backlog is empty
+			line = <-forwardChan
+			// Add to backlog to ensure it's tracked if first attempt fails
+			backlogMu.Lock()
+			backlog = append(backlog, line)
+			backlogTotalSize += int64(len(line))
+			backlogMu.Unlock()
+		}
+
+		// Try to send
+		data, _ := json.Marshal(map[string]string{"node": nodeName, "line": line})
+		req, _ := http.NewRequest("POST", masterURL+"/api/ingest", bytes.NewBuffer(data))
+		req.Header.Set("Content-Type", "application/json")
+		
+		resp, err := client.Do(req)
+		if err == nil && (resp.StatusCode >= 200 && resp.StatusCode < 300) {
+			_ = resp.Body.Close()
+			// Success! Remove from backlog
+			backlogMu.Lock()
+			if len(backlog) > 0 {
+				backlogTotalSize -= int64(len(backlog[0]))
+				backlog = backlog[1:]
+			}
+			backlogMu.Unlock()
+			backoff = 1 * time.Second // Reset backoff
+		} else {
+			if err == nil { _ = resp.Body.Close() }
+			// Failure! Wait and retry
+			time.Sleep(backoff)
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
+	}
+}
+
 // Gzip middleware
 type gzipResponseWriter struct {
 	io.Writer
@@ -225,7 +284,7 @@ func gzipMiddleware(next http.Handler) http.Handler {
 		}
 		w.Header().Set("Content-Encoding", "gzip")
 		gz := gzip.NewWriter(w)
-		defer gz.Close()
+		defer func() { _ = gz.Close() }()
 		gzw := gzipResponseWriter{Writer: gz, ResponseWriter: w}
 		next.ServeHTTP(gzw, r)
 	})
@@ -375,23 +434,30 @@ func startLogIngestion() {
 	scanner.Buffer(buf, 1024*1024) // 1MB max line length
 
 	log.Println("Log ingestion started, waiting for dnsmasq input...")
-	client := &http.Client{Timeout: 2 * time.Second}
 
 	for scanner.Scan() {
 		line := scanner.Text()
 		fmt.Println(line) // Still print to stdout for docker logs
 		
-		// In slave mode, forward raw logs to master
+		// In slave mode, queue for forwarding
 		if mode == "slave" && masterURL != "" {
-			go func(l string) {
-				data, _ := json.Marshal(map[string]string{"node": nodeName, "line": l})
-				req, _ := http.NewRequest("POST", masterURL+"/api/ingest", bytes.NewBuffer(data))
-				req.Header.Set("Content-Type", "application/json")
-				resp, err := client.Do(req)
-				if err == nil {
-					resp.Body.Close()
+			select {
+			case forwardChan <- line:
+				// Added to chan, now the forward worker handles backlog size
+				backlogMu.Lock()
+				// Prevent chan from growing indefinitely if worker is slow but not failing
+				if backlogTotalSize > maxBacklogSize {
+					// Drop oldest if we are over limit
+					backlogTotalSize -= int64(len(backlog[0]))
+					backlog = backlog[1:]
 				}
-			}(line)
+				backlog = append(backlog, line)
+				backlogTotalSize += int64(len(line))
+				backlogMu.Unlock()
+			default:
+				// Chan full, worker is very behind, drop or handle?
+				// For now we rely on the backlogMu logic inside the worker too
+			}
 		}
 
 		parseLogLine(line, nodeName)
@@ -430,6 +496,7 @@ func main() {
 	go startLogIngestion()
 	go startPendingCleanup()
 	go startHistoryArchiver()
+	go startForwardWorker()
 
 	// Handle signals for graceful reload/shutdown
 	sigChan := make(chan os.Signal, 1)

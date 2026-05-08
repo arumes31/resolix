@@ -159,14 +159,19 @@ fi
 # Generate initial dnsmasq.conf
 generate_dnsmasq_conf "${HEALTHY_UPSTREAMS[@]}"
 
-# Start dnsmasq and pipe its output to Web GUI
+# Start dnsmasq and Web GUI using a named pipe for reliable PID tracking and stability
 echo "Starting dnsmasq and Web GUI..."
-/usr/sbin/dnsmasq -k 2>&1 | /usr/bin/webgui &
+mkfifo /tmp/dnsmasq_logs 2>/dev/null || true
+
+# Start Web GUI reading from the pipe
+/usr/bin/webgui < /tmp/dnsmasq_logs &
+WEBGUI_PID=$!
+
+# Start dnsmasq writing to the pipe
+/usr/sbin/dnsmasq -k 2>&1 > /tmp/dnsmasq_logs &
 DNSMASQ_PID=$!
-# Note: In this pipe, we track the first process. Since we need to manage both,
-# we'll rely on the cleanup function which kills the entire process group if needed,
-# or we can just kill dnsmasq and webgui will exit on EOF.
-WEBGUI_PID=$DNSMASQ_PID # Close enough for cleanup purposes
+
+echo "Processes started: dnsmasq (PID: $DNSMASQ_PID), Web GUI (PID: $WEBGUI_PID)"
 
 # Continuous health check loop
 (
@@ -196,5 +201,15 @@ WEBGUI_PID=$DNSMASQ_PID # Close enough for cleanup purposes
 ) &
 HEALTHCHECK_PID=$!
 
-# Keep the container running
-wait
+# Monitor processes and exit if either core process dies
+while true; do
+    if ! kill -0 $DNSMASQ_PID 2>/dev/null; then
+        echo "Error: dnsmasq process died"
+        exit 1
+    fi
+    if ! kill -0 $WEBGUI_PID 2>/dev/null; then
+        echo "Error: Web GUI process died"
+        exit 1
+    fi
+    sleep 5
+done

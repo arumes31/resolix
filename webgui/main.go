@@ -163,7 +163,7 @@ func parseLogLine(line string) {
 			} else if action == "cached" {
 				upstream = "System Cache"
 			} else if action == "config" {
-				upstream = "Local Config"
+				upstream = "Local Override"
 			} else {
 				upstream = action
 			}

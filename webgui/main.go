@@ -65,6 +65,11 @@ var (
 	hourlyStats = make(map[int64]int)
 	statsMu     sync.RWMutex
 
+	// Incremental stats for the ring buffer window
+	windowDomainCounts = make(map[string]int)
+	windowClientCounts = make(map[string]int)
+	// (Note: node stats are still calculated from buckets for accuracy)
+
 	// Resilient Forwarding for Slaves
 	forwardChan      = make(chan string, 10000) // Buffer for incoming lines
 	backlogMu        sync.Mutex
@@ -218,50 +223,69 @@ func startForwardWorker() {
 	if mode != "slave" || masterURL == "" {
 		return
 	}
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: 10 * time.Second}
 	backoff := 1 * time.Second
 
 	for {
-		var line string
+		var lines []string
 		backlogMu.Lock()
 		if len(backlog) > 0 {
-			line = backlog[0]
+			// Take a batch of up to 100 lines
+			batchSize := 100
+			if len(backlog) < batchSize {
+				batchSize = len(backlog)
+			}
+			lines = append([]string(nil), backlog[:batchSize]...)
 			backlogMu.Unlock()
 		} else {
 			backlogMu.Unlock()
-			// Wait for new lines if backlog is empty
-			line = <-forwardChan
-			// Add to backlog to ensure it's tracked if first attempt fails
+			// Wait for at least one line
+			line := <-forwardChan
+			lines = []string{line}
+			
+			// Try to grab more from chan if available (non-blocking)
+			collectMore := true
+			for collectMore && len(lines) < 100 {
+				select {
+				case l := <-forwardChan:
+					lines = append(lines, l)
+				default:
+					collectMore = false
+				}
+			}
+
+			// Add to backlog for tracking
 			backlogMu.Lock()
-			backlog = append(backlog, line)
-			backlogTotalSize += int64(len(line))
+			for _, l := range lines {
+				backlog = append(backlog, l)
+				backlogTotalSize += int64(len(l))
+			}
 			backlogMu.Unlock()
 		}
 
-		// Try to send
-		data, _ := json.Marshal(map[string]string{"node": nodeName, "line": line})
+		// Try to send batch
+		data, _ := json.Marshal(map[string]interface{}{"node": nodeName, "batch": lines})
 		req, _ := http.NewRequest("POST", masterURL+"/api/ingest", bytes.NewBuffer(data))
 		req.Header.Set("Content-Type", "application/json")
 		
 		resp, err := client.Do(req)
 		if err == nil && (resp.StatusCode >= 200 && resp.StatusCode < 300) {
 			_ = resp.Body.Close()
-			// Success! Remove from backlog
+			// Success! Remove batch from backlog
 			backlogMu.Lock()
-			if len(backlog) > 0 {
-				backlogTotalSize -= int64(len(backlog[0]))
-				backlog = backlog[1:]
+			if len(backlog) >= len(lines) {
+				for i := 0; i < len(lines); i++ {
+					backlogTotalSize -= int64(len(backlog[i]))
+				}
+				backlog = backlog[len(lines):]
 			}
 			backlogMu.Unlock()
-			backoff = 1 * time.Second // Reset backoff
+			backoff = 1 * time.Second
 		} else {
 			if err == nil { _ = resp.Body.Close() }
-			// Failure! Wait and retry
 			time.Sleep(backoff)
 			backoff *= 2
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
-			}
+			if backoff > 30*time.Second { backoff = 30 * time.Second }
 		}
 	}
 }
@@ -355,7 +379,17 @@ func parseLogLine(line string, node string) {
 		pendingMu.Unlock()
 
 		eventsMu.Lock()
+		if count == maxEvents {
+			// About to overwrite oldest: decrement counters
+			old := events[head]
+			windowDomainCounts[old.Domain]--
+			windowClientCounts[old.ClientIP]--
+		}
+
 		events[head] = event
+		windowDomainCounts[event.Domain]++
+		windowClientCounts[event.ClientIP]++
+
 		head = (head + 1) % maxEvents
 		if count < maxEvents {
 			count++
@@ -521,8 +555,9 @@ func main() {
 			return
 		}
 		var payload struct {
-			Node string `json:"node"`
-			Line string `json:"line"`
+			Node  string   `json:"node"`
+			Line  string   `json:"line"`
+			Batch []string `json:"batch"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			http.Error(w, "Bad request", http.StatusBadRequest)
@@ -530,6 +565,9 @@ func main() {
 		}
 		if payload.Line != "" {
 			parseLogLine(payload.Line, payload.Node)
+		}
+		for _, l := range payload.Batch {
+			parseLogLine(l, payload.Node)
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
@@ -572,12 +610,22 @@ func main() {
 
 		eventsMu.RLock()
 		total = count
+		// Using pre-calculated window counts for performance
+		for k, v := range windowDomainCounts {
+			if v > 0 { domainCounts[k] = v }
+		}
+		for k, v := range windowClientCounts {
+			if v > 0 { clientCounts[k] = v }
+		}
+		
+		// RPM/RPH still require a scan or separate trackers
+		// Given we already limited scan to RPM/RPH window, let's keep it optimized
 		for i := 0; i < count; i++ {
 			idx := (head - 1 - i + maxEvents) % maxEvents
 			e := events[idx]
-			domainCounts[e.Domain]++
-			clientCounts[e.ClientIP]++
 			
+			if e.UnixTime < now-3600 { break } // Stop scanning once out of RPH window
+
 			nodeName := e.Node
 			if nodeName == "" { nodeName = "local" }
 

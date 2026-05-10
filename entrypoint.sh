@@ -84,6 +84,11 @@ EOL
     # Add upstream DNS servers (Go app will handle health updates in future versions via signals)
     # For now, we add all provided upstreams initially.
     for server in $UPSTREAM_DNS; do
+        server=$(echo "$server" | tr -d '[:space:]')
+        if [[ ! "$server" =~ ^[a-zA-Z0-9.:-]+$ ]]; then
+            echo "Warning: Skipping invalid upstream: $server"
+            continue
+        fi
         echo "Adding upstream: $server"
         echo "server=$server" >> /etc/dnsmasq.conf
     done

@@ -7,17 +7,28 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
+
+	"golang.org/x/crypto/pbkdf2"
 )
 
-// Encrypt encrypts plaintext using AES-GCM with a key derived from the password.
+const saltSize = 16
+const iterCount = 100000
+
+// Encrypt encrypts plaintext using AES-GCM and PBKDF2.
 func Encrypt(plaintext []byte, password string) (string, error) {
 	if password == "" {
-		return string(plaintext), nil
+		return "", fmt.Errorf("encryption password required")
 	}
 
-	key := sha256.Sum256([]byte(password))
-	block, err := aes.NewCipher(key[:])
+	salt := make([]byte, saltSize)
+	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
+		return "", err
+	}
+
+	key := pbkdf2.Key([]byte(password), salt, iterCount, 32, sha256.New)
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", err
 	}
@@ -33,22 +44,30 @@ func Encrypt(plaintext []byte, password string) (string, error) {
 	}
 
 	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
-	return base64.StdEncoding.EncodeToString(ciphertext), nil
+
+	salt = append(salt, ciphertext...)
+	return base64.StdEncoding.EncodeToString(salt), nil
 }
 
-// Decrypt decrypts a base64 encoded ciphertext using AES-GCM and the provided password.
+// Decrypt decrypts a base64 encoded ciphertext using AES-GCM and PBKDF2.
 func Decrypt(encodedCiphertext string, password string) ([]byte, error) {
 	if password == "" {
-		return []byte(encodedCiphertext), nil
+		return nil, fmt.Errorf("encryption password required")
 	}
 
-	ciphertext, err := base64.StdEncoding.DecodeString(encodedCiphertext)
+	data, err := base64.StdEncoding.DecodeString(encodedCiphertext)
 	if err != nil {
 		return nil, err
 	}
 
-	key := sha256.Sum256([]byte(password))
-	block, err := aes.NewCipher(key[:])
+	if len(data) < saltSize {
+		return nil, errors.New("ciphertext too short")
+	}
+
+	salt, ciphertext := data[:saltSize], data[saltSize:]
+
+	key := pbkdf2.Key([]byte(password), salt, iterCount, 32, sha256.New)
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
 	}

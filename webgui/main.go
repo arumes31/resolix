@@ -112,19 +112,30 @@ func main() {
 				srv.Broadcast(*ev)
 			}
 		}
+		if err := scanner.Err(); err != nil {
+			log.Printf("stdin scan error: %v", err)
+		}
 	}()
 
 	// Handle signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	errChan := make(chan error, 1)
 	go func() {
-		sig := <-sigChan
-		log.Printf("Received signal %v, shutting down", sig)
-		cancel()
-		os.Exit(0)
+		if err := srv.Start(ctx); err != nil {
+			errChan <- err
+		}
 	}()
 
-	if err := srv.Start(); err != nil {
+	select {
+	case sig := <-sigChan:
+		log.Printf("Received signal %v, shutting down", sig)
+		cancel()
+	case err := <-errChan:
 		log.Printf("Server error: %v", err)
+		cancel()
 	}
+
+	fwd.Stop()
+	time.Sleep(1 * time.Second)
 }

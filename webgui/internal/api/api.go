@@ -3,7 +3,9 @@ package api
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -28,7 +30,7 @@ type Server struct {
 	tmpl   *template.Template
 
 	// SSE Broadcaster (Improvement 78)
-	subscribers map[chan models.QueryEvent]bool
+	subscribers map[chan models.QueryEvent]int
 	subMu       sync.Mutex
 }
 
@@ -39,7 +41,7 @@ func NewServer(cfg *config.Config, store *storage.Store, prs *parser.Parser, tmp
 		store:       store,
 		parser:      prs,
 		tmpl:        tmpl,
-		subscribers: make(map[chan models.QueryEvent]bool),
+		subscribers: make(map[chan models.QueryEvent]int),
 	}
 }
 
@@ -47,11 +49,19 @@ func NewServer(cfg *config.Config, store *storage.Store, prs *parser.Parser, tmp
 func (s *Server) Broadcast(e models.QueryEvent) {
 	s.subMu.Lock()
 	defer s.subMu.Unlock()
-	for ch := range s.subscribers {
+	for ch, drops := range s.subscribers {
 		select {
 		case ch <- e:
+			if drops > 0 {
+				s.subscribers[ch] = 0
+			}
 		default:
-			// Buffer full, skip or drop client
+			s.subscribers[ch]++
+			if s.subscribers[ch] > 10 {
+				log.Printf("Dropping slow subscriber")
+				delete(s.subscribers, ch)
+				close(ch)
+			}
 		}
 	}
 }
@@ -159,8 +169,21 @@ func (s *Server) handleSimulate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Missing domain parameter", http.StatusBadRequest)
 		return
 	}
-	ips, err := net.LookupIP(domain)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	ips, err := (&net.Resolver{}).LookupIPAddr(ctx, domain)
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			w.WriteHeader(http.StatusGatewayTimeout)
+		} else {
+			var dnsErr *net.DNSError
+			if errors.As(err, &dnsErr) {
+				w.WriteHeader(http.StatusBadGateway)
+			} else {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "error", "error": err.Error()})
 		return
 	}
@@ -184,7 +207,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	ch := make(chan models.QueryEvent, 100)
 	s.subMu.Lock()
-	s.subscribers[ch] = true
+	s.subscribers[ch] = 0
 	s.subMu.Unlock()
 
 	defer func() {
@@ -234,19 +257,25 @@ func (w gzipResponseWriter) Write(b []byte) (int, error) {
 }
 
 // Start launches the HTTP server and listens for requests.
-func (s *Server) Start() error {
+func (s *Server) Start(ctx context.Context) error {
 	server := &http.Server{
-		Addr:         ":" + s.cfg.Port,
-		Handler:      s.SetupMux(),
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:              ":" + s.cfg.Port,
+		Handler:           s.SetupMux(),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	ln, err := net.Listen("tcp", server.Addr)
 	if err != nil {
 		return err
 	}
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
 
 	log.Printf("Starting Advanced Web GUI on %s", server.Addr)
 	return server.Serve(ln)

@@ -26,11 +26,21 @@ func NewChecker(cfg *config.Config, upstreamDNS string) *Checker {
 	if len(servers) == 0 {
 		servers = []string{"8.8.8.8", "8.8.4.4"}
 	}
-	return &Checker{
+	c := &Checker{
 		cfg:       cfg,
 		upstreams: servers,
 		healthy:   servers,
 	}
+	var initialHealthy []string
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, s := range servers {
+		if c.CheckUpstream(ctx, s) {
+			initialHealthy = append(initialHealthy, s)
+		}
+	}
+	c.healthy = initialHealthy
+	return c
 }
 
 // CheckUpstream verifies if a specific DNS server is responsive.
@@ -57,31 +67,34 @@ func (c *Checker) Start(ctx context.Context, onChange func([]string)) {
 			return
 		case <-ticker.C:
 			var wg sync.WaitGroup
-			var mu sync.Mutex
-			newHealthy := []string{}
+			results := make([]bool, len(c.upstreams))
 
-			for _, ups := range c.upstreams {
+			for i, ups := range c.upstreams {
 				wg.Add(1)
-				go func(u string) {
+				go func(idx int, u string) {
 					defer wg.Done()
-					if c.CheckUpstream(ctx, u) {
-						mu.Lock()
-						newHealthy = append(newHealthy, u)
-						mu.Unlock()
-					}
-				}(ups)
+					results[idx] = c.CheckUpstream(ctx, u)
+				}(i, ups)
 			}
 			wg.Wait()
 
+			var newHealthy []string
+			for i, r := range results {
+				if r {
+					newHealthy = append(newHealthy, c.upstreams[i])
+				}
+			}
+
 			c.mu.Lock()
 			changed := !equalSlices(c.healthy, newHealthy)
-			if changed && len(newHealthy) > 0 {
+			if changed {
 				log.Printf("Healthy upstreams changed: %v -> %v", c.healthy, newHealthy)
 				c.healthy = newHealthy
 				c.mu.Unlock()
 
-				// Reload dnsmasq configuration (Improvement 39)
-				_ = exec.Command("pkill", "-HUP", "dnsmasq").Run()
+				if err := exec.Command("pkill", "-HUP", "dnsmasq").Run(); err != nil {
+					log.Printf("Error reloading dnsmasq: %v", err)
+				}
 
 				onChange(newHealthy)
 			} else {

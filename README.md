@@ -29,11 +29,11 @@ graph LR
 
 ## 🚀 Quick Start
 
-### 3. Deploy
+### 1. Deploy
 ```bash
 docker-compose up -d --build
 ```
-*Note: Use `./history` and `./tailscale` volumes for data persistence (Improvement 70).*
+*Note: Use `./history` and `./tailscale` volumes for data persistence.*
 
 ---
 
@@ -51,7 +51,7 @@ docker-compose up -d --build
 | `MASTER_URL` | URL of the Master node (Required for `slave` mode) | - |
 | `NODE_NAME` | Unique identifier for the node in the dashboard | Hostname |
 
-### Performance Optimization (Improvement 75)
+### Performance Optimization
 The provided `docker-compose.yaml` includes kernel `sysctls` optimizations:
 - `net.core.somaxconn=1024`: Higher connection backlog for heavy traffic.
 - `net.ipv4.tcp_fastopen=3`: Reduces latency for repeated TCP connections.
@@ -68,7 +68,7 @@ The provided `docker-compose.yaml` includes kernel `sysctls` optimizations:
 1. **Tailscale Connection**: The container joins your Tailnet and gets a unique IP.
 2. **DNS Logic**: `dnsmasq` listens on the Tailscale IP, resolving custom mappings first and then forwarding to healthy upstreams.
 3. **In-Memory Pipe**: Logs are streamed from `dnsmasq` through a named pipe directly into the Web GUI's RAM buffer.
-4. **Zero Disk Write**: No logs are written to physical storage, preserving disk health while maintaining full visibility via `docker logs`.
+4. **Persistent Logging**: History is stored on disk and periodically archived, preserving visibility while allowing retention policies to manage disk usage.
 
 ---
 

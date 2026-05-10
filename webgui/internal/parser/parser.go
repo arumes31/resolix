@@ -49,16 +49,16 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 			return nil
 		}
 		qType := string(action[6 : len(action)-1])
-		if len(parts) < actionIdx+4 {
+		if len(parts) < actionIdx+4 || string(parts[actionIdx+2]) != "from" {
 			return nil
 		}
 		domain := string(parts[actionIdx+1])
 		clientIP := string(parts[actionIdx+3])
 
-		tsStr := now.Format("Jan _2 15:04:05")
-		if actionIdx >= 3 {
-			tsStr = string(bytes.Join(parts[:3], []byte(" ")))
+		if actionIdx < 3 {
+			return nil
 		}
+		tsStr := string(bytes.Join(parts[:3], []byte(" ")))
 
 		event := models.QueryEvent{
 			Timestamp: tsStr,
@@ -75,7 +75,7 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 	}
 
 	if bytes.Equal(action, []byte("forwarded")) {
-		if len(parts) >= actionIdx+4 {
+		if len(parts) >= actionIdx+4 && string(parts[actionIdx+2]) == "to" {
 			domain := string(parts[actionIdx+1])
 			upstream := string(parts[actionIdx+3])
 			p.store.SetUpstream(node, domain, upstream)

@@ -1,7 +1,9 @@
 package config
 
 import (
+	"log"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -49,14 +51,27 @@ func LoadConfig() *Config {
 	if mode == "" {
 		mode = "master"
 	}
+	if mode != "master" && mode != "slave" {
+		log.Printf("Warning: Invalid MODE '%s', falling back to master", mode)
+		mode = "master"
+	}
 
 	nodeName := os.Getenv("NODE_NAME")
 	if nodeName == "" {
-		nodeName, _ = os.Hostname()
+		host, err := os.Hostname()
+		if err != nil {
+			log.Printf("Error getting hostname: %v", err)
+			nodeName = "unknown-node"
+		} else {
+			nodeName = host
+		}
 	}
 
 	port := os.Getenv("PORT")
 	if port == "" {
+		port = DefaultPort
+	} else if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+		log.Printf("Warning: Invalid PORT '%s', falling back to %s", port, DefaultPort)
 		port = DefaultPort
 	}
 
@@ -70,7 +85,7 @@ func LoadConfig() *Config {
 		healthDomain = DefaultHealthDomain
 	}
 
-	return &Config{
+	cfg := &Config{
 		Mode:             mode,
 		MasterURL:        os.Getenv("MASTER_URL"),
 		NodeName:         nodeName,
@@ -84,4 +99,10 @@ func LoadConfig() *Config {
 		HistoryRetention: DefaultHistoryRetention,
 		IngestSecret:     os.Getenv("INGEST_SECRET"),
 	}
+
+	if cfg.Mode == "slave" && cfg.MasterURL == "" {
+		log.Fatal("MASTER_URL is required when MODE is slave")
+	}
+
+	return cfg
 }

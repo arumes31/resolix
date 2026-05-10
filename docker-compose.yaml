@@ -10,9 +10,8 @@ services:
       - MODE=master
       - MASTER_URL=
       - NODE_NAME=dns-server-1
-      - PORT=${PORT:-35353}
     ports:
-      - "127.0.0.1:${PORT:-35353}:${PORT:-35353}"
+      - "127.0.0.1:${PORT:-35353}:35353"
     volumes:
       - ./history:/var/lib/tailscale-dnsrewrite
       - ./tailscale:/var/lib/tailscale

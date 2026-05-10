@@ -114,7 +114,12 @@ func (s *Store) loadStatsFromHistory() {
 					}
 				}
 			}
-			_ = file.Close()
+			if err := scanner.Err(); err != nil {
+				log.Printf("Error scanning history file %s: %v", path, err)
+			}
+			if err := file.Close(); err != nil {
+				log.Printf("Error closing history file %s: %v", path, err)
+			}
 		}
 	}
 	s.statsMu.RLock()
@@ -415,7 +420,7 @@ func (s *Store) ArchiveStep(now time.Time) int {
 				allSuccess = false
 				continue
 			}
-			
+
 			writeErr := func() error {
 				for _, e := range evs {
 					data, err := json.Marshal(e)
@@ -435,19 +440,16 @@ func (s *Store) ArchiveStep(now time.Time) int {
 						return err
 					}
 				}
-				if err := f.Sync(); err != nil {
-					return err
-				}
-				return f.Close()
+				return f.Sync()
 			}()
 
 			if writeErr != nil {
 				log.Printf("Error writing to history file %s: %v", path, writeErr)
 				allSuccess = false
-				_ = f.Close()
 			}
+			_ = f.Close()
 		}
-		
+
 		if allSuccess {
 			s.lastArchivedTime = cutoff
 			log.Printf("Archived %d events to disk", len(toArchive))

@@ -1,5 +1,5 @@
 # Stage 1: Build
-FROM golang:1.26-alpine AS builder
+FROM golang:1.22-alpine AS builder
 
 WORKDIR /app
 
@@ -26,13 +26,18 @@ RUN apk add --no-cache tailscale dnsmasq bash bind-tools
 COPY --from=builder /app/webgui /usr/bin/webgui
 
 # Create history directory
-RUN mkdir -p /var/lib/tailscale-dnsrewrite && chmod 750 /var/lib/tailscale-dnsrewrite
+RUN mkdir -p /var/lib/tailscale-dnsrewrite && chmod 750 /var/lib/tailscale-dnsrewrite \
+    && mkdir -p /var/lib/tailscale && chmod 750 /var/lib/tailscale
 
 # Copy entrypoint
 COPY entrypoint.sh /usr/bin/entrypoint.sh
 RUN chmod +x /usr/bin/entrypoint.sh
 
 # Environment variables
+RUN mkdir -p /var/run/tailscale && chmod 750 /var/run/tailscale
+
+RUN mkdir -p /var/run/tailscale && chmod 750 /var/run/tailscale
+
 ENV MODE=master
 ENV PORT=35353
 ENV HISTORY_DIR=/var/lib/tailscale-dnsrewrite

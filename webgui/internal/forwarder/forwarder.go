@@ -15,7 +15,7 @@ import (
 // Forwarder handles sending batches of logs from slave to master.
 type Forwarder struct {
 	cfg              *config.Config
-	forwardChan      chan string
+	stopChan         chan struct{}
 	backlogMu        sync.Mutex
 	backlog          []string
 	backlogTotalSize int64
@@ -24,8 +24,8 @@ type Forwarder struct {
 // NewForwarder creates a new log forwarder for slave nodes.
 func NewForwarder(cfg *config.Config) *Forwarder {
 	return &Forwarder{
-		cfg:         cfg,
-		forwardChan: make(chan string, 10000),
+		stopChan: make(chan struct{}),
+		cfg:      cfg,
 	}
 }
 
@@ -36,7 +36,7 @@ func (f *Forwarder) Enqueue(line string) {
 	}
 	f.backlogMu.Lock()
 	defer f.backlogMu.Unlock()
-	
+
 	// Enforce a maximum backlog size to prevent OOM
 	if f.backlogTotalSize > 10*1024*1024 { // 10MB limit
 		return
@@ -81,38 +81,61 @@ func (f *Forwarder) Start() {
 	backoff := 1 * time.Second
 
 	for {
-		var lines []string
+		select {
+		case <-f.stopChan:
+			return
+		default:
+		}
+
 		f.backlogMu.Lock()
 		if len(f.backlog) == 0 {
 			f.backlogMu.Unlock()
-			time.Sleep(100 * time.Millisecond)
+			select {
+			case <-time.After(100 * time.Millisecond):
+			case <-f.stopChan:
+				return
+			}
 			continue
 		}
 		batchSize := 100
 		if len(f.backlog) < batchSize {
 			batchSize = len(f.backlog)
 		}
-		lines = append([]string(nil), f.backlog[:batchSize]...)
+		lines := append([]string(nil), f.backlog[:batchSize]...)
+
+		for i := 0; i < len(lines); i++ {
+			f.backlogTotalSize -= int64(len(f.backlog[i]))
+		}
+		f.backlog = f.backlog[batchSize:]
 		f.backlogMu.Unlock()
 
 		err := f.sendBatch(client, lines)
 		if err == nil {
-			f.backlogMu.Lock()
-			if len(f.backlog) >= len(lines) {
-				for i := 0; i < len(lines); i++ {
-					f.backlogTotalSize -= int64(len(f.backlog[i]))
-				}
-				f.backlog = f.backlog[len(lines):]
-			}
-			f.backlogMu.Unlock()
 			backoff = 1 * time.Second
 		} else {
 			log.Printf("Error sending batch to master: %v", err)
-			time.Sleep(backoff)
+
+			f.backlogMu.Lock()
+			f.backlog = append(lines, f.backlog...)
+			for i := 0; i < len(lines); i++ {
+				f.backlogTotalSize += int64(len(lines[i]))
+			}
+			f.backlogMu.Unlock()
+
+			select {
+			case <-time.After(backoff):
+			case <-f.stopChan:
+				return
+			}
 			backoff *= 2
 			if backoff > 30*time.Second {
 				backoff = 30 * time.Second
 			}
 		}
 	}
+}
+
+// Stop cleanly shuts down the forwarder
+func (f *Forwarder) Stop() {
+	close(f.stopChan)
 }

@@ -311,6 +311,13 @@
     </div>
 
     <script>
+        function escapeHtml(unsafe) {
+            if (unsafe == null) return '';
+            const el = document.createElement('div');
+            el.textContent = unsafe;
+            return el.innerHTML;
+        }
+
         let allEvents = [];
         let rpmHistory = Array(20).fill(0);
         let lastEventTimestamp = 0;
@@ -319,9 +326,13 @@
         function startStream() {
             const eventSource = new EventSource('/api/stream');
             eventSource.onmessage = (event) => {
-                const newEvent = JSON.parse(event.data);
-                allEvents = [newEvent, ...allEvents].slice(0, 1000);
-                renderEvents();
+                try {
+                    const newEvent = JSON.parse(event.data);
+                    allEvents = [newEvent, ...allEvents].slice(0, 1000);
+                    renderEvents();
+                } catch (e) {
+                    console.error("Failed to parse SSE event:", e, event.data);
+                }
             };
             eventSource.onerror = () => {
                 console.error("SSE connection lost. Reconnecting...");
@@ -371,7 +382,7 @@
                 if (stats.nodes) {
                     nodeStats.innerHTML = Object.entries(stats.nodes).map(([name, s]) => `
                         <li class="top-item">
-                            <span>${name}</span>
+                            <span>${escapeHtml(name)}</span>
                             <span><span class="top-count">${s.rpm}</span> <span class="top-count" style="background: rgba(129, 140, 248, 0.1); color: #818cf8;">${s.rph}</span></span>
                         </li>
                     `).join('');
@@ -418,13 +429,13 @@
 
                 return `
                     <tr>
-                        <td class="timestamp">${new Date(e.unix_time * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false})}</td>
-                        <td><span class="badge" style="background: rgba(255,255,255,0.1); font-size: 0.7rem;">${e.node || 'local'}</span></td>
-                        <td><span class="badge badge-type">${e.type}</span></td>
-                        <td class="domain">${e.domain}</td>
-                        <td><span class="badge badge-ip">${e.client_ip}</span></td>
-                        <td>${e.upstream ? `<span class="upstream-badge">${e.upstream}</span>` : '-'}</td>
-                        <td class="latency-cell ${latencyClass}">${e.latency_ms ? e.latency_ms.toFixed(1) + 'ms' : '-'}</td>
+                        <td class="timestamp">${escapeHtml(new Date(e.unix_time * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false}))}</td>
+                        <td><span class="badge" style="background: rgba(255,255,255,0.1); font-size: 0.7rem;">${escapeHtml(e.node || 'local')}</span></td>
+                        <td><span class="badge badge-type">${escapeHtml(e.type)}</span></td>
+                        <td class="domain">${escapeHtml(e.domain)}</td>
+                        <td><span class="badge badge-ip">${escapeHtml(e.client_ip)}</span></td>
+                        <td>${e.upstream ? `<span class="upstream-badge">${escapeHtml(e.upstream)}</span>` : '-'}</td>
+                        <td class="latency-cell ${latencyClass}">${e.latency_ms ? escapeHtml(e.latency_ms.toFixed(1)) + 'ms' : '-'}</td>
                     </tr>
                 `;
             }).join('');
@@ -434,7 +445,7 @@
             const el = document.getElementById(id);
             el.innerHTML = list.map(item => `
                 <li class="top-item">
-                    <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px;">${item.key}</span>
+                    <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px;">${escapeHtml(item.key)}</span>
                     <span class="top-count">${item.count}</span>
                 </li>
             `).join('');

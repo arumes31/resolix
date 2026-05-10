@@ -12,6 +12,7 @@ import (
 	"tailscale-dnsrewrite/webgui/internal/config"
 )
 
+// Forwarder handles sending batches of logs from slave to master.
 type Forwarder struct {
 	cfg              *config.Config
 	forwardChan      chan string
@@ -20,6 +21,7 @@ type Forwarder struct {
 	backlogTotalSize int64
 }
 
+// NewForwarder creates a new log forwarder for slave nodes.
 func NewForwarder(cfg *config.Config) *Forwarder {
 	return &Forwarder{
 		cfg:         cfg,
@@ -27,15 +29,21 @@ func NewForwarder(cfg *config.Config) *Forwarder {
 	}
 }
 
+// Enqueue adds a log line to the forwarding queue.
 func (f *Forwarder) Enqueue(line string) {
 	if f.cfg.Mode != "slave" || f.cfg.MasterURL == "" {
 		return
 	}
-	select {
-	case f.forwardChan <- line:
-	default:
-		// Channel full, add to backlog directly if needed or drop
+	f.backlogMu.Lock()
+	defer f.backlogMu.Unlock()
+	
+	// Enforce a maximum backlog size to prevent OOM
+	if f.backlogTotalSize > 10*1024*1024 { // 10MB limit
+		return
 	}
+
+	f.backlog = append(f.backlog, line)
+	f.backlogTotalSize += int64(len(line))
 }
 
 func (f *Forwarder) sendBatch(client *http.Client, lines []string) error {
@@ -48,19 +56,23 @@ func (f *Forwarder) sendBatch(client *http.Client, lines []string) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	
+	if f.cfg.IngestSecret != "" {
+		req.Header.Set("Authorization", "Bearer "+f.cfg.IngestSecret)
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	
+	defer func() { _ = resp.Body.Close() }()
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 	return nil
 }
 
+// Start begins the forwarding worker loop.
 func (f *Forwarder) Start() {
 	if f.cfg.Mode != "slave" || f.cfg.MasterURL == "" {
 		return
@@ -71,36 +83,17 @@ func (f *Forwarder) Start() {
 	for {
 		var lines []string
 		f.backlogMu.Lock()
-		if len(f.backlog) > 0 {
-			batchSize := 100
-			if len(f.backlog) < batchSize {
-				batchSize = len(f.backlog)
-			}
-			lines = append([]string(nil), f.backlog[:batchSize]...)
+		if len(f.backlog) == 0 {
 			f.backlogMu.Unlock()
-		} else {
-			f.backlogMu.Unlock()
-			line, ok := <-f.forwardChan
-			if !ok { return }
-			lines = []string{line}
-			
-			collectMore := true
-			for collectMore && len(lines) < 100 {
-				select {
-				case l := <-f.forwardChan:
-					lines = append(lines, l)
-				default:
-					collectMore = false
-				}
-			}
-
-			f.backlogMu.Lock()
-			for _, l := range lines {
-				f.backlog = append(f.backlog, l)
-				f.backlogTotalSize += int64(len(l))
-			}
-			f.backlogMu.Unlock()
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
+		batchSize := 100
+		if len(f.backlog) < batchSize {
+			batchSize = len(f.backlog)
+		}
+		lines = append([]string(nil), f.backlog[:batchSize]...)
+		f.backlogMu.Unlock()
 
 		err := f.sendBatch(client, lines)
 		if err == nil {
@@ -117,7 +110,9 @@ func (f *Forwarder) Start() {
 			log.Printf("Error sending batch to master: %v", err)
 			time.Sleep(backoff)
 			backoff *= 2
-			if backoff > 30*time.Second { backoff = 30 * time.Second }
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
 		}
 	}
 }

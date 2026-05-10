@@ -18,6 +18,7 @@ func NewParser(store *storage.Store) *Parser {
 	return &Parser{store: store}
 }
 
+// ParseLogBytes parses a raw dnsmasq log line and updates the store.
 func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 	now := time.Now()
 	parts := bytes.Fields(line)
@@ -44,6 +45,9 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 	action := parts[actionIdx]
 
 	if bytes.HasPrefix(action, []byte("query[")) {
+		if len(action) < 8 { // Must be at least query[A]
+			return nil
+		}
 		qType := string(action[6 : len(action)-1])
 		if len(parts) < actionIdx+4 {
 			return nil

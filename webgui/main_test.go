@@ -1,16 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"html/template"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"tailscale-dnsrewrite/webgui/internal/api"
 	"tailscale-dnsrewrite/webgui/internal/config"
+	"tailscale-dnsrewrite/webgui/internal/forwarder"
 	"tailscale-dnsrewrite/webgui/internal/models"
 	"tailscale-dnsrewrite/webgui/internal/parser"
 	"tailscale-dnsrewrite/webgui/internal/storage"
@@ -18,7 +22,12 @@ import (
 
 func setupTest() (*config.Config, *storage.Store, *parser.Parser, *api.Server) {
 	cfg := config.LoadConfig()
-	cfg.MaxEvents = 100
+	cfg.MaxEvents = 1000
+	tmp, err := os.MkdirTemp("", "history-test")
+	if err != nil {
+		panic(fmt.Sprintf("failed to create temp dir: %v", err))
+	}
+	cfg.HistoryDir = tmp
 	store := storage.NewStore(cfg)
 	prs := parser.NewParser(store)
 	tmpl := template.Must(template.New("test").Parse("{{range .Events}}{{.Domain}}{{end}}"))
@@ -28,6 +37,7 @@ func setupTest() (*config.Config, *storage.Store, *parser.Parser, *api.Server) {
 
 func TestParseLogBytes(t *testing.T) {
 	_, store, prs, _ := setupTest()
+	defer func() { _ = os.RemoveAll(store.GetConfig().HistoryDir) }()
 	node := "test-node"
 
 	// 1. Test Query
@@ -63,8 +73,38 @@ func TestParseLogBytes(t *testing.T) {
 	}
 }
 
+func TestApiIngest(t *testing.T) {
+	_, store, _, srv := setupTest()
+	defer func() { _ = os.RemoveAll(store.GetConfig().HistoryDir) }()
+
+	payload := map[string]interface{}{
+		"node": "slave-1",
+		"batch": []string{
+			"query[A] d1.com from 1.1.1.1",
+			"query[A] d2.com from 2.2.2.2",
+		},
+	}
+	data, _ := json.Marshal(payload)
+
+	req := httptest.NewRequest("POST", "/api/ingest", bytes.NewBuffer(data))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	srv.SetupMux().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Errorf("Expected status 204, got %d", rr.Code)
+	}
+
+	events := store.GetRecentEvents(0)
+	if len(events) != 2 {
+		t.Errorf("Expected 2 events, got %d", len(events))
+	}
+}
+
 func TestApiEvents(t *testing.T) {
 	cfg, store, _, srv := setupTest()
+	defer func() { _ = os.RemoveAll(store.GetConfig().HistoryDir) }()
 	now := time.Now().Unix()
 
 	store.AddEvent(models.QueryEvent{UnixTime: now - 10, Domain: "old.com", Node: cfg.NodeName})
@@ -91,7 +131,8 @@ func TestApiEvents(t *testing.T) {
 }
 
 func TestApiStats(t *testing.T) {
-	cfg, _, prs, srv := setupTest()
+	cfg, store, prs, srv := setupTest()
+	defer func() { _ = os.RemoveAll(store.GetConfig().HistoryDir) }()
 
 	prs.ParseLogBytes([]byte("query[A] domain1.com from 1.1.1.1"), cfg.NodeName)
 	prs.ParseLogBytes([]byte("query[A] domain1.com from 1.1.1.1"), cfg.NodeName)
@@ -113,7 +154,8 @@ func TestApiStats(t *testing.T) {
 }
 
 func TestRootHandler(t *testing.T) {
-	cfg, _, prs, srv := setupTest()
+	cfg, store, prs, srv := setupTest()
+	defer func() { _ = os.RemoveAll(store.GetConfig().HistoryDir) }()
 	prs.ParseLogBytes([]byte("dnsmasq[1]: query[A] root.com from 1.1.1.1"), cfg.NodeName)
 
 	handler := srv.SetupMux()
@@ -124,4 +166,133 @@ func TestRootHandler(t *testing.T) {
 	if !strings.Contains(rr.Body.String(), "root.com") {
 		t.Error("Dashboard did not contain injected event")
 	}
+}
+
+func TestConcurrency(t *testing.T) {
+	_, store, prs, srv := setupTest()
+	defer func() { _ = os.RemoveAll(store.GetConfig().HistoryDir) }()
+	handler := srv.SetupMux()
+
+	const workers = 10
+	const iterations = 50
+
+	done := make(chan bool)
+
+	// Concurrent Ingestors
+	for i := 0; i < workers; i++ {
+		go func(id int) {
+			for j := 0; j < iterations; j++ {
+				line := []byte(fmt.Sprintf("query[A] domain-%d-%d.com from 1.1.1.1", id, j))
+				prs.ParseLogBytes(line, "node-1")
+
+				payload := map[string]interface{}{
+					"node": "slave-1",
+					"batch": []string{
+						fmt.Sprintf("query[A] batch-%d-%d.com from 2.2.2.2", id, j),
+					},
+				}
+				data, _ := json.Marshal(payload)
+				req := httptest.NewRequest("POST", "/api/ingest", bytes.NewBuffer(data))
+				rr := httptest.NewRecorder()
+				handler.ServeHTTP(rr, req)
+			}
+			done <- true
+		}(i)
+	}
+
+	for i := 0; i < workers; i++ {
+		<-done
+	}
+
+	events := store.GetRecentEvents(0)
+	if len(events) < workers*iterations {
+		t.Errorf("Expected at least %d events, got %d", workers*iterations, len(events))
+	}
+}
+
+func TestApiIngestAuth(t *testing.T) {
+	cfg, store, _, srv := setupTest()
+	defer func() { _ = os.RemoveAll(store.GetConfig().HistoryDir) }()
+
+	cfg.IngestSecret = "secret123"
+	handler := srv.SetupMux()
+
+	payload := map[string]interface{}{
+		"node": "slave-1",
+		"batch": []string{"query[A] d1.com from 1.1.1.1"},
+	}
+	data, _ := json.Marshal(payload)
+
+	// 1. Unauthorized
+	req := httptest.NewRequest("POST", "/api/ingest", bytes.NewBuffer(data))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("Expected status 401, got %d", rr.Code)
+	}
+
+	// 2. Authorized
+	req = httptest.NewRequest("POST", "/api/ingest", bytes.NewBuffer(data))
+	req.Header.Set("Authorization", "Bearer secret123")
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Errorf("Expected status 204, got %d", rr.Code)
+	}
+}
+
+func TestParseLogMalformed(t *testing.T) {
+	_, store, prs, _ := setupTest()
+	defer func() { _ = os.RemoveAll(store.GetConfig().HistoryDir) }()
+
+	// Test short query[
+	line := []byte("dnsmasq[1]: query[")
+	ev := prs.ParseLogBytes(line, "node")
+	if ev != nil {
+		t.Error("Expected nil for malformed query[")
+	}
+
+	// Test exactly query[A] (length 8)
+	line2 := []byte("dnsmasq[1]: query[A] ok.com from 1.1.1.1")
+	ev2 := prs.ParseLogBytes(line2, "node")
+	if ev2 == nil || ev2.Type != "A" {
+		t.Errorf("Expected successful parse for query[A], got %+v", ev2)
+	}
+}
+
+func TestArchiveStep(t *testing.T) {
+	cfg, store, _, _ := setupTest()
+	defer func() { _ = os.RemoveAll(store.GetConfig().HistoryDir) }()
+
+	now := time.Now().Unix()
+	// Add some old events
+	store.AddEvent(models.QueryEvent{UnixTime: now - 7200, Domain: "old1.com", Node: cfg.NodeName})
+	store.AddEvent(models.QueryEvent{UnixTime: now - 3601, Domain: "old2.com", Node: cfg.NodeName})
+	// Add a new event
+	store.AddEvent(models.QueryEvent{UnixTime: now, Domain: "new.com", Node: cfg.NodeName})
+
+	archived := store.ArchiveStep(time.Now())
+	if archived != 2 {
+		t.Errorf("Expected 2 events archived, got %d", archived)
+	}
+
+	// Verify file exists
+	dateStr := time.Now().Format("2006-01-02")
+	path := fmt.Sprintf("%s/history-%s.jsonl", cfg.HistoryDir, dateStr)
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		t.Errorf("History file %s was not created", path)
+	}
+}
+
+func TestForwarder(t *testing.T) {
+	cfg := &config.Config{Mode: "slave", MasterURL: "http://localhost:12345", NodeName: "slave-1"}
+	fwd := forwarder.NewForwarder(cfg)
+
+	// Test Enqueue adds to backlog
+	fwd.Enqueue("line1")
+	fwd.Enqueue("line2")
+
+	// Verify backlog indirectly or via reflection if needed, 
+	// but let's just ensure no panic and basic functionality.
+	// We can't easily test the Start() loop without a mock server here.
 }

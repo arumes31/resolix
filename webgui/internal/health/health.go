@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -19,7 +20,7 @@ type Checker struct {
 	mu        sync.RWMutex
 }
 
-// NewChecker creates a new health checker instance.
+// NewChecker initializes a new upstream health checker.
 func NewChecker(cfg *config.Config, upstreamDNS string) *Checker {
 	servers := strings.Fields(upstreamDNS)
 	if len(servers) == 0 {
@@ -36,7 +37,7 @@ func NewChecker(cfg *config.Config, upstreamDNS string) *Checker {
 func (c *Checker) CheckUpstream(ctx context.Context, server string) bool {
 	resolver := &net.Resolver{
 		PreferGo: true,
-		Dial: func(ctx context.Context, _, address string) (net.Conn, error) {
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			d := net.Dialer{Timeout: 2 * time.Second}
 			return d.DialContext(ctx, "udp", server+":53")
 		},
@@ -45,7 +46,7 @@ func (c *Checker) CheckUpstream(ctx context.Context, server string) bool {
 	return err == nil
 }
 
-// Start begins the periodic health monitoring loop.
+// Start begins the health check loop.
 func (c *Checker) Start(ctx context.Context, onChange func([]string)) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
@@ -78,6 +79,10 @@ func (c *Checker) Start(ctx context.Context, onChange func([]string)) {
 				log.Printf("Healthy upstreams changed: %v -> %v", c.healthy, newHealthy)
 				c.healthy = newHealthy
 				c.mu.Unlock()
+
+				// Reload dnsmasq configuration (Improvement 39)
+				_ = exec.Command("pkill", "-HUP", "dnsmasq").Run()
+
 				onChange(newHealthy)
 			} else {
 				c.mu.Unlock()
@@ -86,7 +91,7 @@ func (c *Checker) Start(ctx context.Context, onChange func([]string)) {
 	}
 }
 
-// GetHealthy returns the current list of responsive DNS servers.
+// GetHealthy returns the currently healthy upstream servers.
 func (c *Checker) GetHealthy() []string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -97,8 +102,6 @@ func equalSlices(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	// Sort or just compare if order matters. Here dnsmasq order might matter slightly but health set doesn't.
-	// For simplicity, strict order check.
 	for i := range a {
 		if a[i] != b[i] {
 			return false

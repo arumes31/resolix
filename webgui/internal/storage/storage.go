@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -12,10 +13,11 @@ import (
 	"time"
 
 	"tailscale-dnsrewrite/webgui/internal/config"
+	"tailscale-dnsrewrite/webgui/internal/encryption"
 	"tailscale-dnsrewrite/webgui/internal/models"
 )
 
-// Store manages the in-memory and persistent storage of DNS events and statistics.
+// Store manages the in-memory ring buffer of events and disk persistence.
 type Store struct {
 	cfg      *config.Config
 	events   []models.QueryEvent
@@ -41,7 +43,7 @@ type Store struct {
 	cacheMu      sync.RWMutex
 }
 
-// NewStore creates a new storage engine.
+// NewStore initializes a new Store with the provided configuration.
 func NewStore(cfg *config.Config) *Store {
 	return &Store{
 		cfg:                cfg,
@@ -51,11 +53,11 @@ func NewStore(cfg *config.Config) *Store {
 		hourlyStats:        make(map[int64]int),
 		windowDomainCounts: make(map[string]int),
 		windowClientCounts: make(map[string]int),
-		lastArchivedTime:   time.Now().Add(-1 * time.Hour).Unix(),
+		lastArchivedTime:   0,
 	}
 }
 
-// Init initializes the store by loading historical data.
+// Init ensures the history directory exists and warms up stats from disk.
 func (s *Store) Init() {
 	if err := os.MkdirAll(s.cfg.HistoryDir, 0750); err != nil {
 		log.Printf("Error creating history directory: %v", err)
@@ -74,21 +76,33 @@ func (s *Store) loadStatsFromHistory() {
 	for _, f := range files {
 		if strings.HasPrefix(f.Name(), "history-") && strings.HasSuffix(f.Name(), ".jsonl") {
 			path := filepath.Join(s.cfg.HistoryDir, filepath.Clean(f.Name()))
-			file, err := os.Open(path)
+			file, err := os.Open(path) // #nosec G304
 			if err != nil {
 				continue
 			}
-			scanner := json.NewDecoder(file)
-			for scanner.More() {
+
+			scanner := bufio.NewScanner(file)
+			for scanner.Scan() {
+				line := scanner.Text()
 				var e models.QueryEvent
-				if err := scanner.Decode(&e); err == nil {
+
+				// Decrypt if password is set
+				plain := []byte(line)
+				if s.cfg.HistoryPassword != "" {
+					decrypted, err := encryption.Decrypt(line, s.cfg.HistoryPassword)
+					if err != nil {
+						continue
+					}
+					plain = decrypted
+				}
+
+				if err := json.Unmarshal(plain, &e); err == nil {
 					if e.UnixTime >= cutoff {
 						hour := e.UnixTime / 3600
 						s.statsMu.Lock()
 						s.hourlyStats[hour]++
 						s.statsMu.Unlock()
 
-						// Improvement 98: Recover cache stats from history
 						if e.Latency > 0 || e.Upstream != "" {
 							s.cacheMu.Lock()
 							s.totalReplies++
@@ -108,7 +122,12 @@ func (s *Store) loadStatsFromHistory() {
 	s.statsMu.RUnlock()
 }
 
-// AddEvent inserts a new query event into the ring buffer and updates statistics.
+// GetConfig returns the application configuration.
+func (s *Store) GetConfig() *config.Config {
+	return s.cfg
+}
+
+// AddEvent adds a new query event to the ring buffer and updates stats.
 func (s *Store) AddEvent(e models.QueryEvent) {
 	s.eventsMu.Lock()
 	defer s.eventsMu.Unlock()
@@ -132,7 +151,7 @@ func (s *Store) AddEvent(e models.QueryEvent) {
 	s.statsMu.Unlock()
 }
 
-// UpdateEvent searches for an existing event and updates its latency and upstream info.
+// UpdateEvent searches for a matching pending event and updates its latency and upstream.
 func (s *Store) UpdateEvent(node, domain string, latency float64, upstream string) {
 	s.eventsMu.Lock()
 	defer s.eventsMu.Unlock()
@@ -147,7 +166,6 @@ func (s *Store) UpdateEvent(node, domain string, latency float64, upstream strin
 			s.events[idx].Latency = latency
 			s.events[idx].Upstream = upstream
 
-			// Improvement 98: Track cache hits
 			s.cacheMu.Lock()
 			s.totalReplies++
 			if upstream == "System Cache" {
@@ -159,7 +177,7 @@ func (s *Store) UpdateEvent(node, domain string, latency float64, upstream strin
 	}
 }
 
-// GetOrderedEvents returns a list of events ordered from newest to oldest.
+// GetOrderedEvents returns the latest N events in chronological order.
 func (s *Store) GetOrderedEvents(limit int) []models.QueryEvent {
 	s.eventsMu.RLock()
 	defer s.eventsMu.RUnlock()
@@ -177,7 +195,7 @@ func (s *Store) GetOrderedEvents(limit int) []models.QueryEvent {
 	return result
 }
 
-// GetRecentEvents returns events that occurred after the specified unix timestamp.
+// GetRecentEvents returns events newer than the provided unix timestamp.
 func (s *Store) GetRecentEvents(since int64) []models.QueryEvent {
 	s.eventsMu.RLock()
 	defer s.eventsMu.RUnlock()
@@ -200,7 +218,7 @@ func (s *Store) GetRecentEvents(since int64) []models.QueryEvent {
 	return result
 }
 
-// GetStats calculates and returns real-time metrics for the dashboard.
+// GetStats returns aggregated traffic statistics.
 func (s *Store) GetStats() map[string]interface{} {
 	domainCounts := make(map[string]int)
 	clientCounts := make(map[string]int)
@@ -296,7 +314,7 @@ func (s *Store) GetStats() map[string]interface{} {
 	}
 }
 
-// CleanupPending removes stale entries from the pending queries tracking.
+// CleanupPending removes stale entries from the pending query map.
 func (s *Store) CleanupPending(now time.Time) int {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
@@ -305,7 +323,9 @@ func (s *Store) CleanupPending(now time.Time) int {
 		for dom, start := range queries {
 			if now.Sub(start) > s.cfg.CleanupInterval {
 				delete(queries, dom)
-				delete(s.pendingUpstreams[node], dom)
+				if up, ok := s.pendingUpstreams[node]; ok {
+					delete(up, dom)
+				}
 				cleaned++
 			}
 		}
@@ -317,7 +337,7 @@ func (s *Store) CleanupPending(now time.Time) int {
 	return cleaned
 }
 
-// SetPending marks a query as started.
+// SetPending records the start time of a DNS query.
 func (s *Store) SetPending(node, domain string, t time.Time) {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
@@ -327,7 +347,7 @@ func (s *Store) SetPending(node, domain string, t time.Time) {
 	s.pendingQueries[node][domain] = t
 }
 
-// GetPending retrieves the start time of a query.
+// GetPending retrieves the start time of a pending DNS query.
 func (s *Store) GetPending(node, domain string) (time.Time, bool) {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
@@ -335,7 +355,7 @@ func (s *Store) GetPending(node, domain string) (time.Time, bool) {
 	return t, ok
 }
 
-// RemovePending deletes a query from the pending tracking.
+// RemovePending deletes a pending query entry.
 func (s *Store) RemovePending(node, domain string) {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
@@ -343,7 +363,7 @@ func (s *Store) RemovePending(node, domain string) {
 	delete(s.pendingUpstreams[node], domain)
 }
 
-// SetUpstream records the upstream server used for a domain.
+// SetUpstream records the upstream server used for a query.
 func (s *Store) SetUpstream(node, domain, upstream string) {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
@@ -353,13 +373,14 @@ func (s *Store) SetUpstream(node, domain, upstream string) {
 	s.pendingUpstreams[node][domain] = upstream
 }
 
-// GetUpstream retrieves the upstream server used for a domain.
+// GetUpstream retrieves the upstream server used for a query.
 func (s *Store) GetUpstream(node, domain string) string {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
 	return s.pendingUpstreams[node][domain]
 }
 
+// ArchiveStep performs a single archiving cycle, moving events from memory to disk.
 func (s *Store) ArchiveStep(now time.Time) int {
 	cutoff := now.Add(-1 * time.Hour).Unix()
 
@@ -385,21 +406,52 @@ func (s *Store) ArchiveStep(now time.Time) int {
 			files[dateStr] = append(files[dateStr], e)
 		}
 
+		allSuccess := true
 		for dateStr, evs := range files {
 			path := fmt.Sprintf("%s/history-%s.jsonl", s.cfg.HistoryDir, dateStr)
 			f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600) // #nosec G304
 			if err != nil {
 				log.Printf("Error opening history file %s: %v", path, err)
+				allSuccess = false
 				continue
 			}
-			enc := json.NewEncoder(f)
-			for _, e := range evs {
-				_ = enc.Encode(e)
+			
+			writeErr := func() error {
+				for _, e := range evs {
+					data, err := json.Marshal(e)
+					if err != nil {
+						return err
+					}
+					// Encrypt if password is set
+					line := string(data)
+					if s.cfg.HistoryPassword != "" {
+						encrypted, err := encryption.Encrypt(data, s.cfg.HistoryPassword)
+						if err != nil {
+							return err
+						}
+						line = encrypted
+					}
+					if _, err := fmt.Fprintln(f, line); err != nil {
+						return err
+					}
+				}
+				if err := f.Sync(); err != nil {
+					return err
+				}
+				return f.Close()
+			}()
+
+			if writeErr != nil {
+				log.Printf("Error writing to history file %s: %v", path, writeErr)
+				allSuccess = false
+				_ = f.Close()
 			}
-			_ = f.Close()
 		}
-		s.lastArchivedTime = cutoff
-		log.Printf("Archived %d events to disk", len(toArchive))
+		
+		if allSuccess {
+			s.lastArchivedTime = cutoff
+			log.Printf("Archived %d events to disk", len(toArchive))
+		}
 	}
 
 	// Cleanup old files

@@ -19,7 +19,7 @@ import (
 	"tailscale-dnsrewrite/webgui/internal/storage"
 )
 
-// Improvement 55: Semantic Versioning
+// Version represents the current application version.
 const Version = "2.0.0"
 
 //go:embed templates/*
@@ -34,7 +34,7 @@ func main() {
 
 	tmpl, err := template.ParseFS(templates, "templates/index.html")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Fatal error parsing templates: %v", err)
 	}
 
 	prs := parser.NewParser(store)
@@ -54,24 +54,42 @@ func main() {
 	// Improvement 40: Tailscale Keepalive
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)
-		for range ticker.C {
-			// Periodic connectivity check
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// Periodic connectivity check
+			}
 		}
 	}()
 
 	// History Archiver
 	go func() {
 		ticker := time.NewTicker(cfg.ArchiveInterval)
-		for range ticker.C {
-			store.ArchiveStep(time.Now())
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				store.ArchiveStep(time.Now())
+			}
 		}
 	}()
 
 	// Cleanup
 	go func() {
 		ticker := time.NewTicker(cfg.CleanupInterval)
-		for range ticker.C {
-			store.CleanupPending(time.Now())
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				store.CleanupPending(time.Now())
+			}
 		}
 	}()
 
@@ -82,7 +100,10 @@ func main() {
 	go func() {
 		scanner := bufio.NewScanner(os.Stdin)
 		for scanner.Scan() {
-			line := scanner.Bytes()
+			buf := scanner.Bytes()
+			line := make([]byte, len(buf))
+			copy(line, buf)
+
 			if cfg.Mode == "slave" {
 				fwd.Enqueue(string(line))
 			}
@@ -104,6 +125,6 @@ func main() {
 	}()
 
 	if err := srv.Start(); err != nil {
-		log.Fatal(err)
+		log.Printf("Server error: %v", err)
 	}
 }

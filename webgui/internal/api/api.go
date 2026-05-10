@@ -20,6 +20,7 @@ import (
 	"tailscale-dnsrewrite/webgui/internal/storage"
 )
 
+// Server handles HTTP API and Web GUI requests.
 type Server struct {
 	cfg    *config.Config
 	store  *storage.Store
@@ -31,6 +32,7 @@ type Server struct {
 	subMu       sync.Mutex
 }
 
+// NewServer initializes a new API server.
 func NewServer(cfg *config.Config, store *storage.Store, prs *parser.Parser, tmpl *template.Template) *Server {
 	return &Server{
 		cfg:         cfg,
@@ -41,6 +43,7 @@ func NewServer(cfg *config.Config, store *storage.Store, prs *parser.Parser, tmp
 	}
 }
 
+// Broadcast sends an event to all connected SSE clients.
 func (s *Server) Broadcast(e models.QueryEvent) {
 	s.subMu.Lock()
 	defer s.subMu.Unlock()
@@ -53,6 +56,7 @@ func (s *Server) Broadcast(e models.QueryEvent) {
 	}
 }
 
+// SetupMux configures the API routes and middleware.
 func (s *Server) SetupMux() http.Handler {
 	mux := http.NewServeMux()
 
@@ -71,27 +75,50 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	// 1. Enforce Authentication
+	if s.cfg.IngestSecret != "" {
+		auth := r.Header.Get("Authorization")
+		if auth != "Bearer "+s.cfg.IngestSecret {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
+
+	// 2. Limit Total Payload Size (Improvement 112)
+	r.Body = http.MaxBytesReader(w, r.Body, 1*1024*1024) // 1MB limit
+
 	var payload struct {
 		Node  string   `json:"node"`
 		Line  string   `json:"line"`
 		Batch []string `json:"batch"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		http.Error(w, "Bad request", http.StatusBadRequest)
+		http.Error(w, "Payload too large or bad request", http.StatusBadRequest)
 		return
 	}
-	
-	if payload.Line != "" {
-		ev := s.parser.ParseLogBytes([]byte(payload.Line), payload.Node)
+
+	// 3. Strict Input Validation
+	if len(payload.Batch) > 100 {
+		http.Error(w, "Batch too large (max 100)", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	processLine := func(line string) {
+		if len(line) > 1024 { // Cap max bytes per line
+			return
+		}
+		ev := s.parser.ParseLogBytes([]byte(line), payload.Node)
 		if ev != nil {
 			s.Broadcast(*ev)
 		}
 	}
+
+	if payload.Line != "" {
+		processLine(payload.Line)
+	}
 	for _, l := range payload.Batch {
-		ev := s.parser.ParseLogBytes([]byte(l), payload.Node)
-		if ev != nil {
-			s.Broadcast(*ev)
-		}
+		processLine(l)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -206,6 +233,7 @@ func (w gzipResponseWriter) Write(b []byte) (int, error) {
 	return w.Writer.Write(b)
 }
 
+// Start launches the HTTP server and listens for requests.
 func (s *Server) Start() error {
 	server := &http.Server{
 		Addr:         ":" + s.cfg.Port,

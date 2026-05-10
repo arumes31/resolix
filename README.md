@@ -41,7 +41,14 @@ docker-compose up -d --build
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-...
+| `TS_AUTHKEY` | Tailscale Authentication Key (Required) | - |
+| `UPSTREAM_DNS` | Space-separated upstream DNS servers | `8.8.8.8 8.8.4.4` |
+| `DOMAINS` | Comma-separated `domain:ip` mappings | - |
+| `HEALTHCHECK_DOMAIN` | Domain used for upstream health checks | `google.com` |
+| `PORT` | Web GUI listening port | `35353` |
+| `HISTORY_PASSWORD` | Password to encrypt history files on disk | - |
+| `MODE` | Run mode (`master` or `slave`) | `master` |
+| `MASTER_URL` | URL of the Master node (Required for `slave` mode) | - |
 | `NODE_NAME` | Unique identifier for the node in the dashboard | Hostname |
 
 ### Performance Optimization (Improvement 75)

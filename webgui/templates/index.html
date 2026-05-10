@@ -368,12 +368,16 @@
 
                 // Update node list
                 const nodeStats = document.getElementById('nodeStats');
-                nodeStats.innerHTML = Object.entries(stats.nodes).map(([name, s]) => `
-                    <li class="top-item">
-                        <span>${name}</span>
-                        <span><span class="top-count">${s.rpm}</span> <span class="top-count" style="background: rgba(129, 140, 248, 0.1); color: #818cf8;">${s.rph}</span></span>
-                    </li>
-                `).join('');
+                if (stats.nodes) {
+                    nodeStats.innerHTML = Object.entries(stats.nodes).map(([name, s]) => `
+                        <li class="top-item">
+                            <span>${name}</span>
+                            <span><span class="top-count">${s.rpm}</span> <span class="top-count" style="background: rgba(129, 140, 248, 0.1); color: #818cf8;">${s.rph}</span></span>
+                        </li>
+                    `).join('');
+                } else {
+                    nodeStats.innerHTML = '';
+                }
 
                 // Update chart locally
                 rpmHistory.push(stats.rpm);

@@ -129,8 +129,7 @@ func main() {
 					log.Printf("[INGEST] %s", string(line))
 				} else {
 					// Fallback: print everything for now to debug
-					os.Stdout.Write(line)
-					os.Stdout.WriteString("\n")
+					log.Printf("[DEBUG] %s", string(line))
 				}
 
 				if cfg.Mode == "slave" {

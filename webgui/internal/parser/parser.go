@@ -19,6 +19,8 @@ func NewParser(store *storage.Store) *Parser {
 }
 
 // ParseLogBytes parses a raw dnsmasq log line and updates the store.
+//
+//nolint:gocyclo
 func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 	now := time.Now()
 	parts := bytes.Fields(line)

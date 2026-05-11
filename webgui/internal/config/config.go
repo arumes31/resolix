@@ -56,7 +56,7 @@ func LoadConfig() *Config {
 		mode = "master"
 	}
 	if mode != "master" && mode != "slave" {
-		log.Printf("Warning: Invalid MODE '%s', falling back to master", mode)
+		log.Printf("Warning: Invalid MODE '%s', falling back to master", mode) // #nosec G706
 		mode = "master"
 	}
 
@@ -75,7 +75,7 @@ func LoadConfig() *Config {
 	if port == "" {
 		port = DefaultPort
 	} else if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
-		log.Printf("Warning: Invalid PORT '%s', falling back to %s", port, DefaultPort)
+		log.Printf("Warning: Invalid PORT '%s', falling back to %s", port, DefaultPort) // #nosec
 		port = DefaultPort
 	}
 

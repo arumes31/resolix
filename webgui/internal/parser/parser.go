@@ -13,11 +13,12 @@ import (
 // Parser handles the logic of extracting DNS events from raw log lines.
 type Parser struct {
 	store *storage.Store
+	Debug bool
 }
 
 // NewParser creates a new log parser instance.
-func NewParser(store *storage.Store) *Parser {
-	return &Parser{store: store}
+func NewParser(store *storage.Store, debug bool) *Parser {
+	return &Parser{store: store, Debug: debug}
 }
 
 // ParseLogBytes parses a raw dnsmasq log line and updates the store.
@@ -109,11 +110,11 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 	if bytes.Equal(action, []byte("reply")) || bytes.Equal(action, []byte("cached")) || bytes.Equal(action, []byte("config")) {
 		if len(parts) >= actionIdx+2 {
 			domain := normalize(string(parts[actionIdx+1]))
-			startTime, ok := p.store.GetPending(node, domain)
+			startTime, pendingUpstream, ok := p.store.GetPending(node, domain)
 			upstream := ""
 			switch {
 			case bytes.Equal(action, []byte("reply")):
-				upstream = p.store.GetUpstream(node, domain)
+				upstream = pendingUpstream
 			case bytes.Equal(action, []byte("cached")):
 				upstream = "System Cache"
 			case bytes.Equal(action, []byte("config")):
@@ -127,11 +128,10 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 				if latency < 0 {
 					latency = 0
 				}
-				p.store.RemovePending(node, domain)
 				p.store.UpdateEvent(node, domain, latency, upstream)
-			} else {
+			} else if bytes.Equal(action, []byte("reply")) {
 				// Debug: why was it not found?
-				if bytes.Equal(action, []byte("reply")) {
+				if p.Debug {
 					log.Printf("[DEBUG] No pending query found for domain=%s node=%s", domain, node)
 				}
 			}

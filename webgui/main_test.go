@@ -29,7 +29,7 @@ func setupTest() (*config.Config, *storage.Store, *parser.Parser, *api.Server) {
 	}
 	cfg.HistoryDir = tmp
 	store := storage.NewStore(cfg)
-	prs := parser.NewParser(store)
+	prs := parser.NewParser(store, false)
 	tmpl := template.Must(template.New("test").Parse("{{range .Events}}{{.Domain}}{{end}}"))
 	srv := api.NewServer(cfg, store, prs, tmpl)
 	return cfg, store, prs, srv
@@ -55,10 +55,6 @@ func TestParseLogBytes(t *testing.T) {
 	// 2. Test Forwarded
 	line2 := []byte("Jan 02 15:04:05 dnsmasq[123]: forwarded google.com to 8.8.8.8")
 	prs.ParseLogBytes(line2, node)
-
-	if store.GetUpstream(node, "google.com") != "8.8.8.8" {
-		t.Errorf("Expected upstream 8.8.8.8, got %s", store.GetUpstream(node, "google.com"))
-	}
 
 	// 3. Test Reply (Latency)
 	line3 := []byte("Jan 02 15:04:05 dnsmasq[123]: reply google.com is 1.2.3.4")

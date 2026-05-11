@@ -65,6 +65,12 @@ The provided `docker-compose.yaml` includes kernel `sysctls` optimizations:
 ### Example Mapping
 `DOMAINS=.internal.net:100.1.2.3,app.example.com:100.4.5.6`
 
+### Master/Slave Configuration
+For a slave node to report logs to the master, set:
+`MODE=slave`
+`MASTER_URL=http://100.x.y.z:35353` (Tailscale IP of your master node)
+`INGEST_SECRET=your-secret-token` (Must match Master's secret)
+
 ---
 
 ## 🛠️ How It Works

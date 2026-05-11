@@ -86,6 +86,22 @@ func (c *Checker) Start(ctx context.Context, onChange func([]string)) {
 			}
 
 			c.mu.Lock()
+			// check for context cancellation
+			select {
+			case <-ctx.Done():
+				c.mu.Unlock()
+				return
+			default:
+			}
+
+			if len(newHealthy) == 0 {
+				log.Printf("CRITICAL: All upstreams failed health check. Preserving previous healthy set.")
+				newHealthy = c.healthy
+				if len(newHealthy) == 0 {
+					newHealthy = c.upstreams
+				}
+			}
+
 			changed := !equalSlices(c.healthy, newHealthy)
 			if changed {
 				log.Printf("Healthy upstreams changed: %v -> %v", c.healthy, newHealthy)
@@ -112,15 +128,19 @@ func (c *Checker) GetHealthy() []string {
 }
 
 func equalSlices(a, b []string) bool {
-	if len(a) != len(b) {
+	setA := make(map[string]struct{}, len(a))
+	for _, v := range a {
+		setA[v] = struct{}{}
+	}
+	setB := make(map[string]struct{}, len(b))
+	for _, v := range b {
+		setB[v] = struct{}{}
+	}
+	if len(setA) != len(setB) {
 		return false
 	}
-	set := make(map[string]struct{}, len(a))
-	for _, v := range a {
-		set[v] = struct{}{}
-	}
-	for _, v := range b {
-		if _, ok := set[v]; !ok {
+	for k := range setA {
+		if _, ok := setB[k]; !ok {
 			return false
 		}
 	}

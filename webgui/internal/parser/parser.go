@@ -60,16 +60,29 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 		}
 		tsStr := string(bytes.Join(parts[:3], []byte(" ")))
 
-		event := models.QueryEvent{
-			Timestamp: tsStr,
-			UnixTime:  now.Unix(),
-			Type:      qType,
-			Domain:    domain,
-			ClientIP:  clientIP,
-			Node:      node,
+		t, err := time.Parse(time.Stamp, tsStr)
+		var parsedTime time.Time
+		if err == nil {
+			nowYear := now.Year()
+			parsedTime = time.Date(nowYear, t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.Local)
+			if parsedTime.After(now) {
+				parsedTime = parsedTime.AddDate(-1, 0, 0)
+			}
+		} else {
+			parsedTime = now
 		}
 
-		p.store.SetPending(node, domain, now)
+		event := models.QueryEvent{
+			Timestamp:          tsStr,
+			TimestampFormatted: parsedTime.Format("15:04:05"),
+			UnixTime:           parsedTime.Unix(),
+			Type:               qType,
+			Domain:             domain,
+			ClientIP:           clientIP,
+			Node:               node,
+		}
+
+		p.store.SetPending(node, domain, parsedTime)
 		p.store.AddEvent(event)
 		return &event
 	}
@@ -106,10 +119,6 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 				}
 				p.store.RemovePending(node, domain)
 				p.store.UpdateEvent(node, domain, latency, upstream)
-
-				// We return a partially updated event for the stream if needed,
-				// but since UpdateEvent searches the ring buffer, it's already there.
-				// For real-time streaming of replies, we might need a different approach.
 			}
 		}
 		return nil

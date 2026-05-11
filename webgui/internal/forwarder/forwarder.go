@@ -39,7 +39,7 @@ func (f *Forwarder) Enqueue(line string) {
 	defer f.backlogMu.Unlock()
 
 	// Enforce a maximum backlog size to prevent OOM
-	if f.backlogTotalSize > 10*1024*1024 { // 10MB limit
+	if f.backlogTotalSize > f.cfg.MaxBacklogSize {
 		return
 	}
 
@@ -81,20 +81,34 @@ func (f *Forwarder) Start() error {
 	client := &http.Client{Timeout: 10 * time.Second}
 	backoff := 1 * time.Second
 
+	var draining bool
+	var drainEnd time.Time
+
 	for {
-		select {
-		case <-f.stopChan:
+		if !draining {
+			select {
+			case <-f.stopChan:
+				draining = true
+				drainEnd = time.Now().Add(5 * time.Second)
+			default:
+			}
+		}
+
+		if draining && time.Now().After(drainEnd) {
 			return nil
-		default:
 		}
 
 		f.backlogMu.Lock()
 		if len(f.backlog) == 0 {
 			f.backlogMu.Unlock()
+			if draining {
+				return nil
+			}
 			select {
 			case <-time.After(100 * time.Millisecond):
 			case <-f.stopChan:
-				return nil
+				draining = true
+				drainEnd = time.Now().Add(5 * time.Second)
 			}
 			continue
 		}
@@ -123,11 +137,28 @@ func (f *Forwarder) Start() error {
 			}
 			f.backlogMu.Unlock()
 
-			select {
-			case <-time.After(backoff):
-			case <-f.stopChan:
-				return nil
+			waitDur := backoff
+			if draining {
+				rem := time.Until(drainEnd)
+				if rem <= 0 {
+					return nil
+				}
+				if rem < waitDur {
+					waitDur = rem
+				}
 			}
+
+			if draining {
+				time.Sleep(waitDur)
+			} else {
+				select {
+				case <-time.After(waitDur):
+				case <-f.stopChan:
+					draining = true
+					drainEnd = time.Now().Add(5 * time.Second)
+				}
+			}
+
 			backoff *= 2
 			if backoff > 30*time.Second {
 				backoff = 30 * time.Second

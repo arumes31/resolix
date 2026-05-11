@@ -81,45 +81,46 @@ func (s *Store) loadStatsFromHistory() {
 				continue
 			}
 
-			scanner := bufio.NewScanner(file)
-			for scanner.Scan() {
-				line := scanner.Text()
-				var e models.QueryEvent
+			// Defer file close immediately
+			func() {
+				defer file.Close()
+				scanner := bufio.NewScanner(file)
+				for scanner.Scan() {
+					line := scanner.Text()
+					var e models.QueryEvent
 
-				// Decrypt if password is set
-				plain := []byte(line)
-				if s.cfg.HistoryPassword != "" {
-					decrypted, err := encryption.Decrypt(line, s.cfg.HistoryPassword)
-					if err != nil {
-						continue
+					// Decrypt if password is set
+					plain := []byte(line)
+					if s.cfg.HistoryPassword != "" {
+						decrypted, err := encryption.Decrypt(line, s.cfg.HistoryPassword)
+						if err != nil {
+							continue
+						}
+						plain = decrypted
 					}
-					plain = decrypted
-				}
 
-				if err := json.Unmarshal(plain, &e); err == nil {
-					if e.UnixTime >= cutoff {
-						hour := e.UnixTime / 3600
-						s.statsMu.Lock()
-						s.hourlyStats[hour]++
-						s.statsMu.Unlock()
+					if err := json.Unmarshal(plain, &e); err == nil {
+						if e.UnixTime >= cutoff {
+							hour := e.UnixTime / 3600
+							s.statsMu.Lock()
+							s.hourlyStats[hour]++
+							s.statsMu.Unlock()
 
-						if e.Latency > 0 || e.Upstream != "" {
-							s.cacheMu.Lock()
-							s.totalReplies++
-							if e.Upstream == "System Cache" {
-								s.cacheHits++
+							if e.Latency != nil || e.Upstream != "" {
+								s.cacheMu.Lock()
+								s.totalReplies++
+								if e.Upstream == "System Cache" {
+									s.cacheHits++
+								}
+								s.cacheMu.Unlock()
 							}
-							s.cacheMu.Unlock()
 						}
 					}
 				}
-			}
-			if err := scanner.Err(); err != nil {
-				log.Printf("Error scanning history file %s: %v", path, err)
-			}
-			if err := file.Close(); err != nil {
-				log.Printf("Error closing history file %s: %v", path, err)
-			}
+				if err := scanner.Err(); err != nil {
+					log.Printf("Error scanning history file %s: %v", path, err)
+				}
+			}()
 		}
 	}
 	s.statsMu.RLock()
@@ -135,7 +136,6 @@ func (s *Store) GetConfig() *config.Config {
 // AddEvent adds a new query event to the ring buffer and updates stats.
 func (s *Store) AddEvent(e models.QueryEvent) {
 	s.eventsMu.Lock()
-	defer s.eventsMu.Unlock()
 
 	if s.count == s.cfg.MaxEvents {
 		old := s.events[s.head]
@@ -149,7 +149,9 @@ func (s *Store) AddEvent(e models.QueryEvent) {
 	if s.count < s.cfg.MaxEvents {
 		s.count++
 	}
+	s.eventsMu.Unlock()
 
+	// Nested locking fixed
 	hourBucket := e.UnixTime / 3600
 	s.statsMu.Lock()
 	s.hourlyStats[hourBucket]++
@@ -167,8 +169,9 @@ func (s *Store) UpdateEvent(node, domain string, latency float64, upstream strin
 	}
 	for i := 0; i < scanLimit; i++ {
 		idx := (s.head - 1 - i + s.cfg.MaxEvents) % s.cfg.MaxEvents
-		if s.events[idx].Domain == domain && s.events[idx].Node == node && s.events[idx].Latency == 0 {
-			s.events[idx].Latency = latency
+		if s.events[idx].Domain == domain && s.events[idx].Node == node && s.events[idx].Latency == nil {
+			s.events[idx].Latency = &latency
+			s.events[idx].LatencyFormatted = fmt.Sprintf("%.1fms", latency)
 			s.events[idx].Upstream = upstream
 
 			s.cacheMu.Lock()
@@ -182,7 +185,7 @@ func (s *Store) UpdateEvent(node, domain string, latency float64, upstream strin
 	}
 }
 
-// GetOrderedEvents returns the latest N events in chronological order.
+// GetOrderedEvents returns the latest N events in chronological order (oldest first).
 func (s *Store) GetOrderedEvents(limit int) []models.QueryEvent {
 	s.eventsMu.RLock()
 	defer s.eventsMu.RUnlock()
@@ -194,7 +197,7 @@ func (s *Store) GetOrderedEvents(limit int) []models.QueryEvent {
 
 	result := make([]models.QueryEvent, 0, n)
 	for i := 0; i < n; i++ {
-		idx := (s.head - 1 - i + s.cfg.MaxEvents) % s.cfg.MaxEvents
+		idx := (s.head - n + i + s.cfg.MaxEvents) % s.cfg.MaxEvents
 		result = append(result, s.events[idx])
 	}
 	return result
@@ -250,9 +253,6 @@ func (s *Store) GetStats() map[string]interface{} {
 	for i := 0; i < s.count; i++ {
 		idx := (s.head - 1 - i + s.cfg.MaxEvents) % s.cfg.MaxEvents
 		e := s.events[idx]
-		if e.UnixTime < now-3600 {
-			break
-		}
 
 		nodeName := e.Node
 		if nodeName == "" {
@@ -411,7 +411,8 @@ func (s *Store) ArchiveStep(now time.Time) int {
 
 		allSuccess := true
 		for dateStr, evs := range files {
-			path := fmt.Sprintf("%s/history-%s.jsonl", s.cfg.HistoryDir, dateStr)
+			filename := fmt.Sprintf("history-%s.jsonl", dateStr)
+			path := filepath.Join(s.cfg.HistoryDir, filename)
 			f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600) // #nosec G304
 			if err != nil {
 				log.Printf("Error opening history file %s: %v", path, err)
@@ -441,11 +442,15 @@ func (s *Store) ArchiveStep(now time.Time) int {
 				return f.Sync()
 			}()
 
+			closeErr := f.Close()
 			if writeErr != nil {
 				log.Printf("Error writing to history file %s: %v", path, writeErr)
 				allSuccess = false
 			}
-			_ = f.Close()
+			if closeErr != nil {
+				log.Printf("Error closing history file %s: %v", path, closeErr)
+				allSuccess = false
+			}
 		}
 
 		if allSuccess {

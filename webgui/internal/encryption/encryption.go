@@ -9,12 +9,24 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"strconv"
 
 	"golang.org/x/crypto/pbkdf2"
 )
 
 const saltSize = 16
-const iterCount = 100000
+
+func getIterCount() int {
+	if v := os.Getenv("PBKDF2_ITERATIONS"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil && i >= 100000 {
+			return i
+		}
+	}
+	// Recommended modern minimum for PBKDF2-HMAC-SHA256
+	// Tuning: Adjust PBKDF2_ITERATIONS env var to target ~100ms latency on deployment hardware
+	return 600000
+}
 
 // Encrypt encrypts plaintext using AES-GCM and PBKDF2.
 func Encrypt(plaintext []byte, password string) (string, error) {
@@ -27,7 +39,7 @@ func Encrypt(plaintext []byte, password string) (string, error) {
 		return "", err
 	}
 
-	key := pbkdf2.Key([]byte(password), salt, iterCount, 32, sha256.New)
+	key := pbkdf2.Key([]byte(password), salt, getIterCount(), 32, sha256.New)
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", err
@@ -66,7 +78,7 @@ func Decrypt(encodedCiphertext string, password string) ([]byte, error) {
 
 	salt, ciphertext := data[:saltSize], data[saltSize:]
 
-	key := pbkdf2.Key([]byte(password), salt, iterCount, 32, sha256.New)
+	key := pbkdf2.Key([]byte(password), salt, getIterCount(), 32, sha256.New)
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err

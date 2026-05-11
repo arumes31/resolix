@@ -2,6 +2,7 @@ package config
 
 import (
 	"log"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -43,6 +44,9 @@ type Config struct {
 	ArchiveInterval  time.Duration
 	HistoryRetention time.Duration
 	IngestSecret     string
+	ScanLimit        int
+	MaxBacklogSize   int64
+	UpstreamDNS      string
 }
 
 // LoadConfig reads configuration from environment variables.
@@ -85,9 +89,16 @@ func LoadConfig() *Config {
 		healthDomain = DefaultHealthDomain
 	}
 
+	masterURL := os.Getenv("MASTER_URL")
+	if masterURL != "" {
+		if _, err := url.ParseRequestURI(masterURL); err != nil {
+			log.Fatalf("Invalid MASTER_URL: %v", err)
+		}
+	}
+
 	cfg := &Config{
 		Mode:             mode,
-		MasterURL:        os.Getenv("MASTER_URL"),
+		MasterURL:        masterURL,
 		NodeName:         nodeName,
 		Port:             port,
 		HistoryDir:       historyDir,
@@ -98,6 +109,9 @@ func LoadConfig() *Config {
 		ArchiveInterval:  DefaultArchiveInterval,
 		HistoryRetention: DefaultHistoryRetention,
 		IngestSecret:     os.Getenv("INGEST_SECRET"),
+		ScanLimit:        DefaultScanLimit,
+		MaxBacklogSize:   DefaultMaxBacklogSize,
+		UpstreamDNS:      os.Getenv("UPSTREAM_DNS"),
 	}
 
 	if cfg.Mode == "slave" && cfg.MasterURL == "" {

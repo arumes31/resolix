@@ -296,13 +296,13 @@
                 <tbody id="eventTable">
                     {{range .Events}}
                     <tr>
-                        <td class="timestamp">{{.Timestamp}}</td>
+                        <td class="timestamp">{{.TimestampFormatted}}</td>
                         <td><span class="badge" style="background: rgba(255,255,255,0.1); font-size: 0.7rem;">{{if .Node}}{{.Node}}{{else}}local{{end}}</span></td>
                         <td><span class="badge badge-type">{{.Type}}</span></td>
                         <td class="domain">{{.Domain}}</td>
                         <td><span class="badge badge-ip">{{.ClientIP}}</span></td>
                         <td>{{if .Upstream}}<span class="upstream-badge">{{.Upstream}}</span>{{else}}-{{end}}</td>
-                        <td class="latency-cell">{{if .Latency}}{{.Latency}}ms{{else}}-{{end}}</td>
+                        <td class="latency-cell">{{if .LatencyFormatted}}{{.LatencyFormatted}}{{else}}-{{end}}</td>
                     </tr>
                     {{end}}
                 </tbody>

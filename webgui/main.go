@@ -7,6 +7,7 @@ import (
 	"html/template"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"syscall"
 	"time"
@@ -45,10 +46,15 @@ func main() {
 	defer cancel()
 
 	// Improvement 39: Move health checks to Go
-	checker := health.NewChecker(cfg, os.Getenv("UPSTREAM_DNS"))
+	checker := health.NewChecker(cfg, cfg.UpstreamDNS)
 	go checker.Start(ctx, func(healthy []string) {
 		log.Printf("Health status changed. New upstreams: %v", healthy)
-		// Trigger dnsmasq reload if needed
+		cmd := exec.Command("pkill", "-HUP", "dnsmasq")
+		if err := cmd.Run(); err != nil {
+			log.Printf("Error reloading dnsmasq from main: %v", err)
+		} else {
+			log.Printf("Successfully reloaded dnsmasq")
+		}
 	})
 
 	// History Archiver
@@ -90,22 +96,37 @@ func main() {
 
 	// Log Ingestion
 	go func() {
-		scanner := bufio.NewScanner(os.Stdin)
-		for scanner.Scan() {
-			buf := scanner.Bytes()
-			line := make([]byte, len(buf))
-			copy(line, buf)
+		linesCh := make(chan []byte)
+		go func() {
+			scanner := bufio.NewScanner(os.Stdin)
+			for scanner.Scan() {
+				buf := scanner.Bytes()
+				line := make([]byte, len(buf))
+				copy(line, buf)
+				linesCh <- line
+			}
+			if err := scanner.Err(); err != nil {
+				log.Printf("stdin scan error: %v", err)
+			}
+			close(linesCh)
+		}()
 
-			if cfg.Mode == "slave" {
-				fwd.Enqueue(string(line))
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case line, ok := <-linesCh:
+				if !ok {
+					return
+				}
+				if cfg.Mode == "slave" {
+					fwd.Enqueue(string(line))
+				}
+				ev := prs.ParseLogBytes(line, cfg.NodeName)
+				if ev != nil {
+					srv.Broadcast(*ev)
+				}
 			}
-			ev := prs.ParseLogBytes(line, cfg.NodeName)
-			if ev != nil {
-				srv.Broadcast(*ev)
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			log.Printf("stdin scan error: %v", err)
 		}
 	}()
 

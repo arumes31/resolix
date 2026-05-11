@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -60,7 +61,7 @@ func (s *Server) Broadcast(e models.QueryEvent) {
 			if s.subscribers[ch] > 10 {
 				log.Printf("Dropping slow subscriber")
 				delete(s.subscribers, ch)
-				close(ch)
+				// removed close(ch) to prevent panic
 			}
 		}
 	}
@@ -94,7 +95,8 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	// 1. Enforce Authentication
 	if s.cfg.IngestSecret != "" {
 		auth := r.Header.Get("Authorization")
-		if auth != "Bearer "+s.cfg.IngestSecret {
+		expected := "Bearer " + s.cfg.IngestSecret
+		if subtle.ConstantTimeCompare([]byte(auth), []byte(expected)) != 1 {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -139,7 +141,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRoot(w http.ResponseWriter, _ *http.Request) {
-	currentEvents := s.store.GetOrderedEvents(config.DefaultScanLimit)
+	currentEvents := s.store.GetOrderedEvents(s.cfg.ScanLimit)
 	var buf bytes.Buffer
 	if err := s.tmpl.Execute(&buf, map[string]interface{}{
 		"Events": currentEvents,
@@ -169,6 +171,7 @@ func (s *Server) handleStats(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleSimulate(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
 	domain := r.URL.Query().Get("domain")
 	if domain == "" {
 		http.Error(w, "Missing domain parameter", http.StatusBadRequest)
@@ -230,7 +233,10 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-notify:
 			return
-		case ev := <-ch:
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
 			data, _ := json.Marshal(ev)
 			_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()

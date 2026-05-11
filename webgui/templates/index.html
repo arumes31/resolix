@@ -322,19 +322,30 @@
         let rpmHistory = Array(20).fill(0);
         let lastEventTimestamp = 0;
 
-        // Initialize SSE (Improvement 78)
+        // Optimized WebSocket/SSE handler
         function startStream() {
             const eventSource = new EventSource('/api/stream');
             eventSource.onmessage = (event) => {
                 try {
                     const newEvent = JSON.parse(event.data);
                     const index = allEvents.findIndex(e => e.id === newEvent.id);
+                    const searchTerm = document.getElementById('searchInput').value.toLowerCase();
+                    const isFiltered = searchTerm.length > 0;
+
                     if (index !== -1) {
                         allEvents[index] = newEvent;
+                        if (!isFiltered) updateRowInDom(newEvent);
                     } else {
-                        allEvents = [newEvent, ...allEvents].slice(0, 1000);
+                        allEvents.unshift(newEvent);
+                        if (allEvents.length > 1000) allEvents.pop();
+                        if (!isFiltered) prependRowToDom(newEvent);
                     }
-                    renderEvents();
+                    
+                    if (isFiltered) {
+                        // Throttle filter re-render
+                        if (window.renderTimeout) clearTimeout(window.renderTimeout);
+                        window.renderTimeout = setTimeout(renderEvents, 100);
+                    }
                 } catch (e) {
                     console.error("Failed to parse SSE event:", e, event.data);
                 }
@@ -342,6 +353,45 @@
             eventSource.onerror = () => {
                 console.error("SSE connection lost. Reconnecting...");
             };
+        }
+
+        function createRowHtml(e) {
+            let latencyClass = 'latency-low';
+            if (e.latency_ms > 50) latencyClass = 'latency-mid';
+            if (e.latency_ms > 150) latencyClass = 'latency-high';
+            
+            const latencyText = e.LatencyFormatted || (e.latency_ms ? e.latency_ms.toFixed(1) + 'ms' : '-');
+            const timeStr = new Date(e.unix_time * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false});
+
+            return `
+                <td class="timestamp">${escapeHtml(timeStr)}</td>
+                <td><span class="badge" style="background: rgba(255,255,255,0.1); font-size: 0.7rem;">${escapeHtml(e.node || 'local')}</span></td>
+                <td><span class="badge badge-type">${escapeHtml(e.type)}</span></td>
+                <td class="domain">${escapeHtml(e.domain)}</td>
+                <td><span class="badge badge-ip">${escapeHtml(e.client_ip)}</span></td>
+                <td>${e.upstream ? `<span class="upstream-badge">${escapeHtml(e.upstream)}</span>` : '-'}</td>
+                <td class="latency-cell ${latencyClass}">${escapeHtml(latencyText)}</td>
+            `;
+        }
+
+        function prependRowToDom(e) {
+            const tableBody = document.getElementById('eventTable');
+            const row = document.createElement('tr');
+            row.id = `row-${e.id}`;
+            row.innerHTML = createRowHtml(e);
+            tableBody.prepend(row);
+            
+            // Limit DOM size
+            if (tableBody.children.length > 100) {
+                tableBody.removeChild(tableBody.lastChild);
+            }
+        }
+
+        function updateRowInDom(e) {
+            const row = document.getElementById(`row-${e.id}`);
+            if (row) {
+                row.innerHTML = createRowHtml(e);
+            }
         }
 
         async function fetchAll() {
@@ -422,30 +472,19 @@
             const searchTerm = document.getElementById('searchInput').value.toLowerCase();
             const tableBody = document.getElementById('eventTable');
             
+            if (searchTerm === "") {
+                // If no filter, we rely on incremental updates, but sync once to be sure
+                const filtered = allEvents.slice(0, 100);
+                tableBody.innerHTML = filtered.map(e => `<tr id="row-${e.id}">${createRowHtml(e)}</tr>`).join('');
+                return;
+            }
+
             const filtered = allEvents.filter(e => 
                 e.domain.toLowerCase().includes(searchTerm) || 
                 e.client_ip.toLowerCase().includes(searchTerm)
-            ).slice(0, 100); // Only show first 100 for perf
+            ).slice(0, 100);
 
-            tableBody.innerHTML = filtered.map(e => {
-                let latencyClass = 'latency-low';
-                if (e.latency_ms > 50) latencyClass = 'latency-mid';
-                if (e.latency_ms > 150) latencyClass = 'latency-high';
-                
-                const latencyText = e.LatencyFormatted || (e.latency_ms ? e.latency_ms.toFixed(1) + 'ms' : '-');
-
-                return `
-                    <tr id="row-${e.id}">
-                        <td class="timestamp">${escapeHtml(new Date(e.unix_time * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false}))}</td>
-                        <td><span class="badge" style="background: rgba(255,255,255,0.1); font-size: 0.7rem;">${escapeHtml(e.node || 'local')}</span></td>
-                        <td><span class="badge badge-type">${escapeHtml(e.type)}</span></td>
-                        <td class="domain">${escapeHtml(e.domain)}</td>
-                        <td><span class="badge badge-ip">${escapeHtml(e.client_ip)}</span></td>
-                        <td>${e.upstream ? `<span class="upstream-badge">${escapeHtml(e.upstream)}</span>` : '-'}</td>
-                        <td class="latency-cell ${latencyClass}">${escapeHtml(latencyText)}</td>
-                    </tr>
-                `;
-            }).join('');
+            tableBody.innerHTML = filtered.map(e => `<tr id="row-${e.id}">${createRowHtml(e)}</tr>`).join('');
         }
 
         function renderTopList(id, list) {

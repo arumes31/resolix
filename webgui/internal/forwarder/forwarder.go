@@ -126,6 +126,7 @@ func (f *Forwarder) Start() error {
 
 		err := f.sendBatch(client, lines)
 		if err == nil {
+			log.Printf("Successfully sent batch of %d lines to master", len(lines))
 			backoff = 1 * time.Second
 		} else {
 			log.Printf("Error sending batch to master: %v", err)

@@ -22,8 +22,10 @@ graph LR
 - **⚡ Real-time Monitor**: **(NEW)** Real-time updates via Server-Sent Events (SSE). No more polling!
 - **📈 Advanced Stats**: **(NEW)** Cache hit ratio tracking and node-specific traffic analytics.
 - **💾 Persistent Logging**: Optimized for storage using JSONL with automatic archiving and 72h retention.
+- **🔒 Encrypted Storage**: **(NEW)** AES-GCM encryption with PBKDF2 for on-disk history files.
 - **🏥 Parallel Health Checks**: Continuous concurrent monitoring of upstream DNS servers with automatic failover.
-- **🛡️ Security First**: Hardened Content Security Policy (CSP), non-root execution support, and secure file permissions.
+- **🛡️ Security First**: Hardened Content Security Policy (CSP), built-in XSS protection, non-root execution support, and secure file permissions.
+- **🌐 Advanced Upstreams**: **(NEW)** Support for `IP#port` notation for custom upstream DNS servers.
 
 ---
 
@@ -42,11 +44,13 @@ docker-compose up -d --build
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `TS_AUTHKEY` | Tailscale Authentication Key (Required) | - |
-| `UPSTREAM_DNS` | Space-separated upstream DNS servers | `8.8.8.8 8.8.4.4` |
+| `UPSTREAM_DNS` | Space-separated upstream DNS servers (supports `IP#port`) | `8.8.8.8 8.8.4.4` |
 | `DOMAINS` | Comma-separated `domain:ip` mappings | - |
 | `HEALTHCHECK_DOMAIN` | Domain used for upstream health checks | `google.com` |
 | `PORT` | Web GUI listening port | `35353` |
-| `HISTORY_PASSWORD` | Password to encrypt history files on disk | - |
+| `HISTORY_PASSWORD` | Password to encrypt history files on disk (AES-GCM) | - |
+| `PBKDF2_ITERATIONS`| Iteration count for PBKDF2 key derivation | `600000` |
+| `INGEST_SECRET` | Secret token to authenticate logs from slave nodes | - |
 | `MODE` | Run mode (`master` or `slave`) | `master` |
 | `MASTER_URL` | URL of the Master node (Required for `slave` mode) | - |
 | `NODE_NAME` | Unique identifier for the node in the dashboard | Hostname |

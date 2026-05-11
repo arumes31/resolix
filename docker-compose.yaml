@@ -10,6 +10,9 @@ services:
       - MODE=master
       - MASTER_URL=
       - NODE_NAME=dns-server-1
+      - HISTORY_PASSWORD=secure_password_here
+      - PBKDF2_ITERATIONS=600000
+      - INGEST_SECRET=my_super_secret_token
     ports:
       - "127.0.0.1:${PORT:-35353}:35353"
     volumes:

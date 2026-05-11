@@ -2,6 +2,8 @@ package parser
 
 import (
 	"bytes"
+	"log"
+	"strings"
 	"time"
 
 	"tailscale-dnsrewrite/webgui/internal/models"
@@ -46,6 +48,10 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 
 	action := parts[actionIdx]
 
+	normalize := func(d string) string {
+		return strings.ToLower(strings.TrimSuffix(d, "."))
+	}
+
 	if bytes.HasPrefix(action, []byte("query[")) {
 		if len(action) < 8 { // Must be at least query[A]
 			return nil
@@ -54,7 +60,7 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 		if len(parts) < actionIdx+4 || string(parts[actionIdx+2]) != "from" {
 			return nil
 		}
-		domain := string(parts[actionIdx+1])
+		domain := normalize(string(parts[actionIdx+1]))
 		clientIP := string(parts[actionIdx+3])
 
 		var parsedTime time.Time
@@ -76,7 +82,6 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 
 		tsStr := parsedTime.Format(time.Stamp) // Fallback or parsed timestamp
 
-
 		event := models.QueryEvent{
 			Timestamp:          tsStr,
 			TimestampFormatted: parsedTime.Format("15:04:05"),
@@ -94,7 +99,7 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 
 	if bytes.Equal(action, []byte("forwarded")) {
 		if len(parts) >= actionIdx+4 && string(parts[actionIdx+2]) == "to" {
-			domain := string(parts[actionIdx+1])
+			domain := normalize(string(parts[actionIdx+1]))
 			upstream := string(parts[actionIdx+3])
 			p.store.SetUpstream(node, domain, upstream)
 		}
@@ -103,7 +108,7 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 
 	if bytes.Equal(action, []byte("reply")) || bytes.Equal(action, []byte("cached")) || bytes.Equal(action, []byte("config")) {
 		if len(parts) >= actionIdx+2 {
-			domain := string(parts[actionIdx+1])
+			domain := normalize(string(parts[actionIdx+1]))
 			startTime, ok := p.store.GetPending(node, domain)
 			upstream := ""
 			switch {
@@ -124,6 +129,11 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 				}
 				p.store.RemovePending(node, domain)
 				p.store.UpdateEvent(node, domain, latency, upstream)
+			} else {
+				// Debug: why was it not found?
+				if bytes.Equal(action, []byte("reply")) {
+					log.Printf("[DEBUG] No pending query found for domain=%s node=%s", domain, node)
+				}
 			}
 		}
 		return nil

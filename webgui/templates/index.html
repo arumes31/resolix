@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:;">
     <title>Tailscale DNS Monitor - Advanced</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🛡️</text></svg>">
     <style>
         :root {
             --bg-color: #0f172a;
@@ -255,10 +256,17 @@
                 <div style="display: flex; justify-content: space-between; align-items: flex-end; height: 60px; gap: 4px;" id="miniChart">
                     <!-- Simple bar chart will be here -->
                 </div>
-                <div style="margin-top: 1rem; display: flex; justify-content: space-between;">
+                <div style="margin-top: 1rem; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
                     <div><span class="stat-label">Hour:</span> <span id="rph_val" style="font-weight:bold">0</span></div>
+                    <div><span class="stat-label">Day:</span> <span id="rpd_val" style="font-weight:bold">0</span></div>
+                    <div><span class="stat-label">Cache Hit:</span> <span id="cache_ratio" style="font-weight:bold; color: var(--success);">0%</span></div>
                     <div><span class="stat-label">Total:</span> <span id="total_val" style="font-weight:bold">0</span></div>
                 </div>
+            </div>
+
+            <div class="card">
+                <div class="stat-header">Node Traffic (RPM/RPH)</div>
+                <ul class="top-list" id="nodeStats"></ul>
             </div>
 
             <div class="card">
@@ -277,6 +285,7 @@
                 <thead>
                     <tr>
                         <th>Time</th>
+                        <th>Node</th>
                         <th>Type</th>
                         <th>Domain</th>
                         <th>Client</th>
@@ -284,14 +293,51 @@
                         <th>Latency</th>
                     </tr>
                 </thead>
-                <tbody id="eventTable"></tbody>
+                <tbody id="eventTable">
+                    {{range .Events}}
+                    <tr>
+                        <td class="timestamp">{{.TimestampFormatted}}</td>
+                        <td><span class="badge" style="background: rgba(255,255,255,0.1); font-size: 0.7rem;">{{if .Node}}{{.Node}}{{else}}local{{end}}</span></td>
+                        <td><span class="badge badge-type">{{.Type}}</span></td>
+                        <td class="domain">{{.Domain}}</td>
+                        <td><span class="badge badge-ip">{{.ClientIP}}</span></td>
+                        <td>{{if .Upstream}}<span class="upstream-badge">{{.Upstream}}</span>{{else}}-{{end}}</td>
+                        <td class="latency-cell">{{if .LatencyFormatted}}{{.LatencyFormatted}}{{else}}-{{end}}</td>
+                    </tr>
+                    {{end}}
+                </tbody>
             </table>
         </div>
     </div>
 
     <script>
+        function escapeHtml(unsafe) {
+            if (unsafe == null) return '';
+            const el = document.createElement('div');
+            el.textContent = unsafe;
+            return el.innerHTML;
+        }
+
         let allEvents = [];
         let rpmHistory = Array(20).fill(0);
+        let lastEventTimestamp = 0;
+
+        // Initialize SSE (Improvement 78)
+        function startStream() {
+            const eventSource = new EventSource('/api/stream');
+            eventSource.onmessage = (event) => {
+                try {
+                    const newEvent = JSON.parse(event.data);
+                    allEvents = [newEvent, ...allEvents].slice(0, 1000);
+                    renderEvents();
+                } catch (e) {
+                    console.error("Failed to parse SSE event:", e, event.data);
+                }
+            };
+            eventSource.onerror = () => {
+                console.error("SSE connection lost. Reconnecting...");
+            };
+        }
 
         async function fetchAll() {
             await Promise.all([fetchEvents(), fetchStats()]);
@@ -299,11 +345,15 @@
 
         async function fetchEvents() {
             try {
-                const response = await fetch('/api/events');
+                const response = await fetch(`/api/events`);
                 if (!response.ok) throw new Error('API down');
-                allEvents = await response.json();
-                renderEvents();
-                updateMainStats();
+                const newEvents = await response.json();
+                
+                if (newEvents.length > 0) {
+                    allEvents = newEvents.slice(0, 1000);
+                    renderEvents();
+                }
+                
                 document.getElementById('systemStatus').style.color = 'var(--success)';
                 document.getElementById('systemStatus').textContent = '● System Online';
             } catch (e) { 
@@ -319,6 +369,31 @@
                 const stats = await response.json();
                 renderTopList('topDomains', stats.top_domains);
                 renderTopList('topClients', stats.top_clients);
+                
+                // Update global counters from backend (accurate history)
+                document.getElementById('rpm_val').textContent = stats.rpm + ' RPM';
+                document.getElementById('rph_val').textContent = stats.rph;
+                document.getElementById('rpd_val').textContent = stats.rpd;
+                document.getElementById('total_val').textContent = stats.total;
+                document.getElementById('cache_ratio').textContent = (stats.cache_hit_ratio || 0).toFixed(1) + '%';
+
+                // Update node list
+                const nodeStats = document.getElementById('nodeStats');
+                if (stats.nodes) {
+                    nodeStats.innerHTML = Object.entries(stats.nodes).map(([name, s]) => `
+                        <li class="top-item">
+                            <span>${escapeHtml(name)}</span>
+                            <span><span class="top-count">${s.rpm}</span> <span class="top-count" style="background: rgba(129, 140, 248, 0.1); color: #818cf8;">${s.rph}</span></span>
+                        </li>
+                    `).join('');
+                } else {
+                    nodeStats.innerHTML = '';
+                }
+
+                // Update chart locally
+                rpmHistory.push(stats.rpm);
+                rpmHistory.shift();
+                renderMiniChart();
             } catch (e) { console.error(e); }
         }
 
@@ -354,12 +429,13 @@
 
                 return `
                     <tr>
-                        <td class="timestamp">${new Date(e.unix_time * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false})}</td>
-                        <td><span class="badge badge-type">${e.type}</span></td>
-                        <td class="domain">${e.domain}</td>
-                        <td><span class="badge badge-ip">${e.client_ip}</span></td>
-                        <td>${e.upstream ? `<span class="upstream-badge">${e.upstream}</span>` : '-'}</td>
-                        <td class="latency-cell ${latencyClass}">${e.latency_ms ? e.latency_ms.toFixed(1) + 'ms' : '-'}</td>
+                        <td class="timestamp">${escapeHtml(new Date(e.unix_time * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false}))}</td>
+                        <td><span class="badge" style="background: rgba(255,255,255,0.1); font-size: 0.7rem;">${escapeHtml(e.node || 'local')}</span></td>
+                        <td><span class="badge badge-type">${escapeHtml(e.type)}</span></td>
+                        <td class="domain">${escapeHtml(e.domain)}</td>
+                        <td><span class="badge badge-ip">${escapeHtml(e.client_ip)}</span></td>
+                        <td>${e.upstream ? `<span class="upstream-badge">${escapeHtml(e.upstream)}</span>` : '-'}</td>
+                        <td class="latency-cell ${latencyClass}">${e.latency_ms ? escapeHtml(e.latency_ms.toFixed(1)) + 'ms' : '-'}</td>
                     </tr>
                 `;
             }).join('');
@@ -369,24 +445,15 @@
             const el = document.getElementById(id);
             el.innerHTML = list.map(item => `
                 <li class="top-item">
-                    <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px;">${item.key}</span>
+                    <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px;">${escapeHtml(item.key)}</span>
                     <span class="top-count">${item.count}</span>
                 </li>
             `).join('');
         }
 
         function updateMainStats() {
-            const now = Math.floor(Date.now() / 1000);
-            const rpm = allEvents.filter(e => e.unix_time >= now - 60).length;
-            const rph = allEvents.filter(e => e.unix_time >= now - 3600).length;
-
-            document.getElementById('rpm_val').textContent = rpm + ' RPM';
-            document.getElementById('rph_val').textContent = rph;
-            document.getElementById('total_val').textContent = allEvents.length;
-
-            rpmHistory.push(rpm);
-            rpmHistory.shift();
-            renderMiniChart();
+            // Stats are now pulled from /api/stats for better accuracy
+            // This function is kept for any immediate local UI feedback if needed
         }
 
         function renderMiniChart() {
@@ -400,8 +467,9 @@
 
         document.getElementById('searchInput').addEventListener('input', renderEvents);
 
-        setInterval(fetchAll, 5000);
+        setInterval(fetchStats, 5000);
         fetchAll();
+        startStream();
     </script>
 </body>
 </html>

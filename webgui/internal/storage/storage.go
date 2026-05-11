@@ -360,7 +360,7 @@ func (s *Store) SetPending(node, domain string, t time.Time) {
 func (s *Store) GetPending(node, domain string) (time.Time, string, bool) {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
-	
+
 	if s.pendingQueries[node] == nil {
 		return time.Time{}, "", false
 	}
@@ -368,7 +368,7 @@ func (s *Store) GetPending(node, domain string) (time.Time, string, bool) {
 	if len(infos) == 0 {
 		return time.Time{}, "", false
 	}
-	
+
 	// Pop oldest
 	info := infos[0]
 	if len(infos) == 1 {

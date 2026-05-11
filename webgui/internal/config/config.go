@@ -89,7 +89,7 @@ func LoadConfig() *Config {
 		healthDomain = DefaultHealthDomain
 	}
 
-	masterURL := os.Getenv("MASTER_URL")
+	masterURL := strings.TrimSuffix(os.Getenv("MASTER_URL"), "/")
 	if masterURL != "" {
 		if _, err := url.ParseRequestURI(masterURL); err != nil {
 			log.Fatalf("Invalid MASTER_URL: %v", err)

@@ -28,7 +28,7 @@ type Store struct {
 
 	pendingQueries map[string]map[string][]pendingInfo
 	pendingMu      sync.Mutex
-	
+
 	idCounter uint64
 
 	hourlyStats map[int64]int
@@ -142,7 +142,7 @@ func (s *Store) GetConfig() *config.Config {
 // AddEvent adds a new query event to the ring buffer and updates stats.
 func (s *Store) AddEvent(e models.QueryEvent) {
 	s.eventsMu.Lock()
-	
+
 	e.ID = fmt.Sprintf("%d", atomic.AddUint64(&s.idCounter, 1))
 
 	if s.count == s.cfg.MaxEvents {

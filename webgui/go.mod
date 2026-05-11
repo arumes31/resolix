@@ -1,5 +1,5 @@
 module tailscale-dnsrewrite/webgui
 
-go 1.22
+go 1.26.0
 
-require golang.org/x/crypto v0.21.0
+require golang.org/x/crypto v0.51.0

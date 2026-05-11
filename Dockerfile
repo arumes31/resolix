@@ -1,5 +1,5 @@
 # Stage 1: Build
-FROM golang:1.22-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
 
@@ -17,10 +17,14 @@ COPY webgui/ .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o webgui .
 
 # Stage 2: Final Image
-FROM alpine:3.21
+FROM alpine:3.23
 
-# Install runtime dependencies
-RUN apk add --no-cache tailscale dnsmasq bash bind-tools
+# Install runtime dependencies (including those required by Tailscale)
+RUN apk add --no-cache dnsmasq bash bind-tools ca-certificates iptables iproute2 ip6tables
+
+# Get the latest Tailscale binaries from the official image
+COPY --from=tailscale/tailscale:stable /usr/local/bin/tailscale /usr/bin/tailscale
+COPY --from=tailscale/tailscale:stable /usr/local/bin/tailscaled /usr/sbin/tailscaled
 
 # Copy binary from builder
 COPY --from=builder /app/webgui /usr/bin/webgui

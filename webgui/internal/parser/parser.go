@@ -101,6 +101,9 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 
 			if ok {
 				latency := float64(now.Sub(startTime).Microseconds()) / 1000.0
+				if latency < 0 {
+					latency = 0
+				}
 				p.store.RemovePending(node, domain)
 				p.store.UpdateEvent(node, domain, latency, upstream)
 

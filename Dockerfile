@@ -36,8 +36,6 @@ RUN chmod +x /usr/bin/entrypoint.sh
 # Environment variables
 RUN mkdir -p /var/run/tailscale && chmod 750 /var/run/tailscale
 
-RUN mkdir -p /var/run/tailscale && chmod 750 /var/run/tailscale
-
 ENV MODE=master
 ENV PORT=35353
 ENV HISTORY_DIR=/var/lib/tailscale-dnsrewrite

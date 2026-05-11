@@ -75,9 +75,14 @@ func (s *Server) SetupMux() http.Handler {
 	mux.HandleFunc("/api/events", s.handleEvents)
 	mux.HandleFunc("/api/stats", s.handleStats)
 	mux.HandleFunc("/api/simulate", s.handleSimulate)
-	mux.HandleFunc("/api/stream", s.handleStream) // SSE endpoint
 
-	return s.gzipMiddleware(mux)
+	handler := s.gzipMiddleware(mux)
+
+	rootMux := http.NewServeMux()
+	rootMux.Handle("/", handler)
+	rootMux.HandleFunc("/api/stream", s.handleStream) // SSE endpoint bypassed
+
+	return rootMux
 }
 
 func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
@@ -218,6 +223,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	notify := r.Context().Done()
+	timer := time.NewTimer(30 * time.Second)
+	defer timer.Stop()
+
 	for {
 		select {
 		case <-notify:
@@ -226,10 +234,18 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			data, _ := json.Marshal(ev)
 			_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
-		case <-time.After(30 * time.Second):
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(30 * time.Second)
+		case <-timer.C:
 			// Keepalive comment
 			_, _ = fmt.Fprintf(w, ": keepalive\n\n")
 			flusher.Flush()
+			timer.Reset(30 * time.Second)
 		}
 	}
 }

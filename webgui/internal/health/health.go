@@ -115,8 +115,12 @@ func equalSlices(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	for i := range a {
-		if a[i] != b[i] {
+	set := make(map[string]struct{}, len(a))
+	for _, v := range a {
+		set[v] = struct{}{}
+	}
+	for _, v := range b {
+		if _, ok := set[v]; !ok {
 			return false
 		}
 	}

@@ -16,6 +16,7 @@ import (
 type Forwarder struct {
 	cfg              *config.Config
 	stopChan         chan struct{}
+	stopOnce         sync.Once
 	backlogMu        sync.Mutex
 	backlog          []string
 	backlogTotalSize int64
@@ -73,9 +74,9 @@ func (f *Forwarder) sendBatch(client *http.Client, lines []string) error {
 }
 
 // Start begins the forwarding worker loop.
-func (f *Forwarder) Start() {
+func (f *Forwarder) Start() error {
 	if f.cfg.Mode != "slave" || f.cfg.MasterURL == "" {
-		return
+		return nil
 	}
 	client := &http.Client{Timeout: 10 * time.Second}
 	backoff := 1 * time.Second
@@ -83,7 +84,7 @@ func (f *Forwarder) Start() {
 	for {
 		select {
 		case <-f.stopChan:
-			return
+			return nil
 		default:
 		}
 
@@ -93,7 +94,7 @@ func (f *Forwarder) Start() {
 			select {
 			case <-time.After(100 * time.Millisecond):
 			case <-f.stopChan:
-				return
+				return nil
 			}
 			continue
 		}
@@ -125,7 +126,7 @@ func (f *Forwarder) Start() {
 			select {
 			case <-time.After(backoff):
 			case <-f.stopChan:
-				return
+				return nil
 			}
 			backoff *= 2
 			if backoff > 30*time.Second {
@@ -137,5 +138,7 @@ func (f *Forwarder) Start() {
 
 // Stop cleanly shuts down the forwarder
 func (f *Forwarder) Stop() {
-	close(f.stopChan)
+	f.stopOnce.Do(func() {
+		close(f.stopChan)
+	})
 }

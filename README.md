@@ -68,7 +68,7 @@ The provided `docker-compose.yaml` includes kernel `sysctls` optimizations:
 1. **Tailscale Connection**: The container joins your Tailnet and gets a unique IP.
 2. **DNS Logic**: `dnsmasq` listens on the Tailscale IP, resolving custom mappings first and then forwarding to healthy upstreams.
 3. **In-Memory Pipe**: Logs are streamed from `dnsmasq` through a named pipe directly into the Web GUI's RAM buffer.
-4. **Persistent Logging**: History is stored on disk and periodically archived, preserving visibility while allowing retention policies to manage disk usage.
+4. **Persistent Logging**: History is stored on disk and archived every 30 minutes, preserving visibility. Archives rotate and are retained for 72h before deletion to manage disk usage.
 
 ---
 

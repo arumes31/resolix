@@ -216,8 +216,6 @@ func (s *Store) GetRecentEvents(since int64) []models.QueryEvent {
 		e := s.events[idx]
 		if e.UnixTime > since {
 			result = append(result, e)
-		} else if since > 0 {
-			break
 		}
 	}
 	return result

@@ -85,7 +85,7 @@ EOL
     # For now, we add all provided upstreams initially.
     for server in $UPSTREAM_DNS; do
         server=$(echo "$server" | tr -d '[:space:]')
-        if [[ ! "$server" =~ ^[a-zA-Z0-9.:-]+$ ]]; then
+        if [[ ! "$server" =~ ^[a-zA-Z0-9.:-#]+$ ]]; then
             echo "Warning: Skipping invalid upstream: $server"
             continue
         fi

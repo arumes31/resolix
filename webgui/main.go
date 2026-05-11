@@ -51,20 +51,6 @@ func main() {
 		// Trigger dnsmasq reload if needed
 	})
 
-	// Improvement 40: Tailscale Keepalive
-	go func() {
-		ticker := time.NewTicker(1 * time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				// Periodic connectivity check
-			}
-		}
-	}()
-
 	// History Archiver
 	go func() {
 		ticker := time.NewTicker(cfg.ArchiveInterval)
@@ -93,8 +79,14 @@ func main() {
 		}
 	}()
 
+	errChan := make(chan error, 2)
+
 	// Start Forwarder for Slave mode
-	go fwd.Start()
+	go func() {
+		if err := fwd.Start(); err != nil {
+			errChan <- err
+		}
+	}()
 
 	// Log Ingestion
 	go func() {
@@ -120,7 +112,6 @@ func main() {
 	// Handle signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	errChan := make(chan error, 1)
 	go func() {
 		if err := srv.Start(ctx); err != nil {
 			errChan <- err

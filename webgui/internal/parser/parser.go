@@ -129,11 +129,9 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 				}
 				p.store.RemovePending(node, domain)
 				p.store.UpdateEvent(node, domain, latency, upstream)
-			} else {
+			} else if bytes.Equal(action, []byte("reply")) {
 				// Debug: why was it not found?
-				if bytes.Equal(action, []byte("reply")) {
-					log.Printf("[DEBUG] No pending query found for domain=%s node=%s", domain, node)
-				}
+				log.Printf("[DEBUG] No pending query found for domain=%s node=%s", domain, node)
 			}
 		}
 		return nil

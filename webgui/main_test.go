@@ -67,6 +67,22 @@ func TestParseLogBytes(t *testing.T) {
 	if events[0].Latency != nil && *events[0].Latency < 0 {
 		t.Error("Latency should be >= 0")
 	}
+
+	// 4. Test Feature #200: Internal Override Recognition
+	line4 := []byte("Jan 02 15:04:05 dnsmasq[123]: query[A] private.local from 100.64.1.2")
+	prs.ParseLogBytes(line4, node)
+	line5 := []byte("Jan 02 15:04:05 dnsmasq[123]: forwarded private.local to 127.0.0.1#5353")
+	prs.ParseLogBytes(line5, node)
+	line6 := []byte("Jan 02 15:04:05 dnsmasq[123]: reply private.local is 10.0.0.5")
+	prs.ParseLogBytes(line6, node)
+
+	events = store.GetRecentEvents(0)
+	if events[0].Domain != "private.local" {
+		t.Errorf("Expected domain private.local, got %s", events[0].Domain)
+	}
+	if events[0].Upstream != "Local Override" {
+		t.Errorf("Expected 'Local Override' for 127.0.0.1#5353, got %s", events[0].Upstream)
+	}
 }
 
 func TestApiIngest(t *testing.T) {

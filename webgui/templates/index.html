@@ -328,7 +328,12 @@
             eventSource.onmessage = (event) => {
                 try {
                     const newEvent = JSON.parse(event.data);
-                    allEvents = [newEvent, ...allEvents].slice(0, 1000);
+                    const index = allEvents.findIndex(e => e.id === newEvent.id);
+                    if (index !== -1) {
+                        allEvents[index] = newEvent;
+                    } else {
+                        allEvents = [newEvent, ...allEvents].slice(0, 1000);
+                    }
                     renderEvents();
                 } catch (e) {
                     console.error("Failed to parse SSE event:", e, event.data);
@@ -426,16 +431,18 @@
                 let latencyClass = 'latency-low';
                 if (e.latency_ms > 50) latencyClass = 'latency-mid';
                 if (e.latency_ms > 150) latencyClass = 'latency-high';
+                
+                const latencyText = e.LatencyFormatted || (e.latency_ms ? e.latency_ms.toFixed(1) + 'ms' : '-');
 
                 return `
-                    <tr>
+                    <tr id="row-${e.id}">
                         <td class="timestamp">${escapeHtml(new Date(e.unix_time * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false}))}</td>
                         <td><span class="badge" style="background: rgba(255,255,255,0.1); font-size: 0.7rem;">${escapeHtml(e.node || 'local')}</span></td>
                         <td><span class="badge badge-type">${escapeHtml(e.type)}</span></td>
                         <td class="domain">${escapeHtml(e.domain)}</td>
                         <td><span class="badge badge-ip">${escapeHtml(e.client_ip)}</span></td>
                         <td>${e.upstream ? `<span class="upstream-badge">${escapeHtml(e.upstream)}</span>` : '-'}</td>
-                        <td class="latency-cell ${latencyClass}">${e.latency_ms ? escapeHtml(e.latency_ms.toFixed(1)) + 'ms' : '-'}</td>
+                        <td class="latency-cell ${latencyClass}">${escapeHtml(latencyText)}</td>
                     </tr>
                 `;
             }).join('');

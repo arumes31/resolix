@@ -128,7 +128,7 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 				if latency < 0 {
 					latency = 0
 				}
-				p.store.UpdateEvent(node, domain, latency, upstream)
+				return p.store.UpdateEvent(node, domain, latency, upstream)
 			} else if bytes.Equal(action, []byte("reply")) {
 				// Debug: why was it not found?
 				if p.Debug {

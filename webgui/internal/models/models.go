@@ -12,6 +12,7 @@ type QueryEvent struct {
 	LatencyFormatted   string   `json:"LatencyFormatted"`
 	Upstream           string   `json:"upstream,omitempty"`
 	Node               string   `json:"node,omitempty"`
+	ID                 string   `json:"id"`
 }
 
 // StatEntry is a generic key-count pair used for top domains and top clients statistics.

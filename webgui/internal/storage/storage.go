@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"tailscale-dnsrewrite/webgui/internal/config"
@@ -27,6 +28,8 @@ type Store struct {
 
 	pendingQueries map[string]map[string][]pendingInfo
 	pendingMu      sync.Mutex
+	
+	idCounter uint64
 
 	hourlyStats map[int64]int
 	statsMu     sync.RWMutex
@@ -139,6 +142,8 @@ func (s *Store) GetConfig() *config.Config {
 // AddEvent adds a new query event to the ring buffer and updates stats.
 func (s *Store) AddEvent(e models.QueryEvent) {
 	s.eventsMu.Lock()
+	
+	e.ID = fmt.Sprintf("%d", atomic.AddUint64(&s.idCounter, 1))
 
 	if s.count == s.cfg.MaxEvents {
 		old := s.events[s.head]
@@ -162,7 +167,7 @@ func (s *Store) AddEvent(e models.QueryEvent) {
 }
 
 // UpdateEvent searches for a matching pending event and updates its latency and upstream.
-func (s *Store) UpdateEvent(node, domain string, latency float64, upstream string) {
+func (s *Store) UpdateEvent(node, domain string, latency float64, upstream string) *models.QueryEvent {
 	s.eventsMu.Lock()
 	defer s.eventsMu.Unlock()
 
@@ -183,9 +188,10 @@ func (s *Store) UpdateEvent(node, domain string, latency float64, upstream strin
 				s.cacheHits++
 			}
 			s.cacheMu.Unlock()
-			break
+			return &s.events[idx]
 		}
 	}
+	return nil
 }
 
 // GetOrderedEvents returns the latest N events in chronological order (oldest first).

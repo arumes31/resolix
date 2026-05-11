@@ -56,10 +56,6 @@ func TestParseLogBytes(t *testing.T) {
 	line2 := []byte("Jan 02 15:04:05 dnsmasq[123]: forwarded google.com to 8.8.8.8")
 	prs.ParseLogBytes(line2, node)
 
-	if store.GetUpstream(node, "google.com") != "8.8.8.8" {
-		t.Errorf("Expected upstream 8.8.8.8, got %s", store.GetUpstream(node, "google.com"))
-	}
-
 	// 3. Test Reply (Latency)
 	line3 := []byte("Jan 02 15:04:05 dnsmasq[123]: reply google.com is 1.2.3.4")
 	prs.ParseLogBytes(line3, node)

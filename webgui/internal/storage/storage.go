@@ -25,9 +25,8 @@ type Store struct {
 	count    int
 	eventsMu sync.RWMutex
 
-	pendingQueries   map[string]map[string]time.Time
-	pendingUpstreams map[string]map[string]string
-	pendingMu        sync.Mutex
+	pendingQueries map[string]map[string][]pendingInfo
+	pendingMu      sync.Mutex
 
 	hourlyStats map[int64]int
 	statsMu     sync.RWMutex
@@ -43,13 +42,17 @@ type Store struct {
 	cacheMu      sync.RWMutex
 }
 
+type pendingInfo struct {
+	startTime time.Time
+	upstream  string
+}
+
 // NewStore initializes a new Store with the provided configuration.
 func NewStore(cfg *config.Config) *Store {
 	return &Store{
 		cfg:                cfg,
 		events:             make([]models.QueryEvent, cfg.MaxEvents),
-		pendingQueries:     make(map[string]map[string]time.Time),
-		pendingUpstreams:   make(map[string]map[string]string),
+		pendingQueries:     make(map[string]map[string][]pendingInfo),
 		hourlyStats:        make(map[int64]int),
 		windowDomainCounts: make(map[string]int),
 		windowClientCounts: make(map[string]int),
@@ -318,26 +321,29 @@ func (s *Store) GetStats() map[string]interface{} {
 }
 
 // CleanupPending removes stale entries from the pending query map.
-func (s *Store) CleanupPending(now time.Time) int {
+func (s *Store) CleanupPending(now time.Time) {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
-	cleaned := 0
-	for node, queries := range s.pendingQueries {
-		for dom, start := range queries {
-			if now.Sub(start) > s.cfg.CleanupInterval {
-				delete(queries, dom)
-				if up, ok := s.pendingUpstreams[node]; ok {
-					delete(up, dom)
+	cutoff := now.Add(-30 * time.Second)
+	for node, domains := range s.pendingQueries {
+		for domain, infos := range domains {
+			// Remove expired infos from the queue
+			newInfos := make([]pendingInfo, 0)
+			for _, info := range infos {
+				if info.startTime.After(cutoff) {
+					newInfos = append(newInfos, info)
 				}
-				cleaned++
+			}
+			if len(newInfos) == 0 {
+				delete(domains, domain)
+			} else {
+				domains[domain] = newInfos
 			}
 		}
-		if len(queries) == 0 {
+		if len(domains) == 0 {
 			delete(s.pendingQueries, node)
-			delete(s.pendingUpstreams, node)
 		}
 	}
-	return cleaned
 }
 
 // SetPending records the start time of a DNS query.
@@ -345,42 +351,47 @@ func (s *Store) SetPending(node, domain string, t time.Time) {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
 	if s.pendingQueries[node] == nil {
-		s.pendingQueries[node] = make(map[string]time.Time)
+		s.pendingQueries[node] = make(map[string][]pendingInfo)
 	}
-	s.pendingQueries[node][domain] = t
+	s.pendingQueries[node][domain] = append(s.pendingQueries[node][domain], pendingInfo{startTime: t})
 }
 
-// GetPending retrieves the start time of a pending DNS query.
-func (s *Store) GetPending(node, domain string) (time.Time, bool) {
+// GetPending retrieves and removes the oldest pending DNS query for a domain.
+func (s *Store) GetPending(node, domain string) (time.Time, string, bool) {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
-	t, ok := s.pendingQueries[node][domain]
-	return t, ok
+	
+	if s.pendingQueries[node] == nil {
+		return time.Time{}, "", false
+	}
+	infos := s.pendingQueries[node][domain]
+	if len(infos) == 0 {
+		return time.Time{}, "", false
+	}
+	
+	// Pop oldest
+	info := infos[0]
+	if len(infos) == 1 {
+		delete(s.pendingQueries[node], domain)
+	} else {
+		s.pendingQueries[node][domain] = infos[1:]
+	}
+	return info.startTime, info.upstream, true
 }
 
-// RemovePending deletes a pending query entry.
-func (s *Store) RemovePending(node, domain string) {
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-	delete(s.pendingQueries[node], domain)
-	delete(s.pendingUpstreams[node], domain)
-}
-
-// SetUpstream records the upstream server used for a query.
+// SetUpstream records the upstream server used for the latest query of a domain.
 func (s *Store) SetUpstream(node, domain, upstream string) {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
-	if s.pendingUpstreams[node] == nil {
-		s.pendingUpstreams[node] = make(map[string]string)
+	if s.pendingQueries[node] == nil {
+		return
 	}
-	s.pendingUpstreams[node][domain] = upstream
-}
-
-// GetUpstream retrieves the upstream server used for a query.
-func (s *Store) GetUpstream(node, domain string) string {
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-	return s.pendingUpstreams[node][domain]
+	infos := s.pendingQueries[node][domain]
+	if len(infos) == 0 {
+		return
+	}
+	// Update the latest query (assuming dnsmasq logs forwarded right after query)
+	infos[len(infos)-1].upstream = upstream
 }
 
 // ArchiveStep performs a single archiving cycle, moving events from memory to disk.

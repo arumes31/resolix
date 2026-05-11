@@ -110,11 +110,11 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 	if bytes.Equal(action, []byte("reply")) || bytes.Equal(action, []byte("cached")) || bytes.Equal(action, []byte("config")) {
 		if len(parts) >= actionIdx+2 {
 			domain := normalize(string(parts[actionIdx+1]))
-			startTime, ok := p.store.GetPending(node, domain)
+			startTime, pendingUpstream, ok := p.store.GetPending(node, domain)
 			upstream := ""
 			switch {
 			case bytes.Equal(action, []byte("reply")):
-				upstream = p.store.GetUpstream(node, domain)
+				upstream = pendingUpstream
 			case bytes.Equal(action, []byte("cached")):
 				upstream = "System Cache"
 			case bytes.Equal(action, []byte("config")):
@@ -128,7 +128,6 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 				if latency < 0 {
 					latency = 0
 				}
-				p.store.RemovePending(node, domain)
 				p.store.UpdateEvent(node, domain, latency, upstream)
 			} else if bytes.Equal(action, []byte("reply")) {
 				// Debug: why was it not found?

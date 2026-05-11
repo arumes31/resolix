@@ -57,22 +57,25 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 		domain := string(parts[actionIdx+1])
 		clientIP := string(parts[actionIdx+3])
 
-		if actionIdx < 3 {
-			return nil
-		}
-		tsStr := string(bytes.Join(parts[:3], []byte(" ")))
-
-		t, err := time.Parse(time.Stamp, tsStr)
 		var parsedTime time.Time
-		if err == nil {
-			nowYear := now.Year()
-			parsedTime = time.Date(nowYear, t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.Local)
-			if parsedTime.After(now) {
-				parsedTime = parsedTime.AddDate(-1, 0, 0)
+		if actionIdx >= 3 {
+			tsStr := string(bytes.Join(parts[:3], []byte(" ")))
+			t, err := time.Parse(time.Stamp, tsStr)
+			if err == nil {
+				nowYear := now.Year()
+				parsedTime = time.Date(nowYear, t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.Local)
+				if parsedTime.After(now) {
+					parsedTime = parsedTime.AddDate(-1, 0, 0)
+				}
+			} else {
+				parsedTime = now
 			}
 		} else {
 			parsedTime = now
 		}
+
+		tsStr := parsedTime.Format(time.Stamp) // Fallback or parsed timestamp
+
 
 		event := models.QueryEvent{
 			Timestamp:          tsStr,

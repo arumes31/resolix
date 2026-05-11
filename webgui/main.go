@@ -39,7 +39,7 @@ func main() {
 		log.Fatalf("Fatal error parsing templates: %v", err)
 	}
 
-	prs := parser.NewParser(store)
+	prs := parser.NewParser(store, cfg.Debug)
 	srv := api.NewServer(cfg, store, prs, tmpl)
 	fwd := forwarder.NewForwarder(cfg)
 
@@ -123,13 +123,14 @@ func main() {
 					log.Println("Log ingestion loop exiting: channel closed")
 					return
 				}
-				// Improvement: only print if it's a dnsmasq log or for debugging
-				if bytes.Contains(line, []byte("query[")) || bytes.Contains(line, []byte("reply")) {
-					// Use a prefix to distinguish from other logs
-					log.Printf("[INGEST] %s", string(line))
-				} else {
-					// Fallback: print everything for now to debug
-					log.Printf("[DEBUG] %s", string(line))
+				if cfg.Debug {
+					if bytes.Contains(line, []byte("query[")) || bytes.Contains(line, []byte("reply")) {
+						// Use a prefix to distinguish from other logs
+						log.Printf("[INGEST] %s", string(line))
+					} else {
+						// Fallback: print everything for now to debug
+						log.Printf("[DEBUG] %s", string(line))
+					}
 				}
 
 				if cfg.Mode == "slave" {

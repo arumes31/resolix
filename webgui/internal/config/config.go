@@ -47,6 +47,7 @@ type Config struct {
 	ScanLimit        int
 	MaxBacklogSize   int64
 	UpstreamDNS      string
+	Debug            bool
 }
 
 // LoadConfig reads configuration from environment variables.
@@ -112,6 +113,7 @@ func LoadConfig() *Config {
 		ScanLimit:        DefaultScanLimit,
 		MaxBacklogSize:   DefaultMaxBacklogSize,
 		UpstreamDNS:      os.Getenv("UPSTREAM_DNS"),
+		Debug:            strings.ToLower(os.Getenv("DEBUG")) == "true",
 	}
 
 	if cfg.Mode == "slave" && cfg.MasterURL == "" {

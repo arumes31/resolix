@@ -13,11 +13,12 @@ import (
 // Parser handles the logic of extracting DNS events from raw log lines.
 type Parser struct {
 	store *storage.Store
+	Debug bool
 }
 
 // NewParser creates a new log parser instance.
-func NewParser(store *storage.Store) *Parser {
-	return &Parser{store: store}
+func NewParser(store *storage.Store, debug bool) *Parser {
+	return &Parser{store: store, Debug: debug}
 }
 
 // ParseLogBytes parses a raw dnsmasq log line and updates the store.
@@ -131,7 +132,9 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 				p.store.UpdateEvent(node, domain, latency, upstream)
 			} else if bytes.Equal(action, []byte("reply")) {
 				// Debug: why was it not found?
-				log.Printf("[DEBUG] No pending query found for domain=%s node=%s", domain, node)
+				if p.Debug {
+					log.Printf("[DEBUG] No pending query found for domain=%s node=%s", domain, node)
+				}
 			}
 		}
 		return nil

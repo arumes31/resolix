@@ -29,7 +29,7 @@ func setupTest() (*config.Config, *storage.Store, *parser.Parser, *api.Server) {
 	}
 	cfg.HistoryDir = tmp
 	store := storage.NewStore(cfg)
-	prs := parser.NewParser(store)
+	prs := parser.NewParser(store, false)
 	tmpl := template.Must(template.New("test").Parse("{{range .Events}}{{.Domain}}{{end}}"))
 	srv := api.NewServer(cfg, store, prs, tmpl)
 	return cfg, store, prs, srv

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"embed"
 	"html/template"
@@ -98,6 +99,7 @@ func main() {
 	go func() {
 		linesCh := make(chan []byte)
 		go func() {
+			log.Println("Log ingestion scanner started on stdin")
 			scanner := bufio.NewScanner(os.Stdin)
 			for scanner.Scan() {
 				buf := scanner.Bytes()
@@ -108,6 +110,7 @@ func main() {
 			if err := scanner.Err(); err != nil {
 				log.Printf("stdin scan error: %v", err)
 			}
+			log.Println("Log ingestion scanner reached EOF")
 			close(linesCh)
 		}()
 
@@ -117,8 +120,19 @@ func main() {
 				return
 			case line, ok := <-linesCh:
 				if !ok {
+					log.Println("Log ingestion loop exiting: channel closed")
 					return
 				}
+				// Improvement: only print if it's a dnsmasq log or for debugging
+				if bytes.Contains(line, []byte("query[")) || bytes.Contains(line, []byte("reply")) {
+					// Use a prefix to distinguish from other logs
+					log.Printf("[INGEST] %s", string(line))
+				} else {
+					// Fallback: print everything for now to debug
+					os.Stdout.Write(line)
+					os.Stdout.WriteString("\n")
+				}
+
 				if cfg.Mode == "slave" {
 					fwd.Enqueue(string(line))
 				}

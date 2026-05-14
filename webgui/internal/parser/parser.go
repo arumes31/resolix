@@ -88,6 +88,7 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 			Domain:   domain,
 			ClientIP: clientIP,
 			Node:     node,
+			Alias:    p.store.GetAlias(clientIP),
 		}
 
 		p.store.SetPending(node, domain, parsedTime)

@@ -15,6 +15,7 @@ type QueryEvent struct {
 	Latency  *float64 `json:"latency_ms,omitempty"`
 	Upstream string   `json:"upstream,omitempty"`
 	Node     string   `json:"node,omitempty"`
+	Alias    string   `json:"alias,omitempty"`
 	ID       string   `json:"id"`
 }
 
@@ -43,4 +44,6 @@ func (e QueryEvent) MarshalJSON() ([]byte, error) {
 type StatEntry struct {
 	Key   string `json:"key"`
 	Count int    `json:"count"`
+	Trend string `json:"trend,omitempty"`
+	Alias string `json:"alias,omitempty"`
 }

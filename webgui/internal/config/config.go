@@ -47,6 +47,7 @@ type Config struct {
 	ScanLimit        int
 	MaxBacklogSize   int64
 	UpstreamDNS      string
+	ClientAliases    map[string]string
 	Debug            bool
 }
 
@@ -97,6 +98,16 @@ func LoadConfig() *Config {
 		}
 	}
 
+	aliases := make(map[string]string)
+	if a := os.Getenv("CLIENT_ALIASES"); a != "" {
+		for _, pair := range strings.Split(a, ",") {
+			parts := strings.Split(pair, ":")
+			if len(parts) == 2 {
+				aliases[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+			}
+		}
+	}
+
 	cfg := &Config{
 		Mode:             mode,
 		MasterURL:        masterURL,
@@ -113,6 +124,7 @@ func LoadConfig() *Config {
 		ScanLimit:        DefaultScanLimit,
 		MaxBacklogSize:   DefaultMaxBacklogSize,
 		UpstreamDNS:      os.Getenv("UPSTREAM_DNS"),
+		ClientAliases:    aliases,
 		Debug:            strings.ToLower(os.Getenv("DEBUG")) == "true",
 	}
 

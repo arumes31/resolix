@@ -57,6 +57,11 @@ type Store struct {
 
 	// String interning (Optimization)
 	internPool map[string]string
+
+	// Health and Trends (New Features)
+	upstreamHealth map[string]float64
+	healthMu       sync.RWMutex
+	lastTopStats   map[string][]models.StatEntry
 }
 
 type pendingInfo struct {
@@ -79,6 +84,8 @@ func NewStore(cfg *config.Config) *Store {
 		nodeRPHBuckets:     make(map[string]*[60]int),
 		nodeRPHTimes:       make(map[string]*[60]int64),
 		internPool:         make(map[string]string),
+		upstreamHealth:     make(map[string]float64),
+		lastTopStats:       make(map[string][]models.StatEntry),
 	}
 }
 
@@ -371,10 +378,33 @@ func (s *Store) GetStats() map[string]interface{} {
 	}
 	s.eventsMu.RUnlock()
 
-	toStats := func(m map[string]int) []models.StatEntry {
+	toStats := func(m map[string]int, category string) []models.StatEntry {
 		st := make([]models.StatEntry, 0, len(m))
 		for k, v := range m {
-			st = append(st, models.StatEntry{Key: k, Count: v})
+			entry := models.StatEntry{Key: k, Count: v}
+			if category == "clients" {
+				if alias, ok := s.cfg.ClientAliases[k]; ok {
+					entry.Alias = alias
+				}
+			}
+			// Compute trend
+			s.statsMu.RLock()
+			if last, ok := s.lastTopStats[category]; ok {
+				for _, le := range last {
+					if le.Key == k {
+						if v > le.Count {
+							entry.Trend = "up"
+						} else if v < le.Count {
+							entry.Trend = "down"
+						} else {
+							entry.Trend = "stable"
+						}
+						break
+					}
+				}
+			}
+			s.statsMu.RUnlock()
+			st = append(st, entry)
 		}
 		sort.Slice(st, func(i, j int) bool { return st[i].Count > st[j].Count })
 		if len(st) > 10 {
@@ -382,6 +412,23 @@ func (s *Store) GetStats() map[string]interface{} {
 		}
 		return st
 	}
+
+	// Heatmap data
+	heatmap := make(map[string]int)
+	s.statsMu.RLock()
+	for h := currentHour - 23; h <= currentHour; h++ {
+		t := time.Unix(h*3600, 0)
+		heatmap[t.Format("15:00")] = s.hourlyStats[h]
+	}
+	s.statsMu.RUnlock()
+
+	// Upstream health
+	s.healthMu.RLock()
+	health := make(map[string]float64)
+	for k, v := range s.upstreamHealth {
+		health[k] = v
+	}
+	s.healthMu.RUnlock()
 
 	// Improvement 98: Calculate cache hit ratio
 	s.cacheMu.RLock()
@@ -392,14 +439,16 @@ func (s *Store) GetStats() map[string]interface{} {
 	s.cacheMu.RUnlock()
 
 	return map[string]interface{}{
-		"top_domains":     toStats(domainCounts),
-		"top_clients":     toStats(clientCounts),
+		"top_domains":     toStats(domainCounts, "domains"),
+		"top_clients":     toStats(clientCounts, "clients"),
 		"rpm":             rpm,
 		"rph":             rph,
 		"rpd":             rpd,
 		"total":           s.totalEvents,
 		"nodes":           nodeList,
 		"cache_hit_ratio": cacheRatio,
+		"upstream_health": health,
+		"heatmap":         heatmap,
 	}
 }
 
@@ -577,4 +626,41 @@ func (s *Store) ArchiveStep(now time.Time) int {
 	}
 	s.statsMu.Unlock()
 	return len(toArchive)
+}
+
+// SetUpstreamHealth updates the latency mapping for upstream DNS servers.
+func (s *Store) SetUpstreamHealth(health map[string]float64) {
+	s.healthMu.Lock()
+	s.upstreamHealth = health
+	s.healthMu.Unlock()
+}
+
+// GetAlias returns the friendly name for a client IP if configured.
+func (s *Store) GetAlias(ip string) string {
+	if alias, ok := s.cfg.ClientAliases[ip]; ok {
+		return alias
+	}
+	return ""
+}
+
+// StartStatsTrends begins periodic snapshots of top lists for trend analysis.
+func (s *Store) StartStatsTrends() {
+	go func() {
+		for {
+			s.updateTrends()
+			time.Sleep(5 * time.Minute)
+		}
+	}()
+}
+
+func (s *Store) updateTrends() {
+	stats := s.GetStats()
+	s.statsMu.Lock()
+	if td, ok := stats["top_domains"].([]models.StatEntry); ok {
+		s.lastTopStats["domains"] = td
+	}
+	if tc, ok := stats["top_clients"].([]models.StatEntry); ok {
+		s.lastTopStats["clients"] = tc
+	}
+	s.statsMu.Unlock()
 }

@@ -17,6 +17,7 @@ type Checker struct {
 	cfg       *config.Config
 	upstreams []string
 	healthy   []string
+	latencies map[string]float64
 	mu        sync.RWMutex
 }
 
@@ -30,21 +31,27 @@ func NewChecker(cfg *config.Config, upstreamDNS string) *Checker {
 		cfg:       cfg,
 		upstreams: servers,
 		healthy:   servers,
+		latencies: make(map[string]float64),
 	}
 	var initialHealthy []string
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	for _, s := range servers {
-		if c.CheckUpstream(ctx, s) {
+		ok, lat := c.CheckUpstream(ctx, s)
+		if ok {
 			initialHealthy = append(initialHealthy, s)
+			c.latencies[s] = lat
+		} else {
+			c.latencies[s] = -1
 		}
 	}
 	c.healthy = initialHealthy
 	return c
 }
 
-// CheckUpstream verifies if a specific DNS server is responsive.
-func (c *Checker) CheckUpstream(ctx context.Context, server string) bool {
+// CheckUpstream verifies if a specific DNS server is responsive and measures latency.
+func (c *Checker) CheckUpstream(ctx context.Context, server string) (bool, float64) {
+	start := time.Now()
 	resolver := &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -53,11 +60,14 @@ func (c *Checker) CheckUpstream(ctx context.Context, server string) bool {
 		},
 	}
 	_, err := resolver.LookupHost(ctx, c.cfg.HealthDomain)
-	return err == nil
+	if err != nil {
+		return false, -1
+	}
+	return true, float64(time.Since(start).Microseconds()) / 1000.0
 }
 
 // Start begins the health check loop.
-func (c *Checker) Start(ctx context.Context, onChange func([]string)) {
+func (c *Checker) Start(ctx context.Context, onChange func([]string, map[string]float64)) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
@@ -67,21 +77,34 @@ func (c *Checker) Start(ctx context.Context, onChange func([]string)) {
 			return
 		case <-ticker.C:
 			var wg sync.WaitGroup
-			results := make([]bool, len(c.upstreams))
+			type res struct {
+				ok  bool
+				lat float64
+			}
+			results := make(map[string]res)
+			var resMu sync.Mutex
 
-			for i, ups := range c.upstreams {
+			for _, ups := range c.upstreams {
 				wg.Add(1)
-				go func(idx int, u string) {
+				go func(u string) {
 					defer wg.Done()
-					results[idx] = c.CheckUpstream(ctx, u)
-				}(i, ups)
+					ok, lat := c.CheckUpstream(ctx, u)
+					resMu.Lock()
+					results[u] = res{ok: ok, lat: lat}
+					resMu.Unlock()
+				}(ups)
 			}
 			wg.Wait()
 
 			var newHealthy []string
-			for i, r := range results {
-				if r {
-					newHealthy = append(newHealthy, c.upstreams[i])
+			newLatencies := make(map[string]float64)
+			for _, ups := range c.upstreams {
+				r := results[ups]
+				if r.ok {
+					newHealthy = append(newHealthy, ups)
+					newLatencies[ups] = r.lat
+				} else {
+					newLatencies[ups] = -1
 				}
 			}
 
@@ -102,20 +125,24 @@ func (c *Checker) Start(ctx context.Context, onChange func([]string)) {
 				}
 			}
 
+			c.latencies = newLatencies
 			changed := !equalSlices(c.healthy, newHealthy)
-			if changed {
-				log.Printf("Healthy upstreams changed: %v -> %v", c.healthy, newHealthy)
-				c.healthy = newHealthy
-				c.mu.Unlock()
+			c.healthy = newHealthy
+			
+			currentHealthy := c.healthy
+			currentLatencies := make(map[string]float64)
+			for k, v := range c.latencies {
+				currentLatencies[k] = v
+			}
+			c.mu.Unlock()
 
+			if changed {
+				log.Printf("Healthy upstreams changed: %v", currentHealthy)
 				if err := exec.Command("pkill", "-HUP", "dnsmasq").Run(); err != nil {
 					log.Printf("Error reloading dnsmasq: %v", err)
 				}
-
-				onChange(newHealthy)
-			} else {
-				c.mu.Unlock()
 			}
+			onChange(currentHealthy, currentLatencies)
 		}
 	}
 }

@@ -140,6 +140,38 @@
             font-size: 0.75rem;
         }
 
+        .trend-up { color: var(--success); }
+        .trend-down { color: var(--danger); }
+        .trend-stable { color: var(--text-secondary); opacity: 0.5; }
+
+        .heatmap-container {
+            display: flex;
+            gap: 4px;
+            overflow-x: auto;
+            padding: 1rem 0;
+            margin-top: 1rem;
+        }
+        .heatmap-box {
+            width: 30px;
+            height: 30px;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.6rem;
+            color: rgba(255,255,255,0.8);
+            flex-shrink: 0;
+        }
+
+        .alias-tag {
+            background: rgba(139, 92, 246, 0.1);
+            color: #a78bfa;
+            font-size: 0.6rem;
+            padding: 0.1rem 0.3rem;
+            border-radius: 4px;
+            margin-left: 0.3rem;
+        }
+
         .table-container {
             background: var(--glass-bg);
             border: 1px solid var(--glass-border);
@@ -278,6 +310,16 @@
                 <div class="stat-header">Top Clients</div>
                 <ul class="top-list" id="topClients"></ul>
             </div>
+            <div class="card">
+                <div class="stat-header"><span>Upstream Health</span></div>
+                <ul class="top-list" id="upstreamHealth">
+                    <li class="top-item"><span>Loading...</span></li>
+                </ul>
+            </div>
+            <div class="card" style="grid-column: span 2;">
+                <div class="stat-header"><span>24h Traffic Heatmap (Intensity)</span></div>
+                <div class="heatmap-container" id="trafficHeatmap"></div>
+            </div>
         </div>
 
         <div class="table-container">
@@ -300,7 +342,10 @@
                         <td><span class="badge" style="background: rgba(255,255,255,0.1); font-size: 0.7rem;">{{if .Node}}{{.Node}}{{else}}local{{end}}</span></td>
                         <td><span class="badge badge-type">{{.Type}}</span></td>
                         <td class="domain">{{.Domain}}</td>
-                        <td><span class="badge badge-ip">{{.ClientIP}}</span></td>
+                        <td>
+                            <span class="badge badge-ip">{{.ClientIP}}</span>
+                            {{if .Alias}}<span class="alias-tag">{{.Alias}}</span>{{end}}
+                        </td>
                         <td>{{if .Upstream}}<span class="upstream-badge">{{.Upstream}}</span>{{else}}-{{end}}</td>
                         <td class="latency-cell">{{if .LatencyFormatted}}{{.LatencyFormatted}}{{else}}-{{end}}</td>
                     </tr>
@@ -328,9 +373,19 @@
             return num;
         }
 
+        function getRelativeTime(timestamp) {
+            const diff = Math.floor(Date.now() / 1000 - timestamp);
+            if (diff < 60) return 'Just now';
+            if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+            if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+            return Math.floor(diff / 86400) + 'd ago';
+        }
+
         let allEvents = [];
         let rpmHistory = Array(20).fill(0);
         let lastEventTimestamp = 0;
+        let isTabVisible = true;
+        let statsInterval = null;
 
         // Optimized WebSocket/SSE handler
         function startStream() {
@@ -344,14 +399,14 @@
 
                     if (index !== -1) {
                         allEvents[index] = newEvent;
-                        if (!isFiltered) updateRowInDom(newEvent);
+                        if (!isFiltered && isTabVisible) updateRowInDom(newEvent);
                     } else {
                         allEvents.unshift(newEvent);
                         if (allEvents.length > 1000) allEvents.pop();
-                        if (!isFiltered) prependRowToDom(newEvent);
+                        if (!isFiltered && isTabVisible) prependRowToDom(newEvent);
                     }
                     
-                    if (isFiltered) {
+                    if (isFiltered && isTabVisible) {
                         // Throttle filter re-render
                         if (window.renderTimeout) clearTimeout(window.renderTimeout);
                         window.renderTimeout = setTimeout(renderEvents, 100);
@@ -372,13 +427,17 @@
             
             const latencyText = e.LatencyFormatted || (e.latency_ms ? e.latency_ms.toFixed(1) + 'ms' : '-');
             const timeStr = new Date(e.unix_time * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false});
+            const relTime = getRelativeTime(e.unix_time);
 
             return `
-                <td class="timestamp">${escapeHtml(timeStr)}</td>
+                <td class="timestamp"><div style="font-size:0.8rem">${escapeHtml(timeStr)}</div><div style="font-size:0.6rem; opacity:0.6">${escapeHtml(relTime)}</div></td>
                 <td><span class="badge" style="background: rgba(255,255,255,0.1); font-size: 0.7rem;">${escapeHtml(e.node || 'local')}</span></td>
                 <td><span class="badge badge-type">${escapeHtml(e.type)}</span></td>
                 <td class="domain">${escapeHtml(e.domain)}</td>
-                <td><span class="badge badge-ip">${escapeHtml(e.client_ip)}</span></td>
+                <td>
+                    <span class="badge badge-ip">${escapeHtml(e.client_ip)}</span>
+                    ${e.alias ? `<span class="alias-tag">${escapeHtml(e.alias)}</span>` : ''}
+                </td>
                 <td>${e.upstream ? `<span class="upstream-badge">${escapeHtml(e.upstream)}</span>` : '-'}</td>
                 <td class="latency-cell ${latencyClass}">${escapeHtml(latencyText)}</td>
             `;
@@ -442,6 +501,29 @@
                 document.getElementById('total_val').textContent = formatNumber(stats.total);
                 document.getElementById('cache_ratio').textContent = (stats.cache_hit_ratio || 0).toFixed(1) + '%';
 
+                // Update health list
+                const healthEl = document.getElementById('upstreamHealth');
+                if (stats.upstream_health) {
+                    healthEl.innerHTML = Object.entries(stats.upstream_health).map(([ip, lat]) => `
+                        <li class="top-item">
+                            <span>${escapeHtml(ip)}</span>
+                            <span class="top-count" style="background: ${lat === -1 ? 'var(--danger)' : 'rgba(34, 197, 94, 0.1)'}; color: ${lat === -1 ? '#fff' : 'var(--success)'}">${lat === -1 ? 'DOWN' : lat.toFixed(1) + 'ms'}</span>
+                        </li>
+                    `).join('');
+                }
+
+                // Update heatmap
+                const heatmapEl = document.getElementById('trafficHeatmap');
+                if (stats.heatmap) {
+                    const sortedHours = Object.entries(stats.heatmap).sort();
+                    const maxCount = Math.max(...sortedHours.map(h => h[1]), 1);
+                    heatmapEl.innerHTML = sortedHours.map(([hour, count]) => {
+                        const opacity = 0.2 + (count / maxCount) * 0.8;
+                        const color = count === 0 ? 'rgba(255,255,255,0.05)' : `rgba(56, 189, 248, ${opacity})`;
+                        return `<div class="heatmap-box" style="background: ${color}" title="${hour}: ${count} queries">${hour.split(':')[0]}</div>`;
+                    }).join('');
+                }
+
                 // Update node list
                 const nodeStats = document.getElementById('nodeStats');
                 if (stats.nodes) {
@@ -483,28 +565,48 @@
             const tableBody = document.getElementById('eventTable');
             
             if (searchTerm === "") {
-                // If no filter, we rely on incremental updates, but sync once to be sure
                 const filtered = allEvents.slice(0, 100);
                 tableBody.innerHTML = filtered.map(e => `<tr id="row-${e.id}">${createRowHtml(e)}</tr>`).join('');
                 return;
             }
 
-            const filtered = allEvents.filter(e => 
-                e.domain.toLowerCase().includes(searchTerm) || 
-                e.client_ip.toLowerCase().includes(searchTerm)
-            ).slice(0, 100);
+            // Advanced Search Parsing
+            const parts = searchTerm.split(' ');
+            const filtered = allEvents.filter(e => {
+                return parts.every(p => {
+                    if (p.startsWith('node:')) return (e.node || 'local').toLowerCase().includes(p.substring(5));
+                    if (p.startsWith('type:')) return e.type.toLowerCase().includes(p.substring(5));
+                    if (p.startsWith('client:')) return e.client_ip.toLowerCase().includes(p.substring(7));
+                    if (p.startsWith('alias:')) return (e.alias || '').toLowerCase().includes(p.substring(6));
+                    return e.domain.toLowerCase().includes(p) || 
+                           e.client_ip.toLowerCase().includes(p) ||
+                           (e.alias || '').toLowerCase().includes(p) ||
+                           (e.node || 'local').toLowerCase().includes(p);
+                });
+            }).slice(0, 100);
 
             tableBody.innerHTML = filtered.map(e => `<tr id="row-${e.id}">${createRowHtml(e)}</tr>`).join('');
         }
 
         function renderTopList(id, list) {
             const el = document.getElementById(id);
-            el.innerHTML = list.map(item => `
-                <li class="top-item">
-                    <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px;">${escapeHtml(item.key)}</span>
-                    <span class="top-count">${formatNumber(item.count)}</span>
-                </li>
-            `).join('');
+            el.innerHTML = list.map(item => {
+                let trendIcon = '';
+                if (item.trend === 'up') trendIcon = '<span class="trend-up">↑</span>';
+                if (item.trend === 'down') trendIcon = '<span class="trend-down">↓</span>';
+                if (item.trend === 'stable') trendIcon = '<span class="trend-stable">-</span>';
+
+                const aliasTag = item.alias ? `<span class="alias-tag">${escapeHtml(item.alias)}</span>` : '';
+
+                return `
+                    <li class="top-item">
+                        <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px;">
+                            ${escapeHtml(item.key)} ${trendIcon} ${aliasTag}
+                        </span>
+                        <span class="top-count">${formatNumber(item.count)}</span>
+                    </li>
+                `;
+            }).join('');
         }
 
         function updateMainStats() {
@@ -523,8 +625,21 @@
 
         document.getElementById('searchInput').addEventListener('input', renderEvents);
 
-        setInterval(fetchStats, 5000);
-        fetchAll();
+        function updateVisibility() {
+            isTabVisible = document.visibilityState === 'visible';
+            if (statsInterval) clearInterval(statsInterval);
+            
+            const rate = isTabVisible ? 5000 : 60000;
+            statsInterval = setInterval(fetchStats, rate);
+            
+            if (isTabVisible) {
+                fetchAll(); // Catch up immediately
+            }
+        }
+
+        document.addEventListener('visibilitychange', updateVisibility);
+        
+        updateVisibility(); // Initial set
         startStream();
     </script>
 </body>

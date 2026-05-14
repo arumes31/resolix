@@ -109,6 +109,8 @@ We maintain high code quality and security standards using the following tools:
 - **Verify DNS**: `nslookup mydomain.internal <TAILSCALE_IP>`
 - **Tailscale Status**: `docker exec -it dns-tailscale-1 tailscale status`
 - **Upstream Health**: `docker exec -it dns-tailscale-1 dig @<UPSTREAM_IP> google.com`
+- **Config Validation**: `docker exec -it dns-tailscale-1 cat -v /etc/dnsmasq.conf` — look for `^M` (carriage returns) which indicate CRLF corruption
+- **CRLF Issues**: If dnsmasq dies immediately, check that `entrypoint.sh` uses Unix (LF) line endings. Windows CRLF line endings in heredocs will corrupt config files.
 
 ---
 

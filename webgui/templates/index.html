@@ -556,24 +556,33 @@
                 document.getElementById('total_val').textContent = formatNumber(stats.total);
                 document.getElementById('cache_ratio').textContent = (stats.cache_hit_ratio || 0).toFixed(1) + '%';
 
-                // Update health list with sparklines
+                // Update health list with sparklines (Per Node)
                 const healthEl = document.getElementById('upstreamHealth');
-                if (stats.upstream_health) {
-                    healthEl.innerHTML = Object.entries(stats.upstream_health).map(([ip, lat]) => {
-                        const hist = stats.upstream_health_history ? stats.upstream_health_history[ip] || [] : [];
-                        const maxLat = Math.max(...hist.filter(l => l > 0), 1);
-                        const sparkline = `<div class="sparkline">${hist.map(l => {
-                            const h = l === -1 ? 100 : (l / maxLat) * 100;
-                            return `<div class="spark-bar ${l === -1 ? 'fail' : ''}" style="height: ${h}%"></div>`;
-                        }).join('')}</div>`;
+                if (stats.node_health) {
+                    healthEl.innerHTML = Object.entries(stats.node_health).map(([node, upstreams]) => {
+                        const nodeHtml = Object.entries(upstreams).map(([ip, lat]) => {
+                            const hist = (stats.node_health_hist && stats.node_health_hist[node]) ? stats.node_health_hist[node][ip] || [] : [];
+                            const maxLat = Math.max(...hist.filter(l => l > 0), 1);
+                            const sparkline = `<div class="sparkline">${hist.map(l => {
+                                const h = l === -1 ? 100 : (l / maxLat) * 100;
+                                return `<div class="spark-bar ${l === -1 ? 'fail' : ''}" style="height: ${h}%"></div>`;
+                            }).join('')}</div>`;
+
+                            return `
+                                <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.25rem 0; font-size: 0.8rem; border-bottom: 1px solid rgba(255,255,255,0.02);">
+                                    <div style="display: flex; align-items: center;">
+                                        <span style="opacity: 0.8">${escapeHtml(ip)}</span>
+                                        ${sparkline}
+                                    </div>
+                                    <span class="top-count" style="background: ${lat === -1 ? 'var(--danger)' : 'rgba(34, 197, 94, 0.1)'}; color: ${lat === -1 ? '#fff' : 'var(--success)'}">${lat === -1 ? 'DOWN' : lat.toFixed(1) + 'ms'}</span>
+                                </div>
+                            `;
+                        }).join('');
 
                         return `
-                            <li class="top-item">
-                                <div style="display: flex; align-items: center;">
-                                    <span>${escapeHtml(ip)}</span>
-                                    ${sparkline}
-                                </div>
-                                <span class="top-count" style="background: ${lat === -1 ? 'var(--danger)' : 'rgba(34, 197, 94, 0.1)'}; color: ${lat === -1 ? '#fff' : 'var(--success)'}">${lat === -1 ? 'DOWN' : lat.toFixed(1) + 'ms'}</span>
+                            <li style="margin-bottom: 1rem;">
+                                <div style="font-size: 0.7rem; color: var(--accent-color); text-transform: uppercase; margin-bottom: 0.3rem;">Node: ${escapeHtml(node)}</div>
+                                ${nodeHtml}
                             </li>
                         `;
                     }).join('');

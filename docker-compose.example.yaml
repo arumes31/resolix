@@ -1,0 +1,21 @@
+services:
+  dns-tailscale-1:
+    image: ghcr.io/arumes31/tailscale-dnsrewrite:latest
+    container_name: dns-tailscale-1
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY}
+      - DOMAINS=.internal.net:100.1.2.3,app.example.com:100.4.5.6
+      - UPSTREAM_DNS=8.8.8.8 8.8.4.4
+      - HEALTHCHECK_DOMAIN=google.com
+      - MODE=master
+      - NODE_NAME=dns-server-1
+      - INGEST_SECRET=my_super_secret_token
+    ports:
+      - "127.0.0.1:${PORT:-35353}:35353"
+    volumes:
+      - ./history:/var/lib/tailscale-dnsrewrite
+      - ./tailscale:/var/lib/tailscale
+    sysctls:
+      - net.core.somaxconn=1024
+      - net.ipv4.tcp_fastopen=3
+    restart: unless-stopped

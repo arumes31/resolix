@@ -33,9 +33,9 @@ COPY --from=builder /app/webgui /usr/bin/webgui
 RUN mkdir -p /var/lib/tailscale-dnsrewrite && chmod 750 /var/lib/tailscale-dnsrewrite \
     && mkdir -p /var/lib/tailscale && chmod 750 /var/lib/tailscale
 
-# Copy entrypoint
+# Copy entrypoint (strip CRLF — Windows git can inject \r that breaks heredocs)
 COPY entrypoint.sh /usr/bin/entrypoint.sh
-RUN chmod +x /usr/bin/entrypoint.sh
+RUN sed -i 's/\r$//' /usr/bin/entrypoint.sh && chmod +x /usr/bin/entrypoint.sh
 
 # Environment variables
 RUN mkdir -p /var/run/tailscale && chmod 750 /var/run/tailscale

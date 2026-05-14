@@ -9,8 +9,8 @@ HEALTHCHECK_DOMAIN=${HEALTHCHECK_DOMAIN:-"google.com"}
 # Cleanup function for graceful shutdown
 cleanup() {
     echo "Shutting down..."
-    kill "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" "$OVERRIDE_PID" 2>/dev/null
-    wait "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" "$OVERRIDE_PID" 2>/dev/null
+    kill "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" 2>/dev/null
+    wait "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" 2>/dev/null
     exit 0
 }
 
@@ -72,11 +72,10 @@ else
     exit 1
 fi
 
-# Function to generate dnsmasq.conf
+# Function to generate dnsmasq.conf (single instance, direct address overrides)
 generate_dnsmasq_conf() {
     echo "Generating configuration files..."
-    
-    # Instance 1: Main DNS Server (Tagging & Forwarding)
+
     cat > /etc/dnsmasq.conf <<EOL
 listen-address=$TAILSCALE_IP
 port=53
@@ -89,23 +88,6 @@ log-async=25
 log-facility=-
 local-ttl=60
 max-ttl=600
-
-# Feature #200: Define Tailscale client tags (IPv4 and IPv6)
-tag-if=set:tailscale,src:100.64.0.0/10
-tag-if=set:tailscale,src:fd7a:115c:a1e0::/48
-EOL
-
-    # Instance 2: Override Server (Hidden)
-    cat > /etc/dnsmasq-overrides.conf <<EOL
-listen-address=127.0.0.1
-port=5353
-bind-interfaces
-no-resolv
-no-poll
-local-ttl=60
-max-ttl=600
-log-queries
-log-facility=-
 EOL
 
     # Add upstream DNS servers
@@ -113,11 +95,11 @@ EOL
         server=$(echo "$server" | tr -d '[:space:]\r')
         if [ -n "$server" ]; then
             echo "server=$server" >> /etc/dnsmasq.conf
-            echo "server=$server" >> /etc/dnsmasq-overrides.conf
         fi
     done
 
-    # Parse DOMAINS env variable
+    # Parse DOMAINS env variable (format: domain1:ip1,domain2:ip2)
+    # Directly add address= directives to the single dnsmasq instance
     if [ -n "$DOMAINS" ]; then
         IFS=',' read -ra DOMAIN_LIST <<< "$DOMAINS"
         for entry in "${DOMAIN_LIST[@]}"; do
@@ -125,65 +107,49 @@ EOL
             domain=$(echo "$entry" | cut -d':' -f1)
             ip=$(echo "$entry" | cut -d':' -f2)
             if [ -n "$domain" ] && [ -n "$ip" ]; then
-                echo "server=tag:tailscale,/$domain/127.0.0.1#5353" >> /etc/dnsmasq.conf
-                echo "address=/$domain/$ip" >> /etc/dnsmasq-overrides.conf
+                echo "address=/$domain/$ip" >> /etc/dnsmasq.conf
             fi
         done
     fi
 
-    # CRITICAL: Strip carriage returns that break dnsmasq config parsing
-    # Use tr to reliably remove \r bytes (sed \\r does NOT match actual CR)
+    # Strip carriage returns and clean up config
     tr -d '\r' < /etc/dnsmasq.conf > /etc/dnsmasq.conf.tmp && mv /etc/dnsmasq.conf.tmp /etc/dnsmasq.conf
-    tr -d '\r' < /etc/dnsmasq-overrides.conf > /etc/dnsmasq-overrides.conf.tmp && mv /etc/dnsmasq-overrides.conf.tmp /etc/dnsmasq-overrides.conf
-    # Remove any trailing whitespace on lines
     sed -i 's/[[:space:]]*$//' /etc/dnsmasq.conf
-    sed -i 's/[[:space:]]*$//' /etc/dnsmasq-overrides.conf
-    # Remove empty lines (dnsmasq ignores them, but let's be safe)
     sed -i '/^$/d' /etc/dnsmasq.conf
-    sed -i '/^$/d' /etc/dnsmasq-overrides.conf
 
-    echo "Config file /etc/dnsmasq.conf (Main) content (with visible chars):"
+    echo "Config file /etc/dnsmasq.conf content:"
     cat -v /etc/dnsmasq.conf
-    echo "Config file /etc/dnsmasq-overrides.conf (Override) content (with visible chars):"
-    cat -v /etc/dnsmasq-overrides.conf
 }
 
-# Generate initial configurations
+# Generate initial configuration
 generate_dnsmasq_conf
 
 # Check for port conflicts
-echo "Checking for existing processes on port 53/5353..."
+echo "Checking for existing processes on port 53..."
 if command -v netstat >/dev/null; then
-    netstat -tuln | grep -E ':53|:5353' || echo "No conflicts found via netstat"
+    netstat -tuln | grep ':53' || echo "No conflicts found via netstat"
 elif command -v ss >/dev/null; then
-    ss -tuln | grep -E ':53|:5353' || echo "No conflicts found via ss"
+    ss -tuln | grep ':53' || echo "No conflicts found via ss"
 fi
 
 # Start processes
 echo "Starting dnsmasq and Web GUI..."
 mkfifo /tmp/dnsmasq_logs 2>/dev/null || true
 
-# Start Web GUI
+# Start Web GUI reading from the pipe
 /usr/bin/webgui < /tmp/dnsmasq_logs &
 WEBGUI_PID=$!
 
-# Start both dnsmasq instances and redirect ALL output to the pipe for the Web GUI to display
-/usr/sbin/dnsmasq -k --conf-file=/etc/dnsmasq-overrides.conf >> /tmp/dnsmasq_logs 2>&1 &
-OVERRIDE_PID=$!
-
+# Start single dnsmasq instance
 /usr/sbin/dnsmasq -k --conf-file=/etc/dnsmasq.conf >> /tmp/dnsmasq_logs 2>&1 &
 DNSMASQ_PID=$!
 
-echo "Processes started: Main(PID:$DNSMASQ_PID), Override(PID:$OVERRIDE_PID), GUI(PID:$WEBGUI_PID)"
+echo "Processes started: dnsmasq(PID:$DNSMASQ_PID), GUI(PID:$WEBGUI_PID)"
 
 # Monitor processes
 while true; do
     if ! kill -0 $DNSMASQ_PID 2>/dev/null; then
-        echo "Error: main dnsmasq process (PID: $DNSMASQ_PID) died. Details should be in GUI logs above."
-        exit 1
-    fi
-    if ! kill -0 $OVERRIDE_PID 2>/dev/null; then
-        echo "Error: override dnsmasq process (PID: $OVERRIDE_PID) died."
+        echo "Error: dnsmasq process (PID: $DNSMASQ_PID) died. Details should be in GUI logs above."
         exit 1
     fi
     if ! kill -0 $WEBGUI_PID 2>/dev/null; then

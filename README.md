@@ -1,12 +1,12 @@
 # 🛡️ Tailscale DNS Monitor & Rewriter
 
-[![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/arumes31/tailscale-dnsrewrite/go-checks.yml?branch=v2_test&style=flat-square)](https://github.com/arumes31/tailscale-dnsrewrite/actions)
+[![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/arumes31/tailscale-dnsrewrite/go-checks.yml?branch=main&style=flat-square)](https://github.com/arumes31/tailscale-dnsrewrite/actions)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/arumes31/tailscale-dnsrewrite?filename=webgui%2Fgo.mod&style=flat-square)](https://go.dev/)
 [![License](https://img.shields.io/github/license/arumes31/tailscale-dnsrewrite?style=flat-square)](LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/arumes31/tailscale-dnsrewrite?style=flat-square)](https://github.com/arumes31/tailscale-dnsrewrite/stargazers)
 [![GitHub forks](https://img.shields.io/github/forks/arumes31/tailscale-dnsrewrite?style=flat-square)](https://github.com/arumes31/tailscale-dnsrewrite/network)
 [![GitHub issues](https://img.shields.io/github/issues/arumes31/tailscale-dnsrewrite?style=flat-square)](https://github.com/arumes31/tailscale-dnsrewrite/issues)
-[![Last Commit](https://img.shields.io/github/last-commit/arumes31/tailscale-dnsrewrite/v2_test?style=flat-square)](https://github.com/arumes31/tailscale-dnsrewrite/commits/v2_test)
+[![Last Commit](https://img.shields.io/github/last-commit/arumes31/tailscale-dnsrewrite/main?style=flat-square)](https://github.com/arumes31/tailscale-dnsrewrite/commits/main)
 
 A high-performance Tailscale DNS server that provides custom DNS overrides and intelligent upstream forwarding with a premium real-time monitoring dashboard.
 

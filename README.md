@@ -45,7 +45,11 @@ graph LR
 
 ### 1. Deploy
 ```bash
+# Build locally
 docker-compose up -d --build
+
+# OR pull from GHCR
+docker-compose -f docker-compose.example.yaml up -d
 ```
 *Note: Use `./history` and `./tailscale` volumes for data persistence.*
 

@@ -38,11 +38,25 @@ type Store struct {
 	windowClientCounts map[string]int
 
 	lastArchivedTime int64
+	totalEvents      int64
 
 	// Cache Hit Ratio tracking (Improvement 98)
 	cacheHits    int64
 	totalReplies int64
 	cacheMu      sync.RWMutex
+
+	// Rolling window counters (Optimization)
+	rpmBuckets     [60]int
+	rpmTimes       [60]int64
+	rphBuckets     [60]int
+	rphTimes       [60]int64
+	nodeRPMBuckets map[string]*[60]int
+	nodeRPMTimes   map[string]*[60]int64
+	nodeRPHBuckets map[string]*[60]int
+	nodeRPHTimes   map[string]*[60]int64
+
+	// String interning (Optimization)
+	internPool map[string]string
 }
 
 type pendingInfo struct {
@@ -60,7 +74,23 @@ func NewStore(cfg *config.Config) *Store {
 		windowDomainCounts: make(map[string]int),
 		windowClientCounts: make(map[string]int),
 		lastArchivedTime:   0,
+		nodeRPMBuckets:     make(map[string]*[60]int),
+		nodeRPMTimes:       make(map[string]*[60]int64),
+		nodeRPHBuckets:     make(map[string]*[60]int),
+		nodeRPHTimes:       make(map[string]*[60]int64),
+		internPool:         make(map[string]string),
 	}
+}
+
+func (s *Store) intern(str string) string {
+	if str == "" {
+		return ""
+	}
+	if v, ok := s.internPool[str]; ok {
+		return v
+	}
+	s.internPool[str] = str
+	return str
 }
 
 // Init ensures the history directory exists and warms up stats from disk.
@@ -106,6 +136,10 @@ func (s *Store) loadStatsFromHistory() {
 					}
 
 					if err := json.Unmarshal(plain, &e); err == nil {
+						s.statsMu.Lock()
+						s.totalEvents++
+						s.statsMu.Unlock()
+
 						if e.UnixTime >= cutoff {
 							hour := e.UnixTime / 3600
 							s.statsMu.Lock()
@@ -141,10 +175,60 @@ func (s *Store) GetConfig() *config.Config {
 
 // AddEvent adds a new query event to the ring buffer and updates stats.
 func (s *Store) AddEvent(e models.QueryEvent) {
+	s.statsMu.Lock()
+	e.Node = s.intern(e.Node)
+	e.Type = s.intern(e.Type)
+	e.ClientIP = s.intern(e.ClientIP)
+
+	// Rolling buckets update
+	secBucket := e.UnixTime % 60
+	minBucket := (e.UnixTime / 60) % 60
+	minuteStart := (e.UnixTime / 60) * 60
+
+	if s.rpmTimes[secBucket] != e.UnixTime {
+		s.rpmTimes[secBucket] = e.UnixTime
+		s.rpmBuckets[secBucket] = 1
+	} else {
+		s.rpmBuckets[secBucket]++
+	}
+
+	if s.rphTimes[minBucket] != minuteStart {
+		s.rphTimes[minBucket] = minuteStart
+		s.rphBuckets[minBucket] = 1
+	} else {
+		s.rphBuckets[minBucket]++
+	}
+
+	nodeName := e.Node
+	if nodeName == "" {
+		nodeName = "local"
+	}
+	if s.nodeRPMBuckets[nodeName] == nil {
+		s.nodeRPMBuckets[nodeName] = &[60]int{}
+		s.nodeRPMTimes[nodeName] = &[60]int64{}
+		s.nodeRPHBuckets[nodeName] = &[60]int{}
+		s.nodeRPHTimes[nodeName] = &[60]int64{}
+	}
+	if s.nodeRPMTimes[nodeName][secBucket] != e.UnixTime {
+		s.nodeRPMTimes[nodeName][secBucket] = e.UnixTime
+		s.nodeRPMBuckets[nodeName][secBucket] = 1
+	} else {
+		s.nodeRPMBuckets[nodeName][secBucket]++
+	}
+	if s.nodeRPHTimes[nodeName][minBucket] != minuteStart {
+		s.nodeRPHTimes[nodeName][minBucket] = minuteStart
+		s.nodeRPHBuckets[nodeName][minBucket] = 1
+	} else {
+		s.nodeRPHBuckets[nodeName][minBucket]++
+	}
+
+	hourBucket := e.UnixTime / 3600
+	s.hourlyStats[hourBucket]++
+	s.totalEvents++
+	s.statsMu.Unlock()
+
 	s.eventsMu.Lock()
-
 	e.ID = fmt.Sprintf("%d", atomic.AddUint64(&s.idCounter, 1))
-
 	if s.count == s.cfg.MaxEvents {
 		old := s.events[s.head]
 		s.windowDomainCounts[old.Domain]--
@@ -158,12 +242,6 @@ func (s *Store) AddEvent(e models.QueryEvent) {
 		s.count++
 	}
 	s.eventsMu.Unlock()
-
-	// Nested locking fixed
-	hourBucket := e.UnixTime / 3600
-	s.statsMu.Lock()
-	s.hourlyStats[hourBucket]++
-	s.statsMu.Unlock()
 }
 
 // UpdateEvent searches for a matching pending event and updates its latency and upstream.
@@ -179,7 +257,6 @@ func (s *Store) UpdateEvent(node, domain string, latency float64, upstream strin
 		idx := (s.head - 1 - i + s.cfg.MaxEvents) % s.cfg.MaxEvents
 		if s.events[idx].Domain == domain && s.events[idx].Node == node && s.events[idx].Latency == nil {
 			s.events[idx].Latency = &latency
-			s.events[idx].LatencyFormatted = fmt.Sprintf("%.1fms", latency)
 			s.events[idx].Upstream = upstream
 
 			s.cacheMu.Lock()
@@ -232,22 +309,56 @@ func (s *Store) GetRecentEvents(since int64) []models.QueryEvent {
 	}
 	return result
 }
-
 // GetStats returns aggregated traffic statistics.
 func (s *Store) GetStats() map[string]interface{} {
 	domainCounts := make(map[string]int)
 	clientCounts := make(map[string]int)
-	nodeRPM := make(map[string]int)
-	nodeRPH := make(map[string]int)
 
 	now := time.Now().Unix()
 	rpm := 0
 	rph := 0
 	rpd := 0
-	total := 0
+
+	s.statsMu.RLock()
+	for i := 0; i < 60; i++ {
+		if now-s.rpmTimes[i] < 60 {
+			rpm += s.rpmBuckets[i]
+		}
+		if now-s.rphTimes[i] < 3600 {
+			rph += s.rphBuckets[i]
+		}
+	}
+
+	nodeList := make(map[string]interface{})
+	for node, buckets := range s.nodeRPHBuckets {
+		nRPM := 0
+		nRPH := 0
+		rpmTs := s.nodeRPMTimes[node]
+		rphTs := s.nodeRPHTimes[node]
+		rpmB := s.nodeRPMBuckets[node]
+		for i := 0; i < 60; i++ {
+			if now-rpmTs[i] < 60 {
+				nRPM += rpmB[i]
+			}
+			if now-rphTs[i] < 3600 {
+				nRPH += buckets[i]
+			}
+		}
+		if nRPH > 0 {
+			nodeList[node] = map[string]int{
+				"rpm": nRPM,
+				"rph": nRPH,
+			}
+		}
+	}
+
+	currentHour := now / 3600
+	for h := currentHour - 23; h <= currentHour; h++ {
+		rpd += s.hourlyStats[h]
+	}
+	s.statsMu.RUnlock()
 
 	s.eventsMu.RLock()
-	total = s.count
 	for k, v := range s.windowDomainCounts {
 		if v > 0 {
 			domainCounts[k] = v
@@ -258,33 +369,7 @@ func (s *Store) GetStats() map[string]interface{} {
 			clientCounts[k] = v
 		}
 	}
-
-	for i := 0; i < s.count; i++ {
-		idx := (s.head - 1 - i + s.cfg.MaxEvents) % s.cfg.MaxEvents
-		e := s.events[idx]
-
-		nodeName := e.Node
-		if nodeName == "" {
-			nodeName = "local"
-		}
-
-		if e.UnixTime >= now-60 {
-			rpm++
-			nodeRPM[nodeName]++
-		}
-		if e.UnixTime >= now-3600 {
-			rph++
-			nodeRPH[nodeName]++
-		}
-	}
 	s.eventsMu.RUnlock()
-
-	currentHour := now / 3600
-	s.statsMu.RLock()
-	for h := currentHour - 23; h <= currentHour; h++ {
-		rpd += s.hourlyStats[h]
-	}
-	s.statsMu.RUnlock()
 
 	toStats := func(m map[string]int) []models.StatEntry {
 		st := make([]models.StatEntry, 0, len(m))
@@ -296,14 +381,6 @@ func (s *Store) GetStats() map[string]interface{} {
 			st = st[:10]
 		}
 		return st
-	}
-
-	nodeList := make(map[string]interface{})
-	for node := range nodeRPH {
-		nodeList[node] = map[string]int{
-			"rpm": nodeRPM[node],
-			"rph": nodeRPH[node],
-		}
 	}
 
 	// Improvement 98: Calculate cache hit ratio
@@ -320,7 +397,7 @@ func (s *Store) GetStats() map[string]interface{} {
 		"rpm":             rpm,
 		"rph":             rph,
 		"rpd":             rpd,
-		"total":           total,
+		"total":           s.totalEvents,
 		"nodes":           nodeList,
 		"cache_hit_ratio": cacheRatio,
 	}

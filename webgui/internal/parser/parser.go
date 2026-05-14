@@ -81,16 +81,13 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 			parsedTime = now
 		}
 
-		tsStr := parsedTime.Format(time.Stamp) // Fallback or parsed timestamp
 
 		event := models.QueryEvent{
-			Timestamp:          tsStr,
-			TimestampFormatted: parsedTime.Format("15:04:05"),
-			UnixTime:           parsedTime.Unix(),
-			Type:               qType,
-			Domain:             domain,
-			ClientIP:           clientIP,
-			Node:               node,
+			UnixTime: parsedTime.Unix(),
+			Type:     qType,
+			Domain:   domain,
+			ClientIP: clientIP,
+			Node:     node,
 		}
 
 		p.store.SetPending(node, domain, parsedTime)

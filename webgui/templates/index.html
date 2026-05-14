@@ -318,6 +318,16 @@
             return el.innerHTML;
         }
 
+        function formatNumber(num) {
+            if (num >= 1000000) {
+                return (num / 1000000).toFixed(1).replace(/\.0$/, '') + 'M';
+            }
+            if (num >= 1000) {
+                return (num / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
+            }
+            return num;
+        }
+
         let allEvents = [];
         let rpmHistory = Array(20).fill(0);
         let lastEventTimestamp = 0;
@@ -426,10 +436,10 @@
                 renderTopList('topClients', stats.top_clients);
                 
                 // Update global counters from backend (accurate history)
-                document.getElementById('rpm_val').textContent = stats.rpm + ' RPM';
-                document.getElementById('rph_val').textContent = stats.rph;
-                document.getElementById('rpd_val').textContent = stats.rpd;
-                document.getElementById('total_val').textContent = stats.total;
+                document.getElementById('rpm_val').textContent = formatNumber(stats.rpm) + ' RPM';
+                document.getElementById('rph_val').textContent = formatNumber(stats.rph);
+                document.getElementById('rpd_val').textContent = formatNumber(stats.rpd);
+                document.getElementById('total_val').textContent = formatNumber(stats.total);
                 document.getElementById('cache_ratio').textContent = (stats.cache_hit_ratio || 0).toFixed(1) + '%';
 
                 // Update node list
@@ -438,7 +448,7 @@
                     nodeStats.innerHTML = Object.entries(stats.nodes).map(([name, s]) => `
                         <li class="top-item">
                             <span>${escapeHtml(name)}</span>
-                            <span><span class="top-count">${s.rpm}</span> <span class="top-count" style="background: rgba(129, 140, 248, 0.1); color: #818cf8;">${s.rph}</span></span>
+                            <span><span class="top-count">${formatNumber(s.rpm)}</span> <span class="top-count" style="background: rgba(129, 140, 248, 0.1); color: #818cf8;">${formatNumber(s.rph)}</span></span>
                         </li>
                     `).join('');
                 } else {
@@ -492,7 +502,7 @@
             el.innerHTML = list.map(item => `
                 <li class="top-item">
                     <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px;">${escapeHtml(item.key)}</span>
-                    <span class="top-count">${item.count}</span>
+                    <span class="top-count">${formatNumber(item.count)}</span>
                 </li>
             `).join('');
         }

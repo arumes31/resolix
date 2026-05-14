@@ -46,8 +46,8 @@ type Store struct {
 	nodeRPHTimes   map[string]*[60]int64
 
 	// Health and Trends (Per Node)
-	nodeUpstreamHealth        map[string]map[string]float64        // node -> upstream -> latency
-	nodeUpstreamHealthHistory map[string]map[string][]float64      // node -> upstream -> history
+	nodeUpstreamHealth        map[string]map[string]float64   // node -> upstream -> latency
+	nodeUpstreamHealthHistory map[string]map[string][]float64 // node -> upstream -> history
 	healthMu                  sync.RWMutex
 	lastTopStats              map[string][]models.StatEntry
 
@@ -67,24 +67,22 @@ type pendingInfo struct {
 // NewStore initializes a new Store with the provided configuration.
 func NewStore(cfg *config.Config) *Store {
 	return &Store{
-		cfg:                   cfg,
-		events:                make([]models.QueryEvent, cfg.MaxEvents),
-		pendingQueries:        make(map[string]map[string][]pendingInfo),
-		nodeRPMBuckets:        make(map[string]*[60]int),
-		nodeRPMTimes:          make(map[string]*[60]int64),
-		nodeRPHBuckets:        make(map[string]*[60]int),
-		nodeRPHTimes:          make(map[string]*[60]int64),
+		cfg:                       cfg,
+		events:                    make([]models.QueryEvent, cfg.MaxEvents),
+		pendingQueries:            make(map[string]map[string][]pendingInfo),
+		nodeRPMBuckets:            make(map[string]*[60]int),
+		nodeRPMTimes:              make(map[string]*[60]int64),
+		nodeRPHBuckets:            make(map[string]*[60]int),
+		nodeRPHTimes:              make(map[string]*[60]int64),
 		nodeUpstreamHealth:        make(map[string]map[string]float64),
 		nodeUpstreamHealthHistory: make(map[string]map[string][]float64),
-		upstreamHealth:            make(map[string]float64), // deprecated legacy field
-		upstreamHealthHistory:     make(map[string][]float64), // deprecated legacy field
 		lastTopStats:              make(map[string][]models.StatEntry),
 		typeCounts:                make(map[string]int),
 		clientRPMBuckets:          make(map[string]*[60]int),
 		clientRPMTimes:            make(map[string]*[60]int64),
 		clientRPHBuckets:          make(map[string]*[60]int),
 		clientRPHTimes:            make(map[string]*[60]int64),
-		batch:                 make([]models.QueryEvent, 0, 1000),
+		batch:                     make([]models.QueryEvent, 0, 1000),
 	}
 }
 

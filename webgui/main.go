@@ -48,8 +48,11 @@ func main() {
 	// Initialize health checker
 	checker := health.NewChecker(cfg, cfg.UpstreamDNS)
 	go checker.Start(ctx, func(_ []string, latencies map[string]float64) {
-		store.SetUpstreamHealth(latencies)
-		log.Printf("Health status updated. Latencies: %v", latencies)
+		store.SetUpstreamHealth(cfg.NodeName, latencies)
+		if cfg.Mode == "slave" {
+			fwd.ReportHealth(latencies)
+		}
+		log.Printf("Health status updated for node %s. Latencies: %v", cfg.NodeName, latencies)
 	})
 
 	// Start Trend Analysis

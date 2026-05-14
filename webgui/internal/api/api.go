@@ -107,9 +107,10 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1*1024*1024) // 1MB limit
 
 	var payload struct {
-		Node  string   `json:"node"`
-		Line  string   `json:"line"`
-		Batch []string `json:"batch"`
+		Node   string             `json:"node"`
+		Line   string             `json:"line"`
+		Batch  []string           `json:"batch"`
+		Health map[string]float64 `json:"health,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		http.Error(w, "Payload too large or bad request", http.StatusBadRequest)
@@ -137,6 +138,9 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, l := range payload.Batch {
 		processLine(l)
+	}
+	if len(payload.Health) > 0 {
+		s.store.SetUpstreamHealth(payload.Node, payload.Health)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

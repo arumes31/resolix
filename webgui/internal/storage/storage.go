@@ -45,11 +45,11 @@ type Store struct {
 	nodeRPHBuckets map[string]*[60]int
 	nodeRPHTimes   map[string]*[60]int64
 
-	// Health and Trends
-	upstreamHealth        map[string]float64
-	upstreamHealthHistory map[string][]float64
-	healthMu              sync.RWMutex
-	lastTopStats          map[string][]models.StatEntry
+	// Health and Trends (Per Node)
+	nodeUpstreamHealth        map[string]map[string]float64   // node -> upstream -> latency
+	nodeUpstreamHealthHistory map[string]map[string][]float64 // node -> upstream -> history
+	healthMu                  sync.RWMutex
+	lastTopStats              map[string][]models.StatEntry
 
 	// UX Addons
 	typeCounts       map[string]int
@@ -67,22 +67,22 @@ type pendingInfo struct {
 // NewStore initializes a new Store with the provided configuration.
 func NewStore(cfg *config.Config) *Store {
 	return &Store{
-		cfg:                   cfg,
-		events:                make([]models.QueryEvent, cfg.MaxEvents),
-		pendingQueries:        make(map[string]map[string][]pendingInfo),
-		nodeRPMBuckets:        make(map[string]*[60]int),
-		nodeRPMTimes:          make(map[string]*[60]int64),
-		nodeRPHBuckets:        make(map[string]*[60]int),
-		nodeRPHTimes:          make(map[string]*[60]int64),
-		upstreamHealth:        make(map[string]float64),
-		upstreamHealthHistory: make(map[string][]float64),
-		lastTopStats:          make(map[string][]models.StatEntry),
-		typeCounts:            make(map[string]int),
-		clientRPMBuckets:      make(map[string]*[60]int),
-		clientRPMTimes:        make(map[string]*[60]int64),
-		clientRPHBuckets:      make(map[string]*[60]int),
-		clientRPHTimes:        make(map[string]*[60]int64),
-		batch:                 make([]models.QueryEvent, 0, 1000),
+		cfg:                       cfg,
+		events:                    make([]models.QueryEvent, cfg.MaxEvents),
+		pendingQueries:            make(map[string]map[string][]pendingInfo),
+		nodeRPMBuckets:            make(map[string]*[60]int),
+		nodeRPMTimes:              make(map[string]*[60]int64),
+		nodeRPHBuckets:            make(map[string]*[60]int),
+		nodeRPHTimes:              make(map[string]*[60]int64),
+		nodeUpstreamHealth:        make(map[string]map[string]float64),
+		nodeUpstreamHealthHistory: make(map[string]map[string][]float64),
+		lastTopStats:              make(map[string][]models.StatEntry),
+		typeCounts:                make(map[string]int),
+		clientRPMBuckets:          make(map[string]*[60]int),
+		clientRPMTimes:            make(map[string]*[60]int64),
+		clientRPHBuckets:          make(map[string]*[60]int),
+		clientRPHTimes:            make(map[string]*[60]int64),
+		batch:                     make([]models.QueryEvent, 0, 1000),
 	}
 }
 
@@ -413,27 +413,33 @@ func (s *Store) GetStats() map[string]interface{} {
 	}
 
 	s.healthMu.RLock()
-	health := make(map[string]float64)
-	healthHist := make(map[string][]float64)
-	for k, v := range s.upstreamHealth {
-		health[k] = v
-		healthHist[k] = append([]float64(nil), s.upstreamHealthHistory[k]...)
+	nodeHealth := make(map[string]map[string]float64)
+	nodeHealthHist := make(map[string]map[string][]float64)
+	for node, upstreams := range s.nodeUpstreamHealth {
+		nodeHealth[node] = make(map[string]float64)
+		nodeHealthHist[node] = make(map[string][]float64)
+		for up, lat := range upstreams {
+			nodeHealth[node][up] = lat
+			if hist, ok := s.nodeUpstreamHealthHistory[node][up]; ok {
+				nodeHealthHist[node][up] = append([]float64(nil), hist...)
+			}
+		}
 	}
 	s.healthMu.RUnlock()
 
 	return map[string]interface{}{
-		"top_domains":             s.toStats(domainCounts, "domains"),
-		"top_clients":             s.toStats(clientCounts, "clients"),
-		"rpm":                     rpm,
-		"rph":                     rph,
-		"rpd":                     rpd,
-		"total":                   totalEvents,
-		"nodes":                   nodeList,
-		"cache_hit_ratio":         cacheHitRatio,
-		"upstream_health":         health,
-		"upstream_health_history": healthHist,
-		"heatmap":                 heatmap,
-		"type_counts":             typeCounts,
+		"top_domains":      s.toStats(domainCounts, "domains"),
+		"top_clients":      s.toStats(clientCounts, "clients"),
+		"rpm":              rpm,
+		"rph":              rph,
+		"rpd":              rpd,
+		"total":            totalEvents,
+		"nodes":            nodeList,
+		"cache_hit_ratio":  cacheHitRatio,
+		"node_health":      nodeHealth,
+		"node_health_hist": nodeHealthHist,
+		"heatmap":          heatmap,
+		"type_counts":      typeCounts,
 	}
 }
 
@@ -642,19 +648,28 @@ func (s *Store) ArchiveStep(now time.Time) int {
 	return len(toInsert)
 }
 
-// SetUpstreamHealth updates the latency mapping and history for upstream DNS servers.
-func (s *Store) SetUpstreamHealth(health map[string]float64) {
+// SetUpstreamHealth updates the latency mapping and history for upstream DNS servers for a specific node.
+func (s *Store) SetUpstreamHealth(node string, health map[string]float64) {
+	if node == "" {
+		node = "local"
+	}
 	s.healthMu.Lock()
-	s.upstreamHealth = health
+	defer s.healthMu.Unlock()
+
+	if s.nodeUpstreamHealth[node] == nil {
+		s.nodeUpstreamHealth[node] = make(map[string]float64)
+		s.nodeUpstreamHealthHistory[node] = make(map[string][]float64)
+	}
+
+	s.nodeUpstreamHealth[node] = health
 	for ip, lat := range health {
-		hist := s.upstreamHealthHistory[ip]
+		hist := s.nodeUpstreamHealthHistory[node][ip]
 		hist = append(hist, lat)
 		if len(hist) > 20 {
 			hist = hist[1:]
 		}
-		s.upstreamHealthHistory[ip] = hist
+		s.nodeUpstreamHealthHistory[node][ip] = hist
 	}
-	s.healthMu.Unlock()
 }
 
 // GetAlias returns the friendly name for a client IP if configured.

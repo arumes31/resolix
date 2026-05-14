@@ -47,8 +47,15 @@ func (f *Forwarder) Enqueue(line string) {
 	f.backlogTotalSize += int64(len(line))
 }
 
-func (f *Forwarder) sendBatch(client *http.Client, lines []string) error {
-	data, err := json.Marshal(map[string]interface{}{"node": f.cfg.NodeName, "batch": lines})
+func (f *Forwarder) sendBatch(client *http.Client, lines []string, health map[string]float64) error {
+	payload := map[string]interface{}{"node": f.cfg.NodeName}
+	if len(lines) > 0 {
+		payload["batch"] = lines
+	}
+	if len(health) > 0 {
+		payload["health"] = health
+	}
+	data, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
@@ -124,7 +131,7 @@ func (f *Forwarder) Start() error {
 		f.backlog = f.backlog[batchSize:]
 		f.backlogMu.Unlock()
 
-		err := f.sendBatch(client, lines)
+		err := f.sendBatch(client, lines, nil)
 		if err == nil {
 			log.Printf("Successfully sent batch of %d lines to master", len(lines))
 			backoff = 1 * time.Second
@@ -166,6 +173,20 @@ func (f *Forwarder) Start() error {
 			}
 		}
 	}
+}
+
+// ReportHealth sends a health update to the master.
+func (f *Forwarder) ReportHealth(health map[string]float64) {
+	if f.cfg.Mode != "slave" || f.cfg.MasterURL == "" {
+		return
+	}
+	// Send health reports asynchronously to avoid blocking the health checker
+	go func() {
+		client := &http.Client{Timeout: 5 * time.Second}
+		if err := f.sendBatch(client, nil, health); err != nil {
+			log.Printf("Error reporting health to master: %v", err)
+		}
+	}()
 }
 
 // Stop cleanly shuts down the forwarder

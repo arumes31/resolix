@@ -147,6 +147,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, _ *http.Request) {
 	if err := s.tmpl.Execute(&buf, map[string]interface{}{
 		"Events": currentEvents,
 	}); err != nil {
+		log.Printf("Template execution error: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}

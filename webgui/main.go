@@ -120,14 +120,14 @@ func main() {
 					log.Println("Log ingestion loop exiting: channel closed")
 					return
 				}
-				if cfg.Debug {
-					if bytes.Contains(line, []byte("query[")) || bytes.Contains(line, []byte("reply")) {
-						// Use a prefix to distinguish from other logs
+				isData := bytes.Contains(line, []byte("query[")) || bytes.Contains(line, []byte("reply"))
+				if isData {
+					if cfg.Debug {
 						log.Printf("[INGEST] %s", string(line))
-					} else {
-						// Fallback: print everything for now to debug
-						log.Printf("[DEBUG] %s", string(line))
 					}
+				} else {
+					// Always print non-query/reply lines as they are likely errors or important info
+					log.Printf("[DNSMASQ] %s", string(line))
 				}
 
 				if cfg.Mode == "slave" {

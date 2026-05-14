@@ -16,6 +16,12 @@ cleanup() {
 
 trap cleanup SIGINT SIGTERM
 
+# Sanitize environment variables for CRLF (common when running on Windows)
+UPSTREAM_DNS=$(echo "$UPSTREAM_DNS" | tr -d '\r')
+HEALTHCHECK_DOMAIN=$(echo "$HEALTHCHECK_DOMAIN" | tr -d '\r')
+DOMAINS=$(echo "$DOMAINS" | tr -d '\r')
+TS_AUTHKEY=$(echo "$TS_AUTHKEY" | tr -d '\r')
+
 # Start tailscaled
 echo "Starting tailscaled"
 /usr/sbin/tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &
@@ -58,7 +64,7 @@ fi
 
 # Verify Tailscale status
 /usr/bin/tailscale status
-TAILSCALE_IP=$(/usr/bin/tailscale ip -4 | head -n 1)
+TAILSCALE_IP=$(/usr/bin/tailscale ip -4 | head -n 1 | tr -d '\r')
 if [ -n "$TAILSCALE_IP" ]; then
     echo "Tailscale is connected (IP: $TAILSCALE_IP)"
 else
@@ -72,6 +78,7 @@ generate_dnsmasq_conf() {
     cat > /etc/dnsmasq.conf <<EOL
 listen-address=$TAILSCALE_IP
 port=53
+bind-interfaces
 cache-size=25000
 dns-forward-max=150
 strict-order
@@ -100,7 +107,7 @@ EOL
 
     # Add upstream DNS servers to both instances (Instance 1 for general, Instance 2 for partial matches)
     for server in $UPSTREAM_DNS; do
-        server=$(echo "$server" | tr -d '[:space:]')
+        server=$(echo "$server" | tr -d '[:space:]\r')
         if [[ ! "$server" =~ ^[a-zA-Z0-9.:#-]+$ ]]; then
             echo "Warning: Skipping invalid upstream: $server"
             continue
@@ -112,7 +119,7 @@ EOL
 
     # Parse DOMAINS env variable (format: domain1:ip1,domain2:ip2)
     if [ -n "$DOMAINS" ]; then
-        DOMAINS_CLEAN=$(echo "$DOMAINS" | tr -d '[:space:]')
+        DOMAINS_CLEAN=$(echo "$DOMAINS" | tr -d '[:space:]\r')
         IFS=',' read -ra DOMAIN_LIST <<< "$DOMAINS_CLEAN"
         for entry in "${DOMAIN_LIST[@]}"; do
             domain=$(echo "$entry" | cut -d':' -f1)
@@ -130,6 +137,10 @@ EOL
     else
         echo "Warning: DOMAINS not provided, no custom DNS mappings will be applied"
     fi
+
+    # Final sanitization of config files to ensure no CRLF snuck in
+    sed -i 's/\r$//' /etc/dnsmasq.conf
+    sed -i 's/\r$//' /etc/dnsmasq-overrides.conf
 
     echo "Generated /etc/dnsmasq.conf (Main):"
     cat /etc/dnsmasq.conf
@@ -161,15 +172,15 @@ echo "Processes started: dnsmasq (PID: $DNSMASQ_PID), override-dnsmasq (PID: $OV
 # Monitor processes and exit if any core process dies
 while true; do
     if ! kill -0 $DNSMASQ_PID 2>/dev/null; then
-        echo "Error: main dnsmasq process died"
+        echo "Error: main dnsmasq process (PID: $DNSMASQ_PID) died. Check Web GUI logs for details."
         exit 1
     fi
     if ! kill -0 $OVERRIDE_PID 2>/dev/null; then
-        echo "Error: override dnsmasq process died"
+        echo "Error: override dnsmasq process (PID: $OVERRIDE_PID) died."
         exit 1
     fi
     if ! kill -0 $WEBGUI_PID 2>/dev/null; then
-        echo "Error: Web GUI process died"
+        echo "Error: Web GUI process (PID: $WEBGUI_PID) died."
         exit 1
     fi
     sleep 5

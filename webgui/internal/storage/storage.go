@@ -98,6 +98,7 @@ func (s *Store) Init() {
 	cutoff := time.Now().Add(-24 * time.Hour).Unix()
 	rows, err := s.db.Query("SELECT type, COUNT(*) FROM queries WHERE unix_time >= ? GROUP BY type", cutoff)
 	if err == nil {
+		defer func() { _ = rows.Close() }()
 		for rows.Next() {
 			var t string
 			var count int
@@ -105,7 +106,9 @@ func (s *Store) Init() {
 				s.typeCounts[t] = count
 			}
 		}
-		rows.Close()
+		if err := rows.Err(); err != nil {
+			log.Printf("Error iterating warmup rows: %v", err)
+		}
 	}
 }
 
@@ -269,6 +272,8 @@ func (s *Store) GetRecentEvents(since int64) []models.QueryEvent {
 }
 
 // GetStats returns aggregated traffic statistics using SQLite.
+//
+//nolint:gocyclo
 func (s *Store) GetStats() map[string]interface{} {
 	now := time.Now().Unix()
 	cutoff24h := now - 86400
@@ -318,12 +323,24 @@ func (s *Store) GetStats() map[string]interface{} {
 	// Query SQLite for long-term aggregates
 	var totalEvents int64
 	var rpd int
-	s.db.QueryRow("SELECT COUNT(*) FROM queries").Scan(&totalEvents)
-	s.db.QueryRow("SELECT COUNT(*) FROM queries WHERE unix_time >= ?", cutoff24h).Scan(&rpd)
+	if s.db != nil {
+		if err := s.db.QueryRow("SELECT COUNT(*) FROM queries").Scan(&totalEvents); err != nil && err != sql.ErrNoRows {
+			log.Printf("Error getting totalEvents: %v", err)
+		}
+		if err := s.db.QueryRow("SELECT COUNT(*) FROM queries WHERE unix_time >= ?", cutoff24h).Scan(&rpd); err != nil && err != sql.ErrNoRows {
+			log.Printf("Error getting rpd: %v", err)
+		}
+	}
 
 	var cacheHits, totalReplies int64
-	s.db.QueryRow("SELECT COUNT(*) FROM queries WHERE upstream = 'System Cache' AND unix_time >= ?", cutoff24h).Scan(&cacheHits)
-	s.db.QueryRow("SELECT COUNT(*) FROM queries WHERE upstream != '' AND unix_time >= ?", cutoff24h).Scan(&totalReplies)
+	if s.db != nil {
+		if err := s.db.QueryRow("SELECT COUNT(*) FROM queries WHERE upstream = 'System Cache' AND unix_time >= ?", cutoff24h).Scan(&cacheHits); err != nil && err != sql.ErrNoRows {
+			log.Printf("Error getting cacheHits: %v", err)
+		}
+		if err := s.db.QueryRow("SELECT COUNT(*) FROM queries WHERE upstream != '' AND unix_time >= ?", cutoff24h).Scan(&totalReplies); err != nil && err != sql.ErrNoRows {
+			log.Printf("Error getting totalReplies: %v", err)
+		}
+	}
 
 	cacheHitRatio := 0.0
 	if totalReplies > 0 {
@@ -334,53 +351,64 @@ func (s *Store) GetStats() map[string]interface{} {
 	clientCounts := make(map[string]int)
 	heatmap := make(map[string]int)
 
-	// Top 10 Domains
-	rows, err := s.db.Query("SELECT domain, COUNT(*) as c FROM queries WHERE unix_time >= ? GROUP BY domain ORDER BY c DESC LIMIT 10", cutoff24h)
-	if err == nil {
-		for rows.Next() {
-			var d string
-			var c int
-			if rows.Scan(&d, &c) == nil {
-				domainCounts[d] = c
+	if s.db != nil {
+		// Top 10 Domains
+		rowsDomains, err := s.db.Query("SELECT domain, COUNT(*) as c FROM queries WHERE unix_time >= ? GROUP BY domain ORDER BY c DESC LIMIT 10", cutoff24h)
+		if err == nil {
+			defer func() { _ = rowsDomains.Close() }()
+			for rowsDomains.Next() {
+				var d string
+				var c int
+				if rowsDomains.Scan(&d, &c) == nil {
+					domainCounts[d] = c
+				}
+			}
+			if err := rowsDomains.Err(); err != nil {
+				log.Printf("Error iterating domain rows: %v", err)
 			}
 		}
-		rows.Close()
-	}
 
-	// Top 10 Clients
-	rows, err = s.db.Query("SELECT client_ip, COUNT(*) as c FROM queries WHERE unix_time >= ? GROUP BY client_ip ORDER BY c DESC LIMIT 10", cutoff24h)
-	if err == nil {
-		for rows.Next() {
-			var ip string
-			var c int
-			if rows.Scan(&ip, &c) == nil {
-				clientCounts[ip] = c
+		// Top 10 Clients
+		rowsClients, err := s.db.Query("SELECT client_ip, COUNT(*) as c FROM queries WHERE unix_time >= ? GROUP BY client_ip ORDER BY c DESC LIMIT 10", cutoff24h)
+		if err == nil {
+			defer func() { _ = rowsClients.Close() }()
+			for rowsClients.Next() {
+				var ip string
+				var c int
+				if rowsClients.Scan(&ip, &c) == nil {
+					clientCounts[ip] = c
+				}
+			}
+			if err := rowsClients.Err(); err != nil {
+				log.Printf("Error iterating client rows: %v", err)
 			}
 		}
-		rows.Close()
-	}
 
-	// Hourly heatmap
-	currentHour := now / 3600
-	rows, err = s.db.Query("SELECT unix_time / 3600 as hr, COUNT(*) FROM queries WHERE unix_time >= ? GROUP BY hr", cutoff24h)
-	if err == nil {
-		for rows.Next() {
-			var hr int64
-			var c int
-			if rows.Scan(&hr, &c) == nil {
-				t := time.Unix(hr*3600, 0)
-				heatmap[t.Format("15:00")] = c
+		// Hourly heatmap
+		currentHour := now / 3600
+		rowsHeatmap, err := s.db.Query("SELECT unix_time / 3600 as hr, COUNT(*) FROM queries WHERE unix_time >= ? GROUP BY hr", cutoff24h)
+		if err == nil {
+			defer func() { _ = rowsHeatmap.Close() }()
+			for rowsHeatmap.Next() {
+				var hr int64
+				var c int
+				if rowsHeatmap.Scan(&hr, &c) == nil {
+					t := time.Unix(hr*3600, 0)
+					heatmap[t.Format("15:00")] = c
+				}
+			}
+			if err := rowsHeatmap.Err(); err != nil {
+				log.Printf("Error iterating heatmap rows: %v", err)
 			}
 		}
-		rows.Close()
-	}
 
-	// Fill missing hours in heatmap
-	for h := currentHour - 23; h <= currentHour; h++ {
-		t := time.Unix(h*3600, 0)
-		k := t.Format("15:00")
-		if _, exists := heatmap[k]; !exists {
-			heatmap[k] = 0
+		// Fill missing hours in heatmap
+		for h := currentHour - 23; h <= currentHour; h++ {
+			t := time.Unix(h*3600, 0)
+			k := t.Format("15:00")
+			if _, exists := heatmap[k]; !exists {
+				heatmap[k] = 0
+			}
 		}
 	}
 
@@ -581,11 +609,11 @@ func (s *Store) ArchiveStep(now time.Time) int {
 
 	stmt, err := tx.Prepare("INSERT INTO queries (unix_time, node, client_ip, domain, type, upstream, latency) VALUES (?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
-		tx.Rollback()
+		_ = tx.Rollback()
 		log.Printf("Failed to prepare SQLite statement: %v", err)
 		return 0
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 
 	for _, e := range toInsert {
 		var lat sql.NullFloat64

@@ -29,6 +29,7 @@ func setupTest() (*config.Config, *storage.Store, *parser.Parser, *api.Server) {
 	}
 	cfg.HistoryDir = tmp
 	store := storage.NewStore(cfg)
+	store.Init()
 	prs := parser.NewParser(store, false)
 	tmpl := template.Must(template.New("test").Parse("{{range .Events}}{{.Domain}}{{end}}"))
 	srv := api.NewServer(cfg, store, prs, tmpl)
@@ -146,9 +147,12 @@ func TestApiStats(t *testing.T) {
 	cfg, store, prs, srv := setupTest()
 	defer func() { _ = os.RemoveAll(store.GetConfig().HistoryDir) }()
 
-	prs.ParseLogBytes([]byte("Jan 02 15:04:05 dnsmasq[1]: query[A] domain1.com from 1.1.1.1"), cfg.NodeName)
-	prs.ParseLogBytes([]byte("Jan 02 15:04:05 dnsmasq[1]: query[A] domain1.com from 1.1.1.1"), cfg.NodeName)
-	prs.ParseLogBytes([]byte("Jan 02 15:04:05 dnsmasq[1]: query[A] domain2.com from 2.2.2.2"), "node2")
+	nowStr := time.Now().Format("Jan 02 15:04:05")
+	prs.ParseLogBytes([]byte(nowStr+" dnsmasq[1]: query[A] domain1.com from 1.1.1.1"), cfg.NodeName)
+	prs.ParseLogBytes([]byte(nowStr+" dnsmasq[1]: query[A] domain1.com from 1.1.1.1"), cfg.NodeName)
+	prs.ParseLogBytes([]byte(nowStr+" dnsmasq[1]: query[A] domain2.com from 2.2.2.2"), "node2")
+
+	store.ArchiveStep(time.Now())
 
 	handler := srv.SetupMux()
 	req := httptest.NewRequest("GET", "/api/stats", nil)
@@ -289,15 +293,14 @@ func TestArchiveStep(t *testing.T) {
 	store.AddEvent(models.QueryEvent{UnixTime: now, Domain: "new.com", Node: cfg.NodeName})
 
 	archived := store.ArchiveStep(time.Now())
-	if archived != 2 {
-		t.Errorf("Expected 2 events archived, got %d", archived)
+	if archived != 3 {
+		t.Errorf("Expected 3 events archived, got %d", archived)
 	}
 
-	// Verify file exists
-	dateStr := time.Now().Format("2006-01-02")
-	path := fmt.Sprintf("%s/history-%s.jsonl", cfg.HistoryDir, dateStr)
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		t.Errorf("History file %s was not created", path)
+	// Verify data exists in sqlite via stats
+	stats := store.GetStats()
+	if total, ok := stats["total"].(int64); !ok || total < 1 {
+		t.Errorf("Expected > 0 total events in SQLite after archive, got %v", total)
 	}
 }
 

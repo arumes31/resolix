@@ -108,10 +108,30 @@ func Decrypt(encodedCiphertext string, password string) ([]byte, error) {
 		return nil, errors.New("ciphertext too short")
 	}
 
-	// Extract the nonce and ciphertext
+	// Try new fast format: [nonce][ciphertext]
 	nonce, ciphertext := data[:nonceSize], data[nonceSize:]
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err == nil {
+		return plaintext, nil
+	}
 
-	// Old formats (with random salts) will fail authentication here very quickly,
-	// preventing the O(n * 100ms) startup hang.
-	return gcm.Open(nil, nonce, ciphertext, nil)
+	// Try old format: [salt 16 bytes][nonce][ciphertext]
+	if len(data) >= 16+nonceSize {
+		oldSalt := data[:16]
+		oldNonce := data[16 : 16+nonceSize]
+		oldCiphertext := data[16+nonceSize:]
+
+		// Re-derive key with the old salt from the blob
+		oldKey := pbkdf2.Key([]byte(password), oldSalt, getIterCount(), 32, sha256.New)
+		oldBlock, err := aes.NewCipher(oldKey)
+		if err == nil {
+			if oldGCM, err := cipher.NewGCM(oldBlock); err == nil {
+				if oldPlaintext, err := oldGCM.Open(nil, oldNonce, oldCiphertext, nil); err == nil {
+					return oldPlaintext, nil
+				}
+			}
+		}
+	}
+
+	return nil, err
 }

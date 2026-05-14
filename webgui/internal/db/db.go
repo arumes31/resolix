@@ -19,6 +19,16 @@ func InitDB(historyDir string) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
 	}
 
+	var success bool
+	defer func() {
+		if !success {
+			_ = db.Close()
+		}
+	}()
+
+	// Ensure only a single writer connection to avoid WAL writer contention
+	db.SetMaxOpenConns(1)
+
 	// Optimize SQLite for high concurrency and write throughput
 	// WAL mode allows concurrent readers while a write is happening.
 	_, err = db.Exec(`
@@ -53,5 +63,6 @@ func InitDB(historyDir string) (*sql.DB, error) {
 	}
 
 	log.Printf("SQLite database initialized at %s", dbPath)
+	success = true
 	return db, nil
 }

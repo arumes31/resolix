@@ -19,14 +19,22 @@ type QueryEvent struct {
 	ID       string   `json:"id"`
 }
 
+// TimestampFormatted returns a human-readable time string for the template.
+func (e QueryEvent) TimestampFormatted() string {
+	return time.Unix(e.UnixTime, 0).Format("15:04:05")
+}
+
+// LatencyFormatted returns a human-readable latency string for the template.
+func (e QueryEvent) LatencyFormatted() string {
+	if e.Latency == nil {
+		return "-"
+	}
+	return fmt.Sprintf("%.1fms", *e.Latency)
+}
+
 // MarshalJSON provides custom JSON serialization to add human-readable timestamps and latencies.
 func (e QueryEvent) MarshalJSON() ([]byte, error) {
 	type Alias QueryEvent
-	latencyFormatted := "-"
-	if e.Latency != nil {
-		latencyFormatted = fmt.Sprintf("%.1fms", *e.Latency)
-	}
-
 	return json.Marshal(&struct {
 		Timestamp          string `json:"timestamp"`
 		TimestampFormatted string `json:"timestampFormatted"`
@@ -34,8 +42,8 @@ func (e QueryEvent) MarshalJSON() ([]byte, error) {
 		Alias
 	}{
 		Timestamp:          time.Unix(e.UnixTime, 0).Format(time.Stamp),
-		TimestampFormatted: time.Unix(e.UnixTime, 0).Format("15:04:05"),
-		LatencyFormatted:   latencyFormatted,
+		TimestampFormatted: e.TimestampFormatted(),
+		LatencyFormatted:   e.LatencyFormatted(),
 		Alias:              (Alias)(e),
 	})
 }

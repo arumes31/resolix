@@ -81,16 +81,13 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 			parsedTime = now
 		}
 
-		tsStr := parsedTime.Format(time.Stamp) // Fallback or parsed timestamp
-
 		event := models.QueryEvent{
-			Timestamp:          tsStr,
-			TimestampFormatted: parsedTime.Format("15:04:05"),
-			UnixTime:           parsedTime.Unix(),
-			Type:               qType,
-			Domain:             domain,
-			ClientIP:           clientIP,
-			Node:               node,
+			UnixTime: parsedTime.Unix(),
+			Type:     qType,
+			Domain:   domain,
+			ClientIP: clientIP,
+			Node:     node,
+			Alias:    p.store.GetAlias(clientIP),
 		}
 
 		p.store.SetPending(node, domain, parsedTime)
@@ -115,6 +112,10 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 			switch {
 			case bytes.Equal(action, []byte("reply")):
 				upstream = pendingUpstream
+				// Feature #200: Recognize internal override instance
+				if upstream == "127.0.0.1#5353" {
+					upstream = "Local Override"
+				}
 			case bytes.Equal(action, []byte("cached")):
 				upstream = "System Cache"
 			case bytes.Equal(action, []byte("config")):

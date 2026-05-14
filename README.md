@@ -2,6 +2,11 @@
 
 A high-performance Tailscale DNS server that provides custom DNS overrides and intelligent upstream forwarding with a premium real-time monitoring dashboard.
 
+### 🔒 Security Features
+- **Tailscale-Only Overrides**: Custom DNS mappings are only applied to requests originating from Tailscale IP ranges (`100.64.0.0/10` and `fd7a:115c:a1e0::/48`). Non-Tailscale clients (e.g., via subnet routers) receive standard upstream results, preventing unauthorized access to internal resources.
+- **Master/Slave Encryption**: All log ingestion traffic can be secured via `INGEST_SECRET`.
+- **Private History**: History files are stored in a password-protected JSONL format.
+
 ## 🔄 DNS Flow
 
 ```mermaid

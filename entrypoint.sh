@@ -9,8 +9,8 @@ HEALTHCHECK_DOMAIN=${HEALTHCHECK_DOMAIN:-"google.com"}
 # Cleanup function for graceful shutdown
 cleanup() {
     echo "Shutting down..."
-    kill "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" 2>/dev/null
-    wait "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" 2>/dev/null
+    kill "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" "$OVERRIDE_PID" 2>/dev/null
+    wait "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" "$OVERRIDE_PID" 2>/dev/null
     exit 0
 }
 
@@ -68,6 +68,7 @@ fi
 
 # Function to generate dnsmasq.conf
 generate_dnsmasq_conf() {
+    # Instance 1: Main DNS Server (Tagging & Forwarding)
     cat > /etc/dnsmasq.conf <<EOL
 listen-address=$TAILSCALE_IP
 port=53
@@ -79,18 +80,34 @@ log-async=25
 log-facility=-
 local-ttl=60
 max-ttl=600
+
+# Feature #200: Define Tailscale client tags (IPv4 and IPv6)
+tag-if=set:tailscale,src:100.64.0.0/10
+tag-if=set:tailscale,src:fd7a:115c:a1e0::/48
 EOL
 
-    # Add upstream DNS servers (Go app will handle health updates in future versions via signals)
-    # For now, we add all provided upstreams initially.
+    # Instance 2: Override Server (Hidden)
+    cat > /etc/dnsmasq-overrides.conf <<EOL
+listen-address=127.0.0.1
+port=5353
+bind-interfaces
+no-resolv
+no-poll
+local-ttl=60
+max-ttl=600
+# We don't log queries here to avoid duplicate entries in the monitor
+EOL
+
+    # Add upstream DNS servers to both instances (Instance 1 for general, Instance 2 for partial matches)
     for server in $UPSTREAM_DNS; do
         server=$(echo "$server" | tr -d '[:space:]')
         if [[ ! "$server" =~ ^[a-zA-Z0-9.:#-]+$ ]]; then
             echo "Warning: Skipping invalid upstream: $server"
             continue
         fi
-        echo "Adding upstream: $server"
+        echo "Adding upstream to main config: $server"
         echo "server=$server" >> /etc/dnsmasq.conf
+        echo "server=$server" >> /etc/dnsmasq-overrides.conf
     done
 
     # Parse DOMAINS env variable (format: domain1:ip1,domain2:ip2)
@@ -101,8 +118,11 @@ EOL
             domain=$(echo "$entry" | cut -d':' -f1)
             ip=$(echo "$entry" | cut -d':' -f2)
             if [ -n "$domain" ] && [ -n "$ip" ]; then
-                echo "Adding DNS mapping: $domain -> $ip"
-                echo "address=/$domain/$ip" >> /etc/dnsmasq.conf
+                echo "Adding DNS mapping for Tailscale clients: $domain -> $ip"
+                # Main instance: forward to override instance ONLY if tagged as tailscale
+                echo "server=tag:tailscale,/$domain/127.0.0.1#5353" >> /etc/dnsmasq.conf
+                # Override instance: perform the actual address mapping
+                echo "address=/$domain/$ip" >> /etc/dnsmasq-overrides.conf
             else
                 echo "Warning: Invalid domain mapping: $entry"
             fi
@@ -111,8 +131,10 @@ EOL
         echo "Warning: DOMAINS not provided, no custom DNS mappings will be applied"
     fi
 
-    echo "Generated dnsmasq.conf:"
+    echo "Generated /etc/dnsmasq.conf (Main):"
     cat /etc/dnsmasq.conf
+    echo "Generated /etc/dnsmasq-overrides.conf (Override):"
+    cat /etc/dnsmasq-overrides.conf
 }
 
 # Generate initial dnsmasq.conf
@@ -126,16 +148,24 @@ mkfifo /tmp/dnsmasq_logs 2>/dev/null || true
 /usr/bin/webgui < /tmp/dnsmasq_logs &
 WEBGUI_PID=$!
 
-# Start dnsmasq writing to the pipe (capture both stdout and stderr)
-/usr/sbin/dnsmasq -k > /tmp/dnsmasq_logs 2>&1 &
+# Start the override dnsmasq (hidden)
+/usr/sbin/dnsmasq -k --conf-file=/etc/dnsmasq-overrides.conf >/dev/null 2>&1 &
+OVERRIDE_PID=$!
+
+# Start main dnsmasq writing to the pipe (capture both stdout and stderr)
+/usr/sbin/dnsmasq -k --conf-file=/etc/dnsmasq.conf > /tmp/dnsmasq_logs 2>&1 &
 DNSMASQ_PID=$!
 
-echo "Processes started: dnsmasq (PID: $DNSMASQ_PID), Web GUI (PID: $WEBGUI_PID)"
+echo "Processes started: dnsmasq (PID: $DNSMASQ_PID), override-dnsmasq (PID: $OVERRIDE_PID), Web GUI (PID: $WEBGUI_PID)"
 
-# Monitor processes and exit if either core process dies
+# Monitor processes and exit if any core process dies
 while true; do
     if ! kill -0 $DNSMASQ_PID 2>/dev/null; then
-        echo "Error: dnsmasq process died"
+        echo "Error: main dnsmasq process died"
+        exit 1
+    fi
+    if ! kill -0 $OVERRIDE_PID 2>/dev/null; then
+        echo "Error: override dnsmasq process died"
         exit 1
     fi
     if ! kill -0 $WEBGUI_PID 2>/dev/null; then

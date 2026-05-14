@@ -30,7 +30,7 @@ type Server struct {
 	parser *parser.Parser
 	tmpl   *template.Template
 
-	// SSE Broadcaster (Improvement 78)
+	// SSE Broadcaster
 	subscribers map[chan models.QueryEvent]int
 	subMu       sync.Mutex
 }
@@ -75,6 +75,7 @@ func (s *Server) SetupMux() http.Handler {
 	mux.HandleFunc("/", s.handleRoot)
 	mux.HandleFunc("/api/events", s.handleEvents)
 	mux.HandleFunc("/api/stats", s.handleStats)
+	mux.HandleFunc("/api/client_stats", s.handleClientStats)
 	mux.HandleFunc("/api/simulate", s.handleSimulate)
 
 	handler := s.gzipMiddleware(mux)
@@ -166,6 +167,26 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleStats(w http.ResponseWriter, _ *http.Request) {
 	stats := s.store.GetStats()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(stats)
+}
+
+func (s *Server) handleClientStats(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.IngestSecret != "" {
+		auth := r.Header.Get("Authorization")
+		expected := "Bearer " + s.cfg.IngestSecret
+		if subtle.ConstantTimeCompare([]byte(auth), []byte(expected)) != 1 {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
+
+	ip := r.URL.Query().Get("ip")
+	if ip == "" || net.ParseIP(ip) == nil {
+		http.Error(w, "Missing or invalid ip parameter", http.StatusBadRequest)
+		return
+	}
+	stats := s.store.GetClientStats(ip)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(stats)
 }

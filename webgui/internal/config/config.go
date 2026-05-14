@@ -47,6 +47,7 @@ type Config struct {
 	ScanLimit        int
 	MaxBacklogSize   int64
 	UpstreamDNS      string
+	ClientAliases    map[string]string
 	Debug            bool
 }
 
@@ -97,6 +98,24 @@ func LoadConfig() *Config {
 		}
 	}
 
+	aliases := make(map[string]string)
+	if a := os.Getenv("CLIENT_ALIASES"); a != "" {
+		for _, pair := range strings.Split(a, ",") {
+			parts := strings.Split(pair, ":")
+			if len(parts) == 2 {
+				key := strings.TrimSpace(parts[0])
+				val := strings.TrimSpace(parts[1])
+				if key == "" || val == "" {
+					log.Printf("Warning: Invalid CLIENT_ALIASES mapping: %q", pair) // #nosec G706
+					continue
+				}
+				aliases[key] = val
+			} else {
+				log.Printf("Warning: Invalid CLIENT_ALIASES mapping: %q", pair) // #nosec G706
+			}
+		}
+	}
+
 	cfg := &Config{
 		Mode:             mode,
 		MasterURL:        masterURL,
@@ -113,6 +132,7 @@ func LoadConfig() *Config {
 		ScanLimit:        DefaultScanLimit,
 		MaxBacklogSize:   DefaultMaxBacklogSize,
 		UpstreamDNS:      os.Getenv("UPSTREAM_DNS"),
+		ClientAliases:    aliases,
 		Debug:            strings.ToLower(os.Getenv("DEBUG")) == "true",
 	}
 

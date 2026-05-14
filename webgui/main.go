@@ -53,7 +53,7 @@ func main() {
 	})
 
 	// Start Trend Analysis
-	store.StartStatsTrends()
+	store.StartStatsTrends(ctx)
 
 	// History Archiver
 	go func() {

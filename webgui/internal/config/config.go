@@ -103,7 +103,15 @@ func LoadConfig() *Config {
 		for _, pair := range strings.Split(a, ",") {
 			parts := strings.Split(pair, ":")
 			if len(parts) == 2 {
-				aliases[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+				key := strings.TrimSpace(parts[0])
+				val := strings.TrimSpace(parts[1])
+				if key == "" || val == "" {
+					log.Printf("Warning: Invalid CLIENT_ALIASES mapping: %s", pair)
+					continue
+				}
+				aliases[key] = val
+			} else {
+				log.Printf("Warning: Invalid CLIENT_ALIASES mapping: %s", pair)
 			}
 		}
 	}

@@ -81,7 +81,6 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 			parsedTime = now
 		}
 
-
 		event := models.QueryEvent{
 			UnixTime: parsedTime.Unix(),
 			Type:     qType,

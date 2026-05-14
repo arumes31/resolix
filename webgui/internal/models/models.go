@@ -29,8 +29,8 @@ func (e QueryEvent) MarshalJSON() ([]byte, error) {
 
 	return json.Marshal(&struct {
 		Timestamp          string `json:"timestamp"`
-		TimestampFormatted string `json:"TimestampFormatted"`
-		LatencyFormatted   string `json:"LatencyFormatted"`
+		TimestampFormatted string `json:"timestampFormatted"`
+		LatencyFormatted   string `json:"latencyFormatted"`
 		Alias
 	}{
 		Timestamp:          time.Unix(e.UnixTime, 0).Format(time.Stamp),

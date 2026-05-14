@@ -489,7 +489,7 @@
                 <td><span class="badge" style="background: rgba(255,255,255,0.1); font-size: 0.7rem;">${escapeHtml(e.node || 'local')}</span></td>
                 <td><span class="badge badge-type">${escapeHtml(e.type)}</span></td>
                 <td class="domain">${escapeHtml(e.domain)}</td>
-                <td onclick="showClientStats('${escapeHtml(e.client_ip)}')" style="cursor: pointer; position: relative;" title="Click for details">
+                <td onclick='showClientStats(${JSON.stringify(e.client_ip)})' style="cursor: pointer; position: relative;" title="Click for details">
                     <span class="badge badge-ip">${escapeHtml(e.client_ip)}</span>
                     ${e.alias ? `<span class="alias-tag">${escapeHtml(e.alias)}</span>` : ''}
                 </td>
@@ -583,21 +583,25 @@
                 const typeEl = document.getElementById('typeBreakdown');
                 if (stats.type_counts) {
                     const total = Object.values(stats.type_counts).reduce((a, b) => a + b, 0);
-                    const sortedTypes = Object.entries(stats.type_counts).sort((a, b) => b[1] - a[1]).slice(0, 5);
-                    typeEl.innerHTML = sortedTypes.map(([type, count]) => {
-                        const pct = (count / total) * 100;
-                        return `
-                            <div style="font-size: 0.75rem;">
-                                <div style="display: flex; justify-content: space-between; margin-bottom: 2px;">
-                                    <span>${escapeHtml(type)}</span>
-                                    <span style="opacity: 0.6">${count} (${pct.toFixed(1)}%)</span>
+                    if (total === 0) {
+                        typeEl.innerHTML = '<div style="font-size: 0.75rem; color: var(--text-secondary);">No data</div>';
+                    } else {
+                        const sortedTypes = Object.entries(stats.type_counts).sort((a, b) => b[1] - a[1]).slice(0, 5);
+                        typeEl.innerHTML = sortedTypes.map(([type, count]) => {
+                            const pct = (count / total) * 100;
+                            return `
+                                <div style="font-size: 0.75rem;">
+                                    <div style="display: flex; justify-content: space-between; margin-bottom: 2px;">
+                                        <span>${escapeHtml(type)}</span>
+                                        <span style="opacity: 0.6">${count} (${pct.toFixed(1)}%)</span>
+                                    </div>
+                                    <div style="height: 4px; background: rgba(255,255,255,0.05); border-radius: 2px;">
+                                        <div style="height: 100%; background: var(--accent-color); width: ${pct}%; border-radius: 2px; opacity: 0.8"></div>
+                                    </div>
                                 </div>
-                                <div style="height: 4px; background: rgba(255,255,255,0.05); border-radius: 2px;">
-                                    <div style="height: 100%; background: var(--accent-color); width: ${pct}%; border-radius: 2px; opacity: 0.8"></div>
-                                </div>
-                            </div>
-                        `;
-                    }).join('');
+                            `;
+                        }).join('');
+                    }
                 }
 
                 // Update heatmap
@@ -659,13 +663,13 @@
             }
 
             // Advanced Search Parsing
-            const parts = searchTerm.split(' ');
+            const parts = searchTerm.split(' ').filter(p => p.trim() !== '');
             const filtered = allEvents.filter(e => {
                 return parts.every(p => {
-                    if (p.startsWith('node:')) return (e.node || 'local').toLowerCase().includes(p.substring(5));
-                    if (p.startsWith('type:')) return e.type.toLowerCase().includes(p.substring(5));
-                    if (p.startsWith('client:')) return e.client_ip.toLowerCase().includes(p.substring(7));
-                    if (p.startsWith('alias:')) return (e.alias || '').toLowerCase().includes(p.substring(6));
+                    if (p.startsWith('node:')) return p.length > 5 && (e.node || 'local').toLowerCase().includes(p.substring(5));
+                    if (p.startsWith('type:')) return p.length > 5 && e.type.toLowerCase().includes(p.substring(5));
+                    if (p.startsWith('client:')) return p.length > 7 && e.client_ip.toLowerCase().includes(p.substring(7));
+                    if (p.startsWith('alias:')) return p.length > 6 && (e.alias || '').toLowerCase().includes(p.substring(6));
                     return e.domain.toLowerCase().includes(p) || 
                            e.client_ip.toLowerCase().includes(p) ||
                            (e.alias || '').toLowerCase().includes(p) ||
@@ -717,7 +721,7 @@
             modal.style.display = 'flex';
             
             try {
-                const response = await fetch(`/api/client_stats?ip=${ip}`);
+                const response = await fetch(`/api/client_stats?ip=${encodeURIComponent(ip)}`);
                 const data = await response.json();
                 
                 document.getElementById('modalRPM').textContent = data.rpm;

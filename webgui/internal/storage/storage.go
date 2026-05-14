@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -68,6 +69,8 @@ type Store struct {
 	typeCounts       map[string]int
 	clientRPMBuckets map[string]*[60]int
 	clientRPMTimes   map[string]*[60]int64
+	clientRPHBuckets map[string]*[60]int
+	clientRPHTimes   map[string]*[60]int64
 }
 
 type pendingInfo struct {
@@ -78,24 +81,26 @@ type pendingInfo struct {
 // NewStore initializes a new Store with the provided configuration.
 func NewStore(cfg *config.Config) *Store {
 	return &Store{
-		cfg:                cfg,
-		events:             make([]models.QueryEvent, cfg.MaxEvents),
-		pendingQueries:     make(map[string]map[string][]pendingInfo),
-		hourlyStats:        make(map[int64]int),
-		windowDomainCounts: make(map[string]int),
-		windowClientCounts: make(map[string]int),
-		lastArchivedTime:   0,
-		nodeRPMBuckets:     make(map[string]*[60]int),
-		nodeRPMTimes:       make(map[string]*[60]int64),
-		nodeRPHBuckets:     make(map[string]*[60]int),
-		nodeRPHTimes:       make(map[string]*[60]int64),
-		internPool:         make(map[string]string),
+		cfg:                   cfg,
+		events:                make([]models.QueryEvent, cfg.MaxEvents),
+		pendingQueries:        make(map[string]map[string][]pendingInfo),
+		hourlyStats:           make(map[int64]int),
+		windowDomainCounts:    make(map[string]int),
+		windowClientCounts:    make(map[string]int),
+		lastArchivedTime:      0,
+		nodeRPMBuckets:        make(map[string]*[60]int),
+		nodeRPMTimes:          make(map[string]*[60]int64),
+		nodeRPHBuckets:        make(map[string]*[60]int),
+		nodeRPHTimes:          make(map[string]*[60]int64),
+		internPool:            make(map[string]string),
 		upstreamHealth:        make(map[string]float64),
 		upstreamHealthHistory: make(map[string][]float64),
 		lastTopStats:          make(map[string][]models.StatEntry),
 		typeCounts:            make(map[string]int),
 		clientRPMBuckets:      make(map[string]*[60]int),
 		clientRPMTimes:        make(map[string]*[60]int64),
+		clientRPHBuckets:      make(map[string]*[60]int),
+		clientRPHTimes:        make(map[string]*[60]int64),
 	}
 }
 
@@ -248,12 +253,20 @@ func (s *Store) AddEvent(e models.QueryEvent) {
 	if s.clientRPMBuckets[e.ClientIP] == nil {
 		s.clientRPMBuckets[e.ClientIP] = &[60]int{}
 		s.clientRPMTimes[e.ClientIP] = &[60]int64{}
+		s.clientRPHBuckets[e.ClientIP] = &[60]int{}
+		s.clientRPHTimes[e.ClientIP] = &[60]int64{}
 	}
 	if s.clientRPMTimes[e.ClientIP][secBucket] != e.UnixTime {
 		s.clientRPMTimes[e.ClientIP][secBucket] = e.UnixTime
 		s.clientRPMBuckets[e.ClientIP][secBucket] = 1
 	} else {
 		s.clientRPMBuckets[e.ClientIP][secBucket]++
+	}
+	if s.clientRPHTimes[e.ClientIP][minBucket] != minuteStart {
+		s.clientRPHTimes[e.ClientIP][minBucket] = minuteStart
+		s.clientRPHBuckets[e.ClientIP][minBucket] = 1
+	} else {
+		s.clientRPHBuckets[e.ClientIP][minBucket]++
 	}
 
 	s.statsMu.Unlock()
@@ -340,6 +353,7 @@ func (s *Store) GetRecentEvents(since int64) []models.QueryEvent {
 	}
 	return result
 }
+
 // GetStats returns aggregated traffic statistics.
 func (s *Store) GetStats() map[string]interface{} {
 	domainCounts := make(map[string]int)
@@ -351,6 +365,7 @@ func (s *Store) GetStats() map[string]interface{} {
 	rpd := 0
 
 	s.statsMu.RLock()
+	totalEventsLocal := s.totalEvents
 	for i := 0; i < 60; i++ {
 		if now-s.rpmTimes[i] < 60 {
 			rpm += s.rpmBuckets[i]
@@ -478,7 +493,7 @@ func (s *Store) GetStats() map[string]interface{} {
 		"rpm":                     rpm,
 		"rph":                     rph,
 		"rpd":                     rpd,
-		"total":                   s.totalEvents,
+		"total":                   totalEventsLocal,
 		"nodes":                   nodeList,
 		"cache_hit_ratio":         cacheRatio,
 		"upstream_health":         health,
@@ -498,21 +513,27 @@ func (s *Store) GetClientStats(ip string) map[string]interface{} {
 	rph := 0
 	rpmHistory := make([]int, 60)
 
-	buckets := s.clientRPMBuckets[ip]
-	times := s.clientRPMTimes[ip]
+	rpmBuckets := s.clientRPMBuckets[ip]
+	rpmTimes := s.clientRPMTimes[ip]
+	rphBuckets := s.clientRPHBuckets[ip]
+	rphTimes := s.clientRPHTimes[ip]
 
-	if buckets != nil && times != nil {
+	if rpmBuckets != nil && rpmTimes != nil {
 		for i := 0; i < 60; i++ {
-			if now-times[i] < 60 {
-				rpm += buckets[i]
-			}
-			if now-times[i] < 3600 {
-				rph += buckets[i]
+			if now-rpmTimes[i] < 60 {
+				rpm += rpmBuckets[i]
 			}
 			// Fill historical window for sparkline (last 60 secs)
 			idx := (now - 59 + int64(i)) % 60
-			if now-times[idx] < 60 {
-				rpmHistory[i] = buckets[idx]
+			if now-rpmTimes[idx] < 60 {
+				rpmHistory[i] = rpmBuckets[idx]
+			}
+		}
+	}
+	if rphBuckets != nil && rphTimes != nil {
+		for i := 0; i < 60; i++ {
+			if now-rphTimes[i] < 3600 {
+				rph += rphBuckets[i]
 			}
 		}
 	}
@@ -726,11 +747,15 @@ func (s *Store) GetAlias(ip string) string {
 }
 
 // StartStatsTrends begins periodic snapshots of top lists for trend analysis.
-func (s *Store) StartStatsTrends() {
+func (s *Store) StartStatsTrends(ctx context.Context) {
 	go func() {
 		for {
-			s.updateTrends()
-			time.Sleep(5 * time.Minute)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Minute):
+				s.updateTrends()
+			}
 		}
 	}()
 }

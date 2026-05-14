@@ -45,6 +45,9 @@ func NewChecker(cfg *config.Config, upstreamDNS string) *Checker {
 			c.latencies[s] = -1
 		}
 	}
+	if len(initialHealthy) == 0 {
+		initialHealthy = servers
+	}
 	c.healthy = initialHealthy
 	return c
 }
@@ -128,8 +131,8 @@ func (c *Checker) Start(ctx context.Context, onChange func([]string, map[string]
 			c.latencies = newLatencies
 			changed := !equalSlices(c.healthy, newHealthy)
 			c.healthy = newHealthy
-			
-			currentHealthy := c.healthy
+
+			currentHealthy := append([]string(nil), c.healthy...)
 			currentLatencies := make(map[string]float64)
 			for k, v := range c.latencies {
 				currentLatencies[k] = v

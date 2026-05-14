@@ -172,9 +172,18 @@ func (s *Server) handleStats(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleClientStats(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.IngestSecret != "" {
+		auth := r.Header.Get("Authorization")
+		expected := "Bearer " + s.cfg.IngestSecret
+		if subtle.ConstantTimeCompare([]byte(auth), []byte(expected)) != 1 {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
+
 	ip := r.URL.Query().Get("ip")
-	if ip == "" {
-		http.Error(w, "Missing ip parameter", http.StatusBadRequest)
+	if ip == "" || net.ParseIP(ip) == nil {
+		http.Error(w, "Missing or invalid ip parameter", http.StatusBadRequest)
 		return
 	}
 	stats := s.store.GetClientStats(ip)

@@ -9,8 +9,8 @@ HEALTHCHECK_DOMAIN=${HEALTHCHECK_DOMAIN:-"google.com"}
 # Cleanup function for graceful shutdown
 cleanup() {
     echo "Shutting down..."
-    kill "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" 2>/dev/null
-    wait "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" 2>/dev/null
+    kill "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" "$OVERRIDE_PID" 2>/dev/null
+    wait "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" "$OVERRIDE_PID" 2>/dev/null
     exit 0
 }
 

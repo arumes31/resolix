@@ -11,11 +11,17 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"sync"
 
 	"golang.org/x/crypto/pbkdf2"
 )
 
-const saltSize = 16
+var (
+	// fixedSalt is used so we only run the expensive PBKDF2 once per password
+	fixedSalt = []byte("TailscaleDNSHist")
+	keyCache  = make(map[string][]byte)
+	keyMu     sync.RWMutex
+)
 
 func getIterCount() int {
 	if v := os.Getenv("PBKDF2_ITERATIONS"); v != "" {
@@ -28,18 +34,31 @@ func getIterCount() int {
 	return 600000
 }
 
+func getKey(password string) []byte {
+	keyMu.RLock()
+	k, ok := keyCache[password]
+	keyMu.RUnlock()
+	if ok {
+		return k
+	}
+
+	keyMu.Lock()
+	defer keyMu.Unlock()
+	if k, ok := keyCache[password]; ok {
+		return k
+	}
+	k = pbkdf2.Key([]byte(password), fixedSalt, getIterCount(), 32, sha256.New)
+	keyCache[password] = k
+	return k
+}
+
 // Encrypt encrypts plaintext using AES-GCM and PBKDF2.
 func Encrypt(plaintext []byte, password string) (string, error) {
 	if password == "" {
 		return "", fmt.Errorf("encryption password required")
 	}
 
-	salt := make([]byte, saltSize)
-	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
-		return "", err
-	}
-
-	key := pbkdf2.Key([]byte(password), salt, getIterCount(), 32, sha256.New)
+	key := getKey(password)
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", err
@@ -55,10 +74,11 @@ func Encrypt(plaintext []byte, password string) (string, error) {
 		return "", err
 	}
 
+	// For the fast format, we just prepend the nonce to the ciphertext
+	// We no longer store the 16-byte random salt per line.
 	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
 
-	salt = append(salt, ciphertext...)
-	return base64.StdEncoding.EncodeToString(salt), nil
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
 }
 
 // Decrypt decrypts a base64 encoded ciphertext using AES-GCM and PBKDF2.
@@ -72,13 +92,7 @@ func Decrypt(encodedCiphertext string, password string) ([]byte, error) {
 		return nil, err
 	}
 
-	if len(data) < saltSize {
-		return nil, errors.New("ciphertext too short")
-	}
-
-	salt, ciphertext := data[:saltSize], data[saltSize:]
-
-	key := pbkdf2.Key([]byte(password), salt, getIterCount(), 32, sha256.New)
+	key := getKey(password)
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
@@ -90,10 +104,34 @@ func Decrypt(encodedCiphertext string, password string) ([]byte, error) {
 	}
 
 	nonceSize := gcm.NonceSize()
-	if len(ciphertext) < nonceSize {
+	if len(data) < nonceSize {
 		return nil, errors.New("ciphertext too short")
 	}
 
-	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
-	return gcm.Open(nil, nonce, ciphertext, nil)
+	// Try new fast format: [nonce][ciphertext]
+	nonce, ciphertext := data[:nonceSize], data[nonceSize:]
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err == nil {
+		return plaintext, nil
+	}
+
+	// Try old format: [salt 16 bytes][nonce][ciphertext]
+	if len(data) >= 16+nonceSize {
+		oldSalt := data[:16]
+		oldNonce := data[16 : 16+nonceSize]
+		oldCiphertext := data[16+nonceSize:]
+
+		// Re-derive key with the old salt from the blob
+		oldKey := pbkdf2.Key([]byte(password), oldSalt, getIterCount(), 32, sha256.New)
+		oldBlock, err := aes.NewCipher(oldKey)
+		if err == nil {
+			if oldGCM, err := cipher.NewGCM(oldBlock); err == nil {
+				if oldPlaintext, err := oldGCM.Open(nil, oldNonce, oldCiphertext, nil); err == nil {
+					return oldPlaintext, nil
+				}
+			}
+		}
+	}
+
+	return nil, err
 }

@@ -41,12 +41,12 @@ type Store struct {
 	lastArchivedTime int64
 	totalEvents      int64
 
-	// Cache Hit Ratio tracking (Improvement 98)
+	// Cache Hit Ratio tracking
 	cacheHits    int64
 	totalReplies int64
 	cacheMu      sync.RWMutex
 
-	// Rolling window counters (Optimization)
+	// Rolling window counters
 	rpmBuckets     [60]int
 	rpmTimes       [60]int64
 	rphBuckets     [60]int
@@ -56,16 +56,16 @@ type Store struct {
 	nodeRPHBuckets map[string]*[60]int
 	nodeRPHTimes   map[string]*[60]int64
 
-	// String interning (Optimization)
+	// String interning
 	internPool map[string]string
 
-	// Health and Trends (New Features)
+	// Health and Trends
 	upstreamHealth        map[string]float64
 	upstreamHealthHistory map[string][]float64
 	healthMu              sync.RWMutex
 	lastTopStats          map[string][]models.StatEntry
 
-	// UX Addons (1, 2, 3, 19, 20)
+	// UX Addons
 	typeCounts       map[string]int
 	clientRPMBuckets map[string]*[60]int
 	clientRPMTimes   map[string]*[60]int64
@@ -248,7 +248,7 @@ func (s *Store) AddEvent(e models.QueryEvent) {
 	s.hourlyStats[hourBucket]++
 	s.totalEvents++
 
-	// UX Addons (2 & 3)
+	// UX tracking
 	s.typeCounts[e.Type]++
 	if s.clientRPMBuckets[e.ClientIP] == nil {
 		s.clientRPMBuckets[e.ClientIP] = &[60]int{}
@@ -417,42 +417,6 @@ func (s *Store) GetStats() map[string]interface{} {
 	}
 	s.eventsMu.RUnlock()
 
-	toStats := func(m map[string]int, category string) []models.StatEntry {
-		st := make([]models.StatEntry, 0, len(m))
-		for k, v := range m {
-			entry := models.StatEntry{Key: k, Count: v}
-			if category == "clients" {
-				if alias, ok := s.cfg.ClientAliases[k]; ok {
-					entry.Alias = alias
-				}
-			}
-			// Compute trend
-			s.statsMu.RLock()
-			if last, ok := s.lastTopStats[category]; ok {
-				for _, le := range last {
-					if le.Key == k {
-						if v > le.Count {
-							entry.Trend = "up"
-						} else if v < le.Count {
-							entry.Trend = "down"
-						} else {
-							entry.Trend = "stable"
-						}
-						break
-					}
-				}
-			}
-			s.statsMu.RUnlock()
-			st = append(st, entry)
-		}
-		sort.Slice(st, func(i, j int) bool { return st[i].Count > st[j].Count })
-		if len(st) > 10 {
-			st = st[:10]
-		}
-		return st
-	}
-
-	// Heatmap data
 	heatmap := make(map[string]int)
 	s.statsMu.RLock()
 	for h := currentHour - 23; h <= currentHour; h++ {
@@ -479,28 +443,69 @@ func (s *Store) GetStats() map[string]interface{} {
 	}
 	s.statsMu.RUnlock()
 
-	// Improvement 98: Calculate cache hit ratio
-	s.cacheMu.RLock()
-	var cacheRatio float64
-	if s.totalReplies > 0 {
-		cacheRatio = float64(s.cacheHits) / float64(s.totalReplies) * 100
-	}
-	s.cacheMu.RUnlock()
-
 	return map[string]interface{}{
-		"top_domains":             toStats(domainCounts, "domains"),
-		"top_clients":             toStats(clientCounts, "clients"),
+		"top_domains":             s.toStats(domainCounts, "domains"),
+		"top_clients":             s.toStats(clientCounts, "clients"),
 		"rpm":                     rpm,
 		"rph":                     rph,
 		"rpd":                     rpd,
 		"total":                   totalEventsLocal,
 		"nodes":                   nodeList,
-		"cache_hit_ratio":         cacheRatio,
+		"cache_hit_ratio":         s.getCacheRatio(),
 		"upstream_health":         health,
 		"upstream_health_history": healthHist,
 		"heatmap":                 heatmap,
 		"type_counts":             typeCounts,
 	}
+}
+
+func (s *Store) getCacheRatio() float64 {
+	s.cacheMu.RLock()
+	defer s.cacheMu.RUnlock()
+	if s.totalReplies > 0 {
+		return float64(s.cacheHits) / float64(s.totalReplies) * 100
+	}
+	return 0
+}
+
+func (s *Store) toStats(m map[string]int, category string) []models.StatEntry {
+	st := make([]models.StatEntry, 0, len(m))
+	for k, v := range m {
+		entry := models.StatEntry{Key: k, Count: v}
+		if category == "clients" {
+			if alias, ok := s.cfg.ClientAliases[k]; ok {
+				entry.Alias = alias
+			}
+		}
+		// Compute trend
+		s.statsMu.RLock()
+		if last, ok := s.lastTopStats[category]; ok {
+			for _, le := range last {
+				if le.Key == k {
+					switch {
+					case v > le.Count:
+						entry.Trend = "up"
+					case v < le.Count:
+						entry.Trend = "down"
+					default:
+						entry.Trend = "stable"
+					}
+					break
+				}
+			}
+		}
+		s.statsMu.RUnlock()
+		st = append(st, entry)
+	}
+
+	sort.Slice(st, func(i, j int) bool {
+		return st[i].Count > st[j].Count
+	})
+
+	if len(st) > 10 {
+		st = st[:10]
+	}
+	return st
 }
 
 // GetClientStats returns the RPM/RPH stats for a specific client.

@@ -30,7 +30,7 @@ type Server struct {
 	parser *parser.Parser
 	tmpl   *template.Template
 
-	// SSE Broadcaster (Improvement 78)
+	// SSE Broadcaster
 	subscribers map[chan models.QueryEvent]int
 	subMu       sync.Mutex
 }

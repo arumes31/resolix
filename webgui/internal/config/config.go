@@ -106,12 +106,12 @@ func LoadConfig() *Config {
 				key := strings.TrimSpace(parts[0])
 				val := strings.TrimSpace(parts[1])
 				if key == "" || val == "" {
-					log.Printf("Warning: Invalid CLIENT_ALIASES mapping: %s", pair)
+					log.Printf("Warning: Invalid CLIENT_ALIASES mapping: %q", pair) // #nosec G706
 					continue
 				}
 				aliases[key] = val
 			} else {
-				log.Printf("Warning: Invalid CLIENT_ALIASES mapping: %s", pair)
+				log.Printf("Warning: Invalid CLIENT_ALIASES mapping: %q", pair) // #nosec G706
 			}
 		}
 	}

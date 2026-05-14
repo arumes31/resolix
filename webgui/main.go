@@ -45,9 +45,9 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Improvement 39: Move health checks to Go
+	// Initialize health checker
 	checker := health.NewChecker(cfg, cfg.UpstreamDNS)
-	go checker.Start(ctx, func(healthy []string, latencies map[string]float64) {
+	go checker.Start(ctx, func(_ []string, latencies map[string]float64) {
 		store.SetUpstreamHealth(latencies)
 		log.Printf("Health status updated. Latencies: %v", latencies)
 	})

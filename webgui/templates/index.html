@@ -439,7 +439,7 @@
         let isFrozen = false;
         let statsInterval = null;
 
-        // Optimized WebSocket/SSE handler
+        // Stream handler
         function startStream() {
             const eventSource = new EventSource('/api/stream');
             eventSource.onmessage = (event) => {
@@ -549,7 +549,7 @@
                 renderTopList('topDomains', stats.top_domains);
                 renderTopList('topClients', stats.top_clients);
                 
-                // Update global counters from backend (accurate history)
+                // Update counters
                 document.getElementById('rpm_val').textContent = formatNumber(stats.rpm) + ' RPM';
                 document.getElementById('rph_val').textContent = formatNumber(stats.rph);
                 document.getElementById('rpd_val').textContent = formatNumber(stats.rpd);

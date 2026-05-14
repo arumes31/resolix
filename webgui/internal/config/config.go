@@ -37,7 +37,6 @@ type Config struct {
 	NodeName         string
 	Port             string
 	HistoryDir       string
-	HistoryPassword  string
 	MaxEvents        int
 	HealthDomain     string
 	CleanupInterval  time.Duration
@@ -122,7 +121,6 @@ func LoadConfig() *Config {
 		NodeName:         nodeName,
 		Port:             port,
 		HistoryDir:       historyDir,
-		HistoryPassword:  os.Getenv("HISTORY_PASSWORD"),
 		MaxEvents:        DefaultMaxEvents,
 		HealthDomain:     healthDomain,
 		CleanupInterval:  DefaultCleanupInterval,

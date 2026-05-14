@@ -110,7 +110,7 @@ func Decrypt(encodedCiphertext string, password string) ([]byte, error) {
 
 	// Extract the nonce and ciphertext
 	nonce, ciphertext := data[:nonceSize], data[nonceSize:]
-	
+
 	// Old formats (with random salts) will fail authentication here very quickly,
 	// preventing the O(n * 100ms) startup hang.
 	return gcm.Open(nil, nonce, ciphertext, nil)

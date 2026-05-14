@@ -1,27 +1,24 @@
 package storage
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
+	"database/sql"
 	"fmt"
 	"log"
-	"os"
-	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"tailscale-dnsrewrite/webgui/internal/config"
-	"tailscale-dnsrewrite/webgui/internal/encryption"
+	"tailscale-dnsrewrite/webgui/internal/db"
 	"tailscale-dnsrewrite/webgui/internal/models"
 )
 
-// Store manages the in-memory ring buffer of events and disk persistence.
+// Store manages the in-memory ring buffer of events and SQLite disk persistence.
 type Store struct {
 	cfg      *config.Config
+	db       *sql.DB
 	events   []models.QueryEvent
 	head     int
 	count    int
@@ -32,21 +29,13 @@ type Store struct {
 
 	idCounter uint64
 
-	hourlyStats map[int64]int
-	statsMu     sync.RWMutex
+	// Database Batching
+	batchMu sync.Mutex
+	batch   []models.QueryEvent
 
-	windowDomainCounts map[string]int
-	windowClientCounts map[string]int
+	statsMu sync.RWMutex
 
-	lastArchivedTime int64
-	totalEvents      int64
-
-	// Cache Hit Ratio tracking
-	cacheHits    int64
-	totalReplies int64
-	cacheMu      sync.RWMutex
-
-	// Rolling window counters
+	// Rolling window counters for fast real-time sparklines
 	rpmBuckets     [60]int
 	rpmTimes       [60]int64
 	rphBuckets     [60]int
@@ -55,9 +44,6 @@ type Store struct {
 	nodeRPMTimes   map[string]*[60]int64
 	nodeRPHBuckets map[string]*[60]int
 	nodeRPHTimes   map[string]*[60]int64
-
-	// String interning
-	internPool map[string]string
 
 	// Health and Trends
 	upstreamHealth        map[string]float64
@@ -84,15 +70,10 @@ func NewStore(cfg *config.Config) *Store {
 		cfg:                   cfg,
 		events:                make([]models.QueryEvent, cfg.MaxEvents),
 		pendingQueries:        make(map[string]map[string][]pendingInfo),
-		hourlyStats:           make(map[int64]int),
-		windowDomainCounts:    make(map[string]int),
-		windowClientCounts:    make(map[string]int),
-		lastArchivedTime:      0,
 		nodeRPMBuckets:        make(map[string]*[60]int),
 		nodeRPMTimes:          make(map[string]*[60]int64),
 		nodeRPHBuckets:        make(map[string]*[60]int),
 		nodeRPHTimes:          make(map[string]*[60]int64),
-		internPool:            make(map[string]string),
 		upstreamHealth:        make(map[string]float64),
 		upstreamHealthHistory: make(map[string][]float64),
 		lastTopStats:          make(map[string][]models.StatEntry),
@@ -101,93 +82,31 @@ func NewStore(cfg *config.Config) *Store {
 		clientRPMTimes:        make(map[string]*[60]int64),
 		clientRPHBuckets:      make(map[string]*[60]int),
 		clientRPHTimes:        make(map[string]*[60]int64),
+		batch:                 make([]models.QueryEvent, 0, 1000),
 	}
 }
 
-func (s *Store) intern(str string) string {
-	if str == "" {
-		return ""
-	}
-	if v, ok := s.internPool[str]; ok {
-		return v
-	}
-	s.internPool[str] = str
-	return str
-}
-
-// Init ensures the history directory exists and warms up stats from disk.
+// Init ensures the SQLite database is ready and warms up basic stats.
 func (s *Store) Init() {
-	if err := os.MkdirAll(s.cfg.HistoryDir, 0750); err != nil {
-		log.Printf("Error creating history directory: %v", err)
-	}
-	s.loadStatsFromHistory()
-}
-
-func (s *Store) loadStatsFromHistory() {
-	files, err := os.ReadDir(s.cfg.HistoryDir)
+	database, err := db.InitDB(s.cfg.HistoryDir)
 	if err != nil {
-		return
+		log.Fatalf("Failed to initialize SQLite DB: %v", err)
 	}
-	now := time.Now().Unix()
-	cutoff := now - int64(s.cfg.HistoryRetention.Seconds())
+	s.db = database
 
-	for _, f := range files {
-		if strings.HasPrefix(f.Name(), "history-") && strings.HasSuffix(f.Name(), ".jsonl") {
-			path := filepath.Join(s.cfg.HistoryDir, filepath.Clean(f.Name()))
-			file, err := os.Open(path) // #nosec G304
-			if err != nil {
-				continue
+	// Warmup basic type counts from DB for current day
+	cutoff := time.Now().Add(-24 * time.Hour).Unix()
+	rows, err := s.db.Query("SELECT type, COUNT(*) FROM queries WHERE unix_time >= ? GROUP BY type", cutoff)
+	if err == nil {
+		for rows.Next() {
+			var t string
+			var count int
+			if err := rows.Scan(&t, &count); err == nil {
+				s.typeCounts[t] = count
 			}
-
-			// Defer file close immediately
-			func() {
-				defer func() { _ = file.Close() }()
-				scanner := bufio.NewScanner(file)
-				for scanner.Scan() {
-					line := scanner.Text()
-					var e models.QueryEvent
-
-					// Decrypt if password is set
-					plain := []byte(line)
-					if s.cfg.HistoryPassword != "" {
-						decrypted, err := encryption.Decrypt(line, s.cfg.HistoryPassword)
-						if err != nil {
-							continue
-						}
-						plain = decrypted
-					}
-
-					if err := json.Unmarshal(plain, &e); err == nil {
-						s.statsMu.Lock()
-						s.totalEvents++
-						s.statsMu.Unlock()
-
-						if e.UnixTime >= cutoff {
-							hour := e.UnixTime / 3600
-							s.statsMu.Lock()
-							s.hourlyStats[hour]++
-							s.statsMu.Unlock()
-
-							if e.Latency != nil || e.Upstream != "" {
-								s.cacheMu.Lock()
-								s.totalReplies++
-								if e.Upstream == "System Cache" {
-									s.cacheHits++
-								}
-								s.cacheMu.Unlock()
-							}
-						}
-					}
-				}
-				if err := scanner.Err(); err != nil {
-					log.Printf("Error scanning history file %s: %v", path, err)
-				}
-			}()
 		}
+		rows.Close()
 	}
-	s.statsMu.RLock()
-	log.Printf("Warmed up stats: %d buckets loaded", len(s.hourlyStats))
-	s.statsMu.RUnlock()
 }
 
 // GetConfig returns the application configuration.
@@ -195,13 +114,9 @@ func (s *Store) GetConfig() *config.Config {
 	return s.cfg
 }
 
-// AddEvent adds a new query event to the ring buffer and updates stats.
+// AddEvent adds a new query event to the ring buffer and batches it for SQLite.
 func (s *Store) AddEvent(e models.QueryEvent) {
 	s.statsMu.Lock()
-	e.Node = s.intern(e.Node)
-	e.Type = s.intern(e.Type)
-	e.ClientIP = s.intern(e.ClientIP)
-
 	// Rolling buckets update
 	secBucket := e.UnixTime % 60
 	minBucket := (e.UnixTime / 60) % 60
@@ -244,10 +159,6 @@ func (s *Store) AddEvent(e models.QueryEvent) {
 		s.nodeRPHBuckets[nodeName][minBucket]++
 	}
 
-	hourBucket := e.UnixTime / 3600
-	s.hourlyStats[hourBucket]++
-	s.totalEvents++
-
 	// UX tracking
 	s.typeCounts[e.Type]++
 	if s.clientRPMBuckets[e.ClientIP] == nil {
@@ -273,22 +184,20 @@ func (s *Store) AddEvent(e models.QueryEvent) {
 
 	s.eventsMu.Lock()
 	e.ID = fmt.Sprintf("%d", atomic.AddUint64(&s.idCounter, 1))
-	if s.count == s.cfg.MaxEvents {
-		old := s.events[s.head]
-		s.windowDomainCounts[old.Domain]--
-		s.windowClientCounts[old.ClientIP]--
-	}
 	s.events[s.head] = e
-	s.windowDomainCounts[e.Domain]++
-	s.windowClientCounts[e.ClientIP]++
 	s.head = (s.head + 1) % s.cfg.MaxEvents
 	if s.count < s.cfg.MaxEvents {
 		s.count++
 	}
 	s.eventsMu.Unlock()
+
+	// Add to SQLite batch
+	s.batchMu.Lock()
+	s.batch = append(s.batch, e)
+	s.batchMu.Unlock()
 }
 
-// UpdateEvent searches for a matching pending event and updates its latency and upstream.
+// UpdateEvent searches for a matching pending event and updates its latency and upstream in memory and batch.
 func (s *Store) UpdateEvent(node, domain string, latency float64, upstream string) *models.QueryEvent {
 	s.eventsMu.Lock()
 	defer s.eventsMu.Unlock()
@@ -303,19 +212,24 @@ func (s *Store) UpdateEvent(node, domain string, latency float64, upstream strin
 			s.events[idx].Latency = &latency
 			s.events[idx].Upstream = upstream
 
-			s.cacheMu.Lock()
-			s.totalReplies++
-			if upstream == "System Cache" {
-				s.cacheHits++
+			// Also try to update it in the pending batch if it hasn't been written to SQLite yet
+			s.batchMu.Lock()
+			for b := len(s.batch) - 1; b >= 0; b-- {
+				if s.batch[b].Domain == domain && s.batch[b].Node == node && s.batch[b].Latency == nil {
+					s.batch[b].Latency = &latency
+					s.batch[b].Upstream = upstream
+					break
+				}
 			}
-			s.cacheMu.Unlock()
+			s.batchMu.Unlock()
+
 			return &s.events[idx]
 		}
 	}
 	return nil
 }
 
-// GetOrderedEvents returns the latest N events in chronological order (oldest first).
+// GetOrderedEvents returns the latest N events from memory.
 func (s *Store) GetOrderedEvents(limit int) []models.QueryEvent {
 	s.eventsMu.RLock()
 	defer s.eventsMu.RUnlock()
@@ -333,7 +247,7 @@ func (s *Store) GetOrderedEvents(limit int) []models.QueryEvent {
 	return result
 }
 
-// GetRecentEvents returns events newer than the provided unix timestamp.
+// GetRecentEvents returns events newer than the provided unix timestamp from memory.
 func (s *Store) GetRecentEvents(since int64) []models.QueryEvent {
 	s.eventsMu.RLock()
 	defer s.eventsMu.RUnlock()
@@ -354,18 +268,15 @@ func (s *Store) GetRecentEvents(since int64) []models.QueryEvent {
 	return result
 }
 
-// GetStats returns aggregated traffic statistics.
+// GetStats returns aggregated traffic statistics using SQLite.
 func (s *Store) GetStats() map[string]interface{} {
-	domainCounts := make(map[string]int)
-	clientCounts := make(map[string]int)
-
 	now := time.Now().Unix()
+	cutoff24h := now - 86400
+
 	rpm := 0
 	rph := 0
-	rpd := 0
 
 	s.statsMu.RLock()
-	totalEventsLocal := s.totalEvents
 	for i := 0; i < 60; i++ {
 		if now-s.rpmTimes[i] < 60 {
 			rpm += s.rpmBuckets[i]
@@ -398,34 +309,81 @@ func (s *Store) GetStats() map[string]interface{} {
 		}
 	}
 
-	currentHour := now / 3600
-	for h := currentHour - 23; h <= currentHour; h++ {
-		rpd += s.hourlyStats[h]
+	typeCounts := make(map[string]int)
+	for k, v := range s.typeCounts {
+		typeCounts[k] = v
 	}
 	s.statsMu.RUnlock()
 
-	s.eventsMu.RLock()
-	for k, v := range s.windowDomainCounts {
-		if v > 0 {
-			domainCounts[k] = v
-		}
-	}
-	for k, v := range s.windowClientCounts {
-		if v > 0 {
-			clientCounts[k] = v
-		}
-	}
-	s.eventsMu.RUnlock()
+	// Query SQLite for long-term aggregates
+	var totalEvents int64
+	var rpd int
+	s.db.QueryRow("SELECT COUNT(*) FROM queries").Scan(&totalEvents)
+	s.db.QueryRow("SELECT COUNT(*) FROM queries WHERE unix_time >= ?", cutoff24h).Scan(&rpd)
 
+	var cacheHits, totalReplies int64
+	s.db.QueryRow("SELECT COUNT(*) FROM queries WHERE upstream = 'System Cache' AND unix_time >= ?", cutoff24h).Scan(&cacheHits)
+	s.db.QueryRow("SELECT COUNT(*) FROM queries WHERE upstream != '' AND unix_time >= ?", cutoff24h).Scan(&totalReplies)
+
+	cacheHitRatio := 0.0
+	if totalReplies > 0 {
+		cacheHitRatio = float64(cacheHits) / float64(totalReplies) * 100
+	}
+
+	domainCounts := make(map[string]int)
+	clientCounts := make(map[string]int)
 	heatmap := make(map[string]int)
-	s.statsMu.RLock()
+
+	// Top 10 Domains
+	rows, err := s.db.Query("SELECT domain, COUNT(*) as c FROM queries WHERE unix_time >= ? GROUP BY domain ORDER BY c DESC LIMIT 10", cutoff24h)
+	if err == nil {
+		for rows.Next() {
+			var d string
+			var c int
+			if rows.Scan(&d, &c) == nil {
+				domainCounts[d] = c
+			}
+		}
+		rows.Close()
+	}
+
+	// Top 10 Clients
+	rows, err = s.db.Query("SELECT client_ip, COUNT(*) as c FROM queries WHERE unix_time >= ? GROUP BY client_ip ORDER BY c DESC LIMIT 10", cutoff24h)
+	if err == nil {
+		for rows.Next() {
+			var ip string
+			var c int
+			if rows.Scan(&ip, &c) == nil {
+				clientCounts[ip] = c
+			}
+		}
+		rows.Close()
+	}
+
+	// Hourly heatmap
+	currentHour := now / 3600
+	rows, err = s.db.Query("SELECT unix_time / 3600 as hr, COUNT(*) FROM queries WHERE unix_time >= ? GROUP BY hr", cutoff24h)
+	if err == nil {
+		for rows.Next() {
+			var hr int64
+			var c int
+			if rows.Scan(&hr, &c) == nil {
+				t := time.Unix(hr*3600, 0)
+				heatmap[t.Format("15:00")] = c
+			}
+		}
+		rows.Close()
+	}
+
+	// Fill missing hours in heatmap
 	for h := currentHour - 23; h <= currentHour; h++ {
 		t := time.Unix(h*3600, 0)
-		heatmap[t.Format("15:00")] = s.hourlyStats[h]
+		k := t.Format("15:00")
+		if _, exists := heatmap[k]; !exists {
+			heatmap[k] = 0
+		}
 	}
-	s.statsMu.RUnlock()
 
-	// Upstream health and history
 	s.healthMu.RLock()
 	health := make(map[string]float64)
 	healthHist := make(map[string][]float64)
@@ -435,37 +393,20 @@ func (s *Store) GetStats() map[string]interface{} {
 	}
 	s.healthMu.RUnlock()
 
-	// Type counts
-	s.statsMu.RLock()
-	typeCounts := make(map[string]int)
-	for k, v := range s.typeCounts {
-		typeCounts[k] = v
-	}
-	s.statsMu.RUnlock()
-
 	return map[string]interface{}{
 		"top_domains":             s.toStats(domainCounts, "domains"),
 		"top_clients":             s.toStats(clientCounts, "clients"),
 		"rpm":                     rpm,
 		"rph":                     rph,
 		"rpd":                     rpd,
-		"total":                   totalEventsLocal,
+		"total":                   totalEvents,
 		"nodes":                   nodeList,
-		"cache_hit_ratio":         s.getCacheRatio(),
+		"cache_hit_ratio":         cacheHitRatio,
 		"upstream_health":         health,
 		"upstream_health_history": healthHist,
 		"heatmap":                 heatmap,
 		"type_counts":             typeCounts,
 	}
-}
-
-func (s *Store) getCacheRatio() float64 {
-	s.cacheMu.RLock()
-	defer s.cacheMu.RUnlock()
-	if s.totalReplies > 0 {
-		return float64(s.cacheHits) / float64(s.totalReplies) * 100
-	}
-	return 0
 }
 
 func (s *Store) toStats(m map[string]int, category string) []models.StatEntry {
@@ -477,7 +418,6 @@ func (s *Store) toStats(m map[string]int, category string) []models.StatEntry {
 				entry.Alias = alias
 			}
 		}
-		// Compute trend
 		s.statsMu.RLock()
 		if last, ok := s.lastTopStats[category]; ok {
 			for _, le := range last {
@@ -528,7 +468,6 @@ func (s *Store) GetClientStats(ip string) map[string]interface{} {
 			if now-rpmTimes[i] < 60 {
 				rpm += rpmBuckets[i]
 			}
-			// Fill historical window for sparkline (last 60 secs)
 			idx := (now - 59 + int64(i)) % 60
 			if now-rpmTimes[idx] < 60 {
 				rpmHistory[i] = rpmBuckets[idx]
@@ -559,7 +498,6 @@ func (s *Store) CleanupPending(now time.Time) {
 	cutoff := now.Add(-30 * time.Second)
 	for node, domains := range s.pendingQueries {
 		for domain, infos := range domains {
-			// Remove expired infos from the queue
 			newInfos := make([]pendingInfo, 0)
 			for _, info := range infos {
 				if info.startTime.After(cutoff) {
@@ -601,7 +539,6 @@ func (s *Store) GetPending(node, domain string) (time.Time, string, bool) {
 		return time.Time{}, "", false
 	}
 
-	// Pop oldest
 	info := infos[0]
 	if len(infos) == 1 {
 		delete(s.pendingQueries[node], domain)
@@ -622,110 +559,59 @@ func (s *Store) SetUpstream(node, domain, upstream string) {
 	if len(infos) == 0 {
 		return
 	}
-	// Update the latest query (assuming dnsmasq logs forwarded right after query)
 	infos[len(infos)-1].upstream = upstream
 }
 
-// ArchiveStep performs a single archiving cycle, moving events from memory to disk.
+// ArchiveStep performs a batch insert of recent queries into SQLite and deletes old ones.
 func (s *Store) ArchiveStep(now time.Time) int {
-	cutoff := now.Add(-1 * time.Hour).Unix()
-
-	var toArchive []models.QueryEvent
-	s.eventsMu.RLock()
-	for i := 0; i < s.count; i++ {
-		idx := (s.head - 1 - i + s.cfg.MaxEvents) % s.cfg.MaxEvents
-		e := s.events[idx]
-		if e.UnixTime > s.lastArchivedTime && e.UnixTime <= cutoff {
-			toArchive = append(toArchive, e)
-		}
+	s.batchMu.Lock()
+	if len(s.batch) == 0 {
+		s.batchMu.Unlock()
+		return 0
 	}
-	s.eventsMu.RUnlock()
+	toInsert := s.batch
+	s.batch = make([]models.QueryEvent, 0, 1000)
+	s.batchMu.Unlock()
 
-	if len(toArchive) > 0 {
-		sort.Slice(toArchive, func(i, j int) bool {
-			return toArchive[i].UnixTime < toArchive[j].UnixTime
-		})
+	tx, err := s.db.Begin()
+	if err != nil {
+		log.Printf("Failed to begin SQLite transaction: %v", err)
+		return 0
+	}
 
-		files := make(map[string][]models.QueryEvent)
-		for _, e := range toArchive {
-			dateStr := time.Unix(e.UnixTime, 0).Format("2006-01-02")
-			files[dateStr] = append(files[dateStr], e)
+	stmt, err := tx.Prepare("INSERT INTO queries (unix_time, node, client_ip, domain, type, upstream, latency) VALUES (?, ?, ?, ?, ?, ?, ?)")
+	if err != nil {
+		tx.Rollback()
+		log.Printf("Failed to prepare SQLite statement: %v", err)
+		return 0
+	}
+	defer stmt.Close()
+
+	for _, e := range toInsert {
+		var lat sql.NullFloat64
+		if e.Latency != nil {
+			lat.Float64 = *e.Latency
+			lat.Valid = true
 		}
-
-		allSuccess := true
-		for dateStr, evs := range files {
-			filename := fmt.Sprintf("history-%s.jsonl", dateStr)
-			path := filepath.Join(s.cfg.HistoryDir, filename)
-			f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600) // #nosec G304
-			if err != nil {
-				log.Printf("Error opening history file %s: %v", path, err)
-				allSuccess = false
-				continue
-			}
-
-			writeErr := func() error {
-				for _, e := range evs {
-					data, err := json.Marshal(e)
-					if err != nil {
-						return err
-					}
-					// Encrypt if password is set
-					line := string(data)
-					if s.cfg.HistoryPassword != "" {
-						encrypted, err := encryption.Encrypt(data, s.cfg.HistoryPassword)
-						if err != nil {
-							return err
-						}
-						line = encrypted
-					}
-					if _, err := fmt.Fprintln(f, line); err != nil {
-						return err
-					}
-				}
-				return f.Sync()
-			}()
-
-			closeErr := f.Close()
-			if writeErr != nil {
-				log.Printf("Error writing to history file %s: %v", path, writeErr)
-				allSuccess = false
-			}
-			if closeErr != nil {
-				log.Printf("Error closing history file %s: %v", path, closeErr)
-				allSuccess = false
-			}
-		}
-
-		if allSuccess {
-			s.lastArchivedTime = cutoff
-			log.Printf("Archived %d events to disk", len(toArchive))
+		_, err = stmt.Exec(e.UnixTime, e.Node, e.ClientIP, e.Domain, e.Type, e.Upstream, lat)
+		if err != nil {
+			log.Printf("Error inserting event into SQLite: %v", err)
 		}
 	}
 
-	// Cleanup old files
-	files, err := os.ReadDir(s.cfg.HistoryDir)
-	if err == nil {
-		for _, f := range files {
-			if strings.HasPrefix(f.Name(), "history-") && strings.HasSuffix(f.Name(), ".jsonl") {
-				info, err := f.Info()
-				if err == nil && now.Sub(info.ModTime()) > s.cfg.HistoryRetention {
-					_ = os.Remove(filepath.Join(s.cfg.HistoryDir, f.Name()))
-					log.Printf("Deleted old history file: %s", f.Name())
-				}
-			}
-		}
+	if err := tx.Commit(); err != nil {
+		log.Printf("Failed to commit SQLite transaction: %v", err)
+		return 0
 	}
 
-	// Also cleanup hourly stats
-	s.statsMu.Lock()
-	cutoffHour := now.Unix()/3600 - int64(s.cfg.HistoryRetention.Hours())
-	for h := range s.hourlyStats {
-		if h < cutoffHour {
-			delete(s.hourlyStats, h)
-		}
+	// Delete old data based on retention policy
+	cutoff := now.Add(-s.cfg.HistoryRetention).Unix()
+	_, err = s.db.Exec("DELETE FROM queries WHERE unix_time < ?", cutoff)
+	if err != nil {
+		log.Printf("Failed to prune old SQLite data: %v", err)
 	}
-	s.statsMu.Unlock()
-	return len(toArchive)
+
+	return len(toInsert)
 }
 
 // SetUpstreamHealth updates the latency mapping and history for upstream DNS servers.

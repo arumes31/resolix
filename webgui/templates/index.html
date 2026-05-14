@@ -256,6 +256,46 @@
             border-radius: 4px;
         }
 
+        /* Compact Mode */
+        body.compact { padding: 0.5rem; }
+        body.compact .card { padding: 0.75rem; }
+        body.compact table th, body.compact table td { padding: 0.4rem 0.5rem; font-size: 0.8rem; }
+        body.compact .stat-value { font-size: 1.5rem; }
+
+        /* Modal */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.8);
+            backdrop-filter: blur(8px);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+        .modal-content {
+            background: var(--bg-color);
+            border: 1px solid var(--glass-border);
+            padding: 2rem;
+            border-radius: 1.5rem;
+            width: 90%;
+            max-width: 600px;
+        }
+
+        .sparkline {
+            display: flex;
+            align-items: flex-end;
+            height: 20px;
+            gap: 1px;
+            margin-left: 0.5rem;
+        }
+        .spark-bar {
+            width: 3px;
+            background: var(--success);
+            opacity: 0.5;
+        }
+        .spark-bar.fail { background: var(--danger); }
+
         @media (max-width: 1024px) {
             .dashboard-grid {
                 grid-template-columns: 1fr;
@@ -270,9 +310,13 @@
                 <h1>Tailscale DNS Monitor</h1>
                 <p id="systemStatus" style="color: var(--success); font-size: 0.8rem;">● System Online</p>
             </div>
-            <div class="search-container">
-                <svg class="search-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
-                <input type="text" id="searchInput" class="search-input" placeholder="Quick Filter...">
+            <div style="display: flex; gap: 0.5rem; align-items: center;">
+                <button id="freezeBtn" class="btn" style="background: rgba(255,255,255,0.1); color: #fff; width: 40px; padding: 0.5rem;" title="Freeze/Pause Log">⏸️</button>
+                <button id="compactToggle" class="btn" style="background: rgba(255,255,255,0.1); color: #fff; width: 40px; padding: 0.5rem;" title="Toggle Compact Mode">↕️</button>
+                <div class="search-container">
+                    <svg class="search-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+                    <input type="text" id="searchInput" class="search-input" placeholder="Quick Filter...">
+                </div>
             </div>
             <div class="simulator-box card" style="padding: 0.75rem; margin-bottom: 0;">
                 <input type="text" id="simDomain" class="simulator-input" placeholder="Test domain...">
@@ -293,6 +337,13 @@
                     <div><span class="stat-label">Day:</span> <span id="rpd_val" style="font-weight:bold">0</span></div>
                     <div><span class="stat-label">Cache Hit:</span> <span id="cache_ratio" style="font-weight:bold; color: var(--success);">0%</span></div>
                     <div><span class="stat-label">Total:</span> <span id="total_val" style="font-weight:bold">0</span></div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="stat-header">Query Type Breakdown</div>
+                <div id="typeBreakdown" style="display: flex; flex-direction: column; gap: 8px; margin-top: 0.5rem;">
+                    <!-- Type bars will be here -->
                 </div>
             </div>
 
@@ -385,6 +436,7 @@
         let rpmHistory = Array(20).fill(0);
         let lastEventTimestamp = 0;
         let isTabVisible = true;
+        let isFrozen = false;
         let statsInterval = null;
 
         // Optimized WebSocket/SSE handler
@@ -393,6 +445,9 @@
             eventSource.onmessage = (event) => {
                 try {
                     const newEvent = JSON.parse(event.data);
+                    
+                    if (isFrozen) return;
+
                     const index = allEvents.findIndex(e => e.id === newEvent.id);
                     const searchTerm = document.getElementById('searchInput').value.toLowerCase();
                     const isFiltered = searchTerm.length > 0;
@@ -434,7 +489,7 @@
                 <td><span class="badge" style="background: rgba(255,255,255,0.1); font-size: 0.7rem;">${escapeHtml(e.node || 'local')}</span></td>
                 <td><span class="badge badge-type">${escapeHtml(e.type)}</span></td>
                 <td class="domain">${escapeHtml(e.domain)}</td>
-                <td>
+                <td onclick="showClientStats('${escapeHtml(e.client_ip)}')" style="cursor: pointer; position: relative;" title="Click for details">
                     <span class="badge badge-ip">${escapeHtml(e.client_ip)}</span>
                     ${e.alias ? `<span class="alias-tag">${escapeHtml(e.alias)}</span>` : ''}
                 </td>
@@ -501,15 +556,48 @@
                 document.getElementById('total_val').textContent = formatNumber(stats.total);
                 document.getElementById('cache_ratio').textContent = (stats.cache_hit_ratio || 0).toFixed(1) + '%';
 
-                // Update health list
+                // Update health list with sparklines
                 const healthEl = document.getElementById('upstreamHealth');
                 if (stats.upstream_health) {
-                    healthEl.innerHTML = Object.entries(stats.upstream_health).map(([ip, lat]) => `
-                        <li class="top-item">
-                            <span>${escapeHtml(ip)}</span>
-                            <span class="top-count" style="background: ${lat === -1 ? 'var(--danger)' : 'rgba(34, 197, 94, 0.1)'}; color: ${lat === -1 ? '#fff' : 'var(--success)'}">${lat === -1 ? 'DOWN' : lat.toFixed(1) + 'ms'}</span>
-                        </li>
-                    `).join('');
+                    healthEl.innerHTML = Object.entries(stats.upstream_health).map(([ip, lat]) => {
+                        const hist = stats.upstream_health_history ? stats.upstream_health_history[ip] || [] : [];
+                        const maxLat = Math.max(...hist.filter(l => l > 0), 1);
+                        const sparkline = `<div class="sparkline">${hist.map(l => {
+                            const h = l === -1 ? 100 : (l / maxLat) * 100;
+                            return `<div class="spark-bar ${l === -1 ? 'fail' : ''}" style="height: ${h}%"></div>`;
+                        }).join('')}</div>`;
+
+                        return `
+                            <li class="top-item">
+                                <div style="display: flex; align-items: center;">
+                                    <span>${escapeHtml(ip)}</span>
+                                    ${sparkline}
+                                </div>
+                                <span class="top-count" style="background: ${lat === -1 ? 'var(--danger)' : 'rgba(34, 197, 94, 0.1)'}; color: ${lat === -1 ? '#fff' : 'var(--success)'}">${lat === -1 ? 'DOWN' : lat.toFixed(1) + 'ms'}</span>
+                            </li>
+                        `;
+                    }).join('');
+                }
+
+                // Update type breakdown bars
+                const typeEl = document.getElementById('typeBreakdown');
+                if (stats.type_counts) {
+                    const total = Object.values(stats.type_counts).reduce((a, b) => a + b, 0);
+                    const sortedTypes = Object.entries(stats.type_counts).sort((a, b) => b[1] - a[1]).slice(0, 5);
+                    typeEl.innerHTML = sortedTypes.map(([type, count]) => {
+                        const pct = (count / total) * 100;
+                        return `
+                            <div style="font-size: 0.75rem;">
+                                <div style="display: flex; justify-content: space-between; margin-bottom: 2px;">
+                                    <span>${escapeHtml(type)}</span>
+                                    <span style="opacity: 0.6">${count} (${pct.toFixed(1)}%)</span>
+                                </div>
+                                <div style="height: 4px; background: rgba(255,255,255,0.05); border-radius: 2px;">
+                                    <div style="height: 100%; background: var(--accent-color); width: ${pct}%; border-radius: 2px; opacity: 0.8"></div>
+                                </div>
+                            </div>
+                        `;
+                    }).join('');
                 }
 
                 // Update heatmap
@@ -623,6 +711,37 @@
             }).join('');
         }
 
+        async function showClientStats(ip) {
+            const modal = document.getElementById('clientModal');
+            document.getElementById('modalTitle').textContent = `Stats for ${ip}`;
+            modal.style.display = 'flex';
+            
+            try {
+                const response = await fetch(`/api/client_stats?ip=${ip}`);
+                const data = await response.json();
+                
+                document.getElementById('modalRPM').textContent = data.rpm;
+                document.getElementById('modalRPH').textContent = data.rph;
+                
+                const charts = document.getElementById('modalCharts');
+                const max = Math.max(...data.rpm_history, 1);
+                charts.innerHTML = data.rpm_history.map(h => {
+                    const height = (h / max) * 100;
+                    return `<div style="flex: 1; background: var(--accent-color); height: ${height}%; border-radius: 4px; opacity: 0.8"></div>`;
+                }).join('');
+            } catch (e) { console.error(e); }
+        }
+
+        document.getElementById('freezeBtn').addEventListener('click', function() {
+            isFrozen = !isFrozen;
+            this.style.background = isFrozen ? 'var(--danger)' : 'rgba(255,255,255,0.1)';
+            this.textContent = isFrozen ? '▶️' : '⏸️';
+        });
+
+        document.getElementById('compactToggle').addEventListener('click', function() {
+            document.body.classList.toggle('compact');
+        });
+
         document.getElementById('searchInput').addEventListener('input', renderEvents);
 
         function updateVisibility() {
@@ -642,5 +761,22 @@
         updateVisibility(); // Initial set
         startStream();
     </script>
+    <div id="clientModal" class="modal" onclick="if(event.target === this) this.style.display='none'">
+        <div class="modal-content">
+            <h2 id="modalTitle" style="margin-bottom: 1rem;">Client Stats</h2>
+            <div id="modalCharts" style="height: 200px; display: flex; align-items: flex-end; gap: 4px; margin-bottom: 1.5rem;"></div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+                <div class="card" style="background: rgba(255,255,255,0.05)">
+                    <div class="stat-header">RPM</div>
+                    <div class="stat-value" id="modalRPM">0</div>
+                </div>
+                <div class="card" style="background: rgba(255,255,255,0.05)">
+                    <div class="stat-header">RPH</div>
+                    <div class="stat-value" id="modalRPH">0</div>
+                </div>
+            </div>
+            <button class="btn btn-primary" style="margin-top: 1.5rem; width: 100%;" onclick="document.getElementById('clientModal').style.display='none'">Close</button>
+        </div>
+    </div>
 </body>
 </html>

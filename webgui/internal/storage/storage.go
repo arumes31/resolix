@@ -59,9 +59,15 @@ type Store struct {
 	internPool map[string]string
 
 	// Health and Trends (New Features)
-	upstreamHealth map[string]float64
-	healthMu       sync.RWMutex
-	lastTopStats   map[string][]models.StatEntry
+	upstreamHealth        map[string]float64
+	upstreamHealthHistory map[string][]float64
+	healthMu              sync.RWMutex
+	lastTopStats          map[string][]models.StatEntry
+
+	// UX Addons (1, 2, 3, 19, 20)
+	typeCounts       map[string]int
+	clientRPMBuckets map[string]*[60]int
+	clientRPMTimes   map[string]*[60]int64
 }
 
 type pendingInfo struct {
@@ -84,8 +90,12 @@ func NewStore(cfg *config.Config) *Store {
 		nodeRPHBuckets:     make(map[string]*[60]int),
 		nodeRPHTimes:       make(map[string]*[60]int64),
 		internPool:         make(map[string]string),
-		upstreamHealth:     make(map[string]float64),
-		lastTopStats:       make(map[string][]models.StatEntry),
+		upstreamHealth:        make(map[string]float64),
+		upstreamHealthHistory: make(map[string][]float64),
+		lastTopStats:          make(map[string][]models.StatEntry),
+		typeCounts:            make(map[string]int),
+		clientRPMBuckets:      make(map[string]*[60]int),
+		clientRPMTimes:        make(map[string]*[60]int64),
 	}
 }
 
@@ -232,6 +242,20 @@ func (s *Store) AddEvent(e models.QueryEvent) {
 	hourBucket := e.UnixTime / 3600
 	s.hourlyStats[hourBucket]++
 	s.totalEvents++
+
+	// UX Addons (2 & 3)
+	s.typeCounts[e.Type]++
+	if s.clientRPMBuckets[e.ClientIP] == nil {
+		s.clientRPMBuckets[e.ClientIP] = &[60]int{}
+		s.clientRPMTimes[e.ClientIP] = &[60]int64{}
+	}
+	if s.clientRPMTimes[e.ClientIP][secBucket] != e.UnixTime {
+		s.clientRPMTimes[e.ClientIP][secBucket] = e.UnixTime
+		s.clientRPMBuckets[e.ClientIP][secBucket] = 1
+	} else {
+		s.clientRPMBuckets[e.ClientIP][secBucket]++
+	}
+
 	s.statsMu.Unlock()
 
 	s.eventsMu.Lock()
@@ -422,13 +446,23 @@ func (s *Store) GetStats() map[string]interface{} {
 	}
 	s.statsMu.RUnlock()
 
-	// Upstream health
+	// Upstream health and history
 	s.healthMu.RLock()
 	health := make(map[string]float64)
+	healthHist := make(map[string][]float64)
 	for k, v := range s.upstreamHealth {
 		health[k] = v
+		healthHist[k] = append([]float64(nil), s.upstreamHealthHistory[k]...)
 	}
 	s.healthMu.RUnlock()
+
+	// Type counts
+	s.statsMu.RLock()
+	typeCounts := make(map[string]int)
+	for k, v := range s.typeCounts {
+		typeCounts[k] = v
+	}
+	s.statsMu.RUnlock()
 
 	// Improvement 98: Calculate cache hit ratio
 	s.cacheMu.RLock()
@@ -439,16 +473,56 @@ func (s *Store) GetStats() map[string]interface{} {
 	s.cacheMu.RUnlock()
 
 	return map[string]interface{}{
-		"top_domains":     toStats(domainCounts, "domains"),
-		"top_clients":     toStats(clientCounts, "clients"),
-		"rpm":             rpm,
-		"rph":             rph,
-		"rpd":             rpd,
-		"total":           s.totalEvents,
-		"nodes":           nodeList,
-		"cache_hit_ratio": cacheRatio,
-		"upstream_health": health,
-		"heatmap":         heatmap,
+		"top_domains":             toStats(domainCounts, "domains"),
+		"top_clients":             toStats(clientCounts, "clients"),
+		"rpm":                     rpm,
+		"rph":                     rph,
+		"rpd":                     rpd,
+		"total":                   s.totalEvents,
+		"nodes":                   nodeList,
+		"cache_hit_ratio":         cacheRatio,
+		"upstream_health":         health,
+		"upstream_health_history": healthHist,
+		"heatmap":                 heatmap,
+		"type_counts":             typeCounts,
+	}
+}
+
+// GetClientStats returns the RPM/RPH stats for a specific client.
+func (s *Store) GetClientStats(ip string) map[string]interface{} {
+	s.statsMu.RLock()
+	defer s.statsMu.RUnlock()
+
+	now := time.Now().Unix()
+	rpm := 0
+	rph := 0
+	rpmHistory := make([]int, 60)
+
+	buckets := s.clientRPMBuckets[ip]
+	times := s.clientRPMTimes[ip]
+
+	if buckets != nil && times != nil {
+		for i := 0; i < 60; i++ {
+			if now-times[i] < 60 {
+				rpm += buckets[i]
+			}
+			if now-times[i] < 3600 {
+				rph += buckets[i]
+			}
+			// Fill historical window for sparkline (last 60 secs)
+			idx := (now - 59 + int64(i)) % 60
+			if now-times[idx] < 60 {
+				rpmHistory[i] = buckets[idx]
+			}
+		}
+	}
+
+	return map[string]interface{}{
+		"ip":          ip,
+		"alias":       s.cfg.ClientAliases[ip],
+		"rpm":         rpm,
+		"rph":         rph,
+		"rpm_history": rpmHistory,
 	}
 }
 
@@ -628,10 +702,18 @@ func (s *Store) ArchiveStep(now time.Time) int {
 	return len(toArchive)
 }
 
-// SetUpstreamHealth updates the latency mapping for upstream DNS servers.
+// SetUpstreamHealth updates the latency mapping and history for upstream DNS servers.
 func (s *Store) SetUpstreamHealth(health map[string]float64) {
 	s.healthMu.Lock()
 	s.upstreamHealth = health
+	for ip, lat := range health {
+		hist := s.upstreamHealthHistory[ip]
+		hist = append(hist, lat)
+		if len(hist) > 20 {
+			hist = hist[1:]
+		}
+		s.upstreamHealthHistory[ip] = hist
+	}
 	s.healthMu.Unlock()
 }
 

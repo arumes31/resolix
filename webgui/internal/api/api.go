@@ -75,6 +75,7 @@ func (s *Server) SetupMux() http.Handler {
 	mux.HandleFunc("/", s.handleRoot)
 	mux.HandleFunc("/api/events", s.handleEvents)
 	mux.HandleFunc("/api/stats", s.handleStats)
+	mux.HandleFunc("/api/client_stats", s.handleClientStats)
 	mux.HandleFunc("/api/simulate", s.handleSimulate)
 
 	handler := s.gzipMiddleware(mux)
@@ -166,6 +167,17 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleStats(w http.ResponseWriter, _ *http.Request) {
 	stats := s.store.GetStats()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(stats)
+}
+
+func (s *Server) handleClientStats(w http.ResponseWriter, r *http.Request) {
+	ip := r.URL.Query().Get("ip")
+	if ip == "" {
+		http.Error(w, "Missing ip parameter", http.StatusBadRequest)
+		return
+	}
+	stats := s.store.GetClientStats(ip)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(stats)
 }

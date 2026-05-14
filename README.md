@@ -1,10 +1,19 @@
 # 🛡️ Tailscale DNS Monitor & Rewriter
 
+[![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/arumes31/tailscale-dnsrewrite/go.yml?branch=main&style=flat-square)](https://github.com/arumes31/tailscale-dnsrewrite/actions)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/arumes31/tailscale-dnsrewrite?style=flat-square)](https://go.dev/)
+[![License](https://img.shields.io/github/license/arumes31/tailscale-dnsrewrite?style=flat-square)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/arumes31/tailscale-dnsrewrite?style=flat-square)](https://github.com/arumes31/tailscale-dnsrewrite/stargazers)
+[![GitHub forks](https://img.shields.io/github/forks/arumes31/tailscale-dnsrewrite?style=flat-square)](https://github.com/arumes31/tailscale-dnsrewrite/network)
+[![GitHub issues](https://img.shields.io/github/issues/arumes31/tailscale-dnsrewrite?style=flat-square)](https://github.com/arumes31/tailscale-dnsrewrite/issues)
+[![Last Commit](https://img.shields.io/github/last-commit/arumes31/tailscale-dnsrewrite?style=flat-square)](https://github.com/arumes31/tailscale-dnsrewrite/commits/main)
+
 A high-performance Tailscale DNS server that provides custom DNS overrides and intelligent upstream forwarding with a premium real-time monitoring dashboard.
 
 ### 🔒 Security Features
 - **Master/Slave Encryption**: All log ingestion traffic can be secured via `INGEST_SECRET`.
-- **Private History**: History files are stored in a password-protected JSONL format.
+- **Private History**: Metrics history is stored in a local SQLite database, isolated within the container volume.
+- **Hardened Security**: Built-in XSS protection, non-root execution support, and secure file permissions.
 
 ## 🔄 DNS Flow
 
@@ -23,13 +32,12 @@ graph LR
 ## ✨ Features
 
 - **🚀 Tailscale Native**: Seamlessly integrates with your Tailscale network.
-- **⚡ Real-time Monitor**: **(NEW)** Real-time updates via Server-Sent Events (SSE). No more polling!
-- **📈 Advanced Stats**: **(NEW)** Cache hit ratio tracking and node-specific traffic analytics.
-- **💾 Persistent Logging**: Optimized for storage using JSONL with automatic archiving and 72h retention.
-- **🔒 Encrypted Storage**: **(NEW)** AES-GCM encryption with PBKDF2 for on-disk history files.
+- **⚡ Real-time Monitor**: Real-time updates via Server-Sent Events (SSE). No more polling!
+- **📊 High-Performance Database**: **(NEW)** Powered by SQLite for instant historical queries and sub-millisecond dashboard loading.
+- **📈 Advanced Stats**: Cache hit ratio tracking and node-specific traffic analytics.
 - **🏥 Parallel Health Checks**: Continuous concurrent monitoring of upstream DNS servers with automatic failover.
-- **🛡️ Security First**: Hardened Content Security Policy (CSP), built-in XSS protection, non-root execution support, and secure file permissions.
-- **🌐 Advanced Upstreams**: **(NEW)** Support for `IP#port` notation for custom upstream DNS servers.
+- **🛡️ Security First**: Hardened Content Security Policy (CSP) and optimized kernel `sysctls`.
+- **🌐 Advanced Upstreams**: Support for `IP#port` notation for custom upstream DNS servers.
 
 ---
 
@@ -52,8 +60,6 @@ docker-compose up -d --build
 | `DOMAINS` | Comma-separated `domain:ip` mappings | - |
 | `HEALTHCHECK_DOMAIN` | Domain used for upstream health checks | `google.com` |
 | `PORT` | Web GUI listening port | `35353` |
-| `HISTORY_PASSWORD` | Password to encrypt history files on disk (AES-GCM) | - |
-| `PBKDF2_ITERATIONS`| Iteration count for PBKDF2 key derivation | `600000` |
 | `INGEST_SECRET` | Secret token to authenticate logs from slave nodes | - |
 | `MODE` | Run mode (`master` or `slave`) | `master` |
 | `MASTER_URL` | URL of the Master node (Required for `slave` mode) | - |
@@ -82,7 +88,7 @@ For a slave node to report logs to the master, set:
 1. **Tailscale Connection**: The container joins your Tailnet and gets a unique IP.
 2. **DNS Logic**: `dnsmasq` listens on the Tailscale IP, resolving custom mappings first and then forwarding to healthy upstreams.
 3. **In-Memory Pipe**: Logs are streamed from `dnsmasq` through a named pipe directly into the Web GUI's RAM buffer.
-4. **Persistent Logging**: History is stored on disk and archived every 30 minutes, preserving visibility. Archives rotate and are retained for 72h before deletion to manage disk usage.
+4. **Persistent Storage**: Events are batched and persisted to a local SQLite database every 30 seconds, ensuring zero data loss and instant dashboard responsiveness.
 
 ---
 
@@ -108,8 +114,8 @@ We maintain high code quality and security standards using the following tools:
 - **Verify DNS**: `nslookup mydomain.internal <TAILSCALE_IP>`
 - **Tailscale Status**: `docker exec -it dns-tailscale-1 tailscale status`
 - **Upstream Health**: `docker exec -it dns-tailscale-1 dig @<UPSTREAM_IP> google.com`
-- **Config Validation**: `docker exec -it dns-tailscale-1 cat -v /etc/dnsmasq.conf` — look for `^M` (carriage returns) which indicate CRLF corruption
-- **CRLF Issues**: If dnsmasq dies immediately, check that `entrypoint.sh` uses Unix (LF) line endings. Windows CRLF line endings in heredocs will corrupt config files.
+- **Config Validation**: `docker exec -it dns-tailscale-1 cat -v /etc/dnsmasq.conf`
+- **CRLF Issues**: If dnsmasq dies immediately, the build-time `sed` scripts should have fixed this, but ensure your `entrypoint.sh` is saved with LF endings.
 
 ---
 

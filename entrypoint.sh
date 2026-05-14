@@ -131,12 +131,16 @@ EOL
         done
     fi
 
-    # CRITICAL: Strip ANY non-ascii or carriage returns that might break dnsmasq
-    sed -i 's/\r//g' /etc/dnsmasq.conf
-    sed -i 's/\r//g' /etc/dnsmasq-overrides.conf
+    # CRITICAL: Strip carriage returns that break dnsmasq config parsing
+    # Use tr to reliably remove \r bytes (sed \\r does NOT match actual CR)
+    tr -d '\r' < /etc/dnsmasq.conf > /etc/dnsmasq.conf.tmp && mv /etc/dnsmasq.conf.tmp /etc/dnsmasq.conf
+    tr -d '\r' < /etc/dnsmasq-overrides.conf > /etc/dnsmasq-overrides.conf.tmp && mv /etc/dnsmasq-overrides.conf.tmp /etc/dnsmasq-overrides.conf
     # Remove any trailing whitespace on lines
     sed -i 's/[[:space:]]*$//' /etc/dnsmasq.conf
     sed -i 's/[[:space:]]*$//' /etc/dnsmasq-overrides.conf
+    # Remove empty lines (dnsmasq ignores them, but let's be safe)
+    sed -i '/^$/d' /etc/dnsmasq.conf
+    sed -i '/^$/d' /etc/dnsmasq-overrides.conf
 
     echo "Config file /etc/dnsmasq.conf (Main) content (with visible chars):"
     cat -v /etc/dnsmasq.conf

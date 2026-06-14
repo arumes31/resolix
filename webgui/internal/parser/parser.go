@@ -1,14 +1,37 @@
+// Package parser handles the logic of extracting DNS events from raw
+// dnsmasq log lines. It uses a sync.Pool for byte buffers to reduce
+// GC pressure under high log ingestion rates.
 package parser
 
 import (
 	"bytes"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"tailscale-dnsrewrite/webgui/internal/models"
 	"tailscale-dnsrewrite/webgui/internal/storage"
 )
+
+// bufPool is a sync.Pool for byte buffers used during log parsing.
+// Reusing buffers reduces GC pressure under high log ingestion rates.
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		return bytes.NewBuffer(make([]byte, 0, 4096))
+	},
+}
+
+// getBuffer retrieves a buffer from the pool.
+func getBuffer() *bytes.Buffer {
+	return bufPool.Get().(*bytes.Buffer)
+}
+
+// putBuffer resets and returns a buffer to the pool.
+func putBuffer(b *bytes.Buffer) {
+	b.Reset()
+	bufPool.Put(b)
+}
 
 // Parser handles the logic of extracting DNS events from raw log lines.
 type Parser struct {
@@ -37,7 +60,8 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 			bytes.Equal(pt, []byte("forwarded")) ||
 			bytes.Equal(pt, []byte("reply")) ||
 			bytes.Equal(pt, []byte("config")) ||
-			bytes.Equal(pt, []byte("cached")) {
+			bytes.Equal(pt, []byte("cached")) ||
+			bytes.Equal(pt, []byte("validation")) {
 			actionIdx = i
 			break
 		}
@@ -53,11 +77,28 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 		return strings.ToLower(strings.TrimSuffix(d, "."))
 	}
 
+	// --- DNSSEC validation lines ---
+	// dnsmasq logs: "validation|dnsmasq.org|IN|secure" or similar patterns
+	// Also: "dnsmasq: validation dnsmasq.org IN secure"
+	if bytes.Equal(action, []byte("validation")) {
+		p.parseDNSSEC(parts, actionIdx, node)
+		return nil
+	}
+
+	// Also check for pipe-delimited DNSSEC lines: "validation|domain|IN|secure"
+	if bytes.Contains(line, []byte("validation|")) {
+		p.parseDNSSECPipe(line, node)
+		return nil
+	}
+
 	if bytes.HasPrefix(action, []byte("query[")) {
 		if len(action) < 8 { // Must be at least query[A]
 			return nil
 		}
 		qType := string(action[6 : len(action)-1])
+
+		// Items 69 & 70: AAAA, SRV, TXT are handled naturally by extracting qType
+		// The parser already handles any query type inside brackets: query[AAAA], query[SRV], query[TXT]
 		if len(parts) < actionIdx+4 || string(parts[actionIdx+2]) != "from" {
 			return nil
 		}
@@ -66,7 +107,17 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 
 		var parsedTime time.Time
 		if actionIdx >= 3 {
-			tsStr := string(bytes.Join(parts[:3], []byte(" ")))
+			// Use pooled buffer for timestamp joining
+			buf := getBuffer()
+			for i, pt := range parts[:3] {
+				if i > 0 {
+					buf.WriteByte(' ')
+				}
+				buf.Write(pt)
+			}
+			tsStr := buf.String()
+			putBuffer(buf)
+
 			t, err := time.Parse(time.Stamp, tsStr)
 			if err == nil {
 				nowYear := now.Year()
@@ -124,12 +175,19 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 				upstream = string(action)
 			}
 
+			// Item 64: Parse DNS response codes from reply lines
+			responseCode := parseResponseCode(line, actionIdx, parts)
+
 			if ok {
 				latency := float64(now.Sub(startTime).Microseconds()) / 1000.0
 				if latency < 0 {
 					latency = 0
 				}
-				return p.store.UpdateEvent(node, domain, latency, upstream)
+				updated := p.store.UpdateEvent(node, domain, latency, upstream)
+				if updated != nil {
+					updated.ResponseCode = responseCode
+				}
+				return updated
 			} else if bytes.Equal(action, []byte("reply")) {
 				// Debug: why was it not found?
 				if p.Debug {
@@ -140,4 +198,94 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 		return nil
 	}
 	return nil
+}
+
+// parseDNSSEC handles space-delimited DNSSEC validation log lines.
+// Format: "validation <domain> <class> <result>"
+func (p *Parser) parseDNSSEC(parts [][]byte, actionIdx int, node string) {
+	// Expected: validation <domain> <class> <result>
+	// e.g., "validation dnsmasq.org IN secure"
+	if len(parts) < actionIdx+4 {
+		return
+	}
+	domain := strings.ToLower(strings.TrimSuffix(string(parts[actionIdx+1]), "."))
+	result := strings.ToLower(string(parts[actionIdx+3]))
+
+	// Validate DNSSEC result
+	switch result {
+	case "secure", "insecure", "bogus", "indeterminate":
+		p.store.SetDNSSEC(node, domain, result)
+	default:
+		if p.Debug {
+			log.Printf("[DEBUG] Unknown DNSSEC result: %s for domain=%s", result, domain)
+		}
+	}
+}
+
+// parseDNSSECPipe handles pipe-delimited DNSSEC validation log lines.
+// Format: "validation|domain|IN|secure"
+func (p *Parser) parseDNSSECPipe(line []byte, node string) {
+	// Find the validation| part
+	idx := bytes.Index(line, []byte("validation|"))
+	if idx == -1 {
+		return
+	}
+	after := line[idx+len("validation|"):]
+	pipeParts := bytes.Split(after, []byte("|"))
+	if len(pipeParts) < 4 {
+		return
+	}
+	domain := strings.ToLower(strings.TrimSuffix(string(pipeParts[0]), "."))
+	result := strings.ToLower(string(pipeParts[3]))
+
+	switch result {
+	case "secure", "insecure", "bogus", "indeterminate":
+		p.store.SetDNSSEC(node, domain, result)
+	default:
+		if p.Debug {
+			log.Printf("[DEBUG] Unknown DNSSEC pipe result: %s for domain=%s", result, domain)
+		}
+	}
+}
+
+// parseResponseCode extracts DNS response codes from dnsmasq reply log lines.
+// Common codes: NXDOMAIN, SERVFAIL, REFUSED, NOERROR, TIMEOUT
+func parseResponseCode(line []byte, actionIdx int, parts [][]byte) string {
+	lineStr := strings.ToLower(string(line))
+
+	// Check for common response code patterns in the log line
+	switch {
+	case bytes.Contains(line, []byte("NXDOMAIN")) || strings.Contains(lineStr, "nxdomain"):
+		return "NXDOMAIN"
+	case bytes.Contains(line, []byte("SERVFAIL")) || strings.Contains(lineStr, "servfail"):
+		return "SERVFAIL"
+	case bytes.Contains(line, []byte("REFUSED")) || strings.Contains(lineStr, "refused"):
+		return "REFUSED"
+	case bytes.Contains(line, []byte("timeout")) || strings.Contains(lineStr, "timed out"):
+		return "TIMEOUT"
+	}
+
+	// For reply lines, check if the reply content indicates success or error
+	if actionIdx >= 0 && len(parts) > actionIdx+2 {
+		replyContent := strings.ToLower(string(parts[actionIdx+2]))
+		switch {
+		case replyContent == "nxdomain":
+			return "NXDOMAIN"
+		case replyContent == "servfail":
+			return "SERVFAIL"
+		case replyContent == "refused":
+			return "REFUSED"
+		case replyContent == "timeout":
+			return "TIMEOUT"
+		}
+	}
+
+	// If it's a reply/cached/config action with no error, it's NOERROR
+	if actionIdx >= 0 && (bytes.Equal(parts[actionIdx], []byte("reply")) ||
+		bytes.Equal(parts[actionIdx], []byte("cached")) ||
+		bytes.Equal(parts[actionIdx], []byte("config"))) {
+		return "NOERROR"
+	}
+
+	return ""
 }

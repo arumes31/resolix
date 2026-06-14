@@ -1,0 +1,208 @@
+/* Fonts */
+@import url('/static/fonts/fonts.css');
+
+/* ===== Theme Variables ===== */
+:root {
+    /* Dark theme (default) */
+    --bg-primary: hsl(222, 47%, 11%);
+    --bg-secondary: hsl(240, 33%, 15%);
+    --bg-card: hsla(0, 0%, 100%, 0.05);
+    --bg-input: hsla(0, 0%, 100%, 0.03);
+    --text-primary: hsl(210, 40%, 98%);
+    --text-secondary: hsl(215, 20%, 65%);
+    --text-muted: hsl(215, 20%, 45%);
+    --accent: hsl(239, 55%, 55%);
+    --accent-hover: hsl(239, 55%, 48%);
+    --border-color: hsla(0, 0%, 100%, 0.1);
+    --status-online: hsl(142, 71%, 45%);
+    --status-warning: hsl(38, 92%, 50%);
+    --status-error: hsl(0, 84%, 60%);
+    --shadow-color: hsla(0, 0%, 0%, 0.5);
+    --glass-bg: hsla(0, 0%, 100%, 0.05);
+    --glass-border: hsla(0, 0%, 100%, 0.1);
+    --header-gradient-from: hsl(239, 55%, 65%);
+    --header-gradient-to: hsl(270, 55%, 72%);
+    --body-gradient-from: hsl(222, 47%, 11%);
+    --body-gradient-to: hsl(240, 33%, 15%);
+    --input-focus-border: hsl(239, 55%, 55%);
+    --input-focus-shadow: hsla(239, 55%, 55%, 0.1);
+    --btn-bg: hsl(239, 55%, 55%);
+    --btn-hover-bg: hsl(239, 55%, 48%);
+    --btn-shadow: hsla(239, 55%, 55%, 0.3);
+    --btn-color: hsl(0, 0%, 100%);
+    --error-bg: hsla(0, 84%, 60%, 0.1);
+    --error-border: hsla(0, 84%, 60%, 0.2);
+    --error-text: hsl(0, 84%, 80%);
+    --input-color: hsl(0, 0%, 100%);
+    --input-focus-bg: hsla(0, 0%, 100%, 0.07);
+}
+
+[data-theme="light"] {
+    --bg-primary: hsl(220, 14%, 96%);
+    --bg-secondary: hsl(220, 14%, 100%);
+    --bg-card: hsl(220, 14%, 100%);
+    --bg-input: hsl(220, 14%, 94%);
+    --text-primary: hsl(222, 47%, 11%);
+    --text-secondary: hsl(215, 16%, 47%);
+    --text-muted: hsl(215, 16%, 65%);
+    --accent: hsl(239, 55%, 50%);
+    --accent-hover: hsl(239, 55%, 42%);
+    --border-color: hsl(220, 13%, 88%);
+    --status-online: hsl(142, 71%, 38%);
+    --status-warning: hsl(38, 92%, 45%);
+    --status-error: hsl(0, 84%, 55%);
+    --shadow-color: hsla(220, 14%, 50%, 0.12);
+    --glass-bg: hsl(220, 14%, 100%);
+    --glass-border: hsl(220, 13%, 88%);
+    --header-gradient-from: hsl(239, 55%, 55%);
+    --header-gradient-to: hsl(270, 55%, 65%);
+    --body-gradient-from: hsl(220, 14%, 96%);
+    --body-gradient-to: hsl(230, 20%, 94%);
+    --input-focus-border: hsl(239, 55%, 50%);
+    --input-focus-shadow: hsla(239, 55%, 50%, 0.12);
+    --btn-bg: hsl(239, 55%, 50%);
+    --btn-hover-bg: hsl(239, 55%, 42%);
+    --btn-shadow: hsla(239, 55%, 50%, 0.25);
+    --btn-color: hsl(0, 0%, 100%);
+    --error-bg: hsla(0, 84%, 55%, 0.08);
+    --error-border: hsla(0, 84%, 55%, 0.2);
+    --error-text: hsl(0, 84%, 45%);
+    --input-color: hsl(222, 47%, 11%);
+    --input-focus-bg: hsl(220, 14%, 96%);
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: 'Inter', sans-serif;
+    background: linear-gradient(135deg, var(--body-gradient-from) 0%, var(--body-gradient-to) 100%);
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-primary);
+    overflow: hidden;
+}
+
+.login-container {
+    background: var(--glass-bg);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid var(--glass-border);
+    padding: 3rem;
+    border-radius: 24px;
+    width: 100%;
+    max-width: 400px;
+    box-shadow: 0 25px 50px -12px var(--shadow-color);
+    animation: fadeIn 0.6s ease-out;
+}
+
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(20px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.header {
+    text-align: center;
+    margin-bottom: 2.5rem;
+}
+
+.header h1 {
+    font-family: 'Outfit', sans-serif;
+    font-size: 2rem;
+    font-weight: 700;
+    margin-bottom: 0.5rem;
+    background: linear-gradient(to right, var(--header-gradient-from), var(--header-gradient-to));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+
+.header p {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+}
+
+.form-group {
+    margin-bottom: 1.5rem;
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: 0.5rem;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.form-group input {
+    width: 100%;
+    padding: 0.85rem 1rem;
+    background: var(--bg-input);
+    border: 1px solid var(--glass-border);
+    border-radius: 12px;
+    color: var(--input-color);
+    font-size: 1rem;
+    transition: all 0.3s ease;
+    outline: none;
+}
+
+.form-group input:focus {
+    background: var(--input-focus-bg);
+    border-color: var(--input-focus-border);
+    box-shadow: 0 0 0 4px var(--input-focus-shadow);
+}
+
+.btn-login {
+    width: 100%;
+    padding: 0.85rem;
+    background: var(--btn-bg);
+    border: none;
+    border-radius: 12px;
+    color: var(--btn-color);
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    margin-top: 1rem;
+}
+
+.btn-login:hover {
+    background: var(--btn-hover-bg);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px var(--btn-shadow);
+}
+
+.btn-login:active {
+    transform: translateY(0);
+}
+
+.error-message {
+    background: var(--error-bg);
+    border: 1px solid var(--error-border);
+    color: var(--error-text);
+    padding: 0.75rem;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    margin-bottom: 1.5rem;
+    text-align: center;
+}
+
+.footer {
+    margin-top: 2rem;
+    text-align: center;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}

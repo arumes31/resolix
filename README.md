@@ -38,6 +38,10 @@ graph LR
 - **🏥 Parallel Health Checks**: Continuous concurrent monitoring of upstream DNS servers with automatic failover.
 - **🛡️ Security First**: Hardened Content Security Policy (CSP) and optimized kernel `sysctls`.
 - **🌐 Advanced Upstreams**: Support for `IP#port` notation for custom upstream DNS servers.
+- **🔧 Configurable Logging**: Level-aware logging (DEBUG, INFO, WARNING, ERROR) via `LOG_LEVEL`.
+- **🏷️ Client Aliases**: Map client IPs to friendly names via environment variable or file.
+- **🩺 Health Endpoint**: Lightweight `/healthz` endpoint for container liveness probes.
+- **🔄 Reverse Proxy Support**: Configurable `BASE_URL` for hosting behind a reverse proxy subpath.
 
 ---
 
@@ -66,13 +70,50 @@ docker-compose -f docker-compose.example.yaml up -d
 | `PORT` | Web GUI listening port | `35353` |
 | `INGEST_SECRET` | Secret token to authenticate logs from slave nodes | - |
 | `MODE` | Run mode (`master` or `slave`) | `master` |
-| `MASTER_URL` | URL of the Master node (Required for `slave` mode) | - |
+| `MASTER_URL` | URL of the Master node (Required for `slave` mode, must start with `http://` or `https://`) | - |
 | `NODE_NAME` | Unique identifier for the node in the dashboard | Hostname |
+| `WEB_USERNAME` | Web GUI authentication username | - |
+| `WEB_PASSWORD` | Web GUI authentication password (recommended to set) | - |
+| `LOG_LEVEL` | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` | `INFO` |
+| `BASE_URL` | Base URL path for reverse proxy subpath hosting (e.g., `/dashboard`) | `/` |
+| `DB_PATH` | SQLite database file name or absolute path | `dns.db` |
+| `CLIENT_ALIASES_FILE` | Path to a file with `IP=Alias` mappings (reloaded every 30s) | - |
+| `CLIENT_ALIASES` | Comma-separated `IP:Alias` mappings (alternative to file) | - |
 
 ### Performance Optimization
+
 The provided `docker-compose.yaml` includes kernel `sysctls` optimizations:
+
 - `net.core.somaxconn=1024`: Higher connection backlog for heavy traffic.
 - `net.ipv4.tcp_fastopen=3`: Reduces latency for repeated TCP connections.
+
+#### Custom Sysctl Parameters for Network Optimization
+
+These optional kernel parameters can improve network performance for high-traffic deployments. They are **not required** for normal operation but are recommended when serving many concurrent connections.
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `net.core.somaxconn` | `1024` | Increases the maximum number of socket connections queued for acceptance. The default (128) can cause connection drops under heavy load. Setting to 1024 allows the kernel to buffer more incoming connections before the application accepts them. |
+| `net.ipv4.tcp_fastopen` | `3` | Enables TCP Fast Open (TFO) for both client and server. TFO allows clients to send data in the initial SYN packet, reducing connection setup latency by one round-trip. Value `3` means both client and server TFO are enabled (0=disabled, 1=client only, 2=server only, 3=both). |
+
+**How to apply these settings:**
+
+Temporary (until reboot):
+```bash
+sudo sysctl -w net.core.somaxconn=1024
+sudo sysctl -w net.ipv4.tcp_fastopen=3
+```
+
+Persistent (survives reboot) — create a file in `/etc/sysctl.d/`:
+```bash
+cat <<EOF | sudo tee /etc/sysctl.d/99-tailscale-dnsrewrite.conf
+net.core.somaxconn=1024
+net.ipv4.tcp_fastopen=3
+EOF
+sudo sysctl --system
+```
+
+> **Note:** These parameters are optional but recommended for high-traffic deployments. The Docker Compose file already applies these settings to the container automatically.
 
 ---
 
@@ -84,6 +125,41 @@ For a slave node to report logs to the master, set:
 `MODE=slave`
 `MASTER_URL=http://100.x.y.z:35353` (Tailscale IP of your master node)
 `INGEST_SECRET=your-secret-token` (Must match Master's secret)
+
+### Client Aliases
+Map client IP addresses to friendly names in the dashboard:
+
+**Via environment variable:**
+```
+CLIENT_ALIASES=192.168.1.1:Gateway,100.64.0.1:Router
+```
+
+**Via file (supports hot-reload every 30 seconds):**
+```
+CLIENT_ALIASES_FILE=/etc/tailscale-dnsrewrite/aliases.txt
+```
+File format (`IP=Alias`, one per line, `#` comments supported):
+```
+# Network devices
+192.168.1.1=Gateway
+100.64.0.1=Router
+100.64.0.2=NAS
+```
+
+### Reverse Proxy Subpath
+To host the dashboard behind a reverse proxy at a subpath (e.g., `/dashboard`):
+```
+BASE_URL=/dashboard
+```
+All internal URLs will be prefixed with the base URL path. Configure your reverse proxy to strip the prefix or forward it as-is.
+
+### Health Check Endpoint
+A lightweight `/healthz` endpoint is available for container liveness probes:
+```bash
+curl http://localhost:35353/healthz
+# Returns: {"status":"ok"}
+```
+This endpoint does **not** require authentication and performs no database queries.
 
 ---
 
@@ -120,6 +196,7 @@ We maintain high code quality and security standards using the following tools:
 - **Upstream Health**: `docker exec -it dns-tailscale-1 dig @<UPSTREAM_IP> google.com`
 - **Config Validation**: `docker exec -it dns-tailscale-1 cat -v /etc/dnsmasq.conf`
 - **CRLF Issues**: If dnsmasq dies immediately, the build-time `sed` scripts should have fixed this, but ensure your `entrypoint.sh` is saved with LF endings.
+- **Health Check**: `curl http://localhost:35353/healthz` — should return `{"status":"ok"}`
 
 ---
 

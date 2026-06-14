@@ -1,0 +1,45 @@
+# tailscale-dnsrewrite.service — systemd unit for Tailscale DNS Monitor & Rewriter
+#
+# Installation:
+#   1. Copy this file to /etc/systemd/system/tailscale-dnsrewrite.service
+#   2. Copy the environment file to /etc/default/tailscale-dnsrewrite
+#      (see .env.example for available variables)
+#   3. Reload systemd:  sudo systemctl daemon-reload
+#   4. Enable at boot:  sudo systemctl enable tailscale-dnsrewrite
+#   5. Start now:       sudo systemctl start tailscale-dnsrewrite
+#
+# Usage:
+#   sudo systemctl status tailscale-dnsrewrite   # Check status
+#   sudo journalctl -u tailscale-dnsrewrite -f   # Follow logs
+#   sudo systemctl restart tailscale-dnsrewrite  # Restart service
+#
+# The binary should be installed at /usr/local/bin/tailscale-dnsrewrite
+# or adjust ExecStart to match your installation path.
+
+[Unit]
+Description=Tailscale DNS Monitor & Rewriter
+After=network.target
+Documentation=https://github.com/arumes31/tailscale-dnsrewrite
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/tailscale-dnsrewrite
+ExecStart=/usr/local/bin/tailscale-dnsrewrite
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/tailscale-dnsrewrite
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tailscale-dnsrewrite
+
+[Install]
+WantedBy=multi-user.target

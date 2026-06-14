@@ -1,3 +1,6 @@
+run:
+  timeout: 5m
+
 linters:
   enable:
     - revive
@@ -11,17 +14,54 @@ linters:
     - gocyclo
     - misspell
     - unparam
+    - gosec
+    - govet
 
 linters-settings:
   gocyclo:
     min-complexity: 25
   revive:
+    severity: warning
     rules:
-      - name: exported
-      - name: unused-parameter
       - name: var-naming
+        severity: warning
+      - name: exported
+        severity: warning
+      - name: unused-parameter
+        severity: warning
+      - name: unreachable-code
+        severity: error
+      - name: context-as-argument
+        severity: warning
+      - name: error-return
+        severity: warning
+  gosec:
+    severity: medium
+    excludes:
+      - G104
+    config:
+      G101:
+        omit_entropy: false
+      G601:
+        min_length: 16
+  gocritic:
+    enabled-checks:
+      - dupImport
+      - importShadow
+      - truncateCmp
+    severity: warning
+  misspell:
+    locale: US
+
+severity:
+  default-severity: warning
+  rules:
+    - linters:
+        - govet
+        - gosec
+      severity: error
 
 issues:
   exclude-use-default: false
-  max-issues-per-linter: 0
-  max-same-issues: 0
+  max-issues-per-linter: 50
+  max-same-issues: 5

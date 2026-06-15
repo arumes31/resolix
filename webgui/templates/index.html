@@ -8,7 +8,7 @@
         content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:;">
     <title>Tailscale DNS Monitor - Advanced</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
-    <style>
+    <style nonce="{{.Nonce}}">
         :root {
             --bg-color: #0f172a;
             --glass-bg: rgba(30, 41, 59, 0.7);
@@ -403,16 +403,6 @@
                 font-size: 0.875rem;
             }
 
-            /* Hide Node, Upstream, Latency columns on mobile */
-            th:nth-child(2),
-            td:nth-child(2),
-            th:nth-child(6),
-            td:nth-child(6),
-            th:nth-child(7),
-            td:nth-child(7) {
-                display: none;
-            }
-
             table {
                 min-width: auto;
             }
@@ -568,7 +558,7 @@
         {{end}}
     </div>
 
-    <script>
+    <script nonce="{{.Nonce}}">
         function escapeHtml(unsafe) {
             if (unsafe == null) return '';
             const el = document.createElement('div');
@@ -601,6 +591,7 @@
         let isFrozen = false;
         let isViewCleared = false;
         let statsInterval = null;
+        let nodeStatusInterval = null;
 
         // Stream handler
         function startStream() {
@@ -660,7 +651,7 @@
                 <td class="timestamp"><div style="font-size:0.8rem">${escapeHtml(timeStr)}</div><div style="font-size:0.6rem; opacity:0.6">${escapeHtml(relTime)}</div></td>
                 <td><span class="badge" style="background: rgba(255,255,255,0.1); font-size: 0.7rem;">${escapeHtml(e.node || 'local')}</span></td>
                 <td><span class="badge badge-type">${escapeHtml(e.type)}</span></td>
-                <td class="domain cell-with-copy">${escapeHtml(e.domain)}<button class="test-domain-btn" title="Test in simulator" onclick="event.stopPropagation(); prefillSimulator('${escapeHtml(e.domain)}')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></button></td>
+                <td class="domain cell-with-copy">${escapeHtml(e.domain)}<button class="test-domain-btn" title="Test in simulator" data-domain="${escapeHtml(e.domain)}"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></button></td>
                 <td onclick='showClientStats(${JSON.stringify(e.client_ip)})' style="cursor: pointer; position: relative;" title="Click for details">
                     <span class="badge badge-ip">${escapeHtml(e.client_ip)}</span>
                     ${e.alias ? `<span class="alias-tag">${escapeHtml(e.alias)}</span>` : ''}
@@ -997,10 +988,11 @@
         function updateVisibility() {
             isTabVisible = document.visibilityState === 'visible';
             if (statsInterval) clearInterval(statsInterval);
+            if (nodeStatusInterval) clearInterval(nodeStatusInterval);
 
             const rate = isTabVisible ? 5000 : 60000;
             statsInterval = setInterval(fetchStats, rate);
-            setInterval(fetchNodeStatus, 30000);
+            nodeStatusInterval = setInterval(fetchNodeStatus, 30000);
 
             if (isTabVisible) {
                 fetchAll(); // Catch up immediately
@@ -1008,6 +1000,15 @@
         }
 
         document.addEventListener('visibilitychange', updateVisibility);
+
+        // Event delegation for test-domain-btn (XSS-safe: domain from data attribute)
+        document.addEventListener('click', function (e) {
+            const btn = e.target.closest('.test-domain-btn');
+            if (btn) {
+                e.stopPropagation();
+                prefillSimulator(btn.dataset.domain);
+            }
+        });
 
         updateVisibility(); // Initial set
         startStream();

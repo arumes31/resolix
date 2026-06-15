@@ -34,7 +34,7 @@ import (
 )
 
 // Version represents the current application version.
-var Version = "2.0.0"  // Changed from const to var for -ldflags build-time setting (Item 88)
+var Version = "2.0.0" // Changed from const to var for -ldflags build-time setting (Item 88)
 
 //go:embed templates static
 var embedFS embed.FS
@@ -59,7 +59,7 @@ func cspMiddleware(next http.Handler) http.Handler {
 		// Set Content-Security-Policy HTTP header
 		csp := "default-src 'self'; " +
 			"script-src 'nonce-" + nonce + "'; " +
-			"style-src 'self'; " +
+			"style-src 'self' 'nonce-" + nonce + "'; " +
 			"font-src 'self'; " +
 			"img-src 'self' data:; " +
 			"connect-src 'self'; " +
@@ -129,7 +129,7 @@ func generateEnvFile() {
 		logger.Info(".env.example not found, generating .env from defaults")
 	}
 
-	if err := os.WriteFile(envPath, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(envPath, []byte(content), 0600); err != nil {
 		logger.Warning("Failed to generate .env file: %v", err)
 	} else {
 		logger.Info("Generated default .env file at %s", envPath)

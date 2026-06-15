@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,10 +20,10 @@ import (
 func newTestStore(t *testing.T) (*Store, func()) {
 	t.Helper()
 	cfg := &config.Config{
-		MaxEvents:        1000,
-		HistoryDir:       t.TempDir(),
-		DBPath:           "test.db",
-		HistoryRetention: 72 * time.Hour,
+		MaxEvents:                1000,
+		HistoryDir:               t.TempDir(),
+		DBPath:                   "test.db",
+		HistoryRetention:         72 * time.Hour,
 		UpstreamLatencyThreshold: 200,
 	}
 	s := NewStore(cfg)
@@ -35,10 +36,10 @@ func newTestStore(t *testing.T) (*Store, func()) {
 
 func TestNewStore(t *testing.T) {
 	cfg := &config.Config{
-		MaxEvents:        500,
-		HistoryDir:       t.TempDir(),
-		DBPath:           "test.db",
-		HistoryRetention: 24 * time.Hour,
+		MaxEvents:                500,
+		HistoryDir:               t.TempDir(),
+		DBPath:                   "test.db",
+		HistoryRetention:         24 * time.Hour,
 		UpstreamLatencyThreshold: 200,
 	}
 	s := NewStore(cfg)
@@ -112,10 +113,10 @@ func TestAddEvent_SingleEvent(t *testing.T) {
 
 func TestAddEvent_MaxCapacity(t *testing.T) {
 	cfg := &config.Config{
-		MaxEvents:        5,
-		HistoryDir:       t.TempDir(),
-		DBPath:           "test.db",
-		HistoryRetention: 72 * time.Hour,
+		MaxEvents:                5,
+		HistoryDir:               t.TempDir(),
+		DBPath:                   "test.db",
+		HistoryRetention:         72 * time.Hour,
 		UpstreamLatencyThreshold: 200,
 	}
 	s := NewStore(cfg)
@@ -504,11 +505,11 @@ func TestGetUpstreamHealth(t *testing.T) {
 
 func TestGetAlias(t *testing.T) {
 	cfg := &config.Config{
-		MaxEvents:        100,
-		HistoryDir:       t.TempDir(),
-		DBPath:           "test.db",
-		HistoryRetention: 72 * time.Hour,
-		ClientAliases:    map[string]string{"192.168.1.1": "Gateway"},
+		MaxEvents:                100,
+		HistoryDir:               t.TempDir(),
+		DBPath:                   "test.db",
+		HistoryRetention:         72 * time.Hour,
+		ClientAliases:            map[string]string{"192.168.1.1": "Gateway"},
 		UpstreamLatencyThreshold: 200,
 	}
 	s := NewStore(cfg)
@@ -528,10 +529,10 @@ func TestGetAlias(t *testing.T) {
 
 func TestClose(t *testing.T) {
 	cfg := &config.Config{
-		MaxEvents:        100,
-		HistoryDir:       t.TempDir(),
-		DBPath:           "test.db",
-		HistoryRetention: 72 * time.Hour,
+		MaxEvents:                100,
+		HistoryDir:               t.TempDir(),
+		DBPath:                   "test.db",
+		HistoryRetention:         72 * time.Hour,
 		UpstreamLatencyThreshold: 200,
 	}
 	s := NewStore(cfg)
@@ -596,8 +597,7 @@ func TestCachedQueryCount(t *testing.T) {
 
 // atomicLoadInt64 is a helper to atomically load an int64.
 func atomicLoadInt64(addr *int64) int64 {
-	// Use the sync/atomic package pattern
-	return *addr // For test purposes, direct read is fine since we're single-threaded here
+	return atomic.LoadInt64(addr)
 }
 
 func TestBandwidthSaved(t *testing.T) {

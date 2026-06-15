@@ -171,9 +171,18 @@ func Error(format string, args ...interface{}) {
 	}
 }
 
-// Fatal logs a message at ERROR level and exits with code 1.
+// Fatal logs a message at FATAL level and exits with code 1.
 func Fatal(format string, args ...interface{}) {
-	stdLogger.Fatalf("[FATAL] "+format, args...)
+	msg := fmt.Sprintf("[FATAL] "+format, args...)
+
+	fileMu.Lock()
+	if fileLogger != nil {
+		fileLogger.Print(msg)
+		_ = fileWriter.Flush()
+	}
+	fileMu.Unlock()
+
+	stdLogger.Fatal(msg)
 }
 
 // Fatalf is an alias for Fatal.

@@ -106,6 +106,7 @@ type Config struct {
 	MaxBacklogSize   int64
 	UpstreamDNS      string
 	ClientAliases    map[string]string
+	clientAliasesMu  sync.RWMutex
 	Debug            bool
 	LogLevel         string
 	BaseURL          string
@@ -233,6 +234,7 @@ func (p *clientAliasesProvider) load() {
 
 // startReload begins periodic reloading of the aliases file.
 func (p *clientAliasesProvider) startReload(ctx context.Context) {
+	ctx, p.cancel = context.WithCancel(ctx)
 	ticker := time.NewTicker(DefaultClientAliasesReloadInterval)
 	go func() {
 		defer ticker.Stop()
@@ -282,6 +284,8 @@ func (c *Config) GetClientAlias(ip string) string {
 		}
 	}
 	// Fall back to env var aliases
+	c.clientAliasesMu.RLock()
+	defer c.clientAliasesMu.RUnlock()
 	if c.ClientAliases != nil {
 		return c.ClientAliases[ip]
 	}
@@ -301,6 +305,8 @@ func (c *Config) SetClientAliases(aliases map[string]string) {
 	if aliases == nil {
 		return
 	}
+	c.clientAliasesMu.Lock()
+	defer c.clientAliasesMu.Unlock()
 	c.ClientAliases = aliases
 }
 
@@ -649,15 +655,15 @@ func (c *Config) VerifyConfig() ([]string, []string) {
 
 	// 6. Blocklist file check (non-critical warning)
 	if c.BlocklistFile != "" {
-		if _, err := os.Stat(c.BlocklistFile); os.IsNotExist(err) {
-			warnings = append(warnings, fmt.Sprintf("BLOCKLIST_FILE '%s' does not exist (will be watched for creation)", c.BlocklistFile))
+		if _, err := os.Stat(c.FullBlocklistPath()); os.IsNotExist(err) {
+			warnings = append(warnings, fmt.Sprintf("BLOCKLIST_FILE '%s' does not exist (will be watched for creation)", c.FullBlocklistPath()))
 		}
 	}
 
 	// 7. DNS routes file check (non-critical warning)
 	if c.DNSRoutesFile != "" {
-		if _, err := os.Stat(c.DNSRoutesFile); os.IsNotExist(err) {
-			warnings = append(warnings, fmt.Sprintf("DNS_ROUTES_FILE '%s' does not exist (will be created on first save)", c.DNSRoutesFile))
+		if _, err := os.Stat(c.FullDNSRoutesPath()); os.IsNotExist(err) {
+			warnings = append(warnings, fmt.Sprintf("DNS_ROUTES_FILE '%s' does not exist (will be created on first save)", c.FullDNSRoutesPath()))
 		}
 	}
 

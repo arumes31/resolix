@@ -21,7 +21,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -158,6 +157,9 @@ type Server struct {
 	// DNS routes (Item 66)
 	dnsRoutes *dnsroutes.DNSRoutes
 
+	// Mutex protecting resolver, blocklist, and dnsRoutes fields
+	fieldsMu sync.RWMutex
+
 	// DNS loop detection (Item 65)
 	dnsLoopDetected bool
 	dnsLoopMu       sync.Mutex
@@ -201,16 +203,22 @@ func NewServer(cfg *config.Config, store *storage.Store, prs *parser.Parser, tmp
 
 // SetResolver configures the reverse DNS resolver for enriching events with hostnames.
 func (s *Server) SetResolver(r *resolver.Resolver) {
+	s.fieldsMu.Lock()
+	defer s.fieldsMu.Unlock()
 	s.resolver = r
 }
 
 // SetBlocklist configures the blocklist for checking blocked domains.
 func (s *Server) SetBlocklist(bl *blocklist.Blocklist) {
+	s.fieldsMu.Lock()
+	defer s.fieldsMu.Unlock()
 	s.blocklist = bl
 }
 
 // SetDNSRoutes configures the domain-specific DNS routing rules.
 func (s *Server) SetDNSRoutes(dr *dnsroutes.DNSRoutes) {
+	s.fieldsMu.Lock()
+	defer s.fieldsMu.Unlock()
 	s.dnsRoutes = dr
 }
 
@@ -367,15 +375,20 @@ func (s *Server) Unsubscribe(ch chan models.QueryEvent) {
 // Subscribers that exceed 10 consecutive drops are removed.
 func (s *Server) BroadcastEvent(e models.QueryEvent) {
 	// Item 59: Enrich with reverse DNS hostname
-	if s.resolver != nil && e.ClientIP != "" {
-		if hostname := s.resolver.GetHostname(e.ClientIP); hostname != "" {
+	s.fieldsMu.RLock()
+	resolver := s.resolver
+	bl := s.blocklist
+	s.fieldsMu.RUnlock()
+
+	if resolver != nil && e.ClientIP != "" {
+		if hostname := resolver.GetHostname(e.ClientIP); hostname != "" {
 			e.ClientHostname = hostname
 		}
 	}
 
 	// Item 61: Check blocklist
-	if s.blocklist != nil && e.Domain != "" {
-		if s.blocklist.IsBlocked(e.Domain) {
+	if bl != nil && e.Domain != "" {
+		if bl.IsBlocked(e.Domain) {
 			e.Blocked = true
 		}
 	}
@@ -482,9 +495,12 @@ func (s *Server) checkDNSLoop() {
 	}
 
 	// Also check upstreams file
-	if s.dnsRoutes != nil {
+	s.fieldsMu.RLock()
+	dnsRoutes := s.dnsRoutes
+	s.fieldsMu.RUnlock()
+	if dnsRoutes != nil {
 		// Check routes for loop patterns
-		routes := s.dnsRoutes.GetRoutesMap()
+		routes := dnsRoutes.GetRoutesMap()
 		for _, upstream := range routes {
 			host := upstream
 			if h, _, err := net.SplitHostPort(upstream); err == nil {
@@ -1044,14 +1060,17 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 // ===== Item 61: Blocklist Status Endpoint =====
 func (s *Server) handleBlocklistStatus(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	if s.blocklist == nil {
+	s.fieldsMu.RLock()
+	bl := s.blocklist
+	s.fieldsMu.RUnlock()
+	if bl == nil {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"count": 0,
 			"file":  "",
 		})
 		return
 	}
-	_ = json.NewEncoder(w).Encode(s.blocklist.Status())
+	_ = json.NewEncoder(w).Encode(bl.Status())
 }
 
 // ===== Item 62: Upstream Configuration Editor =====
@@ -1081,8 +1100,6 @@ func (s *Server) handleGetUpstreams(w http.ResponseWriter, _ *http.Request) {
 	_ = json.NewEncoder(w).Encode(upstreams)
 }
 
-var upstreamAddrRegex = regexp.MustCompile(`^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d{1,5}$`)
-
 func (s *Server) handlePostUpstreams(w http.ResponseWriter, r *http.Request) {
 	var req []struct {
 		Address string `json:"address"`
@@ -1099,12 +1116,32 @@ func (s *Server) handlePostUpstreams(w http.ResponseWriter, r *http.Request) {
 		if addr == "" {
 			continue
 		}
-		if !upstreamAddrRegex.MatchString(addr) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"error": "Invalid upstream address format (expected ip:port)",
 				"input": addr,
+			})
+			return
+		}
+		if net.ParseIP(host) == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": "Invalid upstream IP address",
+				"input": host,
+			})
+			return
+		}
+		portNum, err := strconv.Atoi(port)
+		if err != nil || portNum < 1 || portNum > 65535 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": "Invalid upstream port (must be 1-65535)",
+				"input": port,
 			})
 			return
 		}
@@ -1221,7 +1258,10 @@ func (s *Server) handleDNSRoutes(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetDNSRoutes(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	if s.dnsRoutes == nil {
+	s.fieldsMu.RLock()
+	dr := s.dnsRoutes
+	s.fieldsMu.RUnlock()
+	if dr == nil {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"routes": map[string]string{},
 			"count":  0,
@@ -1230,8 +1270,8 @@ func (s *Server) handleGetDNSRoutes(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"routes": s.dnsRoutes.GetRoutesMap(),
-		"count":  s.dnsRoutes.Count(),
+		"routes": dr.GetRoutesMap(),
+		"count":  dr.Count(),
 	})
 }
 
@@ -1242,12 +1282,15 @@ func (s *Server) handlePostDNSRoutes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.dnsRoutes == nil {
+	s.fieldsMu.RLock()
+	dr := s.dnsRoutes
+	s.fieldsMu.RUnlock()
+	if dr == nil {
 		http.Error(w, "DNS routes not configured", http.StatusInternalServerError)
 		return
 	}
 
-	if err := s.dnsRoutes.SetRoutes(routesMap); err != nil {
+	if err := dr.SetRoutes(routesMap); err != nil {
 		http.Error(w, fmt.Sprintf("Failed to save routes: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -1255,7 +1298,7 @@ func (s *Server) handlePostDNSRoutes(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"status": "ok",
-		"count":  s.dnsRoutes.Count(),
+		"count":  dr.Count(),
 	})
 }
 
@@ -1286,7 +1329,6 @@ func (s *Server) handleUpstreamLatency(w http.ResponseWriter, _ *http.Request) {
 		"slow_upstreams": slowUpstreams,
 	})
 }
-
 
 // ===== Item 92: Heartbeat Endpoint =====
 // handleHeartbeat processes heartbeat messages from slave nodes.
@@ -1421,8 +1463,11 @@ func (s *Server) handleSyncDNSRoutes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	routes := make(map[string]string)
-	if s.dnsRoutes != nil {
-		routes = s.dnsRoutes.GetRoutesMap()
+	s.fieldsMu.RLock()
+	dr := s.dnsRoutes
+	s.fieldsMu.RUnlock()
+	if dr != nil {
+		routes = dr.GetRoutesMap()
 	}
 
 	w.Header().Set("Content-Type", "application/json")

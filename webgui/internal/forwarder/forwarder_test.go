@@ -460,7 +460,9 @@ func TestReportHealth_SlaveMode(t *testing.T) {
 		var payload map[string]interface{}
 		_ = decodeJSONBody(r, &payload)
 		if h, ok := payload["health"]; ok {
-			receivedHealth = h.(map[string]interface{})
+			if hm, ok := h.(map[string]interface{}); ok {
+				receivedHealth = hm
+			}
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))

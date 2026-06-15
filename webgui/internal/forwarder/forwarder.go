@@ -55,16 +55,22 @@ func NewForwarder(cfg *config.Config) *Forwarder {
 
 // SetDNSRoutesFn sets the callback for applying synced DNS routes (Item 91).
 func (f *Forwarder) SetDNSRoutesFn(fn func(routes map[string]string)) {
+	f.syncMu.Lock()
+	defer f.syncMu.Unlock()
 	f.setDNSRoutesFn = fn
 }
 
 // SetAliasesFn sets the callback for applying synced client aliases (Item 90).
 func (f *Forwarder) SetAliasesFn(fn func(aliases map[string]string)) {
+	f.syncMu.Lock()
+	defer f.syncMu.Unlock()
 	f.setAliasesFn = fn
 }
 
 // SetUpstreamHealthFn sets the callback for applying synced upstream health (Item 94).
 func (f *Forwarder) SetUpstreamHealthFn(fn func(node string, health map[string]float64)) {
+	f.syncMu.Lock()
+	defer f.syncMu.Unlock()
 	f.setUpstreamHealthFn = fn
 }
 
@@ -122,12 +128,12 @@ func (f *Forwarder) Enqueue(line string) {
 }
 
 // getResourceStats collects current resource usage statistics (Item 93).
-func getResourceStats() (memoryMB float64, goroutines int, dbSizeMB float64) {
+func getResourceStats() (memoryMB float64, goroutines int) {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	memoryMB = float64(m.Alloc) / 1024 / 1024
 	goroutines = runtime.NumGoroutine()
-	return memoryMB, goroutines, dbSizeMB
+	return memoryMB, goroutines
 }
 
 // getDBSizeMB returns the size of the database file in megabytes.
@@ -219,7 +225,7 @@ func (f *Forwarder) sendBatch(client *http.Client, lines []string, health map[st
 
 // sendHeartbeat sends a heartbeat to the master node (Item 92).
 func (f *Forwarder) sendHeartbeat(client *http.Client, health map[string]float64) error {
-	memoryMB, goroutines, _ := getResourceStats()
+	memoryMB, goroutines := getResourceStats()
 	dbSizeMB := getDBSizeMB(f.cfg)
 
 	hb := models.HeartbeatPayload{
@@ -327,10 +333,11 @@ func (f *Forwarder) syncAliases(client *http.Client) {
 
 	f.syncMu.Lock()
 	f.syncedAliases = result
+	fn := f.setAliasesFn
 	f.syncMu.Unlock()
 
-	if f.setAliasesFn != nil {
-		f.setAliasesFn(result)
+	if fn != nil {
+		fn(result)
 	}
 
 	log.Printf("[INFO] Synced %d client aliases from master", len(result))
@@ -354,10 +361,11 @@ func (f *Forwarder) syncDNSRoutes(client *http.Client) {
 
 	f.syncMu.Lock()
 	f.syncedRoutes = result.Routes
+	fn := f.setDNSRoutesFn
 	f.syncMu.Unlock()
 
-	if f.setDNSRoutesFn != nil {
-		f.setDNSRoutesFn(result.Routes)
+	if fn != nil {
+		fn(result.Routes)
 	}
 
 	log.Printf("[INFO] Synced %d DNS routes from master", len(result.Routes))
@@ -379,11 +387,12 @@ func (f *Forwarder) syncUpstreamHealth(client *http.Client) {
 
 	f.syncMu.Lock()
 	f.syncedHealth = result
+	fn := f.setUpstreamHealthFn
 	f.syncMu.Unlock()
 
-	if f.setUpstreamHealthFn != nil {
+	if fn != nil {
 		for node, health := range result {
-			f.setUpstreamHealthFn(node, health)
+			fn(node, health)
 		}
 	}
 
@@ -530,7 +539,7 @@ func (f *Forwarder) startHeartbeat(client *http.Client) {
 	defer ticker.Stop()
 
 	// Send initial heartbeat immediately
-	memoryMB, goroutines, _ := getResourceStats()
+	memoryMB, goroutines := getResourceStats()
 	dbSizeMB := getDBSizeMB(f.cfg)
 	hb := models.HeartbeatPayload{
 		Node:       f.cfg.NodeName,

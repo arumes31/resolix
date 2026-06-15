@@ -4,11 +4,12 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"log"
 	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"tailscale-dnsrewrite/webgui/internal/logger"
 )
 
 // Route represents a domain-to-upstream mapping.
@@ -50,9 +51,9 @@ func (dr *DNSRoutes) load() {
 	data, err := os.ReadFile(dr.path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			log.Printf("[INFO] DNS routes file not found: %s (will be created on first save)", dr.path)
+			logger.Info("DNS routes file not found: %s (will be created on first save)", dr.path)
 		} else {
-			log.Printf("[ERROR] Failed to read DNS routes file: %v", err)
+			logger.Error("Failed to read DNS routes file: %v", err)
 		}
 		dr.mu.Lock()
 		dr.routes = newRoutes
@@ -62,7 +63,7 @@ func (dr *DNSRoutes) load() {
 
 	var raw map[string]string
 	if err := json.Unmarshal(data, &raw); err != nil {
-		log.Printf("[ERROR] Failed to parse DNS routes file: %v", err)
+		logger.Error("Failed to parse DNS routes file: %v", err)
 		dr.mu.Lock()
 		dr.routes = newRoutes
 		dr.mu.Unlock()
@@ -80,11 +81,14 @@ func (dr *DNSRoutes) load() {
 	dr.routes = newRoutes
 	dr.mu.Unlock()
 
-	log.Printf("[INFO] Loaded %d DNS routes from %s", len(newRoutes), dr.path)
+	logger.Info("Loaded %d DNS routes from %s", len(newRoutes), dr.path)
 }
 
 // StartReload begins periodic reloading of the routes file (every 60 seconds).
 func (dr *DNSRoutes) StartReload(ctx context.Context) {
+	if dr.cancel != nil {
+		dr.cancel()
+	}
 	reloadCtx, cancel := context.WithCancel(ctx)
 	dr.cancel = cancel
 	ticker := time.NewTicker(60 * time.Second)
@@ -178,9 +182,8 @@ func (dr *DNSRoutes) SetRoutes(routesMap map[string]string) error {
 			Upstream: upstream,
 		})
 	}
-	dr.routes = newRoutes
 
-	// Save to file
+	// Save to file first to preserve atomicity
 	if dr.path != "" {
 		data, err := json.MarshalIndent(routesMap, "", "  ")
 		if err != nil {
@@ -189,8 +192,10 @@ func (dr *DNSRoutes) SetRoutes(routesMap map[string]string) error {
 		if err := os.WriteFile(dr.path, data, 0644); err != nil {
 			return err
 		}
-		log.Printf("[INFO] Saved %d DNS routes to %s", len(routesMap), dr.path)
+		logger.Info("Saved %d DNS routes to %s", len(routesMap), dr.path)
 	}
+
+	dr.routes = newRoutes
 
 	return nil
 }

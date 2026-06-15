@@ -3,11 +3,12 @@ package blocklist
 import (
 	"bufio"
 	"context"
-	"log"
 	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"tailscale-dnsrewrite/webgui/internal/logger"
 )
 
 // Blocklist manages a set of blocked domains loaded from a hosts-format file.
@@ -48,14 +49,10 @@ func (bl *Blocklist) load() {
 	file, err := os.Open(bl.path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			log.Printf("[WARN] Blocklist file not found: %s", bl.path)
+			logger.Warn("Blocklist file not found: %s", bl.path)
 		} else {
-			log.Printf("[ERROR] Failed to open blocklist file: %v", err)
+			logger.Error("Failed to open blocklist file: %v", err)
 		}
-		bl.mu.Lock()
-		bl.domains = newDomains
-		bl.lastLoaded = time.Now()
-		bl.mu.Unlock()
 		return
 	}
 	defer func() { _ = file.Close() }()
@@ -95,7 +92,8 @@ func (bl *Blocklist) load() {
 	}
 
 	if err := scanner.Err(); err != nil {
-		log.Printf("[ERROR] Error reading blocklist file: %v", err)
+		logger.Error("Error reading blocklist file: %v", err)
+		return
 	}
 
 	bl.mu.Lock()
@@ -103,11 +101,14 @@ func (bl *Blocklist) load() {
 	bl.lastLoaded = time.Now()
 	bl.mu.Unlock()
 
-	log.Printf("[INFO] Loaded %d blocked domains from %s", len(newDomains), bl.path)
+	logger.Info("Loaded %d blocked domains from %s", len(newDomains), bl.path)
 }
 
 // StartReload begins periodic reloading of the blocklist file (every 60 seconds).
 func (bl *Blocklist) StartReload(ctx context.Context) {
+	if bl.cancel != nil {
+		bl.cancel()
+	}
 	reloadCtx, cancel := context.WithCancel(ctx)
 	bl.cancel = cancel
 	ticker := time.NewTicker(60 * time.Second)

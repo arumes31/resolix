@@ -602,12 +602,12 @@ This is the largest and most complex package. It manages:
 ### 2.16 [`Dockerfile`](Dockerfile) — Container Build
 
 **Multi-stage build:**
-1. **Builder:** `golang:1.26-alpine` → `CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o webgui .`
+1. **Builder:** `golang:1.26.5-alpine` → `CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o webgui .`
 2. **Runtime:** `alpine:3.23`
 
 **Runtime dependencies:** `dnsmasq`, `bash`, `bind-tools`, `ca-certificates`, `iptables`, `iproute2`, `ip6tables`
 
-**Tailscale binaries:** Copied from `tailscale/tailscale:stable` official image
+**Tailscale binaries:** Copied from the `tailscale/tailscale:v1.102.2` official image
 
 **CRLF handling:** `sed -i 's/\r$//' entrypoint.sh` — strips Windows line endings
 

@@ -1,5 +1,5 @@
 # Stage 1: Build
-FROM golang:1.26-alpine AS builder
+FROM golang:1.26.5-alpine AS builder
 
 WORKDIR /app
 
@@ -22,9 +22,9 @@ FROM alpine:3.23
 # Install runtime dependencies (including those required by Tailscale)
 RUN apk add --no-cache dnsmasq bash bind-tools ca-certificates iptables iproute2 ip6tables
 
-# Get the latest Tailscale binaries from the official image
-COPY --from=tailscale/tailscale:stable /usr/local/bin/tailscale /usr/bin/tailscale
-COPY --from=tailscale/tailscale:stable /usr/local/bin/tailscaled /usr/sbin/tailscaled
+# Copy Tailscale binaries from the latest stable release.
+COPY --from=tailscale/tailscale:v1.102.2 /usr/local/bin/tailscale /usr/bin/tailscale
+COPY --from=tailscale/tailscale:v1.102.2 /usr/local/bin/tailscaled /usr/sbin/tailscaled
 
 # Copy binary from builder
 COPY --from=builder /app/webgui /usr/bin/webgui

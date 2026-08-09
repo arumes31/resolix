@@ -158,7 +158,7 @@ func (s *Store) prepareStatements() error {
 	var err error
 
 	s.stmtInsertQuery, err = s.db.Prepare(
-		"INSERT INTO queries (unix_time, node, client_ip, domain, type, upstream, latency, dnssec, response_code, client_hostname, blocked, latency_alert) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+		"INSERT INTO queries (unix_time, node, client_ip, domain, type, upstream, latency, dnssec, response_code, client_hostname, blocked, latency_alert, matched_rule, block_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
 		return fmt.Errorf("prepare stmtInsertQuery: %w", err)
 	}
@@ -858,7 +858,7 @@ func (s *Store) ArchiveStep(now time.Time) int {
 	if s.stmtInsertQuery != nil {
 		stmt = tx.Stmt(s.stmtInsertQuery)
 	} else {
-		stmt, err = tx.Prepare("INSERT INTO queries (unix_time, node, client_ip, domain, type, upstream, latency, dnssec, response_code, client_hostname, blocked, latency_alert) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+		stmt, err = tx.Prepare("INSERT INTO queries (unix_time, node, client_ip, domain, type, upstream, latency, dnssec, response_code, client_hostname, blocked, latency_alert, matched_rule, block_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
 		if err != nil {
 			_ = tx.Rollback()
 			log.Printf("Failed to prepare SQLite statement: %v", err)
@@ -876,7 +876,7 @@ func (s *Store) ArchiveStep(now time.Time) int {
 		if e.LatencyAlert {
 			latencyAlertInt = 1
 		}
-		_, err = stmt.Exec(e.UnixTime, e.Node, e.ClientIP, e.Domain, e.Type, e.Upstream, e.Latency, e.DNSSEC, e.ResponseCode, e.ClientHostname, blockedInt, latencyAlertInt)
+		_, err = stmt.Exec(e.UnixTime, e.Node, e.ClientIP, e.Domain, e.Type, e.Upstream, e.Latency, e.DNSSEC, e.ResponseCode, e.ClientHostname, blockedInt, latencyAlertInt, e.MatchedRule, e.BlockReason)
 		if err != nil {
 			log.Printf("Error inserting event into SQLite: %v", err)
 		}

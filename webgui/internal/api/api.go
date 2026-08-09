@@ -33,6 +33,7 @@ import (
 	"tailscale-dnsrewrite/webgui/internal/config"
 	"tailscale-dnsrewrite/webgui/internal/dnsroutes"
 	apperr "tailscale-dnsrewrite/webgui/internal/errors"
+	"tailscale-dnsrewrite/webgui/internal/filter"
 	"tailscale-dnsrewrite/webgui/internal/models"
 	"tailscale-dnsrewrite/webgui/internal/parser"
 	"tailscale-dnsrewrite/webgui/internal/resolver"
@@ -151,6 +152,9 @@ type Server struct {
 	// Blocklist (Item 61)
 	blocklist *blocklist.Blocklist
 
+	// Filter engine (Step 2: rule-based filtering with subscriptions)
+	filterEngine *filter.Engine
+
 	// DNS routes (Item 66)
 	dnsRoutes *dnsroutes.DNSRoutes
 
@@ -218,6 +222,20 @@ func (s *Server) SetDNSRoutes(dr *dnsroutes.DNSRoutes) {
 	s.fieldsMu.Lock()
 	defer s.fieldsMu.Unlock()
 	s.dnsRoutes = dr
+}
+
+// SetFilter configures the filter engine for status/pause endpoints and metrics.
+func (s *Server) SetFilter(eng *filter.Engine) {
+	s.fieldsMu.Lock()
+	defer s.fieldsMu.Unlock()
+	s.filterEngine = eng
+}
+
+// getFilter returns the configured filter engine (may be nil).
+func (s *Server) getFilter() *filter.Engine {
+	s.fieldsMu.RLock()
+	defer s.fieldsMu.RUnlock()
+	return s.filterEngine
 }
 
 // isBcryptHash returns true if the string looks like a bcrypt hash.
@@ -482,8 +500,9 @@ func (s *Server) BroadcastEvent(e models.QueryEvent) {
 		}
 	}
 
-	// Item 61: Check blocklist
-	if bl != nil && e.Domain != "" {
+	// Item 61: Check blocklist — fallback for legacy-ingested events only;
+	// the DNS pipeline (filter engine) is the source of truth for Blocked.
+	if !e.Blocked && bl != nil && e.Domain != "" {
 		if bl.IsBlocked(e.Domain) {
 			e.Blocked = true
 		}
@@ -651,6 +670,10 @@ func (s *Server) SetupMux() http.Handler {
 	// Item 61: Blocklist status endpoint
 	mux.Handle("/api/blocklist/status", s.authMiddleware(http.HandlerFunc(s.handleBlocklistStatus)))
 
+	// Filter engine: pause/resume protection and status
+	mux.Handle("/api/filtering/pause", s.authMiddleware(http.HandlerFunc(s.handleFilteringPause)))
+	mux.Handle("/api/filtering/status", s.authMiddleware(http.HandlerFunc(s.handleFilteringStatus)))
+
 	// Item 62: Upstream configuration editor
 	mux.Handle("/api/upstreams", s.authMiddleware(http.HandlerFunc(s.handleUpstreams)))
 
@@ -785,6 +808,32 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(&buf, "# HELP process_uptime_seconds Application uptime in seconds\n")
 	fmt.Fprintf(&buf, "# TYPE process_uptime_seconds gauge\n")
 	fmt.Fprintf(&buf, "process_uptime_seconds %f\n", uptime)
+
+	// Filter engine metrics
+	if eng := s.getFilter(); eng != nil {
+		blocked, allowed := eng.Stats()
+		fmt.Fprintf(&buf, "# HELP filter_blocked_total Queries blocked by the filter engine\n")
+		fmt.Fprintf(&buf, "# TYPE filter_blocked_total counter\n")
+		fmt.Fprintf(&buf, "filter_blocked_total %d\n", blocked)
+		fmt.Fprintf(&buf, "# HELP filter_allowed_total Queries allowed by filter exception rules\n")
+		fmt.Fprintf(&buf, "# TYPE filter_allowed_total counter\n")
+		fmt.Fprintf(&buf, "filter_allowed_total %d\n", allowed)
+		fmt.Fprintf(&buf, "# HELP filter_rules_total Loaded filter rules per source\n")
+		fmt.Fprintf(&buf, "# TYPE filter_rules_total gauge\n")
+		for _, src := range eng.Sources() {
+			label := escapePrometheusLabel(src.Name)
+			kind := escapePrometheusLabel(src.Kind)
+			fmt.Fprintf(&buf, "filter_rules_total{source=\"%s\",kind=\"%s\",type=\"block\"} %d\n", label, kind, src.RuleCount)
+			fmt.Fprintf(&buf, "filter_rules_total{source=\"%s\",kind=\"%s\",type=\"allow\"} %d\n", label, kind, src.AllowRuleCount)
+		}
+		fmt.Fprintf(&buf, "# HELP filter_paused Whether filtering is currently paused (1) or active (0)\n")
+		fmt.Fprintf(&buf, "# TYPE filter_paused gauge\n")
+		paused := 0
+		if eng.Paused() {
+			paused = 1
+		}
+		fmt.Fprintf(&buf, "filter_paused %d\n", paused)
+	}
 
 	_, _ = buf.WriteTo(w)
 }
@@ -1299,6 +1348,67 @@ func (s *Server) handleBlocklistStatus(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	_ = json.NewEncoder(w).Encode(bl.Status())
+}
+
+// ===== Filter Engine Endpoints =====
+
+// handleFilteringStatus reports the filter engine state: enabled/paused,
+// per-source rule counts, and last update times.
+func (s *Server) handleFilteringStatus(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	eng := s.getFilter()
+	if eng == nil {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"enabled": true,
+			"sources": []interface{}{},
+		})
+		return
+	}
+	blocked, allowed := eng.Stats()
+	resp := map[string]interface{}{
+		"enabled":              !eng.Paused(),
+		"sources":              eng.Sources(),
+		"filter_blocked_total": blocked,
+		"filter_allowed_total": allowed,
+	}
+	if until := eng.PausedUntil(); !until.IsZero() {
+		resp["paused_until"] = until.Format(time.RFC3339)
+	}
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// handleFilteringPause pauses protection for N minutes (POST {"minutes": n});
+// minutes <= 0 resumes immediately.
+func (s *Server) handleFilteringPause(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	eng := s.getFilter()
+	if eng == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "filter engine is not configured",
+		})
+		return
+	}
+
+	var req struct {
+		Minutes int `json:"minutes"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	eng.Pause(req.Minutes)
+
+	resp := map[string]interface{}{"status": "ok", "enabled": !eng.Paused()}
+	if until := eng.PausedUntil(); !until.IsZero() {
+		resp["paused_until"] = until.Format(time.RFC3339)
+	}
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // ===== Item 62: Upstream Configuration Editor =====

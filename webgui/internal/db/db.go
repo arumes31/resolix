@@ -68,7 +68,9 @@ CREATE TABLE IF NOT EXISTS queries (
 	client_hostname TEXT DEFAULT '',
 	blocked INTEGER DEFAULT 0,
 	response_code TEXT DEFAULT '',
-	latency_alert INTEGER DEFAULT 0
+	latency_alert INTEGER DEFAULT 0,
+	matched_rule TEXT DEFAULT '',
+	block_reason TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_queries_unix_time ON queries(unix_time);
 CREATE INDEX IF NOT EXISTS idx_queries_domain_time ON queries(domain, unix_time);
@@ -92,6 +94,8 @@ CREATE INDEX IF NOT EXISTS idx_queries_response_code ON queries(response_code);
 		{"blocked", "INTEGER DEFAULT 0"},
 		{"response_code", "TEXT DEFAULT ''"},
 		{"latency_alert", "INTEGER DEFAULT 0"},
+		{"matched_rule", "TEXT DEFAULT ''"},
+		{"block_reason", "TEXT DEFAULT ''"},
 	}
 	for _, m := range migrations {
 		// Check if column exists

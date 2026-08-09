@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"maps"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -56,6 +57,14 @@ const (
 	DefaultDNSListenAddr = "0.0.0.0"
 	// DefaultDNSListenPort is the default DNS server listen port.
 	DefaultDNSListenPort = 53
+	// DefaultFilterUpdateInterval is the default filter subscription update interval.
+	DefaultFilterUpdateInterval = 24 * time.Hour
+	// DefaultBlockingMode is the default blocking response mode.
+	DefaultBlockingMode = "nxdomain"
+	// DefaultBlockCustomIP4 is the default A answer in custom_ip blocking mode.
+	DefaultBlockCustomIP4 = "0.0.0.0"
+	// DefaultBlockCustomIP6 is the default AAAA answer in custom_ip blocking mode.
+	DefaultBlockCustomIP6 = "::"
 	// DefaultUpstreamLatencyThreshold is the default latency alert threshold in milliseconds.
 	DefaultUpstreamLatencyThreshold = 200
 
@@ -146,6 +155,19 @@ type Config struct {
 	// Domains holds the raw DOMAINS env value (comma-separated domain:ip
 	// static rewrites, same semantics as dnsmasq address=/).
 	Domains string
+	// BlocklistURLs holds space/comma-separated filter subscription URLs.
+	BlocklistURLs string
+	// AllowlistURLs holds space/comma-separated exception subscription URLs.
+	AllowlistURLs string
+	// AllowlistFile is a local exceptions-only filter list path.
+	AllowlistFile string
+	// FilterUpdateInterval is the subscription refresh interval.
+	FilterUpdateInterval time.Duration
+	// BlockingMode is the blocked-response mode: nxdomain|null_ip|refused|custom_ip.
+	BlockingMode string
+	// BlockCustomIP4/IP6 are the answer addresses in custom_ip mode.
+	BlockCustomIP4 string
+	BlockCustomIP6 string
 	// UpstreamLatencyThreshold is the latency threshold in ms for alerting.
 	UpstreamLatencyThreshold int
 
@@ -518,6 +540,34 @@ func resolveLatencyThreshold() int {
 	return DefaultUpstreamLatencyThreshold
 }
 
+// resolveBlocking reads and validates BLOCKING_MODE and BLOCK_CUSTOM_IP4/IP6.
+func resolveBlocking() (mode, ip4, ip6 string) {
+	mode = strings.ToLower(strings.TrimSpace(os.Getenv("BLOCKING_MODE")))
+	switch mode {
+	case "":
+		mode = DefaultBlockingMode
+	case "nxdomain", "null_ip", "refused", "custom_ip":
+	default:
+		log.Printf("[WARN] Invalid BLOCKING_MODE '%s', falling back to %s", sanitizeForLog(mode), DefaultBlockingMode) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		mode = DefaultBlockingMode
+	}
+	ip4 = os.Getenv("BLOCK_CUSTOM_IP4")
+	if ip4 == "" || net.ParseIP(ip4) == nil {
+		if ip4 != "" {
+			log.Printf("[WARN] Invalid BLOCK_CUSTOM_IP4 '%s', falling back to %s", sanitizeForLog(ip4), DefaultBlockCustomIP4) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		}
+		ip4 = DefaultBlockCustomIP4
+	}
+	ip6 = os.Getenv("BLOCK_CUSTOM_IP6")
+	if ip6 == "" || net.ParseIP(ip6) == nil {
+		if ip6 != "" {
+			log.Printf("[WARN] Invalid BLOCK_CUSTOM_IP6 '%s', falling back to %s", sanitizeForLog(ip6), DefaultBlockCustomIP6) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		}
+		ip6 = DefaultBlockCustomIP6
+	}
+	return mode, ip4, ip6
+}
+
 // LoadConfig reads configuration from environment variables.
 func LoadConfig() *Config {
 	mode := resolveMode()
@@ -604,6 +654,9 @@ func LoadConfig() *Config {
 		dnsListenPort = DefaultDNSListenPort
 	}
 
+	// Filter engine blocking settings
+	blockingMode, blockCustomIP4, blockCustomIP6 := resolveBlocking()
+
 	latencyThreshold := resolveLatencyThreshold()
 
 	// Parse configurable timeout values (Item 80)
@@ -661,6 +714,13 @@ func LoadConfig() *Config {
 		DNSListenAddr:              dnsListenAddr,
 		DNSListenPort:              dnsListenPort,
 		Domains:                    os.Getenv("DOMAINS"),
+		BlocklistURLs:              os.Getenv("BLOCKLIST_URLS"),
+		AllowlistURLs:              os.Getenv("ALLOWLIST_URLS"),
+		AllowlistFile:              os.Getenv("ALLOWLIST_FILE"),
+		FilterUpdateInterval:       parseDurationEnv("FILTER_UPDATE_INTERVAL", DefaultFilterUpdateInterval),
+		BlockingMode:               blockingMode,
+		BlockCustomIP4:             blockCustomIP4,
+		BlockCustomIP6:             blockCustomIP6,
 		UpstreamLatencyThreshold:   latencyThreshold,
 		SSEKeepaliveInterval:       sseKeepalive,
 		BatchArchiveInterval:       batchArchive,

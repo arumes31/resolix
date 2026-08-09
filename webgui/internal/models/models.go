@@ -23,6 +23,8 @@ type QueryEvent struct {
 	Blocked        bool            `json:"blocked,omitempty"`         // True if domain matches blocklist
 	ResponseCode   string          `json:"response_code,omitempty"`   // NOERROR, NXDOMAIN, SERVFAIL, REFUSED, TIMEOUT
 	LatencyAlert   bool            `json:"latency_alert,omitempty"`   // True if latency exceeds threshold
+	MatchedRule    string          `json:"matched_rule,omitempty"`    // Filter rule that matched (when blocked/allowed)
+	BlockReason    string          `json:"block_reason,omitempty"`    // Machine-readable block reason (e.g. FilteredByBlocklist)
 }
 
 // TimestampFormatted returns a human-readable time string for the template.

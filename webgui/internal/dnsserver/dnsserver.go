@@ -11,10 +11,12 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/miekg/dns"
 
+	"tailscale-dnsrewrite/webgui/internal/filter"
 	"tailscale-dnsrewrite/webgui/internal/models"
 )
 
@@ -47,6 +49,14 @@ type Config struct {
 	NodeName string
 	// CacheSize overrides the cache capacity (0 = defaultCacheSize).
 	CacheSize int
+	// Filter is the filter engine (nil = filtering disabled).
+	Filter *filter.Engine
+	// BlockingMode selects the blocked-response mode:
+	// nxdomain (default) | null_ip | refused | custom_ip.
+	BlockingMode string
+	// BlockCustomIP4/IP6 are the answer addresses in custom_ip mode.
+	BlockCustomIP4 string
+	BlockCustomIP6 string
 }
 
 // Server is the embedded DNS server.
@@ -81,9 +91,9 @@ func New(cfg Config, emit func(models.QueryEvent)) *Server {
 	if len(s.upstreams) == 0 {
 		log.Printf("[WARN] No valid upstream DNS servers configured; all non-static queries will fail")
 	}
-	addr := s.ListenAddr()
-	s.udp = &dns.Server{Addr: addr, Net: "udp", Handler: dns.HandlerFunc(s.ServeDNS)}
-	s.tcp = &dns.Server{Addr: addr, Net: "tcp", Handler: dns.HandlerFunc(s.ServeDNS)}
+	handler := dns.HandlerFunc(s.ServeDNS)
+	s.udp = &dns.Server{Net: "udp", Handler: handler}
+	s.tcp = &dns.Server{Net: "tcp", Handler: handler}
 	return s
 }
 
@@ -92,12 +102,49 @@ func (s *Server) ListenAddr() string {
 	return net.JoinHostPort(s.cfg.Addr, fmt.Sprintf("%d", s.cfg.Port))
 }
 
-// Start runs the UDP and TCP listeners until ctx is canceled or a listener
-// fails, then shuts both down gracefully.
+// resetTolerantConn wraps a UDP socket to ignore spurious
+// "connection reset" read errors. On Windows, an ICMP port-unreachable
+// (e.g. from a client that already closed its socket) surfaces as
+// WSAECONNRESET on the next ReadFrom and would otherwise kill the listener.
+type resetTolerantConn struct {
+	net.PacketConn
+}
+
+func (c resetTolerantConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	for {
+		n, addr, err := c.PacketConn.ReadFrom(p)
+		if err != nil && strings.Contains(err.Error(), "connection reset") {
+			continue
+		}
+		return n, addr, err
+	}
+}
+
+// Start binds the configured address and runs the UDP and TCP listeners
+// until ctx is canceled or a listener fails, then shuts both down gracefully.
 func (s *Server) Start(ctx context.Context) error {
+	udpConn, err := net.ListenPacket("udp", s.ListenAddr())
+	if err != nil {
+		return fmt.Errorf("DNS UDP listener on %s: %w", s.ListenAddr(), err)
+	}
+	tcpLn, err := net.Listen("tcp", s.ListenAddr())
+	if err != nil {
+		_ = udpConn.Close()
+		return fmt.Errorf("DNS TCP listener on %s: %w", s.ListenAddr(), err)
+	}
+	return s.StartOn(ctx, udpConn, tcpLn)
+}
+
+// StartOn runs the UDP and TCP listeners on pre-bound sockets until ctx is
+// canceled or a listener fails. Tests use it with :0 sockets to avoid
+// port-reservation races.
+func (s *Server) StartOn(ctx context.Context, udpConn net.PacketConn, tcpLn net.Listener) error {
+	s.udp.PacketConn = resetTolerantConn{udpConn}
+	s.tcp.Listener = tcpLn
+
 	errCh := make(chan error, 2)
-	go func() { errCh <- s.udp.ListenAndServe() }()
-	go func() { errCh <- s.tcp.ListenAndServe() }()
+	go func() { errCh <- s.udp.ActivateAndServe() }()
+	go func() { errCh <- s.tcp.ActivateAndServe() }()
 
 	select {
 	case <-ctx.Done():
@@ -120,8 +167,11 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	resp.RecursionAvailable = true
 
 	var (
-		upstream string
-		cacheHit bool
+		upstream    string
+		cacheHit    bool
+		blocked     bool
+		matchedRule string
+		blockReason string
 	)
 
 	if len(r.Question) == 0 {
@@ -129,10 +179,9 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	} else {
 		question := r.Question[0]
 		domain := normalizeName(question.Name)
-		key := cacheKey{name: domain, qtype: question.Qtype}
 
-		switch {
-		case question.Qtype == dns.TypeA && s.staticHosts() != nil:
+		// Stage 1: static rewrites (DOMAINS).
+		if question.Qtype == dns.TypeA {
 			if ip := matchStatic(s.staticHosts(), domain); ip != nil {
 				resp.Answer = []dns.RR{&dns.A{
 					Hdr: dns.RR_Header{
@@ -144,18 +193,81 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 					A: ip,
 				}}
 				upstream = "Local Override"
-				break
 			}
-			fallthrough
-		default:
+		}
+
+		// Stage 2: filter. Exceptions continue down the pipeline; blocked
+		// queries get a blocking-mode response and are NOT cached (they are
+		// cheap to regenerate and must not poison the forwarded-answer cache).
+		if upstream == "" && s.cfg.Filter != nil && !s.cfg.Filter.Paused() {
+			if res := s.cfg.Filter.Match(domain); res.Blocked && !res.Allowed {
+				resp = s.blockedResponse(r, question)
+				blocked, matchedRule, blockReason = true, res.Rule, res.Reason
+				upstream = "Filtered"
+			}
+		}
+
+		// Stages 3-4: cache lookup → strict-order forward → cache store.
+		if upstream == "" {
+			key := cacheKey{name: domain, qtype: question.Qtype}
 			upstream, cacheHit = s.resolveViaCacheOrUpstream(r, resp, key)
 		}
 	}
 
 	_ = w.WriteMsg(resp)
 	if s.emit != nil {
-		s.emit(s.buildEvent(r, resp, w, upstream, cacheHit, start))
+		s.emit(s.buildEvent(r, resp, w, upstream, cacheHit, blocked, matchedRule, blockReason, start))
 	}
+}
+
+// blockedResponse builds the response for a filtered query according to the
+// configured blocking mode, with TTL 60 per existing conventions.
+func (s *Server) blockedResponse(r *dns.Msg, question dns.Question) *dns.Msg {
+	resp := new(dns.Msg)
+	resp.SetReply(r)
+	resp.RecursionAvailable = true
+
+	hdr := dns.RR_Header{
+		Name:   question.Name,
+		Class:  dns.ClassINET,
+		Ttl:    staticTTL,
+		Rrtype: question.Qtype,
+	}
+	switch s.cfg.BlockingMode {
+	case "refused":
+		resp.Rcode = dns.RcodeRefused
+	case "null_ip", "custom_ip":
+		v4, v6 := s.blockIPs()
+		switch question.Qtype {
+		case dns.TypeA:
+			if ip := net.ParseIP(v4); ip != nil {
+				resp.Answer = []dns.RR{&dns.A{Hdr: hdr, A: ip.To4()}}
+			}
+		case dns.TypeAAAA:
+			if ip := net.ParseIP(v6); ip != nil {
+				resp.Answer = []dns.RR{&dns.AAAA{Hdr: hdr, AAAA: ip}}
+			}
+		default:
+			// Other types get a NODATA (NOERROR, empty) answer.
+		}
+	default: // "nxdomain"
+		resp.Rcode = dns.RcodeNameError
+	}
+	return resp
+}
+
+// blockIPs returns the IPv4/IPv6 answers for null_ip and custom_ip modes.
+func (s *Server) blockIPs() (v4, v6 string) {
+	v4, v6 = "0.0.0.0", "::"
+	if s.cfg.BlockingMode == "custom_ip" {
+		if s.cfg.BlockCustomIP4 != "" {
+			v4 = s.cfg.BlockCustomIP4
+		}
+		if s.cfg.BlockCustomIP6 != "" {
+			v6 = s.cfg.BlockCustomIP6
+		}
+	}
+	return v4, v6
 }
 
 // staticHosts returns the configured static rewrite map (never nil).
@@ -263,11 +375,14 @@ func withTTL(rrs []dns.RR, ttl uint32) []dns.RR {
 }
 
 // buildEvent assembles the QueryEvent for an answered query.
-func (s *Server) buildEvent(r, resp *dns.Msg, w dns.ResponseWriter, upstream string, cacheHit bool, start time.Time) models.QueryEvent {
+func (s *Server) buildEvent(r, resp *dns.Msg, w dns.ResponseWriter, upstream string, cacheHit, blocked bool, matchedRule, blockReason string, start time.Time) models.QueryEvent {
 	ev := models.QueryEvent{
-		UnixTime: time.Now().Unix(),
-		Node:     s.cfg.NodeName,
-		Upstream: upstream,
+		UnixTime:    time.Now().Unix(),
+		Node:        s.cfg.NodeName,
+		Upstream:    upstream,
+		Blocked:     blocked,
+		MatchedRule: matchedRule,
+		BlockReason: blockReason,
 	}
 	if len(r.Question) > 0 {
 		ev.Type = dns.TypeToString[r.Question[0].Qtype]

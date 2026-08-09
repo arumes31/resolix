@@ -26,6 +26,7 @@ import (
 	"tailscale-dnsrewrite/webgui/internal/config"
 	"tailscale-dnsrewrite/webgui/internal/dnsroutes"
 	"tailscale-dnsrewrite/webgui/internal/dnsserver"
+	"tailscale-dnsrewrite/webgui/internal/filter"
 	"tailscale-dnsrewrite/webgui/internal/forwarder"
 	"tailscale-dnsrewrite/webgui/internal/health"
 	"tailscale-dnsrewrite/webgui/internal/logger"
@@ -212,6 +213,20 @@ DB_PATH=dns.db
 # Deprecated: dnsmasq was replaced by the in-process DNS server (Item 63)
 # DNSMASQ_PID_FILE=/run/dnsmasq.pid
 
+# Filter engine (blocklists with adblock/hosts/domain-list/regex syntax)
+# Space- or comma-separated subscription URLs, auto-updated with ETag/Last-Modified
+# BLOCKLIST_URLS=https://example.com/blocklist.txt
+# ALLOWLIST_URLS=https://example.com/allowlist.txt
+# Local exceptions-only list (@@ semantics for every entry)
+# ALLOWLIST_FILE=/etc/tailscale-dnsrewrite/allowlist.txt
+# FILTER_UPDATE_INTERVAL=24h
+
+# Blocking response mode: nxdomain (default), null_ip (0.0.0.0/::), refused,
+# or custom_ip (BLOCK_CUSTOM_IP4/BLOCK_CUSTOM_IP6)
+# BLOCKING_MODE=nxdomain
+# BLOCK_CUSTOM_IP4=0.0.0.0
+# BLOCK_CUSTOM_IP6=::
+
 # Upstream latency alert threshold in milliseconds (Item 68, default: 200)
 # UPSTREAM_LATENCY_THRESHOLD=200
 
@@ -390,16 +405,25 @@ func main() {
 	}()
 
 	// Embedded DNS server (replaces dnsmasq). Pipeline: static rewrites →
-	// cache → strict-order upstream forward → cache store → respond. Each
-	// answered query becomes a QueryEvent fed into Store + SSE (and the
+	// filter → cache → strict-order upstream forward → cache store → respond.
+	// Each answered query becomes a QueryEvent fed into Store + SSE (and the
 	// forwarder in slave mode). dnsDone closes when both listeners have
 	// stopped, so shutdown can archive after events have ceased.
+
+	// Filter engine (Step 2): local files (BLOCKLIST_FILE entries now
+	// actually block) plus URL subscriptions with conditional auto-update.
+	filterEng := setupFilterEngine(ctx, cfg, srv)
+
 	dnsSrv := dnsserver.New(dnsserver.Config{
-		Addr:        cfg.DNSListenAddr,
-		Port:        cfg.DNSListenPort,
-		Upstreams:   strings.Fields(cfg.UpstreamDNS),
-		StaticHosts: dnsserver.ParseStaticHosts(cfg.Domains),
-		NodeName:    cfg.NodeName,
+		Addr:           cfg.DNSListenAddr,
+		Port:           cfg.DNSListenPort,
+		Upstreams:      strings.Fields(cfg.UpstreamDNS),
+		StaticHosts:    dnsserver.ParseStaticHosts(cfg.Domains),
+		NodeName:       cfg.NodeName,
+		Filter:         filterEng,
+		BlockingMode:   cfg.BlockingMode,
+		BlockCustomIP4: cfg.BlockCustomIP4,
+		BlockCustomIP6: cfg.BlockCustomIP6,
 	}, func(ev models.QueryEvent) {
 		store.AddEvent(ev)
 		srv.BroadcastEvent(ev)
@@ -480,6 +504,34 @@ func main() {
 	logger.CloseFile()
 
 	logger.Info("Graceful shutdown complete")
+}
+
+// setupFilterEngine builds and starts the filter engine from configuration
+// and wires it into the API server.
+func setupFilterEngine(ctx context.Context, cfg *config.Config, srv *api.Server) *filter.Engine {
+	eng := filter.New()
+	if p := cfg.FullBlocklistPath(); p != "" {
+		eng.AddFileSource(p, false)
+	}
+	if cfg.AllowlistFile != "" {
+		eng.AddFileSource(cfg.AllowlistFile, true)
+	}
+	for _, u := range splitListEnv(cfg.BlocklistURLs) {
+		eng.AddURLSource(u, false)
+	}
+	for _, u := range splitListEnv(cfg.AllowlistURLs) {
+		eng.AddURLSource(u, true)
+	}
+	eng.StartUpdateLoop(ctx, cfg.FilterUpdateInterval)
+	srv.SetFilter(eng)
+	return eng
+}
+
+// splitListEnv splits a space/comma-separated env list into trimmed entries.
+func splitListEnv(v string) []string {
+	return strings.FieldsFunc(v, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	})
 }
 
 // waitForHTTPServer waits for the HTTP server goroutine to finish, giving up

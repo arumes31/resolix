@@ -81,6 +81,11 @@ docker-compose -f docker-compose.example.yaml up -d
 | `DB_PATH` | SQLite database file name or absolute path | `dns.db` |
 | `CLIENT_ALIASES_FILE` | Path to a file with `IP=Alias` mappings (reloaded every 30s) | - |
 | `CLIENT_ALIASES` | Comma-separated `IP:Alias` mappings (alternative to file) | - |
+| `BLOCKLIST_URLS` | Space/comma-separated filter subscription URLs (auto-updated) | - |
+| `ALLOWLIST_URLS` | Space/comma-separated exception subscription URLs | - |
+| `ALLOWLIST_FILE` | Local exceptions-only filter list path | - |
+| `FILTER_UPDATE_INTERVAL` | Filter subscription refresh interval | `24h` |
+| `BLOCKING_MODE` | Blocked response mode (`nxdomain`, `null_ip`, `refused`, `custom_ip`) | `nxdomain` |
 | `TRUSTED_PROXIES` | Comma-separated proxy IPs/CIDRs whose `X-Forwarded-*` headers are honored | - |
 | `COOKIE_SECURE` | Force the `Secure` attribute on session/CSRF cookies (`true`/`false`) | `false` |
 

@@ -2,7 +2,6 @@ package dnsserver
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -13,16 +12,28 @@ import (
 	"tailscale-dnsrewrite/webgui/internal/models"
 )
 
-// freePort reserves and releases an ephemeral UDP port on 127.0.0.1 for the
-// server under test. The tiny race after Close is acceptable for local tests.
-func freePort(t *testing.T) int {
+// startTestServer runs srv on pre-bound :0 loopback sockets and returns the
+// UDP address clients should query. Binding happens before serving starts,
+// so there is no port-reservation race between tests.
+func startTestServer(t *testing.T, srv *Server) string {
 	t.Helper()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	udpConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("reserve free port: %v", err)
+		t.Fatalf("test UDP socket: %v", err)
 	}
-	defer func() { _ = pc.Close() }()
-	return pc.LocalAddr().(*net.UDPAddr).Port
+	tcpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		_ = udpConn.Close()
+		t.Fatalf("test TCP socket: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.StartOn(ctx, udpConn, tcpLn) }()
+	t.Cleanup(func() {
+		cancel()
+		<-done // wait for listeners to fully release the sockets
+	})
+	return udpConn.LocalAddr().String()
 }
 
 // startFakeUpstream starts a UDP DNS server on an ephemeral loopback port
@@ -54,21 +65,15 @@ func TestEndToEndPipeline(t *testing.T) {
 	var upstreamHits atomic.Int32
 	upstreamAddr := startFakeUpstream(t, &upstreamHits)
 
-	port := freePort(t)
 	events := make(chan models.QueryEvent, 10)
 	srv := New(Config{
 		Addr:        "127.0.0.1",
-		Port:        port,
 		Upstreams:   []string{upstreamAddr},
 		StaticHosts: ParseStaticHosts("static.test:100.64.0.1"),
 		NodeName:    "test-node",
 	}, func(ev models.QueryEvent) { events <- ev })
 
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	go func() { _ = srv.Start(ctx) }()
-
-	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	serverAddr := startTestServer(t, srv)
 	client := &dns.Client{Timeout: 500 * time.Millisecond}
 	query := func(name string) *dns.Msg {
 		t.Helper()

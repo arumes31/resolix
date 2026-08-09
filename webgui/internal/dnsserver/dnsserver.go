@@ -20,6 +20,7 @@ import (
 
 	"github.com/miekg/dns"
 
+	"tailscale-dnsrewrite/webgui/internal/clients"
 	"tailscale-dnsrewrite/webgui/internal/dnsroutes"
 	"tailscale-dnsrewrite/webgui/internal/filter"
 	"tailscale-dnsrewrite/webgui/internal/models"
@@ -75,6 +76,13 @@ type Config struct {
 	Pool *upstream.Pool
 	// Routes provides per-domain upstream routing (nil = no routes).
 	Routes *dnsroutes.DNSRoutes
+	// Clients is the per-client policy registry (nil = all clients global).
+	Clients *clients.Registry
+	// BlockedServices lists globally blocked service IDs.
+	BlockedServices []string
+	// AliasFunc resolves a client IP to its display alias (CLIENT_ALIASES);
+	// a matching registry client's name takes precedence.
+	AliasFunc func(ip string) string
 	// CacheMinTTL/CacheMaxTTL override cache TTL bounds (0 = 60/600).
 	CacheMinTTL     int
 	CacheMaxTTL     int
@@ -86,7 +94,7 @@ type Server struct {
 	cfg       Config
 	upstreams []string
 	cache     *cache
-	emit      func(models.QueryEvent)
+	emit      func(models.QueryEvent, bool) // (event, excludeFromStats)
 	udp       *dns.Server
 	tcp       *dns.Server
 	client    *dns.Client
@@ -98,11 +106,15 @@ type Server struct {
 	// refreshInFlight tracks optimistic-cache background refreshes (single-flight).
 	refreshMu       sync.Mutex
 	refreshInFlight map[cacheKey]bool
+
+	// serviceHits counts blocked-service matches per service ID.
+	serviceHits sync.Map // map[string]*atomic.Int64
 }
 
 // New creates a DNS server. emit is invoked synchronously for every answered
-// query (typically Store.AddEvent + Server.BroadcastEvent wiring from main).
-func New(cfg Config, emit func(models.QueryEvent)) *Server {
+// query with the event and whether the client is stats-excluded (typically
+// Store.AddEvent + Server.BroadcastEvent wiring from main).
+func New(cfg Config, emit func(models.QueryEvent, bool)) *Server {
 	s := &Server{
 		cfg:             cfg,
 		cache:           newCache(cfg.CacheSize, uint32(cfg.CacheMinTTL), uint32(cfg.CacheMaxTTL)), // #nosec G115 -- CacheMinTTL/MaxTTL are validated non-negative in config
@@ -207,19 +219,34 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	resp.SetReply(r)
 	resp.RecursionAvailable = true
 
-	res := s.resolve(r, resp, 0)
-	_ = w.WriteMsg(resp)
-	if s.emit != nil {
-		s.emit(s.buildEvent(r, resp, w, res, start))
+	// Per-client resolution happens once at query start.
+	clientIP := clientIPFromRemote(w.RemoteAddr())
+	var cl *clients.Client
+	if s.cfg.Clients != nil {
+		cl = s.cfg.Clients.Find(clientIP)
 	}
+
+	res := s.resolve(r, resp, 0, cl)
+	_ = w.WriteMsg(resp)
+
+	if s.emit == nil {
+		return
+	}
+	if cl != nil && cl.ExcludeFromLog {
+		return // exclude_from_log: skip event emission entirely
+	}
+	excludeFromStats := cl != nil && cl.ExcludeFromStats
+	s.emit(s.buildEvent(r, resp, clientIP, cl, res, start), excludeFromStats)
 }
 
 // resolve runs the request pipeline and fills resp.
 //
 // Order: refuse-ANY / AAAA-disable short-circuits → typed rewrites →
-// safe-search → filter → cache → strict-order forward → bogus-NXDOMAIN
-// conversion → cache store. depth bounds CNAME/safe-search chase chains.
-func (s *Server) resolve(r *dns.Msg, resp *dns.Msg, depth int) resolution {
+// safe-search (per-client aware) → filter (unless the client disabled
+// filtering) → blocked services (per-client, schedule-aware) → cache →
+// forward (client upstreams → per-domain route → global pool) →
+// bogus-NXDOMAIN conversion → cache store. depth bounds chase chains.
+func (s *Server) resolve(r *dns.Msg, resp *dns.Msg, depth int, cl *clients.Client) resolution {
 	if len(r.Question) == 0 {
 		resp.Rcode = dns.RcodeFormatError
 		return resolution{}
@@ -240,18 +267,19 @@ func (s *Server) resolve(r *dns.Msg, resp *dns.Msg, depth int) resolution {
 	}
 
 	// Stage 1: typed rewrites (short-circuit, pre-cache).
-	if res, handled := s.stageRewrites(r, q, resp, depth); handled {
+	if res, handled := s.stageRewrites(r, q, resp, depth, cl); handled {
 		return res
 	}
 
-	// Stage 2: safe search (CNAME to the restricted variant, chased below).
-	if res, handled := s.stageSafeSearch(r, q, resp, depth); handled {
+	// Stage 2: safe search (global engines or per-client override).
+	if res, handled := s.stageSafeSearch(r, q, resp, depth, cl); handled {
 		return res
 	}
 
-	// Stage 3: filter. Blocked responses are NOT cached (cheap to
-	// regenerate; must not poison the forwarded-answer cache).
-	if s.cfg.Filter != nil && !s.cfg.Filter.Paused() {
+	// Stage 3: filter (skipped for clients with filtering disabled).
+	// Blocked responses are NOT cached (cheap to regenerate; must not poison
+	// the forwarded-answer cache).
+	if s.filteringEnabledFor(cl) && s.cfg.Filter != nil && !s.cfg.Filter.Paused() {
 		if f := s.cfg.Filter.Match(domain); f.Blocked && !f.Allowed {
 			blockedResp := s.blockedResponse(r, q)
 			resp.Rcode = blockedResp.Rcode
@@ -260,14 +288,83 @@ func (s *Server) resolve(r *dns.Msg, resp *dns.Msg, depth int) resolution {
 		}
 	}
 
-	// Stage 4: cache → forward → bogus-NXDOMAIN → cache store.
-	key := cacheKey{name: domain, qtype: q.Qtype}
-	return s.resolveViaCacheOrUpstream(r, resp, key)
+	// Stage 3b: blocked services (global or per-client list, schedule-aware).
+	if res, handled := s.stageBlockedServices(r, q, resp, domain, cl); handled {
+		return res
+	}
+
+	// Stage 4: cache → forward → bogus-NXDOMAIN → cache store. Clients with
+	// custom upstreams get a distinct cache group so their answers never
+	// pollute the shared global cache.
+	group, specs := clientUpstreamGroup(cl)
+	key := cacheKey{name: domain, qtype: q.Qtype, group: group}
+	return s.resolveViaCacheOrUpstream(r, resp, key, specs)
+}
+
+// filteringEnabledFor reports whether the filter engine applies to a client.
+func (s *Server) filteringEnabledFor(cl *clients.Client) bool {
+	return cl == nil || cl.UseGlobalSettings || cl.FilteringEnabled
+}
+
+// clientUpstreamGroup returns the cache discriminator and custom upstream
+// specs for a client (empty when the client uses the global pool).
+func clientUpstreamGroup(cl *clients.Client) (group string, specs []string) {
+	if cl == nil || cl.UseGlobalSettings || len(cl.Upstreams) == 0 {
+		return "", nil
+	}
+	return "up:" + strings.Join(cl.Upstreams, ","), cl.Upstreams
+}
+
+// stageBlockedServices enforces the blocked-services catalog. The service
+// list is global, or per-client when the client opted out of global
+// settings; a client schedule (when set) limits enforcement windows.
+func (s *Server) stageBlockedServices(r *dns.Msg, q dns.Question, resp *dns.Msg, domain string, cl *clients.Client) (resolution, bool) {
+	services := s.cfg.BlockedServices
+	var sched *clients.Schedule
+	if cl != nil {
+		sched = cl.Schedule
+		if !cl.UseGlobalSettings {
+			services = cl.BlockedServices
+		}
+	}
+	if len(services) == 0 || (sched != nil && !sched.Active(time.Now())) {
+		return resolution{}, false
+	}
+	id, ok := policy.MatchService(domain, services)
+	if !ok {
+		return resolution{}, false
+	}
+	s.serviceHit(id)
+	blockedResp := s.blockedResponse(r, q)
+	resp.Rcode = blockedResp.Rcode
+	resp.Answer = blockedResp.Answer
+	return resolution{
+		upstream:    "Filtered",
+		blocked:     true,
+		matchedRule: id,
+		blockReason: "BlockedService:" + id,
+	}, true
+}
+
+// serviceHit increments the per-service blocked counter.
+func (s *Server) serviceHit(id string) {
+	v, _ := s.serviceHits.LoadOrStore(id, &atomic.Int64{})
+	v.(*atomic.Int64).Add(1)
+}
+
+// ServiceStats returns blocked-service hit counts per service ID.
+func (s *Server) ServiceStats() map[string]int64 {
+	out := make(map[string]int64)
+	s.serviceHits.Range(func(k, v interface{}) bool {
+		out[k.(string)] = v.(*atomic.Int64).Load()
+		return true
+	})
+	return out
 }
 
 // stageRewrites applies typed rewrites from the store (or the legacy
 // StaticHosts fallback). handled is true when a rewrite answered the query.
-func (s *Server) stageRewrites(_ *dns.Msg, q dns.Question, resp *dns.Msg, depth int) (resolution, bool) {
+func (s *Server) stageRewrites(_ *dns.Msg, q dns.Question, resp *dns.Msg, depth int, cl *clients.Client) (resolution, bool) {
 	domain := normalizeName(q.Name)
 
 	if s.cfg.Rewrites == nil {
@@ -328,7 +425,7 @@ func (s *Server) stageRewrites(_ *dns.Msg, q dns.Question, resp *dns.Msg, depth 
 			if e.Type != rewrites.TypeCNAME {
 				continue
 			}
-			return s.chaseCNAME(q, resp, e.Value, e.String(), "Rewrite", "Rewrite", depth), true
+			return s.chaseCNAME(q, resp, e.Value, e.String(), "Rewrite", "Rewrite", depth, cl), true
 		}
 	}
 
@@ -337,12 +434,22 @@ func (s *Server) stageRewrites(_ *dns.Msg, q dns.Question, resp *dns.Msg, depth 
 }
 
 // stageSafeSearch rewrites configured safe-search domains to their
-// restricted variants (pre-cache, like rewrites).
-func (s *Server) stageSafeSearch(_ *dns.Msg, q dns.Question, resp *dns.Msg, depth int) (resolution, bool) {
-	if s.cfg.Policy == nil {
-		return resolution{}, false
+// restricted variants (pre-cache, like rewrites). Clients with global
+// settings disabled use their own engine list (or inherit the global set).
+func (s *Server) stageSafeSearch(_ *dns.Msg, q dns.Question, resp *dns.Msg, depth int, cl *clients.Client) (resolution, bool) {
+	target := ""
+	switch {
+	case cl != nil && !cl.UseGlobalSettings:
+		if cl.SafeSearchEnabled {
+			engines := policy.ParseEngines(cl.SafeSearchEngines)
+			if len(engines) == 0 && s.cfg.Policy != nil {
+				engines = s.cfg.Policy.Engines()
+			}
+			target = policy.SafeSearchTargetFor(engines, normalizeName(q.Name))
+		}
+	case s.cfg.Policy != nil:
+		target = s.cfg.Policy.SafeSearchTarget(normalizeName(q.Name))
 	}
-	target := s.cfg.Policy.SafeSearchTarget(normalizeName(q.Name))
 	if target == "" {
 		return resolution{}, false
 	}
@@ -351,7 +458,7 @@ func (s *Server) stageSafeSearch(_ *dns.Msg, q dns.Question, resp *dns.Msg, dept
 	// Address-type queries chase the restricted target through the rest of
 	// the pipeline and return both the CNAME and the target's records.
 	if q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA || q.Qtype == dns.TypeCNAME {
-		return s.chaseCNAME(q, resp, target, "SafeSearch", "SafeSearch", policy.ReasonSafeSearch, depth), true
+		return s.chaseCNAME(q, resp, target, "SafeSearch", "SafeSearch", policy.ReasonSafeSearch, depth, cl), true
 	}
 	// Other types get just the CNAME record.
 	resp.Answer = []dns.RR{&dns.CNAME{
@@ -363,7 +470,7 @@ func (s *Server) stageSafeSearch(_ *dns.Msg, q dns.Question, resp *dns.Msg, dept
 
 // chaseCNAME appends the CNAME record and resolves the target through the
 // rest of the pipeline (filter/cache/forward), merging the answers.
-func (s *Server) chaseCNAME(q dns.Question, resp *dns.Msg, target, rule, label, reason string, depth int) resolution {
+func (s *Server) chaseCNAME(q dns.Question, resp *dns.Msg, target, rule, label, reason string, depth int, cl *clients.Client) resolution {
 	if depth >= maxChainDepth {
 		resp.Rcode = dns.RcodeServerFailure
 		return resolution{upstream: label, matchedRule: rule + " (chain depth exceeded)", blockReason: reason}
@@ -378,7 +485,7 @@ func (s *Server) chaseCNAME(q dns.Question, resp *dns.Msg, target, rule, label, 
 	subResp := new(dns.Msg)
 	subResp.SetReply(sub)
 	subResp.RecursionAvailable = true
-	s.resolve(sub, subResp, depth+1)
+	s.resolve(sub, subResp, depth+1, cl)
 
 	resp.Rcode = subResp.Rcode
 	resp.Answer = append([]dns.RR{cname}, subResp.Answer...)
@@ -442,8 +549,9 @@ func (s *Server) staticHosts() map[string]net.IP {
 }
 
 // resolveViaCacheOrUpstream runs the cache → forward → bogus-NXDOMAIN →
-// cache-store stages. It fills resp on success.
-func (s *Server) resolveViaCacheOrUpstream(r *dns.Msg, resp *dns.Msg, key cacheKey) resolution {
+// cache-store stages. It fills resp on success. specs, when non-empty, are
+// per-client custom upstreams used instead of routes/global pool.
+func (s *Server) resolveViaCacheOrUpstream(r *dns.Msg, resp *dns.Msg, key cacheKey, specs []string) resolution {
 	// Stage: cache lookup.
 	if ent, remaining, ok := s.cache.get(key); ok {
 		resp.Rcode = ent.rcode
@@ -459,13 +567,13 @@ func (s *Server) resolveViaCacheOrUpstream(r *dns.Msg, resp *dns.Msg, key cacheK
 			resp.Rcode = ent.rcode
 			resp.Answer = withTTL(ent.answers, 1)
 			resp.Ns = withTTL(ent.authority, 1)
-			s.refreshAsync(key, r)
+			s.refreshAsync(key, r, specs)
 			return resolution{upstream: "System Cache (stale)", cacheHit: true}
 		}
 	}
 
-	// Stage: forward to upstreams in strict order (first success wins).
-	usedUpstream, m := s.forward(r)
+	// Stage: forward (client upstreams → route → global pool).
+	usedUpstream, m := s.forward(r, specs)
 	if m == nil {
 		resp.Rcode = dns.RcodeServerFailure
 		return resolution{upstream: usedUpstream}
@@ -491,7 +599,9 @@ func (s *Server) resolveViaCacheOrUpstream(r *dns.Msg, resp *dns.Msg, key cacheK
 
 // refreshAsync repopulates a stale cache entry in the background,
 // single-flight per key. No event is emitted (not a client query).
-func (s *Server) refreshAsync(key cacheKey, r *dns.Msg) {
+// refreshAsync repopulates a stale cache entry in the background,
+// single-flight per key. No event is emitted (not a client query).
+func (s *Server) refreshAsync(key cacheKey, r *dns.Msg, specs []string) {
 	s.refreshMu.Lock()
 	if s.refreshInFlight[key] {
 		s.refreshMu.Unlock()
@@ -506,17 +616,26 @@ func (s *Server) refreshAsync(key cacheKey, r *dns.Msg) {
 			delete(s.refreshInFlight, key)
 			s.refreshMu.Unlock()
 		}()
-		if _, m := s.forward(r); m != nil {
+		if _, m := s.forward(r, specs); m != nil {
 			s.storeInCache(key, m)
 		}
 	}()
 }
 
-// forward resolves r through the upstream pool. Per-domain DNS routes take
-// precedence when they match (route failure falls back to the pool). When no
-// pool is configured (legacy/tests), the plain strict-order path is used.
-func (s *Server) forward(r *dns.Msg) (string, *dns.Msg) {
+// forward resolves r through the upstream pool. Per-client custom upstreams
+// (specs) override per-domain routes and the global pool; per-domain DNS
+// routes take precedence over the global pool (route failure falls back).
+// When no pool is configured (legacy/tests), the plain strict-order path is
+// used.
+func (s *Server) forward(r *dns.Msg, specs []string) (string, *dns.Msg) {
 	if s.cfg.Pool != nil {
+		if len(specs) > 0 {
+			if m, used, err := s.cfg.Pool.ExchangeSpecs(specs, r); err == nil && m != nil {
+				m.Id = r.Id
+				return used, m
+			}
+			// Client upstreams failed: fall through to routes/global pool.
+		}
 		if s.cfg.Routes != nil && len(r.Question) > 0 {
 			domain := normalizeName(r.Question[0].Name)
 			if spec := s.cfg.Routes.GetUpstreamForDomain(domain); spec != "" {
@@ -603,8 +722,9 @@ func withTTL(rrs []dns.RR, ttl uint32) []dns.RR {
 	return out
 }
 
-// buildEvent assembles the QueryEvent for an answered query.
-func (s *Server) buildEvent(r, resp *dns.Msg, w dns.ResponseWriter, res resolution, start time.Time) models.QueryEvent {
+// buildEvent assembles the QueryEvent for an answered query. A matching
+// registry client's name wins over CLIENT_ALIASES for the Alias field.
+func (s *Server) buildEvent(r, resp *dns.Msg, clientIP string, cl *clients.Client, res resolution, start time.Time) models.QueryEvent {
 	ev := models.QueryEvent{
 		UnixTime:    time.Now().Unix(),
 		Node:        s.cfg.NodeName,
@@ -617,8 +737,16 @@ func (s *Server) buildEvent(r, resp *dns.Msg, w dns.ResponseWriter, res resoluti
 		ev.Type = dns.TypeToString[r.Question[0].Qtype]
 		ev.Domain = normalizeName(r.Question[0].Name)
 	}
-	ev.ClientIP = clientIPFromRemote(w.RemoteAddr())
+	ev.ClientIP = clientIP
 	ev.ResponseCode = dns.RcodeToString[resp.Rcode]
+
+	// Alias: registry client name wins; otherwise fall back to CLIENT_ALIASES.
+	switch {
+	case cl != nil:
+		ev.Alias = cl.Name
+	case s.cfg.AliasFunc != nil:
+		ev.Alias = s.cfg.AliasFunc(clientIP)
+	}
 
 	latencyMs := float64(time.Since(start).Microseconds()) / 1000.0
 	if res.cacheHit {

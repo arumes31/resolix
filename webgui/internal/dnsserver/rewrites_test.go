@@ -31,7 +31,7 @@ func startPolicyServer(t *testing.T, store *rewrites.Store, pol *policy.Policy, 
 		Rewrites:  store,
 		Policy:    pol,
 		Filter:    nil,
-	}, func(ev models.QueryEvent) { events <- ev })
+	}, func(ev models.QueryEvent, _ bool) { events <- ev })
 
 	serverAddr := startTestServer(t, srv)
 	client := &dns.Client{Timeout: 2 * time.Second}

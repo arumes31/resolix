@@ -20,6 +20,8 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -30,6 +32,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"tailscale-dnsrewrite/webgui/internal/blocklist"
+	"tailscale-dnsrewrite/webgui/internal/clients"
 	"tailscale-dnsrewrite/webgui/internal/config"
 	"tailscale-dnsrewrite/webgui/internal/dnsroutes"
 	"tailscale-dnsrewrite/webgui/internal/dnsserver"
@@ -161,6 +164,9 @@ type Server struct {
 	rewritesStore *rewrites.Store
 	dnsServer     *dnsserver.Server
 
+	// Per-client registry (Step 5)
+	clientsRegistry *clients.Registry
+
 	// upstreamReloadFn reloads the upstream pool after upstreams.json saves
 	upstreamReloadFn func()
 
@@ -252,6 +258,13 @@ func (s *Server) SetDNSServer(srv *dnsserver.Server) {
 	s.fieldsMu.Lock()
 	defer s.fieldsMu.Unlock()
 	s.dnsServer = srv
+}
+
+// SetClients configures the per-client registry for the clients API.
+func (s *Server) SetClients(reg *clients.Registry) {
+	s.fieldsMu.Lock()
+	defer s.fieldsMu.Unlock()
+	s.clientsRegistry = reg
 }
 
 // SetUpstreamReloadFunc configures the callback invoked after the upstreams
@@ -715,6 +728,17 @@ func (s *Server) SetupMux() http.Handler {
 	// Typed DNS rewrites CRUD
 	mux.Handle("/api/rewrites", s.authMiddleware(http.HandlerFunc(s.handleRewrites)))
 
+	// Per-client registry CRUD (Step 5)
+	mux.Handle("/api/clients", s.authMiddleware(http.HandlerFunc(s.handleClients)))
+
+	// Query-log actions: block/unblock a domain via filter user rules
+	mux.Handle("/api/querylog/block", s.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.handleQuerylogAction(w, r, true)
+	})))
+	mux.Handle("/api/querylog/unblock", s.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.handleQuerylogAction(w, r, false)
+	})))
+
 	// Item 62: Upstream configuration editor
 	mux.Handle("/api/upstreams", s.authMiddleware(http.HandlerFunc(s.handleUpstreams)))
 
@@ -888,6 +912,12 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(&buf, "# HELP bogus_nxdomain_total Upstream answers converted to NXDOMAIN (bogus ranges)\n")
 		fmt.Fprintf(&buf, "# TYPE bogus_nxdomain_total counter\n")
 		fmt.Fprintf(&buf, "bogus_nxdomain_total %d\n", bogusNXHits)
+
+		fmt.Fprintf(&buf, "# HELP blocked_service_hits_total Queries blocked per blocked-service ID\n")
+		fmt.Fprintf(&buf, "# TYPE blocked_service_hits_total counter\n")
+		for id, count := range dnsSrv.ServiceStats() {
+			fmt.Fprintf(&buf, "blocked_service_hits_total{service=\"%s\"} %d\n", escapePrometheusLabel(id), count)
+		}
 	}
 
 	_, _ = buf.WriteTo(w)
@@ -1520,6 +1550,195 @@ func (s *Server) handleRewrites(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// ===== Per-Client Registry CRUD =====
+
+// handleClients dispatches GET (list), POST (add), PUT (update), and
+// DELETE (?name=) for the per-client registry. Changes take effect live.
+func (s *Server) handleClients(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	s.fieldsMu.RLock()
+	reg := s.clientsRegistry
+	s.fieldsMu.RUnlock()
+	if reg == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "clients registry is not configured",
+		})
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "ok",
+			"clients": reg.List(),
+		})
+	case http.MethodPost, http.MethodPut:
+		var c clients.Client
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256*1024)).Decode(&c); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(c.Name) == "" || len(c.IDs) == 0 {
+			http.Error(w, "Client requires a name and at least one ID (IP or CIDR)", http.StatusBadRequest)
+			return
+		}
+		var err error
+		if r.Method == http.MethodPost {
+			err = reg.Add(c)
+		} else {
+			err = reg.Update(c)
+		}
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid client: %v", err), http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+	case http.MethodDelete:
+		name := r.URL.Query().Get("name")
+		if name == "" {
+			http.Error(w, "Missing name parameter", http.StatusBadRequest)
+			return
+		}
+		if !reg.Delete(name) {
+			http.Error(w, "Client not found", http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// ===== Query-Log Block/Unblock Actions =====
+
+// userRulesPath returns the filter user-rules file managed by the
+// query-log actions (a plain file source of the filter engine).
+func (s *Server) userRulesPath() string {
+	return filepath.Join(s.cfg.HistoryDir, "user_rules.txt")
+}
+
+// handleQuerylogAction adds a block rule (block=true) or removes it / adds
+// an exception (block=false) for a domain, then reloads the user-rules
+// source so the change takes effect immediately.
+func (s *Server) handleQuerylogAction(w http.ResponseWriter, r *http.Request, block bool) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	eng := s.getFilter()
+	if eng == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "filter engine is not configured",
+		})
+		return
+	}
+
+	var req struct {
+		Domain string `json:"domain"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	domain := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(req.Domain), "."))
+	if domain == "" || !strings.Contains(domain, ".") {
+		http.Error(w, "Invalid domain", http.StatusBadRequest)
+		return
+	}
+
+	path := s.userRulesPath()
+	blockRule := "||" + domain + "^"
+	exceptRule := "@@||" + domain + "^"
+
+	var action, rule string
+	if block {
+		// Blocking: drop any stale exception and add the block rule.
+		if _, err := modifyUserRule(path, exceptRule, true); err != nil {
+			http.Error(w, "Failed to update user rules: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if _, err := modifyUserRule(path, blockRule, false); err != nil {
+			http.Error(w, "Failed to update user rules: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		action, rule = "blocked", blockRule
+	} else {
+		// Unblocking: remove the user block rule when it came from this
+		// file; otherwise add an exception rule.
+		removed, err := modifyUserRule(path, blockRule, true)
+		if err != nil {
+			http.Error(w, "Failed to update user rules: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if removed {
+			action, rule = "unblocked", blockRule
+		} else {
+			if _, err := modifyUserRule(path, exceptRule, false); err != nil {
+				http.Error(w, "Failed to update user rules: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			action, rule = "exception_added", exceptRule
+		}
+	}
+	eng.ReloadSource(path)
+
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "ok",
+		"action": action,
+		"rule":   rule,
+	})
+}
+
+// modifyUserRule adds or removes an exact rule line in the user rules file.
+// It returns whether the file changed.
+func modifyUserRule(path, ruleLine string, remove bool) (bool, error) {
+	data, err := os.ReadFile(path) // #nosec G304 G703 -- path derived from trusted HistoryDir config plus a constant filename, not request input
+	if err != nil && !os.IsNotExist(err) {
+		return false, err
+	}
+
+	var out []string
+	found := false
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == ruleLine {
+			found = true
+			if remove {
+				continue
+			}
+		}
+		if trimmed == "" && len(out) == 0 {
+			continue // skip leading empties
+		}
+		out = append(out, line)
+	}
+
+	changed := false
+	switch {
+	case remove && found:
+		changed = true
+	case !remove && !found:
+		out = append(out, ruleLine)
+		changed = true
+	}
+	if !changed {
+		return false, nil
+	}
+	content := strings.Join(out, "\n")
+	if !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil { // #nosec G703 -- path derived from trusted HistoryDir config plus a constant filename, not request input
+		return false, err
+	}
+	return true, nil
 }
 
 // ===== Item 62: Upstream Configuration Editor =====

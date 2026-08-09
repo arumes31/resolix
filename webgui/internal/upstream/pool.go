@@ -61,7 +61,8 @@ type Pool struct {
 	mu       sync.RWMutex
 	primary  []Resolver
 	fallback []Resolver
-	routes   map[string]Resolver // route-spec resolver cache
+	routes   map[string]Resolver   // route-spec resolver cache
+	groups   map[string][]Resolver // per-client spec-set resolver cache
 
 	boot *bootstrapper
 
@@ -84,6 +85,7 @@ func NewPool(cfg PoolConfig) *Pool {
 	p := &Pool{
 		cfg:    cfg,
 		routes: make(map[string]Resolver),
+		groups: make(map[string][]Resolver),
 		stats:  make(map[string]*stat),
 		boot:   newBootstrapper(cfg.BootstrapServers),
 	}
@@ -238,6 +240,33 @@ func (p *Pool) ExchangeRoute(spec string, m *dns.Msg) (*dns.Msg, string, error) 
 	}
 	resp, err := p.exchange(r, m)
 	return resp, spec, err
+}
+
+// ExchangeSpecs resolves m through an ad-hoc upstream spec set (per-client
+// custom upstreams), using the pool's selection mode. Resolvers are cached
+// per distinct spec set.
+func (p *Pool) ExchangeSpecs(specs []string, m *dns.Msg) (*dns.Msg, string, error) {
+	rs := p.groupResolvers(specs)
+	if len(rs) == 0 {
+		return nil, "", fmt.Errorf("no usable upstreams in spec set")
+	}
+	return p.exchangeByMode(rs, m)
+}
+
+// groupResolvers returns a cached resolver set for a spec list.
+func (p *Pool) groupResolvers(specs []string) []Resolver {
+	key := strings.Join(specs, "\x00")
+	p.mu.RLock()
+	rs, ok := p.groups[key]
+	p.mu.RUnlock()
+	if ok {
+		return rs
+	}
+	rs = p.buildResolvers(specs)
+	p.mu.Lock()
+	p.groups[key] = rs
+	p.mu.Unlock()
+	return rs
 }
 
 // routeResolver returns a cached resolver for a route spec.

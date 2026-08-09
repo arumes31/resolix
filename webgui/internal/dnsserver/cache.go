@@ -10,9 +10,13 @@ import (
 )
 
 // cacheKey identifies a cached DNS response by question name and type.
+// group discriminates the shared cache for clients with custom upstreams
+// (empty for the global pool), so client-specific answers never pollute the
+// global cache space.
 type cacheKey struct {
 	name  string
 	qtype uint16
+	group string
 }
 
 // cacheEntry holds a cached response with its clamped TTL and insertion time

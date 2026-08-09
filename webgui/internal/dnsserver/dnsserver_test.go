@@ -71,7 +71,7 @@ func TestEndToEndPipeline(t *testing.T) {
 		Upstreams:   []string{upstreamAddr},
 		StaticHosts: ParseStaticHosts("static.test:100.64.0.1"),
 		NodeName:    "test-node",
-	}, func(ev models.QueryEvent) { events <- ev })
+	}, func(ev models.QueryEvent, _ bool) { events <- ev })
 
 	serverAddr := startTestServer(t, srv)
 	client := &dns.Client{Timeout: 500 * time.Millisecond}

@@ -67,6 +67,8 @@ const (
 	DefaultBlockCustomIP6 = "::"
 	// DefaultRewritesFile is the default DNS rewrites persistence file name.
 	DefaultRewritesFile = "rewrites.json"
+	// DefaultClientsFile is the default per-client registry file name.
+	DefaultClientsFile = "clients.json"
 
 	// minCacheTTLDefault/maxCacheTTLDefault are the default cache TTL bounds
 	// in seconds (dnsmasq local-ttl=60 / max-ttl=600).
@@ -201,6 +203,10 @@ type Config struct {
 	CacheMaxTTL int
 	// CacheOptimistic serves stale entries while refreshing in background.
 	CacheOptimistic bool
+	// ClientsFile is the per-client registry JSON file.
+	ClientsFile string
+	// BlockedServices lists globally blocked service IDs (comma-separated).
+	BlockedServices string
 	// UpstreamLatencyThreshold is the latency threshold in ms for alerting.
 	UpstreamLatencyThreshold int
 
@@ -672,6 +678,11 @@ func LoadConfig() *Config {
 		rewritesFile = DefaultRewritesFile
 	}
 
+	clientsFile := os.Getenv("CLIENTS_FILE")
+	if clientsFile == "" {
+		clientsFile = DefaultClientsFile
+	}
+
 	dnsmasqPIDFile := os.Getenv("DNSMASQ_PID_FILE")
 	if dnsmasqPIDFile == "" {
 		dnsmasqPIDFile = DefaultDNSMasqPIDFile
@@ -790,6 +801,8 @@ func LoadConfig() *Config {
 		CacheMinTTL:                cacheMinTTL,
 		CacheMaxTTL:                cacheMaxTTL,
 		CacheOptimistic:            strings.ToLower(os.Getenv("CACHE_OPTIMISTIC")) == "true",
+		ClientsFile:                clientsFile,
+		BlockedServices:            os.Getenv("BLOCKED_SERVICES"),
 		UpstreamLatencyThreshold:   latencyThreshold,
 		SSEKeepaliveInterval:       sseKeepalive,
 		BatchArchiveInterval:       batchArchive,
@@ -860,6 +873,17 @@ func (c *Config) FullRewritesPath() string {
 		return c.RewritesFile
 	}
 	return filepath.Join(c.HistoryDir, c.RewritesFile)
+}
+
+// FullClientsPath returns the complete clients registry file path.
+func (c *Config) FullClientsPath() string {
+	if c.ClientsFile == "" {
+		return ""
+	}
+	if filepath.IsAbs(c.ClientsFile) {
+		return c.ClientsFile
+	}
+	return filepath.Join(c.HistoryDir, c.ClientsFile)
 }
 
 // FullBlocklistPath returns the complete blocklist file path.

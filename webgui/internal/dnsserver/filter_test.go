@@ -49,7 +49,7 @@ func startFilteredServer(t *testing.T, mode string) *filterHarness {
 		BlockingMode:   mode,
 		BlockCustomIP4: "192.0.2.66",
 		BlockCustomIP6: "2001:db8::66",
-	}, func(ev models.QueryEvent) { events <- ev })
+	}, func(ev models.QueryEvent, _ bool) { events <- ev })
 
 	serverAddr := startTestServer(t, srv)
 	client := &dns.Client{Timeout: 500 * time.Millisecond}

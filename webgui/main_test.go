@@ -8,12 +8,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"tailscale-dnsrewrite/webgui/internal/api"
 	"tailscale-dnsrewrite/webgui/internal/config"
+	"tailscale-dnsrewrite/webgui/internal/filter"
 	"tailscale-dnsrewrite/webgui/internal/forwarder"
 	"tailscale-dnsrewrite/webgui/internal/models"
 	"tailscale-dnsrewrite/webgui/internal/parser"
@@ -152,6 +154,75 @@ func TestApiIngestEvents(t *testing.T) {
 	// Node status should have been created from the event node name.
 	if ns := store.GetNodeStatus("slave-1"); ns == nil {
 		t.Error("Expected node status for slave-1 after events ingest")
+	}
+}
+
+// TestQuerylogBlockUnblock exercises the query-log actions end to end:
+// block adds a user rule (domain becomes blocked), unblock removes it when
+// it came from the user file, and otherwise adds an exception rule.
+func TestQuerylogBlockUnblock(t *testing.T) {
+	cfg, store, _, srv := setupTest()
+	defer func() { _ = os.RemoveAll(store.GetConfig().HistoryDir) }()
+
+	// Filter engine with the user-rules file source (as main wires it).
+	userRules := filepath.Join(cfg.HistoryDir, "user_rules.txt")
+	if err := os.WriteFile(userRules, []byte("! user rules\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	eng := filter.New()
+	eng.AddFileSource(userRules, false)
+	// A second source blocking a domain NOT in the user file.
+	otherList := filepath.Join(cfg.HistoryDir, "other.txt")
+	if err := os.WriteFile(otherList, []byte("||external.example.com^\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	eng.AddFileSource(otherList, false)
+	srv.SetFilter(eng)
+
+	handler := srv.SetupMux()
+	post := func(path, domain string) {
+		t.Helper()
+		body, _ := json.Marshal(map[string]string{"domain": domain})
+		req := httptest.NewRequest("POST", path, bytes.NewBuffer(body))
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("POST %s %s: status %d, body %s", path, domain, rr.Code, rr.Body.String())
+		}
+	}
+
+	// 1. Block: user rule added, domain now blocked.
+	post("/api/querylog/block", "ads.example.com")
+	if res := eng.Match("ads.example.com"); !res.Blocked {
+		t.Fatal("domain not blocked after /api/querylog/block")
+	}
+	if res := eng.Match("www.ads.example.com"); !res.Blocked {
+		t.Error("subdomain must also be blocked")
+	}
+	data, _ := os.ReadFile(userRules) // #nosec G304 -- test reads a file it just created under cfg.HistoryDir (t.TempDir)
+	if !strings.Contains(string(data), "||ads.example.com^") {
+		t.Error("user rules file missing block rule")
+	}
+
+	// 2. Unblock: the rule came from the user file → removed (no exception).
+	post("/api/querylog/unblock", "ads.example.com")
+	if res := eng.Match("ads.example.com"); res.Blocked {
+		t.Error("domain still blocked after /api/querylog/unblock")
+	}
+	data, _ = os.ReadFile(userRules) // #nosec G304 -- test reads a file it just created under cfg.HistoryDir (t.TempDir)
+	if strings.Contains(string(data), "ads.example.com") {
+		t.Error("user rules file still contains the domain")
+	}
+
+	// 3. Unblock a domain blocked by a different source → exception added.
+	post("/api/querylog/unblock", "external.example.com")
+	if res := eng.Match("external.example.com"); res.Blocked || !res.Allowed {
+		t.Errorf("expected exception after unblock of external rule, got %+v", res)
+	}
+	data, _ = os.ReadFile(userRules) // #nosec G304 -- test reads a file it just created under cfg.HistoryDir (t.TempDir)
+	if !strings.Contains(string(data), "@@||external.example.com^") {
+		t.Error("user rules file missing exception rule")
 	}
 }
 

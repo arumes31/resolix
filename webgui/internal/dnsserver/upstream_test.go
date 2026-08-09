@@ -27,7 +27,7 @@ func TestOptimisticCache(t *testing.T) {
 		CacheMinTTL:     1, // allow the 1s TTL for the test
 		CacheMaxTTL:     600,
 		CacheOptimistic: true,
-	}, func(ev models.QueryEvent) { events <- ev })
+	}, func(ev models.QueryEvent, _ bool) { events <- ev })
 	serverAddr := startTestServer(t, srv)
 
 	// Shorten the cached TTL by pre-seeding via a 1s-TTL upstream response:
@@ -126,7 +126,7 @@ func TestRoutePrecedenceThroughPool(t *testing.T) {
 		NodeName: "test-node",
 		Pool:     pool,
 		Routes:   dr,
-	}, func(ev models.QueryEvent) { events <- ev })
+	}, func(ev models.QueryEvent, _ bool) { events <- ev })
 	serverAddr := startTestServer(t, srv)
 
 	client := &dns.Client{Timeout: 2 * time.Second}

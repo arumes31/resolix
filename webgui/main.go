@@ -23,6 +23,7 @@ import (
 
 	"tailscale-dnsrewrite/webgui/internal/api"
 	"tailscale-dnsrewrite/webgui/internal/blocklist"
+	"tailscale-dnsrewrite/webgui/internal/clients"
 	"tailscale-dnsrewrite/webgui/internal/config"
 	"tailscale-dnsrewrite/webgui/internal/dnsroutes"
 	"tailscale-dnsrewrite/webgui/internal/dnsserver"
@@ -251,6 +252,12 @@ DB_PATH=dns.db
 # CACHE_MIN_TTL=60
 # CACHE_MAX_TTL=600
 
+# Per-client policies (Step 5)
+# CLIENTS_FILE=clients.json (per-client registry: filtering/safe-search/blocked
+#   services/custom upstreams/schedules, hot-reloaded every 30s)
+# BLOCKED_SERVICES=facebook,tiktok (global blocked-service IDs; per-client
+#   overrides live in the clients file)
+
 # Upstream latency alert threshold in milliseconds (Item 68, default: 200)
 # UPSTREAM_LATENCY_THRESHOLD=200
 
@@ -323,11 +330,7 @@ func main() {
 	defer cancel()
 	cfg.StartClientAliasesReload(ctx)
 
-	tmpl, err := template.ParseFS(embedFS, "templates/*.html")
-	if err != nil {
-		logger.Fatal("Fatal error parsing templates: %v", err)
-	}
-
+	tmpl := parseTemplates()
 	prs := parser.NewParser(store, cfg.Debug)
 	srv := api.NewServer(cfg, store, prs, tmpl)
 
@@ -372,11 +375,7 @@ func main() {
 	})
 
 	// Create static file server from embedded FS
-	staticFS, err := fs.Sub(embedFS, "static")
-	if err != nil {
-		logger.Fatal("Fatal error creating static FS: %v", err)
-	}
-	staticHandler := http.FileServer(http.FS(staticFS))
+	staticHandler := newStaticHandler()
 
 	// Upstream specs: upstreams.json overrides env upstreams when the file
 	// contains entries (hot-reloaded below and after API saves).
@@ -455,6 +454,9 @@ func main() {
 	rwStore := loadRewritesStore(cfg)
 	srv.SetRewritesStore(rwStore)
 
+	// Per-client registry (Step 5): JSON-persisted, hot-reloaded.
+	clientReg := setupClientsRegistry(ctx, cfg, srv)
+
 	// Policy (Step 3): safe search, bogus NXDOMAIN, AAAA disable, refuse ANY.
 	pol := policy.New(policy.Config{
 		SafeSearch:   splitListEnv(cfg.SafeSearch),
@@ -474,6 +476,9 @@ func main() {
 		Policy:          pol,
 		Pool:            pool,
 		Routes:          dr,
+		Clients:         clientReg,
+		BlockedServices: splitListEnv(cfg.BlockedServices),
+		AliasFunc:       store.GetAlias,
 		CacheMinTTL:     cfg.CacheMinTTL,
 		CacheMaxTTL:     cfg.CacheMaxTTL,
 		CacheOptimistic: cfg.CacheOptimistic,
@@ -482,12 +487,15 @@ func main() {
 		BlockingMode:    cfg.BlockingMode,
 		BlockCustomIP4:  cfg.BlockCustomIP4,
 		BlockCustomIP6:  cfg.BlockCustomIP6,
-	}, func(ev models.QueryEvent) {
-		store.AddEvent(ev)
-		srv.BroadcastEvent(ev)
-		if cfg.Mode == "slave" {
-			fwd.EnqueueEvent(ev)
+	}, func(ev models.QueryEvent, excludeFromStats bool) {
+		// exclude_from_stats clients emit to SSE only (no store/forwarder).
+		if !excludeFromStats {
+			store.AddEvent(ev)
+			if cfg.Mode == "slave" {
+				fwd.EnqueueEvent(ev)
+			}
 		}
+		srv.BroadcastEvent(ev)
 	})
 	dnsDone := make(chan struct{})
 	srv.SetDNSServer(dnsSrv)
@@ -569,6 +577,16 @@ func main() {
 // and wires it into the API server.
 func setupFilterEngine(ctx context.Context, cfg *config.Config, srv *api.Server) *filter.Engine {
 	eng := filter.New()
+
+	// User rules (query-log block/unblock actions) — a plain file source.
+	userRulesPath := filepath.Join(cfg.HistoryDir, "user_rules.txt")
+	if _, err := os.Stat(userRulesPath); os.IsNotExist(err) {
+		if err := os.WriteFile(userRulesPath, []byte("! user rules (managed via /api/querylog)\n"), 0o600); err != nil {
+			logger.Warning("Failed to create user rules file: %v", err)
+		}
+	}
+	eng.AddFileSource(userRulesPath, false)
+
 	if p := cfg.FullBlocklistPath(); p != "" {
 		eng.AddFileSource(p, false)
 	}
@@ -584,6 +602,37 @@ func setupFilterEngine(ctx context.Context, cfg *config.Config, srv *api.Server)
 	eng.StartUpdateLoop(ctx, cfg.FilterUpdateInterval)
 	srv.SetFilter(eng)
 	return eng
+}
+
+// parseTemplates parses the embedded HTML templates, exiting fatally on error.
+func parseTemplates() *template.Template {
+	tmpl, err := template.ParseFS(embedFS, "templates/*.html")
+	if err != nil {
+		logger.Fatal("Fatal error parsing templates: %v", err)
+	}
+	return tmpl
+}
+
+// newStaticHandler creates the static file server from the embedded FS,
+// exiting fatally on error.
+func newStaticHandler() http.Handler {
+	staticFS, err := fs.Sub(embedFS, "static")
+	if err != nil {
+		logger.Fatal("Fatal error creating static FS: %v", err)
+	}
+	return http.FileServer(http.FS(staticFS))
+}
+
+// setupClientsRegistry loads the per-client registry and starts hot-reload.
+func setupClientsRegistry(ctx context.Context, cfg *config.Config, srv *api.Server) *clients.Registry {
+	reg, err := clients.Load(cfg.FullClientsPath())
+	if err != nil {
+		logger.Warning("Failed to load clients registry: %v", err)
+		reg, _ = clients.Load("") // in-memory fallback
+	}
+	reg.StartReload(ctx)
+	srv.SetClients(reg)
+	return reg
 }
 
 // loadRewritesStore loads the typed rewrites store, seeding from the DOMAINS

@@ -58,19 +58,9 @@ type Policy struct {
 // skipped with a warning.
 func New(cfg Config) *Policy {
 	p := &Policy{
-		engines:      make(map[string]bool),
+		engines:      ParseEngines(cfg.SafeSearch),
 		AAAADisabled: cfg.AAAADisabled,
 		RefuseANY:    cfg.RefuseANY,
-	}
-	for _, eng := range cfg.SafeSearch {
-		eng = strings.ToLower(strings.TrimSpace(eng))
-		switch eng {
-		case "":
-		case "google", "bing", "ddg", "youtube":
-			p.engines[eng] = true
-		default:
-			log.Printf("[WARN] Unknown SAFE_SEARCH engine: %q", eng)
-		}
 	}
 	for _, raw := range cfg.BogusNets {
 		raw = strings.TrimSpace(raw)
@@ -108,26 +98,59 @@ func (p *Policy) RefuseANYEnabled() bool { return p != nil && p.RefuseANY }
 // AAAADisabledEnabled reports whether AAAA queries get NODATA answers.
 func (p *Policy) AAAADisabledEnabled() bool { return p != nil && p.AAAADisabled }
 
+// ParseEngines validates a safe-search engine list into a set.
+func ParseEngines(list []string) map[string]bool {
+	engines := make(map[string]bool)
+	for _, eng := range list {
+		eng = strings.ToLower(strings.TrimSpace(eng))
+		switch eng {
+		case "":
+		case "google", "bing", "ddg", "youtube":
+			engines[eng] = true
+		default:
+			log.Printf("[WARN] Unknown SAFE_SEARCH engine: %q", eng)
+		}
+	}
+	return engines
+}
+
+// Engines returns the enabled safe-search engine set.
+func (p *Policy) Engines() map[string]bool {
+	if p == nil {
+		return nil
+	}
+	return p.engines
+}
+
 // SafeSearchTarget returns the restricted-variant CNAME target for the
 // domain, or "" when no enabled engine matches. domain must be normalized
 // (lowercase, no trailing dot).
 func (p *Policy) SafeSearchTarget(domain string) string {
-	if p == nil || len(p.engines) == 0 {
+	if p == nil {
 		return ""
 	}
-	if p.engines["google"] {
+	return SafeSearchTargetFor(p.engines, domain)
+}
+
+// SafeSearchTargetFor evaluates safe-search targets against an explicit
+// engine set (used for per-client overrides).
+func SafeSearchTargetFor(engines map[string]bool, domain string) string {
+	if len(engines) == 0 {
+		return ""
+	}
+	if engines["google"] {
 		// google.com and every www.google.<TLD> / google.<TLD> variant.
 		if domain == "google.com" || strings.HasPrefix(domain, "www.google.") || strings.HasPrefix(domain, "google.") {
 			return googleTarget
 		}
 	}
-	if p.engines["bing"] && (domain == "bing.com" || domain == "www.bing.com") {
+	if engines["bing"] && (domain == "bing.com" || domain == "www.bing.com") {
 		return bingTarget
 	}
-	if p.engines["ddg"] && (domain == "duckduckgo.com" || domain == "www.duckduckgo.com") {
+	if engines["ddg"] && (domain == "duckduckgo.com" || domain == "www.duckduckgo.com") {
 		return ddgTarget
 	}
-	if p.engines["youtube"] {
+	if engines["youtube"] {
 		if target, ok := youtubeHosts[domain]; ok {
 			return target
 		}

@@ -66,6 +66,14 @@ func (e *Engine) LoadLocal() {
 	}
 }
 
+// ReloadSource re-reads one file source by name (used after user-rule edits
+// via the query-log block/unblock actions).
+func (e *Engine) ReloadSource(name string) {
+	if src := e.findSource(name); src != nil && src.Kind == "file" {
+		e.loadFileSource(src)
+	}
+}
+
 // findSource returns the internal source pointer by name.
 func (e *Engine) findSource(name string) *Source {
 	e.mu.RLock()

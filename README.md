@@ -98,6 +98,8 @@ docker-compose -f docker-compose.example.yaml up -d
 | `DNS64` / `DNS64_PREFIXES` | Synthesize AAAA from A on empty AAAA answers | `false` / `64:ff9b::/96` |
 | `CACHE_OPTIMISTIC` | Serve stale cache entries while refreshing in background | `false` |
 | `CACHE_MIN_TTL` / `CACHE_MAX_TTL` | Cache TTL bounds in seconds | `60` / `600` |
+| `CLIENTS_FILE` | Per-client registry JSON (policies, upstreams, schedules) | `clients.json` |
+| `BLOCKED_SERVICES` | Comma-separated globally blocked service IDs (e.g. `facebook,tiktok`) | - |
 | `TRUSTED_PROXIES` | Comma-separated proxy IPs/CIDRs whose `X-Forwarded-*` headers are honored | - |
 | `COOKIE_SECURE` | Force the `Secure` attribute on session/CSRF cookies (`true`/`false`) | `false` |
 

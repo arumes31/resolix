@@ -17,7 +17,7 @@ COPY webgui/ .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.Version=v2.2.0" -o webgui .
 
 # Stage 2: Final Image
-FROM alpine:3.23
+FROM alpine:3.24
 
 # Install runtime dependencies (including those required by Tailscale)
 RUN apk add --no-cache dnsmasq bash bind-tools ca-certificates iptables iproute2 ip6tables

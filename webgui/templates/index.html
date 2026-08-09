@@ -103,6 +103,7 @@
                         <th>Client</th>
                         <th>Upstream</th>
                         <th>Latency</th>
+                        <th>Action</th>
                     </tr>
                 </thead>
                 <tbody id="eventTable">
@@ -119,11 +120,121 @@
                         </td>
                         <td>{{if .Upstream}}<span class="upstream-badge">{{.Upstream}}</span>{{else}}-{{end}}</td>
                         <td class="latency-cell">{{if .LatencyFormatted}}{{.LatencyFormatted}}{{else}}-{{end}}</td>
+                        <td><button type="button" class="query-action-btn {{if .Blocked}}is-unblock{{end}}"
+                                data-domain="{{.Domain}}" data-action="{{if .Blocked}}unblock{{else}}block{{end}}">{{if
+                                .Blocked}}Unblock{{else}}Block{{end}}</button></td>
                     </tr>
                     {{end}}
                 </tbody>
             </table>
         </div>
+
+        <section class="dns-console" aria-labelledby="dnsConsoleTitle">
+            <div class="console-header">
+                <div>
+                    <p class="console-kicker">DNS CONTROL PLANE</p>
+                    <h2 id="dnsConsoleTitle">Protection settings</h2>
+                    <p class="console-subtitle">Live policy changes apply without restarting the resolver.</p>
+                </div>
+                <div class="console-actions">
+                    <button type="button" id="refreshSettingsBtn" class="btn btn-secondary">Refresh</button>
+                    <button type="button" id="clearCacheBtn" class="btn btn-danger">Clear DNS cache</button>
+                </div>
+            </div>
+            <div id="settingsNotice" class="settings-notice is-hidden" role="status" aria-live="polite"></div>
+
+            <div class="settings-shell">
+                <div class="settings-tabs" role="tablist" aria-label="DNS settings">
+                    <button type="button" class="settings-tab active" role="tab" aria-selected="true"
+                        data-settings-tab="filters">Filters</button>
+                    <button type="button" class="settings-tab" role="tab" aria-selected="false"
+                        data-settings-tab="rewrites">Rewrites</button>
+                    <button type="button" class="settings-tab" role="tab" aria-selected="false"
+                        data-settings-tab="clients">Clients</button>
+                    <button type="button" class="settings-tab" role="tab" aria-selected="false"
+                        data-settings-tab="services">Services</button>
+                </div>
+
+                <div class="settings-panels">
+                    <div id="settings-filters" class="settings-panel active" role="tabpanel">
+                        <div class="panel-heading">
+                            <div>
+                                <span class="panel-index">01</span>
+                                <h3>Filter engine</h3>
+                            </div>
+                            <span id="filterState" class="state-pill">Loading</span>
+                        </div>
+                        <div class="filter-metrics">
+                            <div><span>Blocked</span><strong id="filterBlockedTotal">0</strong></div>
+                            <div><span>Allowed</span><strong id="filterAllowedTotal">0</strong></div>
+                            <div><span>Sources</span><strong id="filterSourceTotal">0</strong></div>
+                        </div>
+                        <div class="inline-actions">
+                            <button type="button" class="btn btn-secondary filter-pause-btn" data-minutes="5">Pause 5m</button>
+                            <button type="button" class="btn btn-secondary filter-pause-btn" data-minutes="30">Pause 30m</button>
+                            <button type="button" class="btn btn-primary filter-pause-btn" data-minutes="0">Resume</button>
+                        </div>
+                        <div id="filterSources" class="settings-list"></div>
+                    </div>
+
+                    <div id="settings-rewrites" class="settings-panel" role="tabpanel" hidden>
+                        <div class="panel-heading">
+                            <div><span class="panel-index">02</span><h3>DNS rewrites</h3></div>
+                            <span id="rewriteCount" class="state-pill">0 rules</span>
+                        </div>
+                        <form id="rewriteForm" class="settings-form compact-form">
+                            <label>Domain<input id="rewriteDomain" type="text" placeholder="printer.internal" required></label>
+                            <label>Type<select id="rewriteType">
+                                    <option>A</option><option>AAAA</option><option>CNAME</option><option>PTR</option>
+                                    <option>MX</option><option>TXT</option><option>SRV</option>
+                                    <option>NXDOMAIN</option><option>REFUSED</option><option>NOERROR</option>
+                                </select></label>
+                            <label id="rewriteValueLabel">Value<input id="rewriteValue" type="text" placeholder="192.0.2.10"></label>
+                            <button type="submit" class="btn btn-primary">Add rewrite</button>
+                        </form>
+                        <div id="rewriteList" class="settings-list"></div>
+                    </div>
+
+                    <div id="settings-clients" class="settings-panel" role="tabpanel" hidden>
+                        <div class="panel-heading">
+                            <div><span class="panel-index">03</span><h3>Client policies</h3></div>
+                            <span id="clientCount" class="state-pill">0 clients</span>
+                        </div>
+                        <form id="clientForm" class="settings-form client-form">
+                            <label>Name<input id="clientName" type="text" placeholder="Kids devices" required></label>
+                            <label class="field-wide">IPs or CIDRs<input id="clientIDs" type="text"
+                                    placeholder="100.64.0.12, 192.168.20.0/24" required></label>
+                            <label class="check-field field-wide"><input id="clientUseGlobal" type="checkbox" checked>
+                                Inherit global filtering and service settings</label>
+                            <div id="clientPolicyFields" class="client-policy-fields field-wide is-muted">
+                                <label class="check-field"><input id="clientFiltering" type="checkbox" checked> Filtering</label>
+                                <label class="check-field"><input id="clientSafeSearch" type="checkbox"> Safe search</label>
+                                <label>Safe-search engines<input id="clientSafeEngines" type="text" placeholder="google,bing,youtube"></label>
+                                <fieldset class="service-picker"><legend>Blocked services</legend><div id="clientServicePicker"></div></fieldset>
+                            </div>
+                            <label class="field-wide">Custom upstreams<input id="clientUpstreams" type="text"
+                                    placeholder="tls://dns.example:853, 9.9.9.9"></label>
+                            <label class="check-field"><input id="clientExcludeLog" type="checkbox"> Exclude from log</label>
+                            <label class="check-field"><input id="clientExcludeStats" type="checkbox"> Exclude from stats</label>
+                            <div class="inline-actions field-wide">
+                                <button type="submit" id="clientSaveBtn" class="btn btn-primary">Add client</button>
+                                <button type="button" id="clientCancelBtn" class="btn btn-secondary is-hidden">Cancel edit</button>
+                            </div>
+                        </form>
+                        <div id="clientList" class="settings-list"></div>
+                    </div>
+
+                    <div id="settings-services" class="settings-panel" role="tabpanel" hidden>
+                        <div class="panel-heading">
+                            <div><span class="panel-index">04</span><h3>Blocked services</h3></div>
+                            <span class="state-pill">Catalog</span>
+                        </div>
+                        <p class="panel-copy">Global enablement comes from <code>BLOCKED_SERVICES</code>. Client-specific overrides are managed in the Clients tab.</p>
+                        <div id="serviceCatalog" class="service-catalog"></div>
+                    </div>
+                </div>
+            </div>
+        </section>
 
         <!-- Node Status Panel (Items 92, 93) -->
         {{if eq .Mode "master"}}

@@ -214,9 +214,6 @@ DB_PATH=dns.db
 # DNS_LISTEN_ADDR=0.0.0.0
 # DNS_LISTEN_PORT=53
 
-# Deprecated: dnsmasq was replaced by the in-process DNS server (Item 63)
-# DNSMASQ_PID_FILE=/run/dnsmasq.pid
-
 # Filter engine (blocklists with adblock/hosts/domain-list/regex syntax)
 # Space- or comma-separated subscription URLs, auto-updated with ETag/Last-Modified
 # BLOCKLIST_URLS=https://example.com/blocklist.txt
@@ -257,6 +254,22 @@ DB_PATH=dns.db
 #   services/custom upstreams/schedules, hot-reloaded every 30s)
 # BLOCKED_SERVICES=facebook,tiktok (global blocked-service IDs; per-client
 #   overrides live in the clients file)
+
+# DNS access and encrypted serving (Step 6)
+# Comma/space-separated IPs or CIDRs. Disallowed clients are dropped; when an
+# allowed list is set, all clients outside it receive REFUSED.
+# DNS_ALLOWED_CLIENTS=100.64.0.0/10,192.168.0.0/16
+# DNS_DISALLOWED_CLIENTS=100.64.0.5
+# RATE_LIMIT_QPS=20 (per IPv4 /24 or IPv6 /56; 0 disables)
+# PRIVATE_PTR=true (answer known RFC1918/CGNAT/ULA client PTRs as <name>.lan)
+# DNSSEC=false (pass the DNSSEC DO bit upstream; no local validation)
+# DOH_ENABLED=false
+# DOH_PATH=/dns-query
+# DOH_AUTH_TOKEN=change-me (Bearer token; when unset, only private/tailnet clients)
+# DOT_ENABLED=false
+# DOT_PORT=853
+# TLS_CERT_FILE=/etc/tailscale-dnsrewrite/tls.crt
+# TLS_KEY_FILE=/etc/tailscale-dnsrewrite/tls.key
 
 # Upstream latency alert threshold in milliseconds (Item 68, default: 200)
 # UPSTREAM_LATENCY_THRESHOLD=200
@@ -482,11 +495,22 @@ func main() {
 		CacheMinTTL:     cfg.CacheMinTTL,
 		CacheMaxTTL:     cfg.CacheMaxTTL,
 		CacheOptimistic: cfg.CacheOptimistic,
-		NodeName:        cfg.NodeName,
-		Filter:          filterEng,
-		BlockingMode:    cfg.BlockingMode,
-		BlockCustomIP4:  cfg.BlockCustomIP4,
-		BlockCustomIP6:  cfg.BlockCustomIP6,
+		// Step 6: ACL, rate limit, private PTR, DNSSEC, DoT.
+		AllowedClients:    cfg.DNSAllowedClients,
+		DisallowedClients: cfg.DNSDisallowedClients,
+		RateLimitQPS:      cfg.RateLimitQPS,
+		PrivatePTR:        cfg.PrivatePTR,
+		DNSSEC:            cfg.DNSSEC,
+		Resolver:          res,
+		DoTEnabled:        cfg.DoTEnabled,
+		DoTPort:           cfg.DoTPort,
+		TLSCertFile:       cfg.TLSCertFile,
+		TLSKeyFile:        cfg.TLSKeyFile,
+		NodeName:          cfg.NodeName,
+		Filter:            filterEng,
+		BlockingMode:      cfg.BlockingMode,
+		BlockCustomIP4:    cfg.BlockCustomIP4,
+		BlockCustomIP6:    cfg.BlockCustomIP6,
 	}, func(ev models.QueryEvent, excludeFromStats bool) {
 		// exclude_from_stats clients emit to SSE only (no store/forwarder).
 		if !excludeFromStats {
@@ -501,7 +525,11 @@ func main() {
 	srv.SetDNSServer(dnsSrv)
 	go func() {
 		defer close(dnsDone)
-		logger.Info("DNS server listening on %s (UDP+TCP)", dnsSrv.ListenAddr())
+		protocols := "UDP+TCP"
+		if cfg.DoTEnabled {
+			protocols += fmt.Sprintf("+DoT:%d", cfg.DoTPort)
+		}
+		logger.Info("DNS server listening on %s (%s)", dnsSrv.ListenAddr(), protocols)
 		if err := dnsSrv.Start(ctx); err != nil {
 			errChan <- err
 		}

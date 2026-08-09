@@ -163,8 +163,10 @@ func TestPoolFallbackOnlyWhenPrimariesDown(t *testing.T) {
 
 func TestPoolECSAttached(t *testing.T) {
 	var sawECS atomic.Bool
+	var sawDO atomic.Bool
 	addr := startUDPUpstreamHandler(t, func(w dns.ResponseWriter, r *dns.Msg) {
 		if opt := r.IsEdns0(); opt != nil {
+			sawDO.Store(opt.Do())
 			for _, o := range opt.Option {
 				if subnet, ok := o.(*dns.EDNS0_SUBNET); ok {
 					if subnet.Address.String() == "192.0.2.0" && subnet.SourceNetmask == 24 {
@@ -179,11 +181,16 @@ func TestPoolECSAttached(t *testing.T) {
 	})
 
 	pool := NewPool(PoolConfig{Mode: ModeStrict, PrimarySpecs: []string{addr}, ECSClientSubnet: "192.0.2.0/24"})
-	if _, _, err := pool.Exchange(queryA()); err != nil {
+	q := queryA()
+	q.SetEdns0(1232, true)
+	if _, _, err := pool.Exchange(q); err != nil {
 		t.Fatal(err)
 	}
 	if !sawECS.Load() {
 		t.Error("upstream query did not carry the ECS option")
+	}
+	if !sawDO.Load() {
+		t.Error("adding ECS cleared the DNSSEC DO bit")
 	}
 
 	// Without ECS configured, no EDNS0 subnet is attached (privacy default).

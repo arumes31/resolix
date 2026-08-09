@@ -18,6 +18,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"mime"
 	"net"
 	"net/http"
 	"os"
@@ -31,6 +32,8 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/miekg/dns"
+
 	"tailscale-dnsrewrite/webgui/internal/blocklist"
 	"tailscale-dnsrewrite/webgui/internal/clients"
 	"tailscale-dnsrewrite/webgui/internal/config"
@@ -40,6 +43,7 @@ import (
 	"tailscale-dnsrewrite/webgui/internal/filter"
 	"tailscale-dnsrewrite/webgui/internal/models"
 	"tailscale-dnsrewrite/webgui/internal/parser"
+	"tailscale-dnsrewrite/webgui/internal/policy"
 	"tailscale-dnsrewrite/webgui/internal/resolver"
 	"tailscale-dnsrewrite/webgui/internal/rewrites"
 	"tailscale-dnsrewrite/webgui/internal/storage"
@@ -708,6 +712,12 @@ func (s *Server) SetupMux() http.Handler {
 	mux.HandleFunc("/login", s.handleLogin)
 	mux.HandleFunc("/logout", s.handleLogout)
 
+	// DoH endpoint (RFC 8484): functional without session auth — protected
+	// by DOH_AUTH_TOKEN when set, otherwise restricted to private client IPs.
+	if s.cfg.DoHEnabled {
+		mux.HandleFunc(s.cfg.DoHPath, s.handleDoH)
+	}
+
 	// Metrics can leak internal state; require authentication.
 	mux.Handle("/metrics", s.authMiddleware(http.HandlerFunc(s.handleMetrics)))
 
@@ -730,6 +740,7 @@ func (s *Server) SetupMux() http.Handler {
 
 	// Per-client registry CRUD (Step 5)
 	mux.Handle("/api/clients", s.authMiddleware(http.HandlerFunc(s.handleClients)))
+	mux.Handle("/api/services", s.authMiddleware(http.HandlerFunc(s.handleServices)))
 
 	// Query-log actions: block/unblock a domain via filter user rules
 	mux.Handle("/api/querylog/block", s.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -808,6 +819,130 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = fmt.Fprintf(w, `{"status":"ok"}`)
+}
+
+// ===== DNS-over-HTTPS (RFC 8484) =====
+
+// dohPrivateNets are the client ranges allowed to use DoH when no
+// DOH_AUTH_TOKEN is configured: loopback, RFC1918, Tailscale CGNAT, ULA.
+var dohPrivateNets = mustParseCIDRs([]string{
+	"127.0.0.0/8", "::1/128",
+	"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+	"100.64.0.0/10", "fc00::/7",
+})
+
+func mustParseCIDRs(raws []string) []*net.IPNet {
+	out := make([]*net.IPNet, 0, len(raws))
+	for _, raw := range raws {
+		_, n, err := net.ParseCIDR(raw)
+		if err != nil {
+			panic(err)
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+// dohClientAllowed enforces the DoH auth model: Bearer token when
+// DOH_AUTH_TOKEN is set, otherwise private/tailnet client IPs only.
+func (s *Server) dohClientAllowed(r *http.Request) bool {
+	if token := s.cfg.DoHAuthToken; token != "" {
+		auth := r.Header.Get("Authorization")
+		return subtle.ConstantTimeCompare([]byte(auth), []byte("Bearer "+token)) == 1
+	}
+	ip := net.ParseIP(s.clientIP(r))
+	if ip == nil {
+		return false
+	}
+	for _, n := range dohPrivateNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// handleDoH serves DNS-over-HTTPS (RFC 8484 GET+POST) through the same
+// pipeline as the UDP/TCP/DoT listeners.
+func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
+	dnsSrv := s.getDNSServer()
+	if dnsSrv == nil {
+		http.Error(w, "DNS server not available", http.StatusServiceUnavailable)
+		return
+	}
+	if !s.dohClientAllowed(r) {
+		if s.cfg.DoHAuthToken != "" {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		} else {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+		}
+		return
+	}
+
+	var wire []byte
+	switch r.Method {
+	case http.MethodGet:
+		raw := r.URL.Query().Get("dns")
+		if raw == "" {
+			http.Error(w, "Missing dns parameter", http.StatusBadRequest)
+			return
+		}
+		decoded, err := base64.RawURLEncoding.DecodeString(raw)
+		if err != nil {
+			http.Error(w, "Invalid dns parameter", http.StatusBadRequest)
+			return
+		}
+		if len(decoded) > 65535 {
+			http.Error(w, "DNS message too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		wire = decoded
+	case http.MethodPost:
+		mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if err != nil || mediaType != "application/dns-message" {
+			http.Error(w, "Unsupported content type", http.StatusUnsupportedMediaType)
+			return
+		}
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64*1024))
+		if err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				http.Error(w, "DNS message too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			http.Error(w, "Failed to read body", http.StatusBadRequest)
+			return
+		}
+		if len(body) > 65535 {
+			http.Error(w, "DNS message too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		wire = body
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	req := new(dns.Msg)
+	if err := req.Unpack(wire); err != nil {
+		http.Error(w, "Invalid DNS message", http.StatusBadRequest)
+		return
+	}
+
+	resp, drop := dnsSrv.Resolve(req, s.clientIP(r))
+	if drop || resp == nil {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+	out, err := resp.Pack()
+	if err != nil {
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/dns-message")
+	_, _ = w.Write(out) // #nosec G705 -- RFC 8484 response is packed binary DNS, not HTML
 }
 
 // handleMetrics exposes Prometheus-format metrics on the /metrics endpoint.
@@ -912,6 +1047,10 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(&buf, "# HELP bogus_nxdomain_total Upstream answers converted to NXDOMAIN (bogus ranges)\n")
 		fmt.Fprintf(&buf, "# TYPE bogus_nxdomain_total counter\n")
 		fmt.Fprintf(&buf, "bogus_nxdomain_total %d\n", bogusNXHits)
+
+		fmt.Fprintf(&buf, "# HELP dns_ratelimit_dropped_total Queries refused by the per-subnet rate limiter\n")
+		fmt.Fprintf(&buf, "# TYPE dns_ratelimit_dropped_total counter\n")
+		fmt.Fprintf(&buf, "dns_ratelimit_dropped_total %d\n", dnsSrv.RateLimitDropped())
 
 		fmt.Fprintf(&buf, "# HELP blocked_service_hits_total Queries blocked per blocked-service ID\n")
 		fmt.Fprintf(&buf, "# TYPE blocked_service_hits_total counter\n")
@@ -1613,6 +1752,37 @@ func (s *Server) handleClients(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleServices returns the blocked-service catalog, global enablement, and
+// live hit counts for the settings UI.
+func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	enabled := make(map[string]bool)
+	for _, id := range strings.FieldsFunc(s.cfg.BlockedServices, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	}) {
+		enabled[strings.ToLower(id)] = true
+	}
+	hits := make(map[string]int64)
+	if dnsSrv := s.getDNSServer(); dnsSrv != nil {
+		hits = dnsSrv.ServiceStats()
+	}
+	type serviceStatus struct {
+		ID      string `json:"id"`
+		Enabled bool   `json:"enabled"`
+		Hits    int64  `json:"hits"`
+	}
+	services := make([]serviceStatus, 0, len(policy.ServiceIDs()))
+	for _, id := range policy.ServiceIDs() {
+		services = append(services, serviceStatus{ID: id, Enabled: enabled[id], Hits: hits[id]})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "services": services})
+}
+
 // ===== Query-Log Block/Unblock Actions =====
 
 // userRulesPath returns the filter user-rules file managed by the
@@ -1844,14 +2014,25 @@ func (s *Server) handlePostUpstreams(w http.ResponseWriter, r *http.Request) {
 }
 
 // ===== Item 63: Cache Clear Endpoint =====
-// dnsmasq (and its SIGUSR1 PID-file cache clear) has been replaced by the
-// in-process DNS server; an in-process cache clear lands in a later step.
-func (s *Server) handleCacheClear(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleCacheClear(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusNotImplemented)
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	dnsSrv := s.getDNSServer()
+	if dnsSrv == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "DNS server is not configured",
+		})
+		return
+	}
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":  "error",
-		"message": "Cache clear is not supported; in-process cache clear lands in a later step",
+		"status":  "ok",
+		"cleared": dnsSrv.ClearCache(),
 	})
 }
 

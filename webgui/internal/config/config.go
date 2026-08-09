@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -69,6 +70,12 @@ const (
 	DefaultRewritesFile = "rewrites.json"
 	// DefaultClientsFile is the default per-client registry file name.
 	DefaultClientsFile = "clients.json"
+	// DefaultRateLimitQPS is the default per-subnet query rate limit.
+	DefaultRateLimitQPS = 20
+	// DefaultDoHPath is the default DNS-over-HTTPS endpoint path.
+	DefaultDoHPath = "/dns-query"
+	// DefaultDoTPort is the default DNS-over-TLS listen port.
+	DefaultDoTPort = 853
 
 	// minCacheTTLDefault/maxCacheTTLDefault are the default cache TTL bounds
 	// in seconds (dnsmasq local-ttl=60 / max-ttl=600).
@@ -152,7 +159,7 @@ type Config struct {
 	UpstreamsFile string
 	// DNSRoutesFile is the path to the domain-specific DNS routes JSON file.
 	DNSRoutesFile string
-	// DNSMasqPIDFile is the path to the dnsmasq PID file for cache clearing.
+	// DNSMasqPIDFile is retained only to recognize the deprecated setting.
 	//
 	// Deprecated: kept for backward compatibility; cache clear is in-process.
 	DNSMasqPIDFile string
@@ -207,6 +214,26 @@ type Config struct {
 	ClientsFile string
 	// BlockedServices lists globally blocked service IDs (comma-separated).
 	BlockedServices string
+	// DNSAllowedClients restricts DNS service to these IPs/CIDRs when non-empty.
+	DNSAllowedClients string
+	// DNSDisallowedClients drops queries from these IPs/CIDRs silently.
+	DNSDisallowedClients string
+	// RateLimitQPS limits queries per second per subnet (0 = disabled).
+	RateLimitQPS int
+	// PrivatePTR answers PTR for known private clients locally (default true).
+	PrivatePTR bool
+	// DNSSEC enables DO-bit passthrough to upstreams (no local validation).
+	DNSSEC bool
+	// DoHEnabled serves DNS-over-HTTPS on the HTTP mux (DOH_PATH).
+	DoHEnabled   bool
+	DoHPath      string
+	DoHAuthToken string
+	// DoTEnabled serves DNS-over-TLS on DoTPort (requires TLS cert/key).
+	DoTEnabled bool
+	DoTPort    int
+	// TLSCertFile/TLSKeyFile are required for DoT.
+	TLSCertFile string
+	TLSKeyFile  string
 	// UpstreamLatencyThreshold is the latency threshold in ms for alerting.
 	UpstreamLatencyThreshold int
 
@@ -579,6 +606,39 @@ func resolveLatencyThreshold() int {
 	return DefaultUpstreamLatencyThreshold
 }
 
+// resolveDoHPath reads DOH_PATH and normalizes it to a safe, non-conflicting
+// literal path on the existing HTTP mux.
+func resolveDoHPath() string {
+	p := strings.TrimSpace(os.Getenv("DOH_PATH"))
+	if p == "" {
+		return DefaultDoHPath
+	}
+	if strings.HasPrefix(p, "//") || strings.ContainsAny(p, " \t\r\n?#{}\\") {
+		log.Printf("[WARN] Invalid DOH_PATH '%s', falling back to %s", sanitizeForLog(p), DefaultDoHPath) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		return DefaultDoHPath
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	p = pathpkg.Clean(p)
+	if !validDoHPath(p) {
+		log.Printf("[WARN] Conflicting DOH_PATH '%s', falling back to %s", sanitizeForLog(p), DefaultDoHPath) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		return DefaultDoHPath
+	}
+	return p
+}
+
+func validDoHPath(p string) bool {
+	if p == "" || p == "/" || strings.HasPrefix(p, "//") || strings.ContainsAny(p, " \t\r\n?#{}\\") {
+		return false
+	}
+	if p == "/healthz" || p == "/login" || p == "/logout" || p == "/metrics" {
+		return false
+	}
+	return p != "/api" && !strings.HasPrefix(p, "/api/") &&
+		p != "/static" && !strings.HasPrefix(p, "/static/")
+}
+
 // resolveBlocking reads and validates BLOCKING_MODE and BLOCK_CUSTOM_IP4/IP6.
 func resolveBlocking() (mode, ip4, ip6 string) {
 	mode = strings.ToLower(strings.TrimSpace(os.Getenv("BLOCKING_MODE")))
@@ -702,6 +762,11 @@ func LoadConfig() *Config {
 		log.Printf("[WARN] DNS_LISTEN_PORT %d out of range, falling back to %d", dnsListenPort, DefaultDNSListenPort)
 		dnsListenPort = DefaultDNSListenPort
 	}
+	dotPort := parseIntEnv("DOT_PORT", DefaultDoTPort)
+	if dotPort < 1 || dotPort > 65535 {
+		log.Printf("[WARN] DOT_PORT %d out of range, falling back to %d", dotPort, DefaultDoTPort)
+		dotPort = DefaultDoTPort
+	}
 
 	// Filter engine blocking settings
 	blockingMode, blockCustomIP4, blockCustomIP6 := resolveBlocking()
@@ -803,6 +868,18 @@ func LoadConfig() *Config {
 		CacheOptimistic:            strings.ToLower(os.Getenv("CACHE_OPTIMISTIC")) == "true",
 		ClientsFile:                clientsFile,
 		BlockedServices:            os.Getenv("BLOCKED_SERVICES"),
+		DNSAllowedClients:          os.Getenv("DNS_ALLOWED_CLIENTS"),
+		DNSDisallowedClients:       os.Getenv("DNS_DISALLOWED_CLIENTS"),
+		RateLimitQPS:               parseIntEnv("RATE_LIMIT_QPS", DefaultRateLimitQPS),
+		PrivatePTR:                 strings.ToLower(os.Getenv("PRIVATE_PTR")) != "false",
+		DNSSEC:                     strings.ToLower(os.Getenv("DNSSEC")) == "true",
+		DoHEnabled:                 strings.ToLower(os.Getenv("DOH_ENABLED")) == "true",
+		DoHPath:                    resolveDoHPath(),
+		DoHAuthToken:               os.Getenv("DOH_AUTH_TOKEN"),
+		DoTEnabled:                 strings.ToLower(os.Getenv("DOT_ENABLED")) == "true",
+		DoTPort:                    dotPort,
+		TLSCertFile:                os.Getenv("TLS_CERT_FILE"),
+		TLSKeyFile:                 os.Getenv("TLS_KEY_FILE"),
 		UpstreamLatencyThreshold:   latencyThreshold,
 		SSEKeepaliveInterval:       sseKeepalive,
 		BatchArchiveInterval:       batchArchive,
@@ -936,7 +1013,18 @@ func (c *Config) VerifyConfig() ([]string, []string) {
 
 	// 4b. DNSMASQ_PID_FILE deprecation notice (non-critical warning)
 	if os.Getenv("DNSMASQ_PID_FILE") != "" {
-		warnings = append(warnings, "DNSMASQ_PID_FILE is deprecated: dnsmasq was replaced by the in-process DNS server (cache clear lands in a later step)")
+		warnings = append(warnings, "DNSMASQ_PID_FILE is deprecated and ignored: cache clearing is handled by the in-process DNS server")
+	}
+
+	// 4c. DoT requires TLS certificates (critical failure)
+	if c.DoTEnabled && (c.TLSCertFile == "" || c.TLSKeyFile == "") {
+		errs = append(errs, "DOT_ENABLED requires TLS_CERT_FILE and TLS_KEY_FILE")
+	}
+	if c.DoTEnabled && (c.DoTPort < 1 || c.DoTPort > 65535) {
+		errs = append(errs, "DOT_PORT must be between 1 and 65535")
+	}
+	if c.DoHEnabled && !validDoHPath(c.DoHPath) {
+		errs = append(errs, "DOH_PATH must be a non-conflicting literal HTTP path")
 	}
 
 	// 5. Client aliases file check (non-critical warning)

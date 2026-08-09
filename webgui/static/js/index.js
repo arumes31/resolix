@@ -47,6 +47,9 @@ let isFrozen = false;
 let isViewCleared = false;
 let statsInterval = null;
 let nodeStatusInterval = null;
+let knownServices = [];
+let configuredClients = [];
+let editingClient = null;
 
 // Stream handler
 function startStream() {
@@ -98,9 +101,11 @@ function createRowHtml(e) {
     if (e.latency_ms > 50) latencyClass = 'latency-mid';
     if (e.latency_ms > 150) latencyClass = 'latency-high';
 
-    const latencyText = e.LatencyFormatted || (e.latency_ms !== null && e.latency_ms !== undefined ? e.latency_ms.toFixed(1) + 'ms' : '-');
+    const latencyText = e.latencyFormatted || (e.latency_ms !== null && e.latency_ms !== undefined ? e.latency_ms.toFixed(1) + 'ms' : '-');
     const timeStr = new Date(e.unix_time * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
     const relTime = getRelativeTime(e.unix_time);
+    const action = e.user_rule_action || (e.blocked ? 'unblock' : 'block');
+    const actionLabel = action === 'unblock' ? 'Unblock' : 'Block';
 
     return `
         <td class="timestamp"><div class="timestamp-primary">${escapeHtml(timeStr)}</div><div class="timestamp-relative">${escapeHtml(relTime)}</div></td>
@@ -113,6 +118,7 @@ function createRowHtml(e) {
         </td>
         <td>${e.upstream ? `<span class="upstream-badge">${escapeHtml(e.upstream)}</span>` : '-'}</td>
         <td class="latency-cell ${latencyClass}">${escapeHtml(latencyText)}</td>
+        <td><button type="button" class="query-action-btn ${action === 'unblock' ? 'is-unblock' : ''}" data-domain="${escapeHtml(e.domain)}" data-action="${action}">${actionLabel}</button></td>
     `;
 }
 
@@ -427,6 +433,274 @@ async function showClientStats(ip) {
     } catch (e) { console.error(e); }
 }
 
+async function apiJSON(path, options = {}) {
+    const response = await fetch(apiPath(path), options);
+    const contentType = response.headers.get('Content-Type') || '';
+    const payload = contentType.includes('application/json') ? await response.json() : await response.text();
+    if (!response.ok) {
+        const message = typeof payload === 'string' ? payload.trim() : payload.message || payload.error;
+        throw new Error(message || `Request failed (${response.status})`);
+    }
+    return payload;
+}
+
+function showSettingsNotice(message, isError = false) {
+    const notice = document.getElementById('settingsNotice');
+    notice.textContent = message;
+    notice.classList.toggle('error', isError);
+    notice.classList.remove('is-hidden');
+    window.clearTimeout(showSettingsNotice.timer);
+    showSettingsNotice.timer = window.setTimeout(() => notice.classList.add('is-hidden'), 5000);
+}
+
+function splitSettingList(value) {
+    return value.split(/[\s,]+/).map(item => item.trim()).filter(Boolean);
+}
+
+function emptySettings(message) {
+    return `<div class="empty-settings">${escapeHtml(message)}</div>`;
+}
+
+async function loadFilterSettings() {
+    const data = await apiJSON('/api/filtering/status');
+    const state = document.getElementById('filterState');
+    state.textContent = data.enabled ? 'Protection active' : 'Protection paused';
+    state.classList.toggle('online', Boolean(data.enabled));
+    state.classList.toggle('paused', !data.enabled);
+    document.getElementById('filterBlockedTotal').textContent = formatNumber(data.filter_blocked_total || 0);
+    document.getElementById('filterAllowedTotal').textContent = formatNumber(data.filter_allowed_total || 0);
+    document.getElementById('filterSourceTotal').textContent = formatNumber((data.sources || []).length);
+    const sourceList = document.getElementById('filterSources');
+    sourceList.innerHTML = (data.sources || []).map(source => {
+        const updated = source.last_update && !source.last_update.startsWith('0001-')
+            ? new Date(source.last_update).toLocaleString()
+            : 'Not updated yet';
+        const detail = source.last_error
+            ? `<span class="error-text">${escapeHtml(source.last_error)}</span>`
+            : `${formatNumber(source.rule_count || 0)} block · ${formatNumber(source.allow_rule_count || 0)} allow · ${escapeHtml(updated)}`;
+        return `<div class="settings-list-row">
+            <div class="settings-list-main">
+                <div class="settings-list-title">${escapeHtml(source.name)}</div>
+                <div class="settings-list-meta">${escapeHtml(source.kind)}${source.allow_only ? ' · allow only' : ''} · ${detail}</div>
+            </div>
+        </div>`;
+    }).join('') || emptySettings('No filter sources configured');
+}
+
+async function setFilterPause(minutes) {
+    await apiJSON('/api/filtering/pause', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ minutes })
+    });
+    showSettingsNotice(minutes > 0 ? `Protection paused for ${minutes} minutes` : 'Protection resumed');
+    await loadFilterSettings();
+}
+
+function rewriteValueState() {
+    const type = document.getElementById('rewriteType').value;
+    const label = document.getElementById('rewriteValueLabel');
+    const input = document.getElementById('rewriteValue');
+    const noValue = ['NXDOMAIN', 'REFUSED', 'NOERROR'].includes(type);
+    label.hidden = noValue;
+    input.required = !noValue;
+    const placeholders = {
+        A: '192.0.2.10', AAAA: '2001:db8::10', CNAME: 'target.internal', PTR: 'host.internal',
+        MX: '10 mail.internal', TXT: 'verification text', SRV: '10 5 443 target.internal'
+    };
+    input.placeholder = placeholders[type] || '';
+    if (noValue) input.value = '';
+}
+
+async function loadRewrites() {
+    const data = await apiJSON('/api/rewrites');
+    const rewrites = data.rewrites || [];
+    document.getElementById('rewriteCount').textContent = `${rewrites.length} ${rewrites.length === 1 ? 'rule' : 'rules'}`;
+    document.getElementById('rewriteList').innerHTML = rewrites.map(rewrite => `
+        <div class="settings-list-row">
+            <div class="settings-list-main">
+                <div class="settings-list-title">${escapeHtml(rewrite.domain)}</div>
+                <div class="settings-list-meta">${escapeHtml(rewrite.type)}${rewrite.value ? ` → ${escapeHtml(rewrite.value)}` : ''}</div>
+            </div>
+            <div class="row-actions"><button type="button" class="mini-action danger rewrite-delete-btn" data-id="${escapeHtml(rewrite.id)}">Delete</button></div>
+        </div>`).join('') || emptySettings('No DNS rewrites configured');
+}
+
+async function addRewrite(event) {
+    event.preventDefault();
+    const domain = document.getElementById('rewriteDomain').value.trim();
+    const type = document.getElementById('rewriteType').value;
+    const value = document.getElementById('rewriteValue').value.trim();
+    await apiJSON('/api/rewrites', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domain, type, value })
+    });
+    event.target.reset();
+    rewriteValueState();
+    showSettingsNotice(`Rewrite added for ${domain}`);
+    await loadRewrites();
+}
+
+async function deleteRewrite(id) {
+    await apiJSON(`/api/rewrites?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+    showSettingsNotice('Rewrite deleted');
+    await loadRewrites();
+}
+
+function renderClientServicePicker(selected = []) {
+    const selectedSet = new Set(selected);
+    document.getElementById('clientServicePicker').innerHTML = knownServices.map(service => `
+        <label class="service-option"><input type="checkbox" value="${escapeHtml(service.id)}" ${selectedSet.has(service.id) ? 'checked' : ''}> ${escapeHtml(service.id)}</label>
+    `).join('') || '<span class="settings-list-meta">Service catalog unavailable</span>';
+}
+
+function setClientPolicyState() {
+    const inherit = document.getElementById('clientUseGlobal').checked;
+    const fields = document.getElementById('clientPolicyFields');
+    fields.classList.toggle('is-muted', inherit);
+    fields.querySelectorAll('input').forEach(input => { input.disabled = inherit; });
+}
+
+function resetClientForm() {
+    const form = document.getElementById('clientForm');
+    form.reset();
+    editingClient = null;
+    document.getElementById('clientName').readOnly = false;
+    document.getElementById('clientUseGlobal').checked = true;
+    document.getElementById('clientFiltering').checked = true;
+    document.getElementById('clientSaveBtn').textContent = 'Add client';
+    document.getElementById('clientCancelBtn').classList.add('is-hidden');
+    renderClientServicePicker();
+    setClientPolicyState();
+}
+
+function editClient(name) {
+    const client = configuredClients.find(item => item.name === name);
+    if (!client) return;
+    editingClient = client;
+    document.getElementById('clientName').value = client.name;
+    document.getElementById('clientName').readOnly = true;
+    document.getElementById('clientIDs').value = (client.ids || []).join(', ');
+    document.getElementById('clientUseGlobal').checked = Boolean(client.use_global_settings);
+    document.getElementById('clientFiltering').checked = Boolean(client.filtering_enabled);
+    document.getElementById('clientSafeSearch').checked = Boolean(client.safe_search_enabled);
+    document.getElementById('clientSafeEngines').value = (client.safe_search_engines || []).join(', ');
+    document.getElementById('clientUpstreams').value = (client.upstreams || []).join(', ');
+    document.getElementById('clientExcludeLog').checked = Boolean(client.exclude_from_log);
+    document.getElementById('clientExcludeStats').checked = Boolean(client.exclude_from_stats);
+    renderClientServicePicker(client.blocked_services || []);
+    setClientPolicyState();
+    document.getElementById('clientSaveBtn').textContent = 'Save client';
+    document.getElementById('clientCancelBtn').classList.remove('is-hidden');
+    document.getElementById('clientForm').scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+async function loadClients() {
+    const data = await apiJSON('/api/clients');
+    configuredClients = data.clients || [];
+    document.getElementById('clientCount').textContent = `${configuredClients.length} ${configuredClients.length === 1 ? 'client' : 'clients'}`;
+    document.getElementById('clientList').innerHTML = configuredClients.map(client => {
+        const mode = client.use_global_settings ? 'Global policy' : 'Custom policy';
+        const services = (client.blocked_services || []).length ? ` · ${(client.blocked_services || []).join(', ')}` : '';
+        return `<div class="settings-list-row">
+            <div class="settings-list-main">
+                <div class="settings-list-title">${escapeHtml(client.name)}</div>
+                <div class="settings-list-meta">${escapeHtml((client.ids || []).join(', '))} · ${mode}${escapeHtml(services)}</div>
+            </div>
+            <div class="row-actions">
+                <button type="button" class="mini-action client-edit-btn" data-name="${escapeHtml(client.name)}">Edit</button>
+                <button type="button" class="mini-action danger client-delete-btn" data-name="${escapeHtml(client.name)}">Delete</button>
+            </div>
+        </div>`;
+    }).join('') || emptySettings('No client policies configured');
+}
+
+async function saveClient(event) {
+    event.preventDefault();
+    const inherit = document.getElementById('clientUseGlobal').checked;
+    const selectedServices = Array.from(document.querySelectorAll('#clientServicePicker input:checked')).map(input => input.value);
+    const client = {
+        ...(editingClient || {}),
+        name: document.getElementById('clientName').value.trim(),
+        ids: splitSettingList(document.getElementById('clientIDs').value),
+        use_global_settings: inherit,
+        filtering_enabled: inherit || document.getElementById('clientFiltering').checked,
+        safe_search_enabled: !inherit && document.getElementById('clientSafeSearch').checked,
+        safe_search_engines: inherit ? [] : splitSettingList(document.getElementById('clientSafeEngines').value),
+        blocked_services: inherit ? [] : selectedServices,
+        upstreams: splitSettingList(document.getElementById('clientUpstreams').value),
+        exclude_from_log: document.getElementById('clientExcludeLog').checked,
+        exclude_from_stats: document.getElementById('clientExcludeStats').checked
+    };
+    await apiJSON('/api/clients', {
+        method: editingClient ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(client)
+    });
+    showSettingsNotice(editingClient ? `Client ${client.name} updated` : `Client ${client.name} added`);
+    resetClientForm();
+    await loadClients();
+}
+
+async function deleteClient(name) {
+    await apiJSON(`/api/clients?name=${encodeURIComponent(name)}`, { method: 'DELETE' });
+    if (editingClient && editingClient.name === name) resetClientForm();
+    showSettingsNotice(`Client ${name} deleted`);
+    await loadClients();
+}
+
+async function loadServices() {
+    const data = await apiJSON('/api/services');
+    knownServices = data.services || [];
+    document.getElementById('serviceCatalog').innerHTML = knownServices.map(service => `
+        <div class="service-card ${service.enabled ? 'enabled' : ''}">
+            <div class="service-card-name">${escapeHtml(service.id)}</div>
+            <div class="service-card-meta">${service.enabled ? 'Globally blocked' : 'Available'} · ${formatNumber(service.hits || 0)} hits</div>
+        </div>`).join('') || emptySettings('Service catalog unavailable');
+    renderClientServicePicker(editingClient ? editingClient.blocked_services || [] : []);
+    setClientPolicyState();
+}
+
+async function loadSettings() {
+    const results = await Promise.allSettled([loadFilterSettings(), loadRewrites(), loadServices(), loadClients()]);
+    const failed = results.find(result => result.status === 'rejected');
+    if (failed) throw new Error(`Some settings could not be loaded: ${failed.reason.message}`);
+}
+
+async function clearDNSCache() {
+    const data = await apiJSON('/api/cache/clear', { method: 'POST' });
+    showSettingsNotice(`DNS cache cleared (${data.cleared || 0} entries removed)`);
+}
+
+async function applyQueryAction(button) {
+    const domain = button.dataset.domain;
+    const action = button.dataset.action;
+    button.disabled = true;
+    try {
+        const data = await apiJSON(`/api/querylog/${action}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ domain })
+        });
+        const nextAction = action === 'block' ? 'unblock' : 'block';
+        document.querySelectorAll('.query-action-btn').forEach(candidate => {
+            if (candidate.dataset.domain === domain) {
+                candidate.dataset.action = nextAction;
+                candidate.textContent = nextAction === 'unblock' ? 'Unblock' : 'Block';
+                candidate.classList.toggle('is-unblock', nextAction === 'unblock');
+            }
+        });
+        allEvents.forEach(event => {
+            if (event.domain === domain) event.user_rule_action = nextAction;
+        });
+        showSettingsNotice(`${domain}: ${data.action.replaceAll('_', ' ')}`);
+        await loadFilterSettings();
+    } finally {
+        button.disabled = false;
+    }
+}
+
 document.getElementById('freezeBtn').addEventListener('click', function () {
     isFrozen = !isFrozen;
     this.classList.toggle('freeze-active', isFrozen);
@@ -451,6 +725,44 @@ document.getElementById('clientModal').addEventListener('click', function (event
 
 document.getElementById('searchInput').addEventListener('input', renderEvents);
 
+document.querySelectorAll('.settings-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+        document.querySelectorAll('.settings-tab').forEach(candidate => {
+            const active = candidate === tab;
+            candidate.classList.toggle('active', active);
+            candidate.setAttribute('aria-selected', String(active));
+        });
+        document.querySelectorAll('.settings-panel').forEach(panel => {
+            const active = panel.id === `settings-${tab.dataset.settingsTab}`;
+            panel.classList.toggle('active', active);
+            panel.hidden = !active;
+        });
+    });
+});
+
+document.querySelectorAll('.filter-pause-btn').forEach(button => {
+    button.addEventListener('click', () => {
+        setFilterPause(Number(button.dataset.minutes)).catch(error => showSettingsNotice(error.message, true));
+    });
+});
+document.getElementById('rewriteType').addEventListener('change', rewriteValueState);
+document.getElementById('rewriteForm').addEventListener('submit', event => {
+    addRewrite(event).catch(error => showSettingsNotice(error.message, true));
+});
+document.getElementById('clientUseGlobal').addEventListener('change', setClientPolicyState);
+document.getElementById('clientForm').addEventListener('submit', event => {
+    saveClient(event).catch(error => showSettingsNotice(error.message, true));
+});
+document.getElementById('clientCancelBtn').addEventListener('click', resetClientForm);
+document.getElementById('refreshSettingsBtn').addEventListener('click', () => {
+    loadSettings()
+        .then(() => showSettingsNotice('Settings refreshed'))
+        .catch(error => showSettingsNotice(error.message, true));
+});
+document.getElementById('clearCacheBtn').addEventListener('click', () => {
+    clearDNSCache().catch(error => showSettingsNotice(error.message, true));
+});
+
 function updateVisibility() {
     isTabVisible = document.visibilityState === 'visible';
     if (statsInterval) clearInterval(statsInterval);
@@ -469,6 +781,27 @@ document.addEventListener('visibilitychange', updateVisibility);
 
 // Event delegation for test-domain-btn (XSS-safe: domain from data attribute)
 document.addEventListener('click', function (e) {
+    const queryAction = e.target.closest('.query-action-btn');
+    if (queryAction) {
+        e.stopPropagation();
+        applyQueryAction(queryAction).catch(error => showSettingsNotice(error.message, true));
+        return;
+    }
+    const rewriteDelete = e.target.closest('.rewrite-delete-btn');
+    if (rewriteDelete) {
+        deleteRewrite(rewriteDelete.dataset.id).catch(error => showSettingsNotice(error.message, true));
+        return;
+    }
+    const clientEdit = e.target.closest('.client-edit-btn');
+    if (clientEdit) {
+        editClient(clientEdit.dataset.name);
+        return;
+    }
+    const clientDelete = e.target.closest('.client-delete-btn');
+    if (clientDelete) {
+        deleteClient(clientDelete.dataset.name).catch(error => showSettingsNotice(error.message, true));
+        return;
+    }
     const btn = e.target.closest('.test-domain-btn');
     if (btn) {
         e.stopPropagation();
@@ -478,5 +811,8 @@ document.addEventListener('click', function (e) {
     if (clientCell) showClientStats(clientCell.dataset.clientIp);
 });
 
+rewriteValueState();
+resetClientForm();
+loadSettings().catch(error => showSettingsNotice(error.message, true));
 updateVisibility(); // Initial set
 startStream();

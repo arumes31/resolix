@@ -477,7 +477,12 @@ func (p *Pool) withECS(m *dns.Msg) *dns.Msg {
 		return m
 	}
 	out := m.Copy()
-	// Drop any existing OPT records, then attach ours.
+	// Drop any existing OPT records (preserving the DO bit for DNSSEC
+	// passthrough), then attach ours.
+	doBit := false
+	if opt := m.IsEdns0(); opt != nil {
+		doBit = opt.Do()
+	}
 	extra := out.Extra[:0]
 	for _, rr := range out.Extra {
 		if rr.Header().Rrtype != dns.TypeOPT {
@@ -497,6 +502,7 @@ func (p *Pool) withECS(m *dns.Msg) *dns.Msg {
 	o.Hdr.Name = "."
 	o.Hdr.Rrtype = dns.TypeOPT
 	o.SetUDPSize(1232)
+	o.SetDo(doBit)
 	o.Option = append(o.Option, e)
 	out.Extra = append(out.Extra, o)
 	return out

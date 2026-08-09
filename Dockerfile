@@ -44,6 +44,6 @@ ENV MODE=master
 ENV PORT=35353
 ENV HISTORY_DIR=/var/lib/tailscale-dnsrewrite
 
-EXPOSE 53/udp 35353/tcp
+EXPOSE 53/udp 53/tcp 853/tcp 35353/tcp
 
 ENTRYPOINT ["/usr/bin/entrypoint.sh"]

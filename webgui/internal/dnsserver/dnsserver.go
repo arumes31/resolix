@@ -9,6 +9,7 @@ package dnsserver
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"fmt"
 	"log"
@@ -25,6 +26,7 @@ import (
 	"tailscale-dnsrewrite/webgui/internal/filter"
 	"tailscale-dnsrewrite/webgui/internal/models"
 	"tailscale-dnsrewrite/webgui/internal/policy"
+	"tailscale-dnsrewrite/webgui/internal/resolver"
 	"tailscale-dnsrewrite/webgui/internal/rewrites"
 	"tailscale-dnsrewrite/webgui/internal/upstream"
 )
@@ -87,6 +89,25 @@ type Config struct {
 	CacheMinTTL     int
 	CacheMaxTTL     int
 	CacheOptimistic bool
+
+	// AllowedClients restricts service to these IPs/CIDRs when non-empty.
+	AllowedClients string
+	// DisallowedClients drops queries from these IPs/CIDRs silently.
+	DisallowedClients string
+	// RateLimitQPS limits queries per second per subnet (0 = disabled).
+	RateLimitQPS int
+	// PrivatePTR answers PTR for known private clients locally.
+	PrivatePTR bool
+	// DNSSEC enables DO-bit passthrough to upstreams (no local validation).
+	DNSSEC bool
+	// Resolver is the reverse-DNS resolver used for private PTR fallback.
+	Resolver *resolver.Resolver
+
+	// DoTEnabled serves DNS-over-TLS on DoTPort (requires TLS cert/key).
+	DoTEnabled  bool
+	DoTPort     int
+	TLSCertFile string
+	TLSKeyFile  string
 }
 
 // Server is the embedded DNS server.
@@ -97,7 +118,14 @@ type Server struct {
 	emit      func(models.QueryEvent, bool) // (event, excludeFromStats)
 	udp       *dns.Server
 	tcp       *dns.Server
+	dot       *dns.Server
 	client    *dns.Client
+
+	// ACL and rate limiting (Step 6)
+	allowed          []*net.IPNet
+	disallowed       []*net.IPNet
+	rateLimiter      *rateLimiter
+	rateLimitDropped atomic.Int64
 
 	rewriteHits    atomic.Int64
 	safeSearchHits atomic.Int64
@@ -135,6 +163,11 @@ func New(cfg Config, emit func(models.QueryEvent, bool)) *Server {
 	if len(s.upstreams) == 0 {
 		log.Printf("[WARN] No valid upstream DNS servers configured; all non-static queries will fail")
 	}
+	s.allowed = parseCIDRList(cfg.AllowedClients)
+	s.disallowed = parseCIDRList(cfg.DisallowedClients)
+	if cfg.RateLimitQPS > 0 {
+		s.rateLimiter = newRateLimiter(cfg.RateLimitQPS)
+	}
 	handler := dns.HandlerFunc(s.ServeDNS)
 	s.udp = &dns.Server{Net: "udp", Handler: handler}
 	s.tcp = &dns.Server{Net: "tcp", Handler: handler}
@@ -164,9 +197,23 @@ func (c resetTolerantConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	}
 }
 
-// Start binds the configured address and runs the UDP and TCP listeners
-// until ctx is canceled or a listener fails, then shuts both down gracefully.
+// Start binds the configured address and runs the listeners until ctx is
+// canceled or a listener fails, then shuts everything down gracefully. When
+// DoT is enabled, certificates are validated before anything is bound.
 func (s *Server) Start(ctx context.Context) error {
+	// DoT requires certificates — fail fast before binding anything.
+	var tlsConfig *tls.Config
+	if s.cfg.DoTEnabled {
+		if s.cfg.TLSCertFile == "" || s.cfg.TLSKeyFile == "" {
+			return fmt.Errorf("DOT_ENABLED requires TLS_CERT_FILE and TLS_KEY_FILE")
+		}
+		cert, err := tls.LoadX509KeyPair(s.cfg.TLSCertFile, s.cfg.TLSKeyFile)
+		if err != nil {
+			return fmt.Errorf("DoT TLS keypair: %w", err)
+		}
+		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	}
+
 	udpConn, err := net.ListenPacket("udp", s.ListenAddr())
 	if err != nil {
 		return fmt.Errorf("DNS UDP listener on %s: %w", s.ListenAddr(), err)
@@ -176,28 +223,65 @@ func (s *Server) Start(ctx context.Context) error {
 		_ = udpConn.Close()
 		return fmt.Errorf("DNS TCP listener on %s: %w", s.ListenAddr(), err)
 	}
-	return s.StartOn(ctx, udpConn, tcpLn)
+
+	var dotLn net.Listener
+	if tlsConfig != nil {
+		port := s.cfg.DoTPort
+		if port == 0 {
+			port = 853
+		}
+		dotAddr := net.JoinHostPort(s.cfg.Addr, fmt.Sprintf("%d", port))
+		raw, err := net.Listen("tcp", dotAddr)
+		if err != nil {
+			_ = udpConn.Close()
+			_ = tcpLn.Close()
+			return fmt.Errorf("DNS DoT listener on %s: %w", dotAddr, err)
+		}
+		dotLn = tls.NewListener(raw, tlsConfig)
+	}
+	return s.startOn(ctx, udpConn, tcpLn, dotLn)
 }
 
 // StartOn runs the UDP and TCP listeners on pre-bound sockets until ctx is
 // canceled or a listener fails. Tests use it with :0 sockets to avoid
 // port-reservation races.
 func (s *Server) StartOn(ctx context.Context, udpConn net.PacketConn, tcpLn net.Listener) error {
+	return s.startOn(ctx, udpConn, tcpLn, nil)
+}
+
+// startOn serves all bound listeners until ctx is canceled or one fails.
+func (s *Server) startOn(ctx context.Context, udpConn net.PacketConn, tcpLn, dotLn net.Listener) error {
+	serveCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	s.udp.PacketConn = resetTolerantConn{udpConn}
 	s.tcp.Listener = tcpLn
+	servers := []*dns.Server{s.udp, s.tcp}
+	if dotLn != nil {
+		s.dot = &dns.Server{Net: "tcp-tls", Listener: dotLn, Handler: dns.HandlerFunc(s.ServeDNS)}
+		servers = append(servers, s.dot)
+	}
 
-	errCh := make(chan error, 2)
-	go func() { errCh <- s.udp.ActivateAndServe() }()
-	go func() { errCh <- s.tcp.ActivateAndServe() }()
+	if s.rateLimiter != nil {
+		go s.rateLimiter.rateLimitCleanupLoop(serveCtx.Done())
+	}
 
+	errCh := make(chan error, len(servers))
+	for _, srv := range servers {
+		go func(srv *dns.Server) { errCh <- srv.ActivateAndServe() }(srv)
+	}
+
+	shutdown := func() {
+		for _, srv := range servers {
+			_ = srv.Shutdown()
+		}
+	}
 	select {
 	case <-ctx.Done():
-		_ = s.udp.Shutdown()
-		_ = s.tcp.Shutdown()
+		shutdown()
 		return nil
 	case err := <-errCh:
-		_ = s.udp.Shutdown()
-		_ = s.tcp.Shutdown()
+		shutdown()
 		return fmt.Errorf("DNS listener on %s: %w", s.ListenAddr(), err)
 	}
 }
@@ -211,38 +295,66 @@ type resolution struct {
 	blockReason string
 }
 
-// ServeDNS handles a single DNS request through the ordered pipeline.
-func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
+// Resolve answers a query message through the full pipeline and emits the
+// query event. It returns drop=true when the client is on the disallowed
+// list (silent drop, anti-amplification). ACL refusals and rate-limit drops
+// return a REFUSED response without emitting an event. Shared by the
+// UDP/TCP/DoT listeners and the DoH endpoint.
+func (s *Server) Resolve(r *dns.Msg, clientIP string) (resp *dns.Msg, drop bool) {
 	start := time.Now()
 
-	resp := new(dns.Msg)
+	resp = new(dns.Msg)
 	resp.SetReply(r)
 	resp.RecursionAvailable = true
 
+	// Stage 0a: ACL — disallowed clients are dropped silently.
+	if s.aclDrop(clientIP) {
+		return nil, true
+	}
+	// Stage 0b: ACL — outside a non-empty allowed list → REFUSED (no event).
+	if s.aclRefuse(clientIP) {
+		resp.Rcode = dns.RcodeRefused
+		return resp, false
+	}
+	// Stage 0c: per-subnet rate limit → REFUSED (AdGuard convention; no event).
+	if s.rateLimiter != nil && !s.rateLimiter.allow(clientIP) {
+		s.rateLimitDropped.Add(1)
+		resp.Rcode = dns.RcodeRefused
+		return resp, false
+	}
+
 	// Per-client resolution happens once at query start.
-	clientIP := clientIPFromRemote(w.RemoteAddr())
 	var cl *clients.Client
 	if s.cfg.Clients != nil {
 		cl = s.cfg.Clients.Find(clientIP)
 	}
 
 	res := s.resolve(r, resp, 0, cl)
-	_ = w.WriteMsg(resp)
 
 	if s.emit == nil {
-		return
+		return resp, false
 	}
 	if cl != nil && cl.ExcludeFromLog {
-		return // exclude_from_log: skip event emission entirely
+		return resp, false // exclude_from_log: skip event emission entirely
 	}
 	excludeFromStats := cl != nil && cl.ExcludeFromStats
 	s.emit(s.buildEvent(r, resp, clientIP, cl, res, start), excludeFromStats)
+	return resp, false
+}
+
+// ServeDNS implements the dns.Handler interface (UDP/TCP/DoT listeners).
+func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
+	resp, drop := s.Resolve(r, clientIPFromRemote(w.RemoteAddr()))
+	if drop || resp == nil {
+		return
+	}
+	_ = w.WriteMsg(resp)
 }
 
 // resolve runs the request pipeline and fills resp.
 //
-// Order: refuse-ANY / AAAA-disable short-circuits → typed rewrites →
-// safe-search (per-client aware) → filter (unless the client disabled
+// Order: refuse-ANY / AAAA-disable short-circuits → typed rewrites → private
+// PTR → safe-search (per-client aware) → filter (unless the client disabled
 // filtering) → blocked services (per-client, schedule-aware) → cache →
 // forward (client upstreams → per-domain route → global pool) →
 // bogus-NXDOMAIN conversion → cache store. depth bounds chase chains.
@@ -268,6 +380,11 @@ func (s *Server) resolve(r *dns.Msg, resp *dns.Msg, depth int, cl *clients.Clien
 
 	// Stage 1: typed rewrites (short-circuit, pre-cache).
 	if res, handled := s.stageRewrites(r, q, resp, depth, cl); handled {
+		return res
+	}
+
+	// Stage 1b: automatic private PTR, below explicit user rewrites.
+	if res, handled := s.stagePrivatePTR(q, resp); handled {
 		return res
 	}
 
@@ -555,6 +672,7 @@ func (s *Server) resolveViaCacheOrUpstream(r *dns.Msg, resp *dns.Msg, key cacheK
 	// Stage: cache lookup.
 	if ent, remaining, ok := s.cache.get(key); ok {
 		resp.Rcode = ent.rcode
+		resp.AuthenticatedData = ent.authenticatedData
 		resp.Answer = withTTL(ent.answers, remaining)
 		resp.Ns = withTTL(ent.authority, remaining)
 		return resolution{upstream: "System Cache", cacheHit: true}
@@ -565,6 +683,7 @@ func (s *Server) resolveViaCacheOrUpstream(r *dns.Msg, resp *dns.Msg, key cacheK
 	if s.cfg.CacheOptimistic {
 		if ent, ok := s.cache.getStale(key); ok {
 			resp.Rcode = ent.rcode
+			resp.AuthenticatedData = ent.authenticatedData
 			resp.Answer = withTTL(ent.answers, 1)
 			resp.Ns = withTTL(ent.authority, 1)
 			s.refreshAsync(key, r, specs)
@@ -588,6 +707,7 @@ func (s *Server) resolveViaCacheOrUpstream(r *dns.Msg, resp *dns.Msg, key cacheK
 	}
 
 	resp.Rcode = m.Rcode
+	resp.AuthenticatedData = m.AuthenticatedData
 	resp.Answer = m.Answer
 	resp.Ns = m.Ns
 	resp.Extra = m.Extra
@@ -597,8 +717,6 @@ func (s *Server) resolveViaCacheOrUpstream(r *dns.Msg, resp *dns.Msg, key cacheK
 	return resolution{upstream: usedUpstream}
 }
 
-// refreshAsync repopulates a stale cache entry in the background,
-// single-flight per key. No event is emitted (not a client query).
 // refreshAsync repopulates a stale cache entry in the background,
 // single-flight per key. No event is emitted (not a client query).
 func (s *Server) refreshAsync(key cacheKey, r *dns.Msg, specs []string) {
@@ -628,6 +746,14 @@ func (s *Server) refreshAsync(key cacheKey, r *dns.Msg, specs []string) {
 // When no pool is configured (legacy/tests), the plain strict-order path is
 // used.
 func (s *Server) forward(r *dns.Msg, specs []string) (string, *dns.Msg) {
+	// DNSSEC passthrough: set or clear the DO bit on a copy so the configured
+	// toggle applies even when the client supplied its own OPT record.
+	r = r.Copy()
+	if opt := r.IsEdns0(); opt != nil {
+		opt.SetDo(s.cfg.DNSSEC)
+	} else if s.cfg.DNSSEC {
+		r.SetEdns0(1232, true)
+	}
 	if s.cfg.Pool != nil {
 		if len(specs) > 0 {
 			if m, used, err := s.cfg.Pool.ExchangeSpecs(specs, r); err == nil && m != nil {
@@ -677,10 +803,11 @@ func (s *Server) forward(r *dns.Msg, specs []string) (string, *dns.Msg) {
 // negative answers (NXDOMAIN/NODATA) keyed off the SOA TTL (max 600s).
 func (s *Server) storeInCache(key cacheKey, m *dns.Msg) {
 	ent := &cacheEntry{
-		answers:   copyRRs(m.Answer),
-		authority: copyRRs(m.Ns),
-		rcode:     m.Rcode,
-		storedAt:  time.Now(),
+		answers:           copyRRs(m.Answer),
+		authority:         copyRRs(m.Ns),
+		rcode:             m.Rcode,
+		authenticatedData: m.AuthenticatedData,
+		storedAt:          time.Now(),
 	}
 
 	switch {
@@ -740,6 +867,16 @@ func (s *Server) buildEvent(r, resp *dns.Msg, clientIP string, cl *clients.Clien
 	ev.ClientIP = clientIP
 	ev.ResponseCode = dns.RcodeToString[resp.Rcode]
 
+	// DNSSEC passthrough status (no local validation): only an upstream AD bit
+	// proves a secure response; all other responses remain indeterminate.
+	if s.cfg.DNSSEC {
+		if resp.AuthenticatedData {
+			ev.DNSSEC = "secure"
+		} else {
+			ev.DNSSEC = "indeterminate"
+		}
+	}
+
 	// Alias: registry client name wins; otherwise fall back to CLIENT_ALIASES.
 	switch {
 	case cl != nil:
@@ -760,6 +897,17 @@ func (s *Server) buildEvent(r, resp *dns.Msg, clientIP string, cl *clients.Clien
 // rewrites, safe-search, and bogus-NXDOMAIN conversions.
 func (s *Server) Stats() (rewriteHits, safeSearchHits, bogusNXHits int64) {
 	return s.rewriteHits.Load(), s.safeSearchHits.Load(), s.bogusNXHits.Load()
+}
+
+// RateLimitDropped returns the number of queries refused by the rate limiter.
+func (s *Server) RateLimitDropped() int64 {
+	return s.rateLimitDropped.Load()
+}
+
+// ClearCache removes all in-process DNS response cache entries and returns
+// the number removed.
+func (s *Server) ClearCache() int {
+	return s.cache.clear()
 }
 
 // clientIPFromRemote extracts the IP part of a DNS client address.

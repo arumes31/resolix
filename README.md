@@ -100,10 +100,30 @@ docker-compose -f docker-compose.example.yaml up -d
 | `CACHE_MIN_TTL` / `CACHE_MAX_TTL` | Cache TTL bounds in seconds | `60` / `600` |
 | `CLIENTS_FILE` | Per-client registry JSON (policies, upstreams, schedules) | `clients.json` |
 | `BLOCKED_SERVICES` | Comma-separated globally blocked service IDs (e.g. `facebook,tiktok`) | - |
+| `DNS_ALLOWED_CLIENTS` | Comma/space-separated client IPs/CIDRs allowed to query DNS; empty allows all | - |
+| `DNS_DISALLOWED_CLIENTS` | Comma/space-separated client IPs/CIDRs whose DNS queries are silently dropped | - |
+| `RATE_LIMIT_QPS` | Per-subnet query limit (IPv4 `/24`, IPv6 `/56`); `0` disables | `20` |
+| `PRIVATE_PTR` | Answer PTR queries for known RFC1918, CGNAT, and ULA clients as `<name>.lan` | `true` |
+| `DNSSEC` | Send the DNSSEC DO bit upstream and pass responses through (no local validation) | `false` |
+| `DOH_ENABLED` | Enable DNS-over-HTTPS on the existing web HTTP mux | `false` |
+| `DOH_PATH` | DNS-over-HTTPS endpoint path | `/dns-query` |
+| `DOH_AUTH_TOKEN` | DoH Bearer token; when unset, access is limited to loopback/private/tailnet clients | - |
+| `DOT_ENABLED` | Enable DNS-over-TLS (requires certificate and key files) | `false` |
+| `DOT_PORT` | DNS-over-TLS listen port | `853` |
+| `TLS_CERT_FILE` | PEM certificate chain used by the DoT listener | - |
+| `TLS_KEY_FILE` | PEM private key used by the DoT listener | - |
 | `TRUSTED_PROXIES` | Comma-separated proxy IPs/CIDRs whose `X-Forwarded-*` headers are honored | - |
 | `COOKIE_SECURE` | Force the `Secure` attribute on session/CSRF cookies (`true`/`false`) | `false` |
 
 > **Note on cookies and reverse proxies**: Session cookies are marked `Secure` automatically when the request arrives over HTTPS. When running behind a TLS-terminating reverse proxy, either list the proxy in `TRUSTED_PROXIES` (so `X-Forwarded-Proto` is honored) or set `COOKIE_SECURE=true` — otherwise browsers will refuse the non-Secure cookie over HTTPS and login will fail.
+
+### Encrypted DNS serving
+
+DoH uses the dashboard HTTP listener and is available at `DOH_PATH` when enabled. Terminate HTTPS at a trusted reverse proxy and forward that path to port `35353`. Set `DOH_AUTH_TOKEN` for public clients; without a token, only loopback, RFC1918, Tailscale CGNAT, and IPv6 ULA clients are accepted.
+
+DoT listens directly on `DOT_PORT`. Enabling it requires readable PEM files in `TLS_CERT_FILE` and `TLS_KEY_FILE`; startup fails before binding DNS if the keypair cannot be loaded.
+
+The dashboard’s **DNS Control Plane** provides filter pause/status, rewrite and client policy management, the blocked-services catalog, query-log block/unblock actions, and in-process cache clearing.
 
 ### Performance Optimization
 
@@ -202,7 +222,8 @@ This endpoint does **not** require authentication and performs no database queri
 ### Unit Testing
 The project includes a comprehensive suite of unit tests covering log parsing, API endpoints, state management, and slave forwarding.
 ```bash
-go test -v ./webgui
+cd webgui
+go test ./...
 ```
 
 ### Security & Linting

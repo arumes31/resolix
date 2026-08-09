@@ -1,6 +1,9 @@
 package policy
 
-import "strings"
+import (
+	"sort"
+	"strings"
+)
 
 // serviceCatalog maps well-known blocked-service IDs to their domains
 // (apex + all subdomains match). Keep entries to the canonical domains of
@@ -28,6 +31,7 @@ func ServiceIDs() []string {
 	for id := range serviceCatalog {
 		ids = append(ids, id)
 	}
+	sort.Strings(ids)
 	return ids
 }
 

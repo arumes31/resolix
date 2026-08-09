@@ -22,11 +22,12 @@ type cacheKey struct {
 // cacheEntry holds a cached response with its clamped TTL and insertion time
 // so TTLs can be decremented on each cache hit.
 type cacheEntry struct {
-	answers   []dns.RR
-	authority []dns.RR
-	rcode     int
-	storedAt  time.Time
-	ttl       uint32 // clamped TTL in seconds captured at store time
+	answers           []dns.RR
+	authority         []dns.RR
+	rcode             int
+	authenticatedData bool
+	storedAt          time.Time
+	ttl               uint32 // clamped TTL in seconds captured at store time
 }
 
 // remainingTTL returns the seconds until expiry; <= 0 means expired.
@@ -104,11 +105,12 @@ func (c *cache) get(key cacheKey) (*cacheEntry, uint32, bool) {
 	c.ll.MoveToFront(el)
 
 	out := &cacheEntry{
-		answers:   copyRRs(ent.answers),
-		authority: copyRRs(ent.authority),
-		rcode:     ent.rcode,
-		storedAt:  ent.storedAt,
-		ttl:       ent.ttl,
+		answers:           copyRRs(ent.answers),
+		authority:         copyRRs(ent.authority),
+		rcode:             ent.rcode,
+		authenticatedData: ent.authenticatedData,
+		storedAt:          ent.storedAt,
+		ttl:               ent.ttl,
 	}
 	// remaining <= int64(ent.ttl), so the conversion cannot overflow; the
 	// explicit clamp keeps gosec G115 satisfied.
@@ -129,11 +131,12 @@ func (c *cache) getStale(key cacheKey) (*cacheEntry, bool) {
 	}
 	ent := el.Value.(entry).value
 	return &cacheEntry{
-		answers:   copyRRs(ent.answers),
-		authority: copyRRs(ent.authority),
-		rcode:     ent.rcode,
-		storedAt:  ent.storedAt,
-		ttl:       ent.ttl,
+		answers:           copyRRs(ent.answers),
+		authority:         copyRRs(ent.authority),
+		rcode:             ent.rcode,
+		authenticatedData: ent.authenticatedData,
+		storedAt:          ent.storedAt,
+		ttl:               ent.ttl,
 	}, true
 }
 
@@ -166,6 +169,16 @@ func (c *cache) len() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.items)
+}
+
+// clear removes every cached response and returns the number removed.
+func (c *cache) clear() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := len(c.items)
+	c.ll.Init()
+	c.items = make(map[cacheKey]*list.Element)
+	return n
 }
 
 // entry bundles the list key with the entry value for LRU bookkeeping.

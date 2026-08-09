@@ -10,8 +10,8 @@ services:
       - MODE=master
       - NODE_NAME=dns-server-1
       - INGEST_SECRET=my_super_secret_token
-      - WEB_USERNAME=admin
-      - WEB_PASSWORD=changeme
+      - WEB_USERNAME=${WEB_USERNAME:?WEB_USERNAME is required}
+      - WEB_PASSWORD=${WEB_PASSWORD:?WEB_PASSWORD is required}
     ports:
       - "127.0.0.1:${PORT:-35353}:35353"
     volumes:

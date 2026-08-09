@@ -314,7 +314,18 @@ func (f *Forwarder) syncFromMaster(client *http.Client, endpoint string) ([]byte
 		reader = gzReader
 	}
 
-	return io.ReadAll(reader)
+	maxResponseSize := f.cfg.MaxRequestSize
+	if maxResponseSize <= 0 {
+		maxResponseSize = config.DefaultMaxRequestSize
+	}
+	data, err := io.ReadAll(io.LimitReader(reader, maxResponseSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxResponseSize {
+		return nil, fmt.Errorf("sync %s: response exceeds %d bytes", endpoint, maxResponseSize)
+	}
+	return data, nil
 }
 
 // syncAliases fetches and applies client aliases from master (Item 90).
@@ -408,6 +419,9 @@ func (f *Forwarder) syncUpstreamHealth(client *http.Client) {
 func calculateBackoff(attempt int) time.Duration {
 	if attempt <= 0 {
 		return 1 * time.Second
+	}
+	if attempt > 6 {
+		attempt = 6
 	}
 	seconds := 1 << uint(attempt-1) // 2^(attempt-1)
 	if seconds > 30 {

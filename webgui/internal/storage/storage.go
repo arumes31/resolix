@@ -19,6 +19,8 @@ import (
 type Store struct {
 	cfg      *config.Config
 	db       *sql.DB
+	dbMu     sync.RWMutex
+	closed   bool
 	events   []models.QueryEvent
 	head     int
 	count    int
@@ -75,9 +77,6 @@ type Store struct {
 	// Configurable intervals for background maintenance
 	vacuumInterval     time.Duration
 	checkpointInterval time.Duration
-
-	// Bandwidth savings tracking (Item 67)
-	cachedQueryCount int64
 }
 
 type pendingInfo struct {
@@ -152,14 +151,6 @@ func (s *Store) Init() {
 		}
 	}
 
-	// Warmup cached query count from DB for bandwidth savings
-	if s.db != nil {
-		var cnt int64
-		cutoff24h := time.Now().Add(-24 * time.Hour).Unix()
-		if err := s.db.QueryRow("SELECT COUNT(*) FROM queries WHERE upstream = 'System Cache' AND unix_time >= ?", cutoff24h).Scan(&cnt); err == nil {
-			s.cachedQueryCount = cnt
-		}
-	}
 }
 
 // prepareStatements creates prepared statements for frequently-used queries and stores them on the Store.
@@ -196,6 +187,13 @@ func (s *Store) prepareStatements() error {
 
 // Close releases all prepared statements and cancels background maintenance goroutines.
 func (s *Store) Close() {
+	s.dbMu.Lock()
+	defer s.dbMu.Unlock()
+	if s.closed {
+		return
+	}
+	s.closed = true
+
 	// Cancel background goroutines
 	if s.cancel != nil {
 		s.cancel()
@@ -222,6 +220,7 @@ func (s *Store) Close() {
 	// Close database connection
 	if s.db != nil {
 		_ = s.db.Close()
+		s.db = nil
 	}
 
 	log.Printf("Store closed: prepared statements released, background goroutines stopped")
@@ -316,9 +315,13 @@ func (s *Store) AddEvent(e models.QueryEvent) {
 }
 
 // UpdateEvent searches for a matching pending event and updates its latency and upstream in memory and batch.
-func (s *Store) UpdateEvent(node, domain string, latency float64, upstream string) *models.QueryEvent {
+func (s *Store) UpdateEvent(node, domain string, latency float64, upstream string, responseCodes ...string) *models.QueryEvent {
 	s.eventsMu.Lock()
 	defer s.eventsMu.Unlock()
+	responseCode := ""
+	if len(responseCodes) > 0 {
+		responseCode = responseCodes[0]
+	}
 
 	scanLimit := s.count
 	if scanLimit > config.DefaultScanLimit {
@@ -329,15 +332,11 @@ func (s *Store) UpdateEvent(node, domain string, latency float64, upstream strin
 		if s.events[idx].Domain == domain && s.events[idx].Node == node && !s.events[idx].Latency.Valid {
 			s.events[idx].Latency = sql.NullFloat64{Float64: latency, Valid: true}
 			s.events[idx].Upstream = upstream
+			s.events[idx].ResponseCode = responseCode
 
 			// Item 68: Check latency alert threshold
 			if latency > float64(s.cfg.UpstreamLatencyThreshold) {
 				s.events[idx].LatencyAlert = true
-			}
-
-			// Item 67: Track cached queries for bandwidth savings
-			if upstream == "System Cache" {
-				atomic.AddInt64(&s.cachedQueryCount, 1)
 			}
 
 			// Also try to update it in the pending batch if it hasn't been written to SQLite yet
@@ -364,7 +363,7 @@ func (s *Store) UpdateEvent(node, domain string, latency float64, upstream strin
 }
 
 // SetBlocked marks an event as blocked in the in-memory ring buffer and batch.
-func (s *Store) SetBlocked(node, domain string) {
+func (s *Store) SetBlocked(node, domain string) bool {
 	s.eventsMu.Lock()
 	defer s.eventsMu.Unlock()
 
@@ -374,25 +373,31 @@ func (s *Store) SetBlocked(node, domain string) {
 	}
 	for i := 0; i < scanLimit; i++ {
 		idx := (s.head - 1 - i + s.cfg.MaxEvents) % s.cfg.MaxEvents
-		if s.events[idx].Domain == domain && s.events[idx].Node == node && !s.events[idx].Blocked {
+		if s.events[idx].Domain == domain && s.events[idx].Node == node {
+			if s.events[idx].Blocked {
+				return true
+			}
 			s.events[idx].Blocked = true
 
 			// Also update in the pending batch
 			s.batchMu.Lock()
 			for b := len(s.batch) - 1; b >= 0; b-- {
-				if s.batch[b].Domain == domain && s.batch[b].Node == node && !s.batch[b].Blocked {
-					s.batch[b].Blocked = true
+				if s.batch[b].Domain == domain && s.batch[b].Node == node {
+					if !s.batch[b].Blocked {
+						s.batch[b].Blocked = true
+					}
 					break
 				}
 			}
 			s.batchMu.Unlock()
-			return
+			return false
 		}
 	}
+	return false
 }
 
 // SetClientHostname sets the hostname for the most recent event of a client IP on a node.
-func (s *Store) SetClientHostname(node, clientIP, hostname string) {
+func (s *Store) SetClientHostname(node, clientIP, hostname string) bool {
 	s.eventsMu.Lock()
 	defer s.eventsMu.Unlock()
 
@@ -402,21 +407,25 @@ func (s *Store) SetClientHostname(node, clientIP, hostname string) {
 	}
 	for i := 0; i < scanLimit; i++ {
 		idx := (s.head - 1 - i + s.cfg.MaxEvents) % s.cfg.MaxEvents
-		if s.events[idx].ClientIP == clientIP && s.events[idx].Node == node && s.events[idx].ClientHostname == "" {
+		if s.events[idx].ClientIP == clientIP && s.events[idx].Node == node {
+			if s.events[idx].ClientHostname == hostname {
+				return true
+			}
 			s.events[idx].ClientHostname = hostname
 
 			// Also update in the pending batch
 			s.batchMu.Lock()
 			for b := len(s.batch) - 1; b >= 0; b-- {
-				if s.batch[b].ClientIP == clientIP && s.batch[b].Node == node && s.batch[b].ClientHostname == "" {
+				if s.batch[b].ClientIP == clientIP && s.batch[b].Node == node {
 					s.batch[b].ClientHostname = hostname
 					break
 				}
 			}
 			s.batchMu.Unlock()
-			return
+			return false
 		}
 	}
+	return false
 }
 
 // GetOrderedEvents returns the latest N events from memory.
@@ -462,6 +471,9 @@ func (s *Store) GetRecentEvents(since int64) []models.QueryEvent {
 //
 //nolint:gocyclo
 func (s *Store) GetStats() map[string]interface{} {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+
 	now := time.Now().Unix()
 	cutoff24h := now - 86400
 
@@ -535,7 +547,7 @@ func (s *Store) GetStats() map[string]interface{} {
 	}
 
 	// Item 67: Bandwidth savings estimate (100 bytes per cached query)
-	bandwidthSaved := atomic.LoadInt64(&s.cachedQueryCount) * 100
+	bandwidthSaved := cacheHits * 100
 
 	domainCounts := make(map[string]int)
 	clientCounts := make(map[string]int)
@@ -643,9 +655,7 @@ func (s *Store) toStats(m map[string]int, category string) []models.StatEntry {
 	for k, v := range m {
 		entry := models.StatEntry{Key: k, Count: v}
 		if category == "clients" {
-			if alias, ok := s.cfg.ClientAliases[k]; ok {
-				entry.Alias = alias
-			}
+			entry.Alias = s.cfg.GetClientAlias(k)
 		}
 		s.statsMu.RLock()
 		if last, ok := s.lastTopStats[category]; ok {
@@ -715,7 +725,7 @@ func (s *Store) GetClientStats(ip string) map[string]interface{} {
 
 	return map[string]interface{}{
 		"ip":          ip,
-		"alias":       s.cfg.ClientAliases[ip],
+		"alias":       s.cfg.GetClientAlias(ip),
 		"rpm":         rpm,
 		"rph":         rph,
 		"rpm_history": rpmHistory,
@@ -822,6 +832,12 @@ func (s *Store) SetDNSSEC(node, domain, result string) {
 
 // ArchiveStep performs a batch insert of recent queries into SQLite and deletes old ones.
 func (s *Store) ArchiveStep(now time.Time) int {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	if s.closed || s.db == nil {
+		return 0
+	}
+
 	s.batchMu.Lock()
 	if len(s.batch) == 0 {
 		s.batchMu.Unlock()
@@ -969,10 +985,7 @@ func (s *Store) GetNodeStatuses() []models.NodeStatus {
 
 // GetAlias returns the friendly name for a client IP if configured.
 func (s *Store) GetAlias(ip string) string {
-	if alias, ok := s.cfg.ClientAliases[ip]; ok {
-		return alias
-	}
-	return ""
+	return s.cfg.GetClientAlias(ip)
 }
 
 // StartStatsTrends begins periodic snapshots of top lists for trend analysis.
@@ -1012,6 +1025,11 @@ func (s *Store) startVacuum(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				s.dbMu.RLock()
+				if s.closed || s.db == nil {
+					s.dbMu.RUnlock()
+					return
+				}
 				log.Printf("Database VACUUM started")
 				start := time.Now()
 				_, err := s.db.Exec("VACUUM;")
@@ -1020,6 +1038,7 @@ func (s *Store) startVacuum(ctx context.Context) {
 				} else {
 					log.Printf("Database VACUUM completed in %s", time.Since(start).Round(time.Millisecond))
 				}
+				s.dbMu.RUnlock()
 			}
 		}
 	}()
@@ -1038,6 +1057,11 @@ func (s *Store) startWALCheckpoint(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				s.dbMu.RLock()
+				if s.closed || s.db == nil {
+					s.dbMu.RUnlock()
+					return
+				}
 				var busy, logFrames, checkpointed int
 				row := s.db.QueryRow("PRAGMA wal_checkpoint(TRUNCATE);")
 				if err := row.Scan(&busy, &logFrames, &checkpointed); err != nil {
@@ -1045,6 +1069,7 @@ func (s *Store) startWALCheckpoint(ctx context.Context) {
 				} else {
 					log.Printf("WAL checkpoint completed: busy=%d, logFrames=%d, checkpointed=%d", busy, logFrames, checkpointed)
 				}
+				s.dbMu.RUnlock()
 			}
 		}
 	}()

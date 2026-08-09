@@ -17,6 +17,7 @@ type Blocklist struct {
 	domains    map[string]bool
 	mu         sync.RWMutex
 	lastLoaded time.Time
+	lastError  error
 	cancel     context.CancelFunc
 }
 
@@ -42,6 +43,7 @@ func (bl *Blocklist) load() {
 		bl.mu.Lock()
 		bl.domains = newDomains
 		bl.lastLoaded = time.Now()
+		bl.lastError = nil
 		bl.mu.Unlock()
 		return
 	}
@@ -53,6 +55,9 @@ func (bl *Blocklist) load() {
 		} else {
 			logger.Error("Failed to open blocklist file: %v", err)
 		}
+		bl.mu.Lock()
+		bl.lastError = err
+		bl.mu.Unlock()
 		return
 	}
 	defer func() { _ = file.Close() }()
@@ -93,12 +98,16 @@ func (bl *Blocklist) load() {
 
 	if err := scanner.Err(); err != nil {
 		logger.Error("Error reading blocklist file: %v", err)
+		bl.mu.Lock()
+		bl.lastError = err
+		bl.mu.Unlock()
 		return
 	}
 
 	bl.mu.Lock()
 	bl.domains = newDomains
 	bl.lastLoaded = time.Now()
+	bl.lastError = nil
 	bl.mu.Unlock()
 
 	logger.Info("Loaded %d blocked domains from %s", len(newDomains), bl.path)
@@ -156,9 +165,16 @@ func (bl *Blocklist) LastLoaded() time.Time {
 
 // Status returns the current blocklist status info.
 func (bl *Blocklist) Status() map[string]interface{} {
+	bl.mu.RLock()
+	defer bl.mu.RUnlock()
+	lastError := ""
+	if bl.lastError != nil {
+		lastError = bl.lastError.Error()
+	}
 	return map[string]interface{}{
-		"count":       bl.Count(),
-		"last_loaded": bl.LastLoaded().Format(time.RFC3339),
+		"count":       len(bl.domains),
+		"last_loaded": bl.lastLoaded.Format(time.RFC3339),
+		"last_error":  lastError,
 		"file":        bl.path,
 	}
 }

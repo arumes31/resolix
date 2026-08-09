@@ -455,13 +455,21 @@ func TestBatchSizeLimit(t *testing.T) {
 
 func TestReportHealth_SlaveMode(t *testing.T) {
 	var receivedHealth map[string]interface{}
+	var mu sync.Mutex
+	received := make(chan struct{}, 1)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var payload map[string]interface{}
 		_ = decodeJSONBody(r, &payload)
 		if h, ok := payload["health"]; ok {
 			if hm, ok := h.(map[string]interface{}); ok {
+				mu.Lock()
 				receivedHealth = hm
+				mu.Unlock()
+				select {
+				case received <- struct{}{}:
+				default:
+				}
 			}
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -479,9 +487,14 @@ func TestReportHealth_SlaveMode(t *testing.T) {
 	health := map[string]float64{"8.8.8.8": 12.3}
 	fwd.ReportHealth(health)
 
-	// Wait for async health report
-	time.Sleep(500 * time.Millisecond)
+	select {
+	case <-received:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for health report")
+	}
 
+	mu.Lock()
+	defer mu.Unlock()
 	if receivedHealth == nil {
 		t.Error("expected health data to be received by server")
 	}
@@ -522,6 +535,20 @@ func TestCalculateBackoff(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSyncFromMasterRejectsOversizedGzipResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		writer := gzip.NewWriter(w)
+		_, _ = writer.Write([]byte("response-too-large"))
+		_ = writer.Close()
+	}))
+	defer server.Close()
+	fwd := NewForwarder(&config.Config{MasterURL: server.URL, MaxRequestSize: 4})
+	if _, err := fwd.syncFromMaster(server.Client(), "/sync"); err == nil {
+		t.Fatal("expected oversized response error")
 	}
 }
 

@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -76,6 +78,7 @@ func (dr *DNSRoutes) load() {
 			Upstream: upstream,
 		})
 	}
+	sortRoutes(newRoutes)
 
 	dr.mu.Lock()
 	dr.routes = newRoutes
@@ -135,7 +138,7 @@ func matchPattern(pattern, domain string) bool {
 	}
 	if strings.HasPrefix(pattern, "*.") {
 		suffix := pattern[2:] // Remove "*."
-		// Domain must end with the suffix and have at least one subdomain label
+		// Wildcards match both the suffix apex and any subdomain below it.
 		if strings.HasSuffix(domain, "."+suffix) || domain == suffix {
 			return true
 		}
@@ -182,6 +185,7 @@ func (dr *DNSRoutes) SetRoutes(routesMap map[string]string) error {
 			Upstream: upstream,
 		})
 	}
+	sortRoutes(newRoutes)
 
 	// Save to file first to preserve atomicity
 	if dr.path != "" {
@@ -189,7 +193,7 @@ func (dr *DNSRoutes) SetRoutes(routesMap map[string]string) error {
 		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(dr.path, data, 0644); err != nil {
+		if err := writeFileAtomic(dr.path, data, 0o644); err != nil {
 			return err
 		}
 		logger.Info("Saved %d DNS routes to %s", len(routesMap), dr.path)
@@ -198,6 +202,48 @@ func (dr *DNSRoutes) SetRoutes(routesMap map[string]string) error {
 	dr.routes = newRoutes
 
 	return nil
+}
+
+func sortRoutes(routes []Route) {
+	sort.Slice(routes, func(i, j int) bool {
+		iWildcard := strings.HasPrefix(routes[i].Pattern, "*.")
+		jWildcard := strings.HasPrefix(routes[j].Pattern, "*.")
+		if iWildcard != jWildcard {
+			return !iWildcard
+		}
+		if iWildcard && len(routes[i].Pattern) != len(routes[j].Pattern) {
+			return len(routes[i].Pattern) > len(routes[j].Pattern)
+		}
+		return routes[i].Pattern < routes[j].Pattern
+	})
+}
+
+func writeFileAtomic(path string, data []byte, mode os.FileMode) (err error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".dnsroutes-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		if err != nil {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err = tmp.Chmod(mode); err != nil {
+		return err
+	}
+	if _, err = tmp.Write(data); err != nil {
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	err = os.Rename(tmpPath, path)
+	return err
 }
 
 // LoadFromFile loads routes from a specific file (used for initial load from upstreams file).

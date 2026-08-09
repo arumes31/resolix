@@ -13,7 +13,7 @@ type QueryEvent struct {
 	Type           string          `json:"type"`
 	Domain         string          `json:"domain"`
 	ClientIP       string          `json:"client_ip"`
-	Latency        sql.NullFloat64 `json:"latency_ms,omitempty"`
+	Latency        sql.NullFloat64 `json:"-"`
 	Upstream       string          `json:"upstream,omitempty"`
 	Node           string          `json:"node,omitempty"`
 	Alias          string          `json:"alias,omitempty"`
@@ -41,17 +41,41 @@ func (e QueryEvent) LatencyFormatted() string {
 // MarshalJSON provides custom JSON serialization to add human-readable timestamps and latencies.
 func (e QueryEvent) MarshalJSON() ([]byte, error) {
 	type Alias QueryEvent
+	var latency *float64
+	if e.Latency.Valid {
+		latency = &e.Latency.Float64
+	}
 	return json.Marshal(&struct {
-		Timestamp          string `json:"timestamp"`
-		TimestampFormatted string `json:"timestampFormatted"`
-		LatencyFormatted   string `json:"latencyFormatted"`
+		Timestamp          string   `json:"timestamp"`
+		TimestampFormatted string   `json:"timestampFormatted"`
+		LatencyFormatted   string   `json:"latencyFormatted"`
+		Latency            *float64 `json:"latency_ms,omitempty"`
 		Alias
 	}{
 		Timestamp:          time.Unix(e.UnixTime, 0).Format(time.Stamp),
 		TimestampFormatted: e.TimestampFormatted(),
 		LatencyFormatted:   e.LatencyFormatted(),
+		Latency:            latency,
 		Alias:              (Alias)(e),
 	})
+}
+
+// UnmarshalJSON accepts latency_ms as a JSON number or null.
+func (e *QueryEvent) UnmarshalJSON(data []byte) error {
+	type Alias QueryEvent
+	aux := struct {
+		Latency *float64 `json:"latency_ms"`
+		*Alias
+	}{Alias: (*Alias)(e)}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if aux.Latency == nil {
+		e.Latency = sql.NullFloat64{}
+	} else {
+		e.Latency = sql.NullFloat64{Float64: *aux.Latency, Valid: true}
+	}
+	return nil
 }
 
 // StatEntry is a generic key-count pair used for top domains and top clients statistics.

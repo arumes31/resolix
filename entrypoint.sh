@@ -113,7 +113,7 @@ EOL
     fi
 
     # Strip carriage returns and clean up config
-    tr -d '\r' < /etc/dnsmasq.conf > /etc/dnsmasq.conf.tmp && mv /etc/dnsmasq.conf.tmp /etc/dnsmasq.conf
+    tr -d '\r' < /etc/dnsmasq.conf > /tmp/dnsmasq.conf.tmp && cat /tmp/dnsmasq.conf.tmp > /etc/dnsmasq.conf
     sed -i 's/[[:space:]]*$//' /etc/dnsmasq.conf
     sed -i '/^$/d' /etc/dnsmasq.conf
 
@@ -148,6 +148,10 @@ echo "Processes started: dnsmasq(PID:$DNSMASQ_PID), GUI(PID:$WEBGUI_PID)"
 
 # Monitor processes
 while true; do
+    if ! kill -0 $TAILSCALED_PID 2>/dev/null; then
+        echo "Error: tailscaled process (PID: $TAILSCALED_PID) died."
+        exit 1
+    fi
     if ! kill -0 $DNSMASQ_PID 2>/dev/null; then
         echo "Error: dnsmasq process (PID: $DNSMASQ_PID) died. Details should be in GUI logs above."
         exit 1

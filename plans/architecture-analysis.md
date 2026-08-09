@@ -522,7 +522,7 @@ This is the largest and most complex package. It manages:
 
 #### Template Structure
 - **All CSS is inline** (lines 9-304) — ~295 lines of CSS in a `<style>` block
-- **All JS is inline** (lines 409-776) — ~367 lines of JavaScript in a `<script>` block
+- **JavaScript assets:** Dashboard and login logic live in `webgui/static/js/`; the GHCR workflow minifies staged copies before building the image.
 - **No external CSS/JS references** (fully self-contained via embed.FS)
 - **No JavaScript framework** — vanilla JS with DOM manipulation
 - **No module system** — all functions in global scope

@@ -20,6 +20,35 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - name: Prepare minified build context
+        shell: bash
+        run: |
+          build_context="${RUNNER_TEMP}/tailscale-dnsrewrite-build"
+          minified_root="${RUNNER_TEMP}/tailscale-dnsrewrite-js"
+          js_root="${build_context}/webgui/static/js"
+
+          mkdir -p "${build_context}" "${minified_root}"
+          rsync -a --delete --exclude '.git' ./ "${build_context}/"
+
+          mapfile -d '' js_files < <(find "${js_root}" -type f -name '*.js' -print0)
+          if (( ${#js_files[@]} == 0 )); then
+            echo "No JavaScript files found under ${js_root}" >&2
+            exit 1
+          fi
+
+          npx --yes esbuild@0.28.1 "${js_files[@]}" \
+            --minify \
+            --outbase="${js_root}" \
+            --outdir="${minified_root}"
+          cp -a "${minified_root}/." "${js_root}/"
+
+          echo "BUILD_CONTEXT=${build_context}" >> "${GITHUB_ENV}"
+
       - name: Log in to the Container registry
         uses: docker/login-action@v4
         with:
@@ -45,7 +74,7 @@ jobs:
       - name: Build and push Docker image
         uses: docker/build-push-action@v7
         with:
-          context: .
+          context: ${{ env.BUILD_CONTEXT }}
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}

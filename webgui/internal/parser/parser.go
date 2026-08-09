@@ -49,6 +49,10 @@ func NewParser(store *storage.Store, debug bool) *Parser {
 //nolint:gocyclo
 func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 	now := time.Now()
+	if bytes.Contains(line, []byte("validation|")) {
+		p.parseDNSSECPipe(line, node)
+		return nil
+	}
 	parts := bytes.Fields(line)
 	if len(parts) < 2 {
 		return nil
@@ -82,12 +86,6 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 	// Also: "dnsmasq: validation dnsmasq.org IN secure"
 	if bytes.Equal(action, []byte("validation")) {
 		p.parseDNSSEC(parts, actionIdx, node)
-		return nil
-	}
-
-	// Also check for pipe-delimited DNSSEC lines: "validation|domain|IN|secure"
-	if bytes.Contains(line, []byte("validation|")) {
-		p.parseDNSSECPipe(line, node)
 		return nil
 	}
 
@@ -176,18 +174,14 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 			}
 
 			// Item 64: Parse DNS response codes from reply lines
-			responseCode := parseResponseCode(line, actionIdx, parts)
+			responseCode := parseResponseCode(actionIdx, parts)
 
 			if ok {
 				latency := float64(now.Sub(startTime).Microseconds()) / 1000.0
 				if latency < 0 {
 					latency = 0
 				}
-				updated := p.store.UpdateEvent(node, domain, latency, upstream)
-				if updated != nil {
-					updated.ResponseCode = responseCode
-				}
-				return updated
+				return p.store.UpdateEvent(node, domain, latency, upstream, responseCode)
 			} else if bytes.Equal(action, []byte("reply")) {
 				// Debug: why was it not found?
 				if p.Debug {
@@ -232,11 +226,11 @@ func (p *Parser) parseDNSSECPipe(line []byte, node string) {
 	}
 	after := line[idx+len("validation|"):]
 	pipeParts := bytes.Split(after, []byte("|"))
-	if len(pipeParts) < 4 {
+	if len(pipeParts) < 3 {
 		return
 	}
 	domain := strings.ToLower(strings.TrimSuffix(string(pipeParts[0]), "."))
-	result := strings.ToLower(string(pipeParts[3]))
+	result := strings.ToLower(string(pipeParts[2]))
 
 	switch result {
 	case "secure", "insecure", "bogus", "indeterminate":
@@ -250,40 +244,26 @@ func (p *Parser) parseDNSSECPipe(line []byte, node string) {
 
 // parseResponseCode extracts DNS response codes from dnsmasq reply log lines.
 // Common codes: NXDOMAIN, SERVFAIL, REFUSED, NOERROR, TIMEOUT
-func parseResponseCode(line []byte, actionIdx int, parts [][]byte) string {
-	lineStr := strings.ToLower(string(line))
-
-	// Check for common response code patterns in the log line
+func parseResponseCode(actionIdx int, parts [][]byte) string {
+	if actionIdx < 0 || len(parts) <= actionIdx+2 {
+		return ""
+	}
+	payload := strings.ToLower(string(bytes.Join(parts[actionIdx+2:], []byte(" "))))
 	switch {
-	case bytes.Contains(line, []byte("NXDOMAIN")) || strings.Contains(lineStr, "nxdomain"):
+	case strings.Contains(payload, "nxdomain"):
 		return "NXDOMAIN"
-	case bytes.Contains(line, []byte("SERVFAIL")) || strings.Contains(lineStr, "servfail"):
+	case strings.Contains(payload, "servfail"):
 		return "SERVFAIL"
-	case bytes.Contains(line, []byte("REFUSED")) || strings.Contains(lineStr, "refused"):
+	case strings.Contains(payload, "refused"):
 		return "REFUSED"
-	case bytes.Contains(line, []byte("timeout")) || strings.Contains(lineStr, "timed out"):
+	case strings.Contains(payload, "timeout") || strings.Contains(payload, "timed out"):
 		return "TIMEOUT"
 	}
 
-	// For reply lines, check if the reply content indicates success or error
-	if actionIdx >= 0 && len(parts) > actionIdx+2 {
-		replyContent := strings.ToLower(string(parts[actionIdx+2]))
-		switch {
-		case replyContent == "nxdomain":
-			return "NXDOMAIN"
-		case replyContent == "servfail":
-			return "SERVFAIL"
-		case replyContent == "refused":
-			return "REFUSED"
-		case replyContent == "timeout":
-			return "TIMEOUT"
-		}
-	}
-
 	// If it's a reply/cached/config action with no error, it's NOERROR
-	if actionIdx >= 0 && (bytes.Equal(parts[actionIdx], []byte("reply")) ||
+	if bytes.Equal(parts[actionIdx], []byte("reply")) ||
 		bytes.Equal(parts[actionIdx], []byte("cached")) ||
-		bytes.Equal(parts[actionIdx], []byte("config"))) {
+		bytes.Equal(parts[actionIdx], []byte("config")) {
 		return "NOERROR"
 	}
 

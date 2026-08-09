@@ -1,39 +1,42 @@
 # tailscale-dnsrewrite.service — systemd unit for Tailscale DNS Monitor & Rewriter
 #
 # Installation:
-#   1. Copy this file to /etc/systemd/system/tailscale-dnsrewrite.service
-#   2. Copy the environment file to /etc/default/tailscale-dnsrewrite
+#   1. Install webgui at /usr/bin/webgui and install entrypoint.sh as
+#      /usr/local/libexec/tailscale-dnsrewrite/entrypoint.sh (mode 0755).
+#   2. Copy this file to /etc/systemd/system/tailscale-dnsrewrite.service
+#   3. Copy the environment file to /etc/default/tailscale-dnsrewrite
 #      (see .env.example for available variables)
-#   3. Reload systemd:  sudo systemctl daemon-reload
-#   4. Enable at boot:  sudo systemctl enable tailscale-dnsrewrite
-#   5. Start now:       sudo systemctl start tailscale-dnsrewrite
+#   4. Ensure /etc/dnsmasq.conf exists and install tailscale and dnsmasq.
+#   5. Reload systemd:  sudo systemctl daemon-reload
+#   6. Enable at boot:  sudo systemctl enable tailscale-dnsrewrite
+#   7. Start now:       sudo systemctl start tailscale-dnsrewrite
 #
 # Usage:
 #   sudo systemctl status tailscale-dnsrewrite   # Check status
 #   sudo journalctl -u tailscale-dnsrewrite -f   # Follow logs
 #   sudo systemctl restart tailscale-dnsrewrite  # Restart service
 #
-# The binary should be installed at /usr/local/bin/tailscale-dnsrewrite
-# or adjust ExecStart to match your installation path.
-
 [Unit]
 Description=Tailscale DNS Monitor & Rewriter
-After=network.target
+Wants=network-online.target
+After=network-online.target
 Documentation=https://github.com/arumes31/tailscale-dnsrewrite
 
 [Service]
 Type=simple
 EnvironmentFile=-/etc/default/tailscale-dnsrewrite
-ExecStart=/usr/local/bin/tailscale-dnsrewrite
+ExecStart=/usr/local/libexec/tailscale-dnsrewrite/entrypoint.sh
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
+RuntimeDirectory=tailscale
+StateDirectory=tailscale tailscale-dnsrewrite
 
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/tailscale-dnsrewrite
+ReadWritePaths=/var/lib/tailscale /var/lib/tailscale-dnsrewrite /var/run/tailscale /etc/dnsmasq.conf
 PrivateTmp=true
 
 # Logging

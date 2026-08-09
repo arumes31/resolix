@@ -24,8 +24,9 @@ type cacheEntry struct {
 
 // Resolver performs background reverse DNS lookups for client IPs.
 type Resolver struct {
-	cache sync.Map // map[string]cacheEntry
-	queue chan string
+	cache   sync.Map // map[string]cacheEntry
+	pending sync.Map // map[string]struct{}
+	queue   chan string
 }
 
 // New creates a new Resolver instance.
@@ -60,9 +61,13 @@ func (r *Resolver) Queue(ip string) {
 			return
 		}
 	}
+	if _, loaded := r.pending.LoadOrStore(ip, struct{}{}); loaded {
+		return
+	}
 	select {
 	case r.queue <- ip:
 	default:
+		r.pending.Delete(ip)
 		// Queue full, drop silently
 		logger.Debug("Reverse DNS lookup queue full, dropping IP: %s", ip)
 	}
@@ -86,8 +91,10 @@ func (r *Resolver) GetHostname(ip string) string {
 
 // lookup performs the actual reverse DNS lookup for an IP.
 func (r *Resolver) lookup(ip string) {
+	defer r.pending.Delete(ip)
 	// Skip common non-routable addresses
 	if ip == "127.0.0.1" || ip == "::1" || ip == "0.0.0.0" {
+		r.cache.Store(ip, cacheEntry{hostname: "", resolvedAt: time.Now()})
 		return
 	}
 

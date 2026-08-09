@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"embed"
 	"encoding/base64"
+	"errors"
 	"html/template"
 	"io/fs"
 	"net/http"
@@ -96,11 +97,11 @@ func verifyConfig(cfg *config.Config) {
 	errs, warnings := cfg.VerifyConfig()
 
 	for _, w := range warnings {
-		logger.Warning(w)
+		logger.Warning("%s", w)
 	}
 
 	for _, e := range errs {
-		logger.Error(e)
+		logger.Error("%s", e)
 	}
 
 	if len(errs) > 0 {
@@ -428,22 +429,28 @@ func main() {
 		}
 	}()
 
-	// Start HTTP server
+	// Start HTTP server and report completion so shutdown can wait before
+	// closing storage used by in-flight handlers.
+	serverDone := make(chan error, 1)
 	go func() {
-		if err := srv.Start(ctx, staticHandler, cspMiddleware, nonceFromContext); err != nil {
-			errChan <- err
-		}
+		serverDone <- srv.Start(ctx, staticHandler, cspMiddleware, nonceFromContext)
 	}()
 
 	// Graceful shutdown with signal handling (Item 56)
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
+	serverStopped := false
 	select {
 	case sig := <-sigChan:
 		logger.Info("Received signal %v, initiating graceful shutdown", sig)
 	case err := <-errChan:
 		logger.Error("Server error: %v", err)
+	case err := <-serverDone:
+		serverStopped = true
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("HTTP server error: %v", err)
+		}
 	}
 
 	// Step 1: Cancel context to stop all background goroutines
@@ -462,19 +469,34 @@ func main() {
 	logger.Info("Shutdown step 4: Stopping blocklist reload...")
 	bl.Stop()
 
-	// Step 5: Flush pending batch buffers to SQLite
-	logger.Info("Shutdown step 5: Flushing pending batch buffers to SQLite...")
+	// Step 5: Wait for HTTP handlers to finish before closing storage.
+	logger.Info("Shutdown step 5: Waiting for HTTP server to finish...")
+	if !serverStopped {
+		timer := time.NewTimer(cfg.HTTPShutdownTimeout)
+		select {
+		case err := <-serverDone:
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Warning("HTTP server shutdown error: %v", err)
+			}
+		case <-timer.C:
+			logger.Warning("HTTP server did not stop within %s", cfg.HTTPShutdownTimeout)
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}
+
+	// Step 6: Flush pending batch buffers to SQLite
+	logger.Info("Shutdown step 6: Flushing pending batch buffers to SQLite...")
 	archived := store.ArchiveStep(time.Now())
-	logger.Info("Shutdown step 5: Archived %d events to SQLite", archived)
+	logger.Info("Shutdown step 6: Archived %d events to SQLite", archived)
 
-	// Step 6: Close the database and release resources
-	logger.Info("Shutdown step 6: Closing storage (database, prepared statements, background goroutines)...")
+	// Step 7: Close the database and release resources
+	logger.Info("Shutdown step 7: Closing storage (database, prepared statements, background goroutines)...")
 	store.Close()
-
-	// Step 7: Allow HTTP server graceful shutdown (handled by ctx cancellation in srv.Start)
-	// Give it a moment to complete the shutdown
-	logger.Info("Shutdown step 7: Waiting for HTTP server to finish...")
-	time.Sleep(2 * time.Second)
 
 	// Step 8: Flush and close log file if file logging is enabled
 	logger.Info("Shutdown step 8: Flushing log file...")

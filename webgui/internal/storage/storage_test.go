@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -509,9 +508,9 @@ func TestGetAlias(t *testing.T) {
 		HistoryDir:               t.TempDir(),
 		DBPath:                   "test.db",
 		HistoryRetention:         72 * time.Hour,
-		ClientAliases:            map[string]string{"192.168.1.1": "Gateway"},
 		UpstreamLatencyThreshold: 200,
 	}
+	cfg.SetClientAliases(map[string]string{"192.168.1.1": "Gateway"})
 	s := NewStore(cfg)
 	s.Init()
 	defer s.Close()
@@ -576,28 +575,6 @@ func TestConcurrentAddEvent(t *testing.T) {
 	if len(events) != workers*eventsPerWorker {
 		t.Errorf("expected %d events, got %d", workers*eventsPerWorker, len(events))
 	}
-}
-
-func TestCachedQueryCount(t *testing.T) {
-	s, cleanup := newTestStore(t)
-	defer cleanup()
-
-	now := time.Now().Unix()
-	s.AddEvent(models.QueryEvent{UnixTime: now, Domain: "cached1.com", Node: "n1", Type: "A", ClientIP: "1.1.1.1"})
-
-	// Simulate a cached reply
-	s.UpdateEvent("n1", "cached1.com", 0.5, "System Cache")
-
-	// The cachedQueryCount should have been incremented
-	count := atomicLoadInt64(&s.cachedQueryCount)
-	if count < 1 {
-		t.Errorf("expected cachedQueryCount >= 1, got %d", count)
-	}
-}
-
-// atomicLoadInt64 is a helper to atomically load an int64.
-func atomicLoadInt64(addr *int64) int64 {
-	return atomic.LoadInt64(addr)
 }
 
 func TestBandwidthSaved(t *testing.T) {

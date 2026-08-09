@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -105,8 +106,9 @@ type Config struct {
 	ScanLimit        int
 	MaxBacklogSize   int64
 	UpstreamDNS      string
-	ClientAliases    map[string]string
+	clientAliases    map[string]string
 	clientAliasesMu  sync.RWMutex
+	TrustedProxies   []string
 	Debug            bool
 	LogLevel         string
 	BaseURL          string
@@ -286,8 +288,8 @@ func (c *Config) GetClientAlias(ip string) string {
 	// Fall back to env var aliases
 	c.clientAliasesMu.RLock()
 	defer c.clientAliasesMu.RUnlock()
-	if c.ClientAliases != nil {
-		return c.ClientAliases[ip]
+	if c.clientAliases != nil {
+		return c.clientAliases[ip]
 	}
 	return ""
 }
@@ -307,7 +309,18 @@ func (c *Config) SetClientAliases(aliases map[string]string) {
 	}
 	c.clientAliasesMu.Lock()
 	defer c.clientAliasesMu.Unlock()
-	c.ClientAliases = aliases
+	c.clientAliases = maps.Clone(aliases)
+}
+
+// GetAllClientAliases returns a copy of the configured client aliases.
+func (c *Config) GetAllClientAliases() map[string]string {
+	c.clientAliasesMu.RLock()
+	defer c.clientAliasesMu.RUnlock()
+	result := maps.Clone(c.clientAliases)
+	if result == nil {
+		result = make(map[string]string)
+	}
+	return result
 }
 
 // parseDurationEnv reads an environment variable and parses it as a duration.
@@ -320,6 +333,10 @@ func parseDurationEnv(key string, defaultVal time.Duration) time.Duration {
 	d, err := time.ParseDuration(val)
 	if err != nil {
 		log.Printf("[WARN] Invalid %s '%s', falling back to %s: %v", key, val, defaultVal, err)
+		return defaultVal
+	}
+	if d <= 0 {
+		log.Printf("[WARN] Invalid %s '%s', falling back to %s: duration must be positive", key, val, defaultVal)
 		return defaultVal
 	}
 	return d
@@ -429,6 +446,13 @@ func LoadConfig() *Config {
 		}
 	}
 
+	var trustedProxies []string
+	for _, proxy := range strings.Split(os.Getenv("TRUSTED_PROXIES"), ",") {
+		if proxy = strings.TrimSpace(proxy); proxy != "" {
+			trustedProxies = append(trustedProxies, proxy)
+		}
+	}
+
 	// Load client aliases from file
 	clientAliasesFile := os.Getenv("CLIENT_ALIASES_FILE")
 	var provider *clientAliasesProvider
@@ -529,7 +553,8 @@ func LoadConfig() *Config {
 		ScanLimit:                  DefaultScanLimit,
 		MaxBacklogSize:             DefaultMaxBacklogSize,
 		UpstreamDNS:                os.Getenv("UPSTREAM_DNS"),
-		ClientAliases:              aliases,
+		clientAliases:              aliases,
+		TrustedProxies:             trustedProxies,
 		Debug:                      strings.ToLower(os.Getenv("DEBUG")) == "true",
 		LogLevel:                   logLevel,
 		BaseURL:                    baseURL,

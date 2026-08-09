@@ -84,8 +84,8 @@ CREATE INDEX IF NOT EXISTS idx_queries_response_code ON queries(response_code);
 
 	// Migrate: add new columns if they don't exist (for existing databases)
 	migrations := []struct {
-		col  string
-		def  string
+		col string
+		def string
 	}{
 		{"dnssec", "TEXT DEFAULT ''"},
 		{"client_hostname", "TEXT DEFAULT ''"},
@@ -102,9 +102,13 @@ CREATE INDEX IF NOT EXISTS idx_queries_response_code ON queries(response_code);
 			alterSQL := fmt.Sprintf("ALTER TABLE queries ADD COLUMN %s %s", m.col, m.def)
 			if _, err := db.Exec(alterSQL); err != nil {
 				log.Printf("[WARN] Migration: failed to add column %s: %v", m.col, err)
+				return nil, fmt.Errorf("migration: add column %s: %w", m.col, err)
 			} else {
 				log.Printf("[INFO] Migration: added column %s to queries table", m.col)
 			}
+		} else if err != nil {
+			log.Printf("[WARN] Migration: failed to inspect column %s: %v", m.col, err)
+			return nil, fmt.Errorf("migration: inspect column %s: %w", m.col, err)
 		}
 	}
 

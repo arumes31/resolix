@@ -7,14 +7,7 @@
     <title>Login | Tailscale DNS Monitor</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <link rel="stylesheet" href="/static/css/login.css">
-    <script nonce="{{.Nonce}}">
-        (function () {
-            var saved = localStorage.getItem('theme');
-            var preferred = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-            var theme = saved || preferred;
-            document.documentElement.setAttribute('data-theme', theme);
-        })();
-    </script>
+    <script nonce="{{.Nonce}}" src="static/js/login.js"></script>
 </head>
 
 <body>
@@ -46,7 +39,7 @@
         </form>
 
         <div class="footer">
-            &copy; 2024 Tailscale DNS Monitor v2.0.0
+            &copy; Tailscale DNS Monitor
         </div>
     </div>
 </body>

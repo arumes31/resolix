@@ -156,7 +156,6 @@ func BenchmarkBufPoolGetPut(b *testing.B) {
 // BenchmarkParseResponseCode benchmarks the response code parsing function.
 func BenchmarkParseResponseCode(b *testing.B) {
 	b.ReportAllocs()
-	line := []byte("Jan 02 15:04:05 dnsmasq[1234]: reply example.com is NXDOMAIN")
 	parts := [][]byte{
 		[]byte("Jan"), []byte("02"), []byte("15:04:05"),
 		[]byte("dnsmasq[1234]:"), []byte("reply"),
@@ -165,6 +164,6 @@ func BenchmarkParseResponseCode(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		parseResponseCode(line, 4, parts)
+		parseResponseCode(4, parts)
 	}
 }

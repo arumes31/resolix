@@ -45,6 +45,10 @@ var (
 	fileCloser io.Closer
 )
 
+func init() {
+	currentLevel.Store(int32(LevelInfo))
+}
+
 // SetLevel updates the current log level from a string representation.
 // Valid values (case-insensitive): DEBUG, INFO, WARNING, ERROR.
 // Defaults to INFO for unrecognized values.
@@ -84,6 +88,12 @@ func EnableFileLogging(path string) error {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to open log file %s: %w", path, err)
+	}
+	if fileWriter != nil {
+		_ = fileWriter.Flush()
+	}
+	if fileCloser != nil {
+		_ = fileCloser.Close()
 	}
 
 	fileWriter = bufio.NewWriterSize(f, 8192) // 8KB buffer

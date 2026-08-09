@@ -44,13 +44,9 @@ const (
 	sessionCookieName = "ts_dns_session"
 	csrfCookieName    = "ts_dns_csrf"
 	csrfTokenBytes    = 32
+	sessionTokenBytes = 32
+	sessionLifetime   = 7 * 24 * time.Hour
 )
-
-// isHTTPS determines whether the request was made over HTTPS,
-// either directly (TLS) or via a reverse proxy (X-Forwarded-Proto).
-func isHTTPS(r *http.Request) bool {
-	return r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
-}
 
 // rateLimitEntry tracks failed login attempts for a single IP.
 type rateLimitEntry struct {
@@ -147,6 +143,8 @@ type Server struct {
 
 	// Hashed password (bcrypt) — populated at startup
 	hashedPassword string
+	sessions       map[string]time.Time
+	sessionMu      sync.Mutex
 
 	// Reverse DNS resolver (Item 59)
 	resolver *resolver.Resolver
@@ -178,6 +176,7 @@ func NewServer(cfg *config.Config, store *storage.Store, prs *parser.Parser, tmp
 		tmpl:        tmpl,
 		subscribers: make(map[chan models.QueryEvent]int),
 		rateLimits:  make(map[string]*rateLimitEntry),
+		sessions:    make(map[string]time.Time),
 		metrics:     &Metrics{StartTime: time.Now()},
 	}
 
@@ -237,26 +236,105 @@ func checkPassword(hashedPassword, suppliedPassword string) bool {
 }
 
 // generateCSRFToken creates a cryptographically random base64-encoded token.
-func generateCSRFToken() string {
+func generateCSRFToken() (string, error) {
 	b := make([]byte, csrfTokenBytes)
 	if _, err := rand.Read(b); err != nil {
-		log.Printf("Warning: crypto/rand failed for CSRF token: %v", err)
-		return base64.StdEncoding.EncodeToString([]byte(time.Now().Format("20060102150405.000000000")))
+		return "", fmt.Errorf("generate CSRF token: %w", err)
 	}
-	return base64.StdEncoding.EncodeToString(b)
+	return base64.StdEncoding.EncodeToString(b), nil
 }
 
-// clientIP extracts the client IP from the request, respecting X-Forwarded-For.
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+func remoteIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+func (s *Server) isTrustedProxy(r *http.Request) bool {
+	ip := net.ParseIP(remoteIP(r))
+	if ip == nil {
+		return false
+	}
+	for _, trusted := range s.cfg.TrustedProxies {
+		if trustedIP := net.ParseIP(trusted); trustedIP != nil {
+			if trustedIP.Equal(ip) {
+				return true
+			}
+			continue
+		}
+		if _, network, err := net.ParseCIDR(trusted); err == nil && network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// isHTTPS determines whether the request was made over HTTPS. Forwarded
+// headers are honored only when the immediate peer is explicitly trusted.
+func (s *Server) isHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if !s.isTrustedProxy(r) {
+		return false
+	}
+	proto, _, _ := strings.Cut(r.Header.Get("X-Forwarded-Proto"), ",")
+	return strings.EqualFold(strings.TrimSpace(proto), "https")
+}
+
+// clientIP extracts the client IP from the request. Forwarded headers are
+// honored only when the immediate peer is explicitly trusted.
+func (s *Server) clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" && s.isTrustedProxy(r) {
 		parts := strings.SplitN(xff, ",", 2)
 		return strings.TrimSpace(parts[0])
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
+	return remoteIP(r)
+}
+
+func (s *Server) newSession() (string, error) {
+	tokenBytes := make([]byte, sessionTokenBytes)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return "", fmt.Errorf("generate session token: %w", err)
 	}
-	return host
+	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
+	now := time.Now()
+	s.sessionMu.Lock()
+	for existing, expires := range s.sessions {
+		if !expires.After(now) {
+			delete(s.sessions, existing)
+		}
+	}
+	s.sessions[token] = now.Add(sessionLifetime)
+	s.sessionMu.Unlock()
+	return token, nil
+}
+
+func (s *Server) validSession(token string) bool {
+	now := time.Now()
+	valid := 0
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	for existing, expires := range s.sessions {
+		if !expires.After(now) {
+			delete(s.sessions, existing)
+			continue
+		}
+		valid |= subtle.ConstantTimeCompare([]byte(existing), []byte(token))
+	}
+	return valid == 1
+}
+
+func (s *Server) deleteSession(token string) {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	for existing := range s.sessions {
+		if subtle.ConstantTimeCompare([]byte(existing), []byte(token)) == 1 {
+			delete(s.sessions, existing)
+		}
+	}
 }
 
 // getRateLimitBackoff returns the required backoff duration and whether the IP is rate-limited.
@@ -355,18 +433,12 @@ func (s *Server) Subscribe() chan models.QueryEvent {
 	return ch
 }
 
-// Unsubscribe removes a subscriber channel and closes it.
+// Unsubscribe removes a subscriber channel. BroadcastEvent owns channel
+// closure so removal cannot race with a concurrent send.
 func (s *Server) Unsubscribe(ch chan models.QueryEvent) {
 	s.subMu.Lock()
 	delete(s.subscribers, ch)
 	s.subMu.Unlock()
-	// Non-blocking close to prevent panic on double-close
-	select {
-	case <-ch:
-		// already closed or drained
-	default:
-		close(ch)
-	}
 }
 
 // BroadcastEvent safely sends an event to all SSE subscribers.
@@ -408,30 +480,22 @@ func (s *Server) BroadcastEvent(e models.QueryEvent) {
 		s.metrics.RecordUpstreamLatency(e.Upstream, e.Latency.Float64)
 	}
 
-	s.subMu.RLock()
-	defer s.subMu.RUnlock()
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
 	for ch, drops := range s.subscribers {
 		select {
 		case ch <- e:
 			if drops > 0 {
-				s.subMu.RUnlock()
-				s.subMu.Lock()
 				s.subscribers[ch] = 0
-				s.subMu.Unlock()
-				s.subMu.RLock()
 			}
 		default:
 			s.subDropCnt.Add(1)
-			s.subMu.RUnlock()
-			s.subMu.Lock()
 			s.subscribers[ch] = drops + 1
 			if s.subscribers[ch] > 10 {
 				log.Printf("Dropping slow subscriber")
 				delete(s.subscribers, ch)
 				close(ch)
 			}
-			s.subMu.Unlock()
-			s.subMu.RLock()
 		}
 	}
 }
@@ -576,16 +640,17 @@ func (s *Server) SetupMux() http.Handler {
 	// Item 68: Upstream latency alerts
 	mux.Handle("/api/upstreams/latency", s.authMiddleware(http.HandlerFunc(s.handleUpstreamLatency)))
 
-	// Internal/System routes (protected by IngestSecret if set, or authMiddleware)
-	mux.HandleFunc("/api/ingest", s.handleIngest)
+	// Internal/System routes use their bearer secret when configured and fall
+	// back to normal web authentication otherwise.
+	mux.Handle("/api/ingest", s.internalAuth(http.HandlerFunc(s.handleIngest)))
 
 	// Item 92: Heartbeat endpoint for slave nodes
-	mux.HandleFunc("/api/heartbeat", s.handleHeartbeat)
+	mux.Handle("/api/heartbeat", s.internalAuth(http.HandlerFunc(s.handleHeartbeat)))
 
 	// Items 90, 91, 94: Sync endpoints for slave configuration
-	mux.HandleFunc("/api/sync/aliases", s.handleSyncAliases)
-	mux.HandleFunc("/api/sync/dns-routes", s.handleSyncDNSRoutes)
-	mux.HandleFunc("/api/sync/upstream-health", s.handleSyncUpstreamHealth)
+	mux.Handle("/api/sync/aliases", s.internalAuth(http.HandlerFunc(s.handleSyncAliases)))
+	mux.Handle("/api/sync/dns-routes", s.internalAuth(http.HandlerFunc(s.handleSyncDNSRoutes)))
+	mux.Handle("/api/sync/upstream-health", s.internalAuth(http.HandlerFunc(s.handleSyncUpstreamHealth)))
 
 	// Item 89: Node discovery and status endpoint
 	mux.Handle("/api/nodes", s.authMiddleware(http.HandlerFunc(s.handleNodes)))
@@ -653,7 +718,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(&buf, "# HELP dns_queries_by_type Queries by DNS record type\n")
 	fmt.Fprintf(&buf, "# TYPE dns_queries_by_type counter\n")
 	m.queriesByType.Range(func(key, value interface{}) bool {
-		fmt.Fprintf(&buf, "dns_queries_by_type{type=\"%s\"} %d\n", key, value.(*atomic.Int64).Load())
+		fmt.Fprintf(&buf, "dns_queries_by_type{type=\"%s\"} %d\n", escapePrometheusLabel(fmt.Sprint(key)), value.(*atomic.Int64).Load())
 		return true
 	})
 
@@ -666,9 +731,10 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		defer lb.mu.Unlock()
 		if lb.count > 0 {
 			avg := lb.sum / float64(lb.count) / 1000.0 // ms to seconds
-			fmt.Fprintf(&buf, "dns_upstream_latency_seconds{upstream=\"%s\",quantile=\"avg\"} %f\n", key, avg)
-			fmt.Fprintf(&buf, "dns_upstream_latency_seconds_count{upstream=\"%s\"} %d\n", key, lb.count)
-			fmt.Fprintf(&buf, "dns_upstream_latency_seconds_sum{upstream=\"%s\"} %f\n", key, lb.sum/1000.0)
+			label := escapePrometheusLabel(fmt.Sprint(key))
+			fmt.Fprintf(&buf, "dns_upstream_latency_seconds{upstream=\"%s\",quantile=\"avg\"} %f\n", label, avg)
+			fmt.Fprintf(&buf, "dns_upstream_latency_seconds_count{upstream=\"%s\"} %d\n", label, lb.count)
+			fmt.Fprintf(&buf, "dns_upstream_latency_seconds_sum{upstream=\"%s\"} %f\n", label, lb.sum/1000.0)
 		}
 		return true
 	})
@@ -697,6 +763,19 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	_, _ = buf.WriteTo(w)
 }
 
+func escapePrometheusLabel(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, "\n", `\n`)
+	return strings.ReplaceAll(value, `"`, `\"`)
+}
+
+func (s *Server) internalAuth(next http.Handler) http.Handler {
+	if s.cfg.IngestSecret != "" {
+		return next
+	}
+	return s.authMiddleware(next)
+}
+
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// If no auth is configured, allow all
@@ -707,7 +786,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 
 		// Check for session cookie
 		cookie, err := r.Cookie(sessionCookieName)
-		if err == nil && cookie.Value == "authenticated" {
+		if err == nil && s.validSession(cookie.Value) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -730,7 +809,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method == http.MethodGet {
 		// Generate CSRF token
-		csrfToken := generateCSRFToken()
+		csrfToken, err := generateCSRFToken()
+		if err != nil {
+			log.Printf("CSRF token generation error: %v", err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
 
 		// Set CSRF cookie (HttpOnly, Secure if HTTPS, SameSite=Strict)
 		http.SetCookie(w, &http.Cookie{
@@ -738,7 +822,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			Value:    csrfToken,
 			Path:     "/",
 			HttpOnly: true,
-			Secure:   isHTTPS(r),
+			Secure:   s.isHTTPS(r),
 			SameSite: http.SameSiteStrictMode,
 			MaxAge:   86400 * 7, // 1 week, matches session cookie
 		})
@@ -756,7 +840,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method == http.MethodPost {
 		// --- Rate limiting check ---
-		ip := clientIP(r)
+		ip := s.clientIP(r)
 		if limited, remaining := s.checkRateLimit(ip); limited {
 			w.Header().Set("Retry-After", fmt.Sprintf("%.0f", remaining.Seconds()))
 			http.Error(w, apperr.NewErrRateLimited("too many login attempts", nil).Error(), http.StatusTooManyRequests)
@@ -783,15 +867,21 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		password := r.FormValue("password")
 
 		if username == s.cfg.WebUsername && checkPassword(s.hashedPassword, password) {
+			sessionToken, err := s.newSession()
+			if err != nil {
+				log.Printf("Session token generation error: %v", err)
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				return
+			}
 			// Successful login — reset rate limiter for this IP
 			s.resetRateLimit(ip)
 
 			http.SetCookie(w, &http.Cookie{
 				Name:     sessionCookieName,
-				Value:    "authenticated",
+				Value:    sessionToken,
 				Path:     "/",
 				HttpOnly: true,
-				Secure:   isHTTPS(r),
+				Secure:   s.isHTTPS(r),
 				MaxAge:   86400 * 7, // 1 week
 				SameSite: http.SameSiteStrictMode,
 			})
@@ -801,22 +891,44 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 		// Failed login — record for rate limiting
 		s.recordFailedLogin(ip)
-
-		_ = s.tmpl.ExecuteTemplate(w, "login.html", map[string]interface{}{
-			"Error":   "Invalid username or password",
-			"Nonce":   nonce,
-			"BaseURL": s.cfg.BaseURL,
+		csrfToken, err := generateCSRFToken()
+		if err != nil {
+			log.Printf("CSRF token generation error: %v", err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     csrfCookieName,
+			Value:    csrfToken,
+			Path:     "/",
+			HttpOnly: true,
+			Secure:   s.isHTTPS(r),
+			SameSite: http.SameSiteStrictMode,
+			MaxAge:   int(sessionLifetime.Seconds()),
 		})
+
+		if err := s.tmpl.ExecuteTemplate(w, "login.html", map[string]interface{}{
+			"Error":     "Invalid username or password",
+			"Nonce":     nonce,
+			"CSRFToken": csrfToken,
+			"BaseURL":   s.cfg.BaseURL,
+		}); err != nil {
+			log.Printf("Template execution error: %v", err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		}
 	}
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if cookie, err := r.Cookie(sessionCookieName); err == nil {
+		s.deleteSession(cookie.Value)
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   isHTTPS(r),
+		Secure:   s.isHTTPS(r),
 		MaxAge:   -1,
 		SameSite: http.SameSiteStrictMode,
 	})
@@ -826,7 +938,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   isHTTPS(r),
+		Secure:   s.isHTTPS(r),
 		MaxAge:   -1,
 		SameSite: http.SameSiteStrictMode,
 	})
@@ -1434,10 +1546,7 @@ func (s *Server) handleSyncAliases(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	aliases := s.cfg.ClientAliases
-	if aliases == nil {
-		aliases = make(map[string]string)
-	}
+	aliases := s.cfg.GetAllClientAliases()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(aliases)
@@ -1561,13 +1670,21 @@ func (s *Server) Start(ctx context.Context, staticHandler http.Handler, cspMiddl
 		return err
 	}
 
+	shutdownDone := make(chan struct{})
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cfg.HTTPShutdownTimeout)
 		defer cancel()
-		_ = server.Shutdown(shutdownCtx)
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("HTTP server shutdown error: %v", err)
+		}
+		close(shutdownDone)
 	}()
 
 	log.Printf("Starting Advanced Web GUI on %s", server.Addr)
-	return server.Serve(ln)
+	err = server.Serve(ln)
+	if ctx.Err() != nil {
+		<-shutdownDone
+	}
+	return err
 }

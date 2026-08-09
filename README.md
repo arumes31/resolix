@@ -82,7 +82,7 @@ docker-compose -f docker-compose.example.yaml up -d
 
 ### Performance Optimization
 
-The provided `docker-compose.yaml` includes kernel `sysctls` optimizations:
+The provided `docker-compose.example.yaml` includes kernel `sysctls` optimizations:
 
 - `net.core.somaxconn=1024`: Higher connection backlog for heavy traffic.
 - `net.ipv4.tcp_fastopen=3`: Reduces latency for repeated TCP connections.

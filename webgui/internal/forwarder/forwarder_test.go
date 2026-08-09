@@ -16,7 +16,23 @@ import (
 	"time"
 
 	"tailscale-dnsrewrite/webgui/internal/config"
+	"tailscale-dnsrewrite/webgui/internal/models"
 )
+
+// testEvents builds query events with the given domains for "test-node".
+func testEvents(domains ...string) []models.QueryEvent {
+	events := make([]models.QueryEvent, len(domains))
+	for i, d := range domains {
+		events[i] = models.QueryEvent{
+			UnixTime: time.Now().Unix(),
+			Type:     "A",
+			Domain:   d,
+			ClientIP: "192.0.2.1",
+			Node:     "test-node",
+		}
+	}
+	return events
+}
 
 // decodeJSONBody handles both gzip-compressed and uncompressed request bodies.
 func decodeJSONBody(r *http.Request, v interface{}) error {
@@ -44,8 +60,8 @@ func TestEnqueue_SlaveMode(t *testing.T) {
 	cfg := &config.Config{Mode: "slave", MasterURL: "http://localhost:12345", NodeName: "test-node"}
 	fwd := NewForwarder(cfg)
 
-	fwd.Enqueue("line1")
-	fwd.Enqueue("line2")
+	fwd.EnqueueEvent(models.QueryEvent{Domain: "line1.example.com", Node: "test-node"})
+	fwd.EnqueueEvent(models.QueryEvent{Domain: "line2.example.com", Node: "test-node"})
 
 	fwd.backlogMu.Lock()
 	count := len(fwd.backlog)
@@ -60,7 +76,7 @@ func TestEnqueue_MasterMode(t *testing.T) {
 	cfg := &config.Config{Mode: "master", NodeName: "test-node"}
 	fwd := NewForwarder(cfg)
 
-	fwd.Enqueue("line1")
+	fwd.EnqueueEvent(models.QueryEvent{Domain: "line1.example.com", Node: "test-node"})
 
 	fwd.backlogMu.Lock()
 	count := len(fwd.backlog)
@@ -75,7 +91,7 @@ func TestEnqueue_NoMasterURL(t *testing.T) {
 	cfg := &config.Config{Mode: "slave", MasterURL: "", NodeName: "test-node"}
 	fwd := NewForwarder(cfg)
 
-	fwd.Enqueue("line1")
+	fwd.EnqueueEvent(models.QueryEvent{Domain: "line1.example.com", Node: "test-node"})
 
 	fwd.backlogMu.Lock()
 	count := len(fwd.backlog)
@@ -91,13 +107,13 @@ func TestEnqueue_MaxBacklogSize(t *testing.T) {
 		Mode:           "slave",
 		MasterURL:      "http://localhost:12345",
 		NodeName:       "test-node",
-		MaxBacklogSize: 100, // Small limit
+		MaxBacklogSize: 2048, // Small limit (a few events)
 	}
 	fwd := NewForwarder(cfg)
 
-	// Add lines that will exceed the max backlog size
+	// Add events that will exceed the max backlog size
 	for i := 0; i < 200; i++ {
-		fwd.Enqueue(fmt.Sprintf("line-%d-this-is-a-longer-line-to-exceed-size", i))
+		fwd.EnqueueEvent(models.QueryEvent{Domain: fmt.Sprintf("line-%d-this-is-a-longer-domain-to-exceed-size.example.com", i), Node: "test-node"})
 	}
 
 	fwd.backlogMu.Lock()
@@ -116,10 +132,7 @@ func TestEnqueue_MaxBacklogSize(t *testing.T) {
 }
 
 func TestSendBatch_Success(t *testing.T) {
-	var receivedPayload struct {
-		Node  string   `json:"node"`
-		Batch []string `json:"batch"`
-	}
+	var receivedEvents []models.QueryEvent
 	var requestCount atomic.Int32
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -130,7 +143,7 @@ func TestSendBatch_Success(t *testing.T) {
 			t.Errorf("expected Content-Type application/json, got %s", ct)
 		}
 
-		if err := decodeJSONBody(r, &receivedPayload); err != nil {
+		if err := decodeJSONBody(r, &receivedEvents); err != nil {
 			t.Errorf("failed to decode payload: %v", err)
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -146,8 +159,8 @@ func TestSendBatch_Success(t *testing.T) {
 	fwd := NewForwarder(cfg)
 
 	client := &http.Client{Timeout: 5 * time.Second}
-	lines := []string{"line1", "line2", "line3"}
-	err := fwd.sendBatch(client, lines, nil)
+	events := testEvents("one.example.com", "two.example.com", "three.example.com")
+	err := fwd.sendBatch(client, events, nil)
 	if err != nil {
 		t.Fatalf("sendBatch failed: %v", err)
 	}
@@ -155,11 +168,13 @@ func TestSendBatch_Success(t *testing.T) {
 	if requestCount.Load() != 1 {
 		t.Errorf("expected 1 request, got %d", requestCount.Load())
 	}
-	if receivedPayload.Node != "test-node" {
-		t.Errorf("expected node 'test-node', got %s", receivedPayload.Node)
+	if len(receivedEvents) != 3 {
+		t.Errorf("expected 3 batch items, got %d", len(receivedEvents))
 	}
-	if len(receivedPayload.Batch) != 3 {
-		t.Errorf("expected 3 batch items, got %d", len(receivedPayload.Batch))
+	for _, ev := range receivedEvents {
+		if ev.Node != "test-node" {
+			t.Errorf("expected node 'test-node', got %s", ev.Node)
+		}
 	}
 }
 
@@ -182,7 +197,7 @@ func TestSendBatch_WithIngestSecret(t *testing.T) {
 	fwd := NewForwarder(cfg)
 
 	client := &http.Client{Timeout: 5 * time.Second}
-	err := fwd.sendBatch(client, []string{"line1"}, nil)
+	err := fwd.sendBatch(client, testEvents("line1.example.com"), nil)
 	if err != nil {
 		t.Fatalf("sendBatch failed: %v", err)
 	}
@@ -208,7 +223,7 @@ func TestSendBatch_ServerError(t *testing.T) {
 	fwd := NewForwarder(cfg)
 
 	client := &http.Client{Timeout: 5 * time.Second}
-	err := fwd.sendBatch(client, []string{"line1"}, nil)
+	err := fwd.sendBatch(client, testEvents("line1.example.com"), nil)
 	if err == nil {
 		t.Error("expected error for 500 response, got nil")
 	}
@@ -224,7 +239,7 @@ func TestSendBatch_ConnectionRefused(t *testing.T) {
 	fwd := NewForwarder(cfg)
 
 	client := &http.Client{Timeout: 1 * time.Second}
-	err := fwd.sendBatch(client, []string{"line1"}, nil)
+	err := fwd.sendBatch(client, testEvents("line1.example.com"), nil)
 	if err == nil {
 		t.Error("expected error for connection refused, got nil")
 	}
@@ -315,8 +330,8 @@ func TestStart_StopDrain(t *testing.T) {
 	fwd := NewForwarder(cfg)
 
 	// Enqueue some lines
-	fwd.Enqueue("drain-line-1")
-	fwd.Enqueue("drain-line-2")
+	fwd.EnqueueEvent(models.QueryEvent{Domain: "drain1.example.com", Node: "test-node"})
+	fwd.EnqueueEvent(models.QueryEvent{Domain: "drain2.example.com", Node: "test-node"})
 
 	// Start the forwarder in a goroutine
 	done := make(chan error, 1)
@@ -374,7 +389,7 @@ func TestRetryMechanism(t *testing.T) {
 	fwd := NewForwarder(cfg)
 
 	// Enqueue a line
-	fwd.Enqueue("retry-line")
+	fwd.EnqueueEvent(models.QueryEvent{Domain: "retry.example.com", Node: "test-node"})
 
 	done := make(chan error, 1)
 	go func() {
@@ -408,13 +423,10 @@ func TestBatchSizeLimit(t *testing.T) {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		var payload struct {
-			Node  string   `json:"node"`
-			Batch []string `json:"batch"`
-		}
-		_ = decodeJSONBody(r, &payload)
+		var events []models.QueryEvent
+		_ = decodeJSONBody(r, &events)
 		mu.Lock()
-		batchSizes = append(batchSizes, len(payload.Batch))
+		batchSizes = append(batchSizes, len(events))
 		mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -434,7 +446,7 @@ func TestBatchSizeLimit(t *testing.T) {
 
 	// Enqueue more than 100 lines
 	for i := 0; i < 150; i++ {
-		fwd.Enqueue(fmt.Sprintf("batch-line-%d", i))
+		fwd.EnqueueEvent(models.QueryEvent{Domain: fmt.Sprintf("batch-line-%d.example.com", i), Node: "test-node"})
 	}
 
 	done := make(chan error, 1)
@@ -624,7 +636,7 @@ func TestVersionHeaders(t *testing.T) {
 	fwd := NewForwarder(cfg)
 
 	client := &http.Client{Timeout: 5 * time.Second}
-	_ = fwd.sendBatch(client, []string{"line1"}, nil)
+	_ = fwd.sendBatch(client, testEvents("line1.example.com"), nil)
 
 	if nodeVersion != Version {
 		t.Errorf("expected X-Node-Version '%s', got '%s'", Version, nodeVersion)

@@ -20,7 +20,6 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -1003,13 +1002,28 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		bodyReader = gzReader
 	}
 
+	// MaxBytesReader (step 2) turns an over-limit body into a read error.
+	body, err := io.ReadAll(bodyReader)
+	if err != nil {
+		http.Error(w, apperr.NewErrParseFailed("payload too large or bad request", err).Error(), http.StatusBadRequest)
+		return
+	}
+
+	// New format: a top-level JSON array of QueryEvent (structured events
+	// from dnsserver-based slaves). Legacy format: an object with raw dnsmasq
+	// log lines parsed via internal/parser.
+	if bytes.HasPrefix(bytes.TrimSpace(body), []byte("[")) {
+		s.handleIngestEvents(w, r, body)
+		return
+	}
+
 	var payload struct {
 		Node   string             `json:"node"`
 		Line   string             `json:"line"`
 		Batch  []string           `json:"batch"`
 		Health map[string]float64 `json:"health,omitempty"`
 	}
-	if err := json.NewDecoder(bodyReader).Decode(&payload); err != nil {
+	if err := json.Unmarshal(body, &payload); err != nil {
 		http.Error(w, apperr.NewErrParseFailed("payload too large or bad request", err).Error(), http.StatusBadRequest)
 		return
 	}
@@ -1058,6 +1072,55 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 			status.BuildInfo = v
 		}
 		s.store.SetNodeStatus(payload.Node, status)
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleIngestEvents processes the new ingest format: a top-level JSON array
+// of models.QueryEvent produced by dnsserver-based slaves. Node status is
+// updated from the X-Node-* headers as with legacy payloads.
+func (s *Server) handleIngestEvents(w http.ResponseWriter, r *http.Request, body []byte) {
+	var events []models.QueryEvent
+	if err := json.Unmarshal(body, &events); err != nil {
+		http.Error(w, apperr.NewErrParseFailed("invalid events payload", err).Error(), http.StatusBadRequest)
+		return
+	}
+	if len(events) > 100 {
+		http.Error(w, "Batch too large (max 100)", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	node := ""
+	for i := range events {
+		if events[i].UnixTime == 0 {
+			events[i].UnixTime = time.Now().Unix()
+		}
+		if node == "" {
+			node = events[i].Node
+		}
+		s.store.AddEvent(events[i])
+		s.BroadcastEvent(events[i])
+	}
+
+	// Item 88: Update node status from version headers on ingest, merging the
+	// header-derived fields into the existing status so heartbeat-provided
+	// values (MemoryMB, Goroutines, DBSizeMB, UpstreamHealth) are preserved.
+	if node != "" {
+		status := models.NodeStatus{Name: node}
+		if existing := s.store.GetNodeStatus(node); existing != nil {
+			status = *existing
+		}
+		if v := r.Header.Get("X-Node-Version"); v != "" {
+			status.Version = v
+		}
+		if v := r.Header.Get("X-Go-Version"); v != "" {
+			status.GoVersion = v
+		}
+		if v := r.Header.Get("X-Node-Build"); v != "" {
+			status.BuildInfo = v
+		}
+		s.store.SetNodeStatus(node, status)
 	}
 
 	w.WriteHeader(http.StatusNoContent)
@@ -1132,7 +1195,17 @@ func (s *Server) handleSimulate(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	ips, err := (&net.Resolver{}).LookupIPAddr(ctx, domain)
+	// Resolve through the in-process DNS server so the full pipeline
+	// (rewrites, cache, upstream forwarding) is exercised.
+	dnsAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(s.cfg.DNSListenPort))
+	localResolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			d := net.Dialer{}
+			return d.DialContext(ctx, network, dnsAddr)
+		},
+	}
+	ips, err := localResolver.LookupIPAddr(ctx, domain)
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			w.WriteHeader(http.StatusGatewayTimeout)
@@ -1323,63 +1396,14 @@ func (s *Server) handlePostUpstreams(w http.ResponseWriter, r *http.Request) {
 }
 
 // ===== Item 63: Cache Clear Endpoint =====
+// dnsmasq (and its SIGUSR1 PID-file cache clear) has been replaced by the
+// in-process DNS server; an in-process cache clear lands in a later step.
 func (s *Server) handleCacheClear(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-
-	// On Windows, SIGUSR1 is not supported
-	if runtime.GOOS == "windows" {
-		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  "error",
-			"message": "Cache clear signal (SIGUSR1) is not supported on Windows",
-		})
-		return
-	}
-
-	pidFile := s.cfg.DNSMasqPIDFile
-	data, err := os.ReadFile(pidFile) // #nosec G304 -- PID file path comes from trusted config (DNSMASQ_PID_FILE env or built-in default), not from request input
-	if err != nil {
-		w.WriteHeader(http.StatusNotFound)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  "error",
-			"message": fmt.Sprintf("PID file not found: %s", pidFile),
-		})
-		return
-	}
-
-	pidStr := strings.TrimSpace(string(data))
-	pid, err := strconv.Atoi(pidStr)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  "error",
-			"message": fmt.Sprintf("Invalid PID in file: %s", pidStr),
-		})
-		return
-	}
-
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  "error",
-			"message": fmt.Sprintf("Failed to find process %d: %v", pid, err),
-		})
-		return
-	}
-
-	if err := sendCacheClearSignal(proc); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  "error",
-			"message": fmt.Sprintf("Failed to send cache clear signal to process %d: %v", pid, err),
-		})
-		return
-	}
-
+	w.WriteHeader(http.StatusNotImplemented)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":  "ok",
-		"message": "DNS cache clear signal sent",
+		"status":  "error",
+		"message": "Cache clear is not supported; in-process cache clear lands in a later step",
 	})
 }
 

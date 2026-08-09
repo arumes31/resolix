@@ -20,7 +20,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.Version=v2.2.0" -o
 FROM alpine:3.24
 
 # Install runtime dependencies (including those required by Tailscale)
-RUN apk add --no-cache dnsmasq bash bind-tools ca-certificates iptables iproute2 ip6tables
+RUN apk add --no-cache bash bind-tools ca-certificates iptables iproute2 ip6tables
 
 # Copy Tailscale binaries from the latest stable release.
 COPY --from=tailscale/tailscale:v1.102.2 /usr/local/bin/tailscale /usr/bin/tailscale

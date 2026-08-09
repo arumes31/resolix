@@ -65,6 +65,8 @@ docker-compose -f docker-compose.example.yaml up -d
 |----------|-------------|---------|
 | `TS_AUTHKEY` | Tailscale Authentication Key (Required) | - |
 | `UPSTREAM_DNS` | Space-separated upstream DNS servers (supports `IP#port`) | `8.8.8.8 8.8.4.4` |
+| `DNS_LISTEN_ADDR` | DNS server listen address (defaults to `TAILSCALE_IP`, then `0.0.0.0`) | - |
+| `DNS_LISTEN_PORT` | DNS server listen port (dev/test override) | `53` |
 | `DOMAINS` | Comma-separated `domain:ip` mappings | - |
 | `HEALTHCHECK_DOMAIN` | Domain used for upstream health checks | `google.com` |
 | `PORT` | Web GUI listening port | `35353` |
@@ -170,8 +172,8 @@ This endpoint does **not** require authentication and performs no database queri
 ## 🛠️ How It Works
 
 1. **Tailscale Connection**: The container joins your Tailnet and gets a unique IP.
-2. **DNS Logic**: `dnsmasq` listens on the Tailscale IP, resolving custom mappings first and then forwarding to healthy upstreams.
-3. **In-Memory Pipe**: Logs are streamed from `dnsmasq` through a named pipe directly into the Web GUI's RAM buffer.
+2. **DNS Logic**: An embedded Go DNS server (miekg/dns) listens on the Tailscale IP port 53 — dnsmasq is no longer used. It resolves custom static mappings (`DOMAINS`) first, then serves from its in-memory cache, then forwards to upstreams in strict order.
+3. **In-Process Events**: Every answered query becomes a structured event fed directly into the Web GUI's RAM buffer and SSE stream (no log pipe).
 4. **Persistent Storage**: Events are batched and persisted to a local SQLite database every 30 seconds, ensuring zero data loss and instant dashboard responsiveness.
 
 ---
@@ -198,8 +200,8 @@ We maintain high code quality and security standards using the following tools:
 - **Verify DNS**: `nslookup mydomain.internal <TAILSCALE_IP>`
 - **Tailscale Status**: `docker exec -it dns-tailscale-1 tailscale status`
 - **Upstream Health**: `docker exec -it dns-tailscale-1 dig @<UPSTREAM_IP> google.com`
-- **Config Validation**: `docker exec -it dns-tailscale-1 cat -v /etc/dnsmasq.conf`
-- **CRLF Issues**: If dnsmasq dies immediately, the build-time `sed` scripts should have fixed this, but ensure your `entrypoint.sh` is saved with LF endings.
+- **Config Validation**: `docker exec -it dns-tailscale-1 env | grep -E 'DNS_LISTEN|UPSTREAM_DNS|DOMAINS'`
+- **CRLF Issues**: If the container exits immediately, ensure your `entrypoint.sh` is saved with LF endings.
 - **Health Check**: `curl http://localhost:35353/healthz` — should return `{"status":"ok"}`
 
 ---

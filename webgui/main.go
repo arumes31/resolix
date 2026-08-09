@@ -5,8 +5,6 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/rand"
 	"embed"
@@ -19,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,9 +25,11 @@ import (
 	"tailscale-dnsrewrite/webgui/internal/blocklist"
 	"tailscale-dnsrewrite/webgui/internal/config"
 	"tailscale-dnsrewrite/webgui/internal/dnsroutes"
+	"tailscale-dnsrewrite/webgui/internal/dnsserver"
 	"tailscale-dnsrewrite/webgui/internal/forwarder"
 	"tailscale-dnsrewrite/webgui/internal/health"
 	"tailscale-dnsrewrite/webgui/internal/logger"
+	"tailscale-dnsrewrite/webgui/internal/models"
 	"tailscale-dnsrewrite/webgui/internal/parser"
 	"tailscale-dnsrewrite/webgui/internal/resolver"
 	"tailscale-dnsrewrite/webgui/internal/storage"
@@ -203,7 +204,12 @@ DB_PATH=dns.db
 # Path to a JSON file with domain-specific DNS routing rules (Item 66)
 # DNS_ROUTES_FILE=/etc/tailscale-dnsrewrite/dns-routes.json
 
-# Path to the dnsmasq PID file for cache clearing (Item 63)
+# DNS server listen address and port for the embedded DNS server (replaces dnsmasq)
+# DNS_LISTEN_ADDR defaults to TAILSCALE_IP (set by entrypoint.sh), then 0.0.0.0
+# DNS_LISTEN_ADDR=0.0.0.0
+# DNS_LISTEN_PORT=53
+
+# Deprecated: dnsmasq was replaced by the in-process DNS server (Item 63)
 # DNSMASQ_PID_FILE=/run/dnsmasq.pid
 
 # Upstream latency alert threshold in milliseconds (Item 68, default: 200)
@@ -383,11 +389,31 @@ func main() {
 		}
 	}()
 
-	// Log Ingestion — ingestDone closes when the parser loop has fully exited.
-	ingestDone := make(chan struct{})
+	// Embedded DNS server (replaces dnsmasq). Pipeline: static rewrites →
+	// cache → strict-order upstream forward → cache store → respond. Each
+	// answered query becomes a QueryEvent fed into Store + SSE (and the
+	// forwarder in slave mode). dnsDone closes when both listeners have
+	// stopped, so shutdown can archive after events have ceased.
+	dnsSrv := dnsserver.New(dnsserver.Config{
+		Addr:        cfg.DNSListenAddr,
+		Port:        cfg.DNSListenPort,
+		Upstreams:   strings.Fields(cfg.UpstreamDNS),
+		StaticHosts: dnsserver.ParseStaticHosts(cfg.Domains),
+		NodeName:    cfg.NodeName,
+	}, func(ev models.QueryEvent) {
+		store.AddEvent(ev)
+		srv.BroadcastEvent(ev)
+		if cfg.Mode == "slave" {
+			fwd.EnqueueEvent(ev)
+		}
+	})
+	dnsDone := make(chan struct{})
 	go func() {
-		defer close(ingestDone)
-		startLogIngestion(ctx, cfg, fwd, prs, srv)
+		defer close(dnsDone)
+		logger.Info("DNS server listening on %s (UDP+TCP)", dnsSrv.ListenAddr())
+		if err := dnsSrv.Start(ctx); err != nil {
+			errChan <- err
+		}
 	}()
 
 	// Start HTTP server and report completion so shutdown can wait before
@@ -436,10 +462,10 @@ func main() {
 		waitForHTTPServer(cfg, serverDone)
 	}
 
-	// Step 6: Flush pending batch buffers to SQLite. Wait for the ingestion
-	// parser loop to exit first so no in-flight parse races the archive.
-	logger.Info("Shutdown step 6: Waiting for log ingestion to stop...")
-	<-ingestDone
+	// Step 6: Flush pending batch buffers to SQLite. Wait for the DNS
+	// listeners to stop first so no in-flight query races the archive.
+	logger.Info("Shutdown step 6: Waiting for DNS server to stop...")
+	<-dnsDone
 	logger.Info("Shutdown step 6: Flushing pending batch buffers to SQLite...")
 	archived := store.ArchiveStep(time.Now())
 	logger.Info("Shutdown step 6: Archived %d events to SQLite", archived)
@@ -454,63 +480,6 @@ func main() {
 	logger.CloseFile()
 
 	logger.Info("Graceful shutdown complete")
-}
-
-// startLogIngestion reads dnsmasq log lines from stdin, mirrors them to the
-// logs, forwards them to the master in slave mode, and broadcasts parsed
-// events to SSE subscribers. It returns when ctx is canceled or stdin closes.
-func startLogIngestion(ctx context.Context, cfg *config.Config, fwd *forwarder.Forwarder, prs *parser.Parser, srv *api.Server) {
-	linesCh := make(chan []byte)
-	go func() {
-		logger.Info("Log ingestion scanner started on stdin")
-		scanner := bufio.NewScanner(os.Stdin)
-		for scanner.Scan() {
-			buf := scanner.Bytes()
-			line := make([]byte, len(buf))
-			copy(line, buf)
-			// Cancellation-aware send: never stay blocked on a full channel
-			// while the parser loop is shutting down.
-			select {
-			case linesCh <- line:
-			case <-ctx.Done():
-				return
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			logger.Warning("stdin scan error: %v", err)
-		}
-		logger.Info("Log ingestion scanner reached EOF")
-		close(linesCh)
-	}()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case line, ok := <-linesCh:
-			if !ok {
-				logger.Info("Log ingestion loop exiting: channel closed")
-				return
-			}
-			isData := bytes.Contains(line, []byte("query[")) || bytes.Contains(line, []byte("reply"))
-			if isData {
-				if cfg.Debug {
-					logger.Debug("[INGEST] %s", string(line))
-				}
-			} else {
-				// Always print non-query/reply lines as they are likely errors or important info
-				logger.Info("[DNSMASQ] %s", string(line))
-			}
-
-			if cfg.Mode == "slave" {
-				fwd.Enqueue(string(line))
-			}
-			ev := prs.ParseLogBytes(line, cfg.NodeName)
-			if ev != nil {
-				srv.BroadcastEvent(*ev)
-			}
-		}
-	}
 }
 
 // waitForHTTPServer waits for the HTTP server goroutine to finish, giving up

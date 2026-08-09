@@ -117,6 +117,44 @@ func TestApiIngest(t *testing.T) {
 	}
 }
 
+// TestApiIngestEvents verifies the new ingest format: a top-level JSON array
+// of structured QueryEvent produced by dnsserver-based slaves.
+func TestApiIngestEvents(t *testing.T) {
+	_, store, _, srv := setupTest()
+	defer func() { _ = os.RemoveAll(store.GetConfig().HistoryDir) }()
+
+	now := time.Now().Unix()
+	events := []models.QueryEvent{
+		{UnixTime: now, Type: "A", Domain: "e1.example.com", ClientIP: "100.64.0.1", Node: "slave-1", Upstream: "8.8.8.8:53", ResponseCode: "NOERROR"},
+		{UnixTime: now, Type: "AAAA", Domain: "e2.example.com", ClientIP: "100.64.0.2", Node: "slave-1", Upstream: "System Cache", ResponseCode: "NXDOMAIN"},
+	}
+	data, _ := json.Marshal(events)
+
+	req := httptest.NewRequest("POST", "/api/ingest", bytes.NewBuffer(data))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+
+	srv.SetupMux().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Errorf("Expected status 204, got %d", rr.Code)
+	}
+
+	stored := store.GetRecentEvents(0)
+	if len(stored) != 2 {
+		t.Fatalf("Expected 2 events, got %d", len(stored))
+	}
+	// GetRecentEvents returns newest first.
+	if stored[1].Domain != "e1.example.com" || stored[1].Node != "slave-1" {
+		t.Errorf("Unexpected stored event: %+v", stored[1])
+	}
+
+	// Node status should have been created from the event node name.
+	if ns := store.GetNodeStatus("slave-1"); ns == nil {
+		t.Error("Expected node status for slave-1 after events ingest")
+	}
+}
+
 func TestApiEvents(t *testing.T) {
 	cfg, store, _, srv := setupTest()
 	defer func() { _ = os.RemoveAll(store.GetConfig().HistoryDir) }()
@@ -311,9 +349,9 @@ func TestForwarder_NoPanic(t *testing.T) {
 	cfg := &config.Config{Mode: "slave", MasterURL: "http://localhost:12345", NodeName: "slave-1"}
 	fwd := forwarder.NewForwarder(cfg)
 
-	// Test Enqueue adds to backlog
-	fwd.Enqueue("line1")
-	fwd.Enqueue("line2")
+	// Test EnqueueEvent adds to backlog
+	fwd.EnqueueEvent(models.QueryEvent{Domain: "line1.example.com", Node: "slave-1"})
+	fwd.EnqueueEvent(models.QueryEvent{Domain: "line2.example.com", Node: "slave-1"})
 
 	// Verify backlog indirectly or via reflection if needed,
 	// but let's just ensure no panic and basic functionality.

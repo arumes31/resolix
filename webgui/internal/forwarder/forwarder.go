@@ -22,13 +22,13 @@ import (
 // Version is set at build time via -ldflags.
 var Version = "dev"
 
-// Forwarder handles sending batches of logs from slave to master.
+// Forwarder handles sending batches of query events from slave to master.
 type Forwarder struct {
 	cfg              *config.Config
 	stopChan         chan struct{}
 	stopOnce         sync.Once
 	backlogMu        sync.Mutex
-	backlog          []string
+	backlog          []models.QueryEvent
 	backlogTotalSize int64
 
 	// Sync state (Items 90, 91, 94)
@@ -111,21 +111,34 @@ func (f *Forwarder) GetSyncedUpstreamHealth() map[string]map[string]float64 {
 	return result
 }
 
-// Enqueue adds a log line to the forwarding queue.
-func (f *Forwarder) Enqueue(line string) {
+// EnqueueEvent adds a query event to the forwarding queue.
+func (f *Forwarder) EnqueueEvent(ev models.QueryEvent) {
 	if f.cfg.Mode != "slave" || f.cfg.MasterURL == "" {
 		return
+	}
+	if ev.Node == "" {
+		ev.Node = f.cfg.NodeName
 	}
 	f.backlogMu.Lock()
 	defer f.backlogMu.Unlock()
 
 	// Enforce a maximum backlog size in bytes to prevent OOM (only when limit is configured)
-	if f.cfg.MaxBacklogSize > 0 && f.backlogTotalSize+int64(len(line)) > f.cfg.MaxBacklogSize {
+	if f.cfg.MaxBacklogSize > 0 && f.backlogTotalSize+eventJSONSize(ev) > f.cfg.MaxBacklogSize {
 		return
 	}
 
-	f.backlog = append(f.backlog, line)
-	f.backlogTotalSize += int64(len(line))
+	f.backlog = append(f.backlog, ev)
+	f.backlogTotalSize += eventJSONSize(ev)
+}
+
+// eventJSONSize approximates the serialized size of an event for backlog
+// byte accounting.
+func eventJSONSize(ev models.QueryEvent) int64 {
+	data, err := json.Marshal(ev)
+	if err != nil {
+		return int64(len(ev.Domain) + 64)
+	}
+	return int64(len(data))
 }
 
 // getResourceStats collects current resource usage statistics (Item 93).
@@ -173,16 +186,21 @@ func gzipCompress(data []byte) ([]byte, bool) {
 	return compressed, true
 }
 
-// sendBatch sends a batch of log lines to the master with gzip compression (Item 85).
-func (f *Forwarder) sendBatch(client *http.Client, lines []string, health map[string]float64) error {
-	payload := map[string]interface{}{"node": f.cfg.NodeName}
-	if len(lines) > 0 {
-		payload["batch"] = lines
+// sendBatch sends a batch of query events to the master with gzip
+// compression (Item 85). Events are sent as a top-level JSON array (the new
+// ingest format); health-only payloads keep the legacy object shape.
+func (f *Forwarder) sendBatch(client *http.Client, events []models.QueryEvent, health map[string]float64) error {
+	var data []byte
+	var err error
+	if len(events) > 0 {
+		data, err = json.Marshal(events)
+	} else {
+		payload := map[string]interface{}{"node": f.cfg.NodeName}
+		if len(health) > 0 {
+			payload["health"] = health
+		}
+		data, err = json.Marshal(payload)
 	}
-	if len(health) > 0 {
-		payload["health"] = health
-	}
-	data, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
@@ -497,29 +515,29 @@ func (f *Forwarder) Start() error {
 		if len(f.backlog) < batchSize {
 			batchSize = len(f.backlog)
 		}
-		lines := append([]string(nil), f.backlog[:batchSize]...)
+		events := append([]models.QueryEvent(nil), f.backlog[:batchSize]...)
 
-		for i := 0; i < len(lines); i++ {
-			f.backlogTotalSize -= int64(len(f.backlog[i]))
+		for i := 0; i < len(events); i++ {
+			f.backlogTotalSize -= eventJSONSize(f.backlog[i])
 		}
 		f.backlog = f.backlog[batchSize:]
 		f.backlogMu.Unlock()
 
-		err := f.sendBatch(client, lines, nil)
+		err := f.sendBatch(client, events, nil)
 		if err == nil {
-			log.Printf("Successfully sent batch of %d lines to master", len(lines))
+			log.Printf("Successfully sent batch of %d events to master", len(events))
 			backoffAttempt = 0 // Reset on success (Item 86)
 		} else {
 			log.Printf("Error sending batch to master: %v", err)
 
 			// Item 86: Check max retry attempts
 			if f.cfg.MaxRetryAttempts > 0 && backoffAttempt >= f.cfg.MaxRetryAttempts {
-				log.Printf("[WARN] Max retry attempts (%d) reached, dropping batch of %d lines", f.cfg.MaxRetryAttempts, len(lines))
+				log.Printf("[WARN] Max retry attempts (%d) reached, dropping batch of %d events", f.cfg.MaxRetryAttempts, len(events))
 				backoffAttempt = 0
 				continue
 			}
 
-			f.requeueBatch(lines)
+			f.requeueBatch(events)
 
 			backoffAttempt++
 			// Item 80: use the configured initial retry interval (falls back to 1s when unset/invalid)
@@ -550,32 +568,33 @@ func (f *Forwarder) Start() error {
 }
 
 // requeueBatch prepends a failed batch back onto the backlog, honoring the
-// configured byte limit (the oldest overflow lines are dropped).
-func (f *Forwarder) requeueBatch(lines []string) {
+// configured byte limit (the oldest overflow events are dropped).
+func (f *Forwarder) requeueBatch(events []models.QueryEvent) {
 	f.backlogMu.Lock()
 	defer f.backlogMu.Unlock()
 
 	if f.cfg.MaxBacklogSize <= 0 {
-		f.backlog = append(lines, f.backlog...)
-		for i := 0; i < len(lines); i++ {
-			f.backlogTotalSize += int64(len(lines[i]))
+		f.backlog = append(events, f.backlog...)
+		for i := 0; i < len(events); i++ {
+			f.backlogTotalSize += eventJSONSize(events[i])
 		}
 		return
 	}
 
 	// Re-queue only what fits within the byte limit; drop the oldest overflow
 	kept := 0
-	for _, line := range lines {
-		if f.backlogTotalSize+int64(len(line)) > f.cfg.MaxBacklogSize {
+	for _, ev := range events {
+		size := eventJSONSize(ev)
+		if f.backlogTotalSize+size > f.cfg.MaxBacklogSize {
 			break
 		}
 		kept++
-		f.backlogTotalSize += int64(len(line))
+		f.backlogTotalSize += size
 	}
-	if kept < len(lines) {
-		log.Printf("[WARN] Backlog byte limit (%d) reached, dropping %d oldest lines of failed batch", f.cfg.MaxBacklogSize, len(lines)-kept)
+	if kept < len(events) {
+		log.Printf("[WARN] Backlog byte limit (%d) reached, dropping %d oldest events of failed batch", f.cfg.MaxBacklogSize, len(events)-kept)
 	}
-	f.backlog = append(lines[:kept:kept], f.backlog...)
+	f.backlog = append(events[:kept:kept], f.backlog...)
 }
 
 // startHeartbeat sends periodic heartbeats to the master (Item 92).

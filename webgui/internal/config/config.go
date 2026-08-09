@@ -49,7 +49,13 @@ const (
 	// DefaultDNSRoutesFile is the default path to the DNS routes JSON file.
 	DefaultDNSRoutesFile = ""
 	// DefaultDNSMasqPIDFile is the default path to the dnsmasq PID file.
+	//
+	// Deprecated: dnsmasq has been replaced by the in-process DNS server.
 	DefaultDNSMasqPIDFile = "/run/dnsmasq.pid"
+	// DefaultDNSListenAddr is the default DNS server listen address.
+	DefaultDNSListenAddr = "0.0.0.0"
+	// DefaultDNSListenPort is the default DNS server listen port.
+	DefaultDNSListenPort = 53
 	// DefaultUpstreamLatencyThreshold is the default latency alert threshold in milliseconds.
 	DefaultUpstreamLatencyThreshold = 200
 
@@ -129,7 +135,17 @@ type Config struct {
 	// DNSRoutesFile is the path to the domain-specific DNS routes JSON file.
 	DNSRoutesFile string
 	// DNSMasqPIDFile is the path to the dnsmasq PID file for cache clearing.
+	//
+	// Deprecated: kept for backward compatibility; cache clear is in-process.
 	DNSMasqPIDFile string
+	// DNSListenAddr is the DNS server listen address (DNS_LISTEN_ADDR,
+	// falling back to TAILSCALE_IP, then 0.0.0.0).
+	DNSListenAddr string
+	// DNSListenPort is the DNS server listen port (DNS_LISTEN_PORT, default 53).
+	DNSListenPort int
+	// Domains holds the raw DOMAINS env value (comma-separated domain:ip
+	// static rewrites, same semantics as dnsmasq address=/).
+	Domains string
 	// UpstreamLatencyThreshold is the latency threshold in ms for alerting.
 	UpstreamLatencyThreshold int
 
@@ -573,6 +589,21 @@ func LoadConfig() *Config {
 		dnsmasqPIDFile = DefaultDNSMasqPIDFile
 	}
 
+	// DNS server listen settings: explicit DNS_LISTEN_ADDR wins, then the
+	// TAILSCALE_IP passed through by entrypoint.sh, then 0.0.0.0.
+	dnsListenAddr := os.Getenv("DNS_LISTEN_ADDR")
+	if dnsListenAddr == "" {
+		dnsListenAddr = os.Getenv("TAILSCALE_IP")
+	}
+	if dnsListenAddr == "" {
+		dnsListenAddr = DefaultDNSListenAddr
+	}
+	dnsListenPort := parseIntEnv("DNS_LISTEN_PORT", DefaultDNSListenPort)
+	if dnsListenPort < 1 || dnsListenPort > 65535 {
+		log.Printf("[WARN] DNS_LISTEN_PORT %d out of range, falling back to %d", dnsListenPort, DefaultDNSListenPort)
+		dnsListenPort = DefaultDNSListenPort
+	}
+
 	latencyThreshold := resolveLatencyThreshold()
 
 	// Parse configurable timeout values (Item 80)
@@ -627,6 +658,9 @@ func LoadConfig() *Config {
 		UpstreamsFile:              upstreamsFile,
 		DNSRoutesFile:              dnsRoutesFile,
 		DNSMasqPIDFile:             dnsmasqPIDFile,
+		DNSListenAddr:              dnsListenAddr,
+		DNSListenPort:              dnsListenPort,
+		Domains:                    os.Getenv("DOMAINS"),
 		UpstreamLatencyThreshold:   latencyThreshold,
 		SSEKeepaliveInterval:       sseKeepalive,
 		BatchArchiveInterval:       batchArchive,
@@ -734,6 +768,11 @@ func (c *Config) VerifyConfig() ([]string, []string) {
 	// 4. Port number validation
 	if p, err := strconv.Atoi(c.Port); err != nil || p < 1 || p > 65535 {
 		errs = append(errs, fmt.Sprintf("Invalid PORT '%s' — must be a number between 1 and 65535", c.Port))
+	}
+
+	// 4b. DNSMASQ_PID_FILE deprecation notice (non-critical warning)
+	if os.Getenv("DNSMASQ_PID_FILE") != "" {
+		warnings = append(warnings, "DNSMASQ_PID_FILE is deprecated: dnsmasq was replaced by the in-process DNS server (cache clear lands in a later step)")
 	}
 
 	// 5. Client aliases file check (non-critical warning)

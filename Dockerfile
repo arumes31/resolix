@@ -1,5 +1,5 @@
 # Stage 1: Build
-FROM golang:1.26-alpine AS builder
+FROM golang:1.26.5-alpine AS builder
 
 WORKDIR /app
 
@@ -13,18 +13,18 @@ RUN go mod download
 # Copy source code
 COPY webgui/ .
 
-# Build the application (Improvement 45: Binary size reduction)
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o webgui .
+# Build the application (Improvement 45: Binary size reduction; inject release version)
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.Version=v2.2.0" -o webgui .
 
 # Stage 2: Final Image
-FROM alpine:3.23
+FROM alpine:3.24
 
 # Install runtime dependencies (including those required by Tailscale)
 RUN apk add --no-cache dnsmasq bash bind-tools ca-certificates iptables iproute2 ip6tables
 
-# Get the latest Tailscale binaries from the official image
-COPY --from=tailscale/tailscale:stable /usr/local/bin/tailscale /usr/bin/tailscale
-COPY --from=tailscale/tailscale:stable /usr/local/bin/tailscaled /usr/sbin/tailscaled
+# Copy Tailscale binaries from the latest stable release.
+COPY --from=tailscale/tailscale:v1.102.2 /usr/local/bin/tailscale /usr/bin/tailscale
+COPY --from=tailscale/tailscale:v1.102.2 /usr/local/bin/tailscaled /usr/sbin/tailscaled
 
 # Copy binary from builder
 COPY --from=builder /app/webgui /usr/bin/webgui

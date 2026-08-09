@@ -1,0 +1,199 @@
+package api
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+	"testing/fstest"
+	"time"
+
+	"tailscale-dnsrewrite/webgui/internal/blocklist"
+	"tailscale-dnsrewrite/webgui/internal/config"
+	"tailscale-dnsrewrite/webgui/internal/models"
+)
+
+func testServer(cfg *config.Config) *Server {
+	return &Server{
+		cfg:         cfg,
+		sessions:    make(map[string]time.Time),
+		subscribers: make(map[chan models.QueryEvent]int),
+		rateLimits:  make(map[string]*rateLimitEntry),
+		metrics:     &Metrics{StartTime: time.Now()},
+	}
+}
+
+func TestForwardedHeadersRequireTrustedProxy(t *testing.T) {
+	s := testServer(&config.Config{TrustedProxies: []string{"10.0.0.0/8"}})
+	r := httptest.NewRequest(http.MethodGet, "http://example.test", nil)
+	r.RemoteAddr = "192.0.2.10:1234"
+	r.Header.Set("X-Forwarded-For", "203.0.113.9")
+	r.Header.Set("X-Forwarded-Proto", "https")
+	if got := s.clientIP(r); got != "192.0.2.10" {
+		t.Fatalf("untrusted client IP = %q", got)
+	}
+	if s.isHTTPS(r) {
+		t.Fatal("untrusted X-Forwarded-Proto was accepted")
+	}
+
+	r.RemoteAddr = "10.1.2.3:1234"
+	if got := s.clientIP(r); got != "203.0.113.9" {
+		t.Fatalf("trusted client IP = %q", got)
+	}
+	if !s.isHTTPS(r) {
+		t.Fatal("trusted X-Forwarded-Proto was ignored")
+	}
+}
+
+func TestSessionLifecycle(t *testing.T) {
+	s := testServer(&config.Config{})
+	token, err := s.newSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token == "" || !s.validSession(token) {
+		t.Fatal("new session is not valid")
+	}
+	s.deleteSession(token)
+	if s.validSession(token) {
+		t.Fatal("deleted session remains valid")
+	}
+}
+
+func TestInternalRoutesUseWebAuthWithoutIngestSecret(t *testing.T) {
+	s := testServer(&config.Config{
+		WebUsername: "admin",
+		WebPassword: "configured",
+		BaseURL:     "/",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/ingest", nil)
+	rec := httptest.NewRecorder()
+	s.SetupMux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d; want %d", rec.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestBroadcastAndUnsubscribeAreSerialized(_ *testing.T) {
+	s := testServer(&config.Config{})
+	ch := s.Subscribe()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for range 100 {
+			s.BroadcastEvent(models.QueryEvent{})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		s.Unsubscribe(ch)
+	}()
+	wg.Wait()
+}
+
+func TestEscapePrometheusLabel(t *testing.T) {
+	if got, want := escapePrometheusLabel("a\\b\n\"c"), `a\\b\n\"c`; got != want {
+		t.Fatalf("escapePrometheusLabel() = %q; want %q", got, want)
+	}
+}
+
+// TestSubpathRouting verifies request-level routing when BaseURL is a prefix
+// such as /dns: static assets are served under the prefix, the SSE stream
+// enforces authentication, and unauthenticated HTML requests redirect to the
+// prefixed login route.
+func TestSubpathRouting(t *testing.T) {
+	s := testServer(&config.Config{
+		BaseURL:        "/dns",
+		WebUsername:    "admin",
+		WebPassword:    "secret",
+		MaxRequestSize: 1048576,
+	})
+	s.SetStaticHandler(http.FileServer(http.FS(fstest.MapFS{
+		"css/test.css": &fstest.MapFile{Data: []byte("body{}")},
+	})), nil, nil)
+	mux := s.SetupMux()
+
+	// Static assets are served under /dns/static/
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dns/static/css/test.css", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "body{}" {
+		t.Fatalf("static under /dns/static/: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	// The SSE stream under the prefix enforces authentication
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dns/api/stream", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated /dns/api/stream: code=%d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+
+	// Unauthenticated HTML requests redirect to the prefixed login route
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/dns/", nil)
+	req.Header.Set("Accept", "text/html")
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/dns/login" {
+		t.Fatalf("HTML redirect: code=%d location=%q, want %d /dns/login",
+			rec.Code, rec.Header().Get("Location"), http.StatusSeeOther)
+	}
+}
+
+// TestBroadcastEventBehavior exercises the real broadcast implementation:
+// blocklist enrichment, Prometheus metrics, delivery to subscribers, and
+// slow-subscriber removal after 10 consecutive drops.
+func TestBroadcastEventBehavior(t *testing.T) {
+	s := testServer(&config.Config{})
+
+	// Blocklist with a parent-domain entry
+	blPath := filepath.Join(t.TempDir(), "blocklist.txt")
+	if err := os.WriteFile(blPath, []byte("ads.example.com\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.SetBlocklist(blocklist.New(blPath))
+
+	// A subscriber receives the enriched event
+	ch := s.Subscribe()
+	s.BroadcastEvent(models.QueryEvent{Domain: "www.ads.example.com", ClientIP: "192.0.2.1", Type: "A"})
+	select {
+	case ev := <-ch:
+		if !ev.Blocked {
+			t.Error("expected event to be marked blocked via parent-domain blocklist entry")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("subscriber did not receive broadcast event")
+	}
+	if got := s.metrics.QueriesTotal.Load(); got != 1 {
+		t.Errorf("QueriesTotal = %d, want 1", got)
+	}
+	if got := s.metrics.QueriesBlocked.Load(); got != 1 {
+		t.Errorf("QueriesBlocked = %d, want 1", got)
+	}
+	s.Unsubscribe(ch)
+
+	// A slow subscriber (never drained) is removed after 10 consecutive drops
+	// and its channel is closed.
+	slow := s.Subscribe()
+	for range 112 { // 100 buffer capacity + 12 drops
+		s.BroadcastEvent(models.QueryEvent{Domain: "example.org"})
+	}
+	drained := make(chan struct{})
+	go func() {
+		for range slow { //nolint:revive // drain until closed
+		}
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow subscriber channel was not closed after 10 consecutive drops")
+	}
+	s.subMu.Lock()
+	remaining := len(s.subscribers)
+	s.subMu.Unlock()
+	if remaining != 0 {
+		t.Errorf("expected slow subscriber to be removed, %d subscribers remain", remaining)
+	}
+}

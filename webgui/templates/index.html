@@ -1,326 +1,39 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:;">
+    <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'nonce-{{.Nonce}}'; style-src 'self' 'nonce-{{.Nonce}}'; font-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';">
     <title>Tailscale DNS Monitor - Advanced</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🛡️</text></svg>">
-    <style>
-        :root {
-            --bg-color: #0f172a;
-            --glass-bg: rgba(30, 41, 59, 0.7);
-            --glass-border: rgba(255, 255, 255, 0.1);
-            --text-primary: #f8fafc;
-            --text-secondary: #94a3b8;
-            --accent-color: #38bdf8;
-            --accent-hover: #0ea5e9;
-            --danger: #ef4444;
-            --success: #22c55e;
-            --warning: #f59e0b;
-        }
-
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-            font-family: 'Inter', system-ui, -apple-system, sans-serif;
-        }
-
-        body {
-            background-color: var(--bg-color);
-            color: var(--text-primary);
-            min-height: 100vh;
-            padding: 1rem;
-            background-image: 
-                radial-gradient(circle at 0% 0%, rgba(56, 189, 248, 0.15) 0%, transparent 50%),
-                radial-gradient(circle at 100% 100%, rgba(139, 92, 246, 0.15) 0%, transparent 50%);
-        }
-
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-        }
-
-        header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 2rem;
-            flex-wrap: wrap;
-            gap: 1rem;
-        }
-
-        h1 {
-            font-size: 1.875rem;
-            font-weight: 700;
-            background: linear-gradient(to right, #38bdf8, #818cf8);
-            -webkit-background-clip: text;
-            background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-
-        .search-container {
-            position: relative;
-            flex: 1;
-            max-width: 400px;
-        }
-
-        .search-input {
-            width: 100%;
-            padding: 0.75rem 1rem 0.75rem 2.5rem;
-            background: var(--glass-bg);
-            border: 1px solid var(--glass-border);
-            border-radius: 0.75rem;
-            color: var(--text-primary);
-            backdrop-filter: blur(12px);
-            outline: none;
-        }
-
-        .search-icon {
-            position: absolute;
-            left: 0.75rem;
-            top: 50%;
-            transform: translateY(-50%);
-            color: var(--text-secondary);
-        }
-
-        .dashboard-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 1rem;
-            margin-bottom: 2rem;
-        }
-
-        .card {
-            background: var(--glass-bg);
-            border: 1px solid var(--glass-border);
-            padding: 1.5rem;
-            border-radius: 1rem;
-            backdrop-filter: blur(12px);
-        }
-
-        .stat-header {
-            font-size: 0.875rem;
-            color: var(--text-secondary);
-            margin-bottom: 1rem;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            display: flex;
-            justify-content: space-between;
-        }
-
-        .stat-value {
-            font-size: 2rem;
-            font-weight: 700;
-            color: var(--text-primary);
-        }
-
-        .top-list {
-            list-style: none;
-        }
-
-        .top-item {
-            display: flex;
-            justify-content: space-between;
-            padding: 0.5rem 0;
-            border-bottom: 1px solid rgba(255,255,255,0.05);
-            font-size: 0.9rem;
-        }
-
-        .top-item:last-child {
-            border-bottom: none;
-        }
-
-        .top-count {
-            background: rgba(56, 189, 248, 0.1);
-            color: var(--accent-color);
-            padding: 0.1rem 0.5rem;
-            border-radius: 4px;
-            font-size: 0.75rem;
-        }
-
-        .trend-up { color: var(--success); }
-        .trend-down { color: var(--danger); }
-        .trend-stable { color: var(--text-secondary); opacity: 0.5; }
-
-        .heatmap-container {
-            display: flex;
-            gap: 4px;
-            overflow-x: auto;
-            padding: 1rem 0;
-            margin-top: 1rem;
-        }
-        .heatmap-box {
-            width: 30px;
-            height: 30px;
-            border-radius: 4px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 0.6rem;
-            color: rgba(255,255,255,0.8);
-            flex-shrink: 0;
-        }
-
-        .alias-tag {
-            background: rgba(139, 92, 246, 0.1);
-            color: #a78bfa;
-            font-size: 0.6rem;
-            padding: 0.1rem 0.3rem;
-            border-radius: 4px;
-            margin-left: 0.3rem;
-        }
-
-        .table-container {
-            background: var(--glass-bg);
-            border: 1px solid var(--glass-border);
-            border-radius: 1rem;
-            overflow: hidden;
-            margin-bottom: 2rem;
-        }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 0.875rem;
-        }
-
-        th {
-            background: rgba(255, 255, 255, 0.05);
-            padding: 0.75rem 1rem;
-            color: var(--text-secondary);
-            text-align: left;
-        }
-
-        td {
-            padding: 0.75rem 1rem;
-            border-top: 1px solid var(--glass-border);
-        }
-
-        .latency-cell {
-            font-family: monospace;
-            font-weight: 600;
-        }
-
-        .latency-low { color: var(--success); }
-        .latency-mid { color: var(--warning); }
-        .latency-high { color: var(--danger); }
-
-        .simulator-box {
-            display: flex;
-            gap: 0.5rem;
-        }
-
-        .simulator-input {
-            flex: 1;
-            padding: 0.5rem;
-            background: rgba(0,0,0,0.2);
-            border: 1px solid var(--glass-border);
-            border-radius: 0.5rem;
-            color: #fff;
-        }
-
-        .btn {
-            padding: 0.5rem 1rem;
-            border-radius: 0.5rem;
-            border: none;
-            cursor: pointer;
-            font-weight: 600;
-            transition: all 0.2s;
-        }
-
-        .btn-primary {
-            background: var(--accent-color);
-            color: var(--bg-color);
-        }
-
-        .btn-primary:hover {
-            background: var(--accent-hover);
-        }
-
-        #simulatorResult {
-            margin-top: 1rem;
-            font-size: 0.8rem;
-            padding: 0.5rem;
-            background: rgba(0,0,0,0.3);
-            border-radius: 0.5rem;
-            display: none;
-        }
-
-        .upstream-badge {
-            font-size: 0.7rem;
-            background: rgba(139, 92, 246, 0.1);
-            color: #a78bfa;
-            padding: 0.1rem 0.4rem;
-            border-radius: 4px;
-        }
-
-        /* Compact Mode */
-        body.compact { padding: 0.5rem; }
-        body.compact .card { padding: 0.75rem; }
-        body.compact table th, body.compact table td { padding: 0.4rem 0.5rem; font-size: 0.8rem; }
-        body.compact .stat-value { font-size: 1.5rem; }
-
-        /* Modal */
-        .modal {
-            display: none;
-            position: fixed;
-            top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(0,0,0,0.8);
-            backdrop-filter: blur(8px);
-            z-index: 1000;
-            align-items: center;
-            justify-content: center;
-        }
-        .modal-content {
-            background: var(--bg-color);
-            border: 1px solid var(--glass-border);
-            padding: 2rem;
-            border-radius: 1.5rem;
-            width: 90%;
-            max-width: 600px;
-        }
-
-        .sparkline {
-            display: flex;
-            align-items: flex-end;
-            height: 20px;
-            gap: 1px;
-            margin-left: 0.5rem;
-        }
-        .spark-bar {
-            width: 3px;
-            background: var(--success);
-            opacity: 0.5;
-        }
-        .spark-bar.fail { background: var(--danger); }
-
-        @media (max-width: 1024px) {
-            .dashboard-grid {
-                grid-template-columns: 1fr;
-            }
-        }
-    </style>
+    <link rel="icon" type="image/svg+xml" href="static/favicon.svg">
+    <link rel="stylesheet" href="static/css/style.css">
 </head>
-<body>
+
+<body data-base-url="{{.BaseURL}}">
     <div class="container">
         <header>
             <div>
                 <h1>Tailscale DNS Monitor</h1>
-                <p id="systemStatus" style="color: var(--success); font-size: 0.8rem;">● System Online</p>
+                <p id="systemStatus" class="system-status">● System Online</p>
             </div>
-            <div style="display: flex; gap: 0.5rem; align-items: center;">
-                <button id="freezeBtn" class="btn" style="background: rgba(255,255,255,0.1); color: #fff; width: 40px; padding: 0.5rem;" title="Freeze/Pause Log">⏸️</button>
-                <button id="compactToggle" class="btn" style="background: rgba(255,255,255,0.1); color: #fff; width: 40px; padding: 0.5rem;" title="Toggle Compact Mode">↕️</button>
+            <div class="header-controls">
+                <button id="freezeBtn" class="btn-icon" title="Freeze/Pause Log">⏸️</button>
+                <button id="compactToggle" class="btn-icon" title="Toggle Compact Mode">↕️</button>
+                <button id="clearViewBtn" class="btn-icon" title="Clear View">🗑️</button>
                 <div class="search-container">
-                    <svg class="search-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+                    <svg class="search-icon" width="20" height="20" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="11" cy="11" r="8"></circle>
+                        <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                    </svg>
                     <input type="text" id="searchInput" class="search-input" placeholder="Quick Filter...">
                 </div>
             </div>
-            <div class="simulator-box card" style="padding: 0.75rem; margin-bottom: 0;">
+            <div class="simulator-box card simulator-compact">
                 <input type="text" id="simDomain" class="simulator-input" placeholder="Test domain...">
-                <button class="btn btn-primary" onclick="simulateQuery()">Test</button>
+                <button id="simulateBtn" class="btn btn-primary">Test</button>
             </div>
         </header>
 
@@ -328,21 +41,24 @@
 
         <div class="dashboard-grid">
             <div class="card">
-                <div class="stat-header"><span>Traffic Stats</span> <span id="rpm_val" style="color: var(--accent-color)">0 RPM</span></div>
-                <div style="display: flex; justify-content: space-between; align-items: flex-end; height: 60px; gap: 4px;" id="miniChart">
+                <div class="stat-header"><span>Traffic Stats</span> <span id="rpm_val" class="stat-accent">0 RPM</span></div>
+                <div class="mini-chart" id="miniChart">
                     <!-- Simple bar chart will be here -->
                 </div>
-                <div style="margin-top: 1rem; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
-                    <div><span class="stat-label">Hour:</span> <span id="rph_val" style="font-weight:bold">0</span></div>
-                    <div><span class="stat-label">Day:</span> <span id="rpd_val" style="font-weight:bold">0</span></div>
-                    <div><span class="stat-label">Cache Hit:</span> <span id="cache_ratio" style="font-weight:bold; color: var(--success);">0%</span></div>
-                    <div><span class="stat-label">Total:</span> <span id="total_val" style="font-weight:bold">0</span></div>
+                <div class="traffic-summary">
+                    <div><span class="stat-label">Hour:</span> <span id="rph_val" class="stat-strong">0</span>
+                    </div>
+                    <div><span class="stat-label">Day:</span> <span id="rpd_val" class="stat-strong">0</span></div>
+                    <div><span class="stat-label">Cache Hit:</span> <span id="cache_ratio"
+                            class="stat-cache">0%</span></div>
+                    <div><span class="stat-label">Total:</span> <span id="total_val" class="stat-strong">0</span>
+                    </div>
                 </div>
             </div>
 
             <div class="card">
                 <div class="stat-header">Query Type Breakdown</div>
-                <div id="typeBreakdown" style="display: flex; flex-direction: column; gap: 8px; margin-top: 0.5rem;">
+                <div id="typeBreakdown" class="type-breakdown">
                     <!-- Type bars will be here -->
                 </div>
             </div>
@@ -367,13 +83,16 @@
                     <li class="top-item"><span>Loading...</span></li>
                 </ul>
             </div>
-            <div class="card" style="grid-column: span 2;">
+            <div class="card wide-card">
                 <div class="stat-header"><span>24h Traffic Heatmap (Intensity)</span></div>
                 <div class="heatmap-container" id="trafficHeatmap"></div>
             </div>
         </div>
 
         <div class="table-container">
+            <div id="viewClearedBanner" class="view-cleared-banner is-hidden">
+                View cleared — new events will appear as they arrive
+            </div>
             <table>
                 <thead>
                     <tr>
@@ -390,7 +109,8 @@
                     {{range .Events}}
                     <tr>
                         <td class="timestamp">{{.TimestampFormatted}}</td>
-                        <td><span class="badge" style="background: rgba(255,255,255,0.1); font-size: 0.7rem;">{{if .Node}}{{.Node}}{{else}}local{{end}}</span></td>
+                        <td><span class="badge node-badge">{{if
+                                .Node}}{{.Node}}{{else}}local{{end}}</span></td>
                         <td><span class="badge badge-type">{{.Type}}</span></td>
                         <td class="domain">{{.Domain}}</td>
                         <td>
@@ -404,392 +124,37 @@
                 </tbody>
             </table>
         </div>
+
+        <!-- Node Status Panel (Items 92, 93) -->
+        {{if eq .Mode "master"}}
+        <div class="node-status-panel" id="nodeStatusPanel">
+            <h3>Cluster Nodes</h3>
+            <div id="nodeCards" class="node-status-grid">
+                <p class="empty-state">No slave
+                    nodes connected</p>
+            </div>
+        </div>
+        {{end}}
     </div>
 
-    <script>
-        function escapeHtml(unsafe) {
-            if (unsafe == null) return '';
-            const el = document.createElement('div');
-            el.textContent = unsafe;
-            return el.innerHTML;
-        }
-
-        function formatNumber(num) {
-            if (num >= 1000000) {
-                return (num / 1000000).toFixed(1).replace(/\.0$/, '') + 'M';
-            }
-            if (num >= 1000) {
-                return (num / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
-            }
-            return num;
-        }
-
-        function getRelativeTime(timestamp) {
-            const diff = Math.floor(Date.now() / 1000 - timestamp);
-            if (diff < 60) return 'Just now';
-            if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
-            if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
-            return Math.floor(diff / 86400) + 'd ago';
-        }
-
-        let allEvents = [];
-        let rpmHistory = Array(20).fill(0);
-        let lastEventTimestamp = 0;
-        let isTabVisible = true;
-        let isFrozen = false;
-        let statsInterval = null;
-
-        // Stream handler
-        function startStream() {
-            const eventSource = new EventSource('/api/stream');
-            eventSource.onmessage = (event) => {
-                try {
-                    const newEvent = JSON.parse(event.data);
-                    
-                    if (isFrozen) return;
-
-                    const index = allEvents.findIndex(e => e.id === newEvent.id);
-                    const searchTerm = document.getElementById('searchInput').value.toLowerCase();
-                    const isFiltered = searchTerm.length > 0;
-
-                    if (index !== -1) {
-                        allEvents[index] = newEvent;
-                        if (!isFiltered && isTabVisible) updateRowInDom(newEvent);
-                    } else {
-                        allEvents.unshift(newEvent);
-                        if (allEvents.length > 1000) allEvents.pop();
-                        if (!isFiltered && isTabVisible) prependRowToDom(newEvent);
-                    }
-                    
-                    if (isFiltered && isTabVisible) {
-                        // Throttle filter re-render
-                        if (window.renderTimeout) clearTimeout(window.renderTimeout);
-                        window.renderTimeout = setTimeout(renderEvents, 100);
-                    }
-                } catch (e) {
-                    console.error("Failed to parse SSE event:", e, event.data);
-                }
-            };
-            eventSource.onerror = () => {
-                console.error("SSE connection lost. Reconnecting...");
-            };
-        }
-
-        function createRowHtml(e) {
-            let latencyClass = 'latency-low';
-            if (e.latency_ms > 50) latencyClass = 'latency-mid';
-            if (e.latency_ms > 150) latencyClass = 'latency-high';
-            
-            const latencyText = e.LatencyFormatted || (e.latency_ms ? e.latency_ms.toFixed(1) + 'ms' : '-');
-            const timeStr = new Date(e.unix_time * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false});
-            const relTime = getRelativeTime(e.unix_time);
-
-            return `
-                <td class="timestamp"><div style="font-size:0.8rem">${escapeHtml(timeStr)}</div><div style="font-size:0.6rem; opacity:0.6">${escapeHtml(relTime)}</div></td>
-                <td><span class="badge" style="background: rgba(255,255,255,0.1); font-size: 0.7rem;">${escapeHtml(e.node || 'local')}</span></td>
-                <td><span class="badge badge-type">${escapeHtml(e.type)}</span></td>
-                <td class="domain">${escapeHtml(e.domain)}</td>
-                <td onclick='showClientStats(${JSON.stringify(e.client_ip)})' style="cursor: pointer; position: relative;" title="Click for details">
-                    <span class="badge badge-ip">${escapeHtml(e.client_ip)}</span>
-                    ${e.alias ? `<span class="alias-tag">${escapeHtml(e.alias)}</span>` : ''}
-                </td>
-                <td>${e.upstream ? `<span class="upstream-badge">${escapeHtml(e.upstream)}</span>` : '-'}</td>
-                <td class="latency-cell ${latencyClass}">${escapeHtml(latencyText)}</td>
-            `;
-        }
-
-        function prependRowToDom(e) {
-            const tableBody = document.getElementById('eventTable');
-            const row = document.createElement('tr');
-            row.id = `row-${e.id}`;
-            row.innerHTML = createRowHtml(e);
-            tableBody.prepend(row);
-            
-            // Limit DOM size
-            if (tableBody.children.length > 100) {
-                tableBody.removeChild(tableBody.lastChild);
-            }
-        }
-
-        function updateRowInDom(e) {
-            const row = document.getElementById(`row-${e.id}`);
-            if (row) {
-                row.innerHTML = createRowHtml(e);
-            }
-        }
-
-        async function fetchAll() {
-            await Promise.all([fetchEvents(), fetchStats()]);
-        }
-
-        async function fetchEvents() {
-            try {
-                const response = await fetch(`/api/events`);
-                if (!response.ok) throw new Error('API down');
-                const newEvents = await response.json();
-                
-                if (newEvents.length > 0) {
-                    allEvents = newEvents.slice(0, 1000);
-                    renderEvents();
-                }
-                
-                document.getElementById('systemStatus').style.color = 'var(--success)';
-                document.getElementById('systemStatus').textContent = '● System Online';
-            } catch (e) { 
-                console.error(e); 
-                document.getElementById('systemStatus').style.color = 'var(--danger)';
-                document.getElementById('systemStatus').textContent = '● System Offline';
-            }
-        }
-
-        async function fetchStats() {
-            try {
-                const response = await fetch('/api/stats');
-                const stats = await response.json();
-                renderTopList('topDomains', stats.top_domains);
-                renderTopList('topClients', stats.top_clients);
-                
-                // Update counters
-                document.getElementById('rpm_val').textContent = formatNumber(stats.rpm) + ' RPM';
-                document.getElementById('rph_val').textContent = formatNumber(stats.rph);
-                document.getElementById('rpd_val').textContent = formatNumber(stats.rpd);
-                document.getElementById('total_val').textContent = formatNumber(stats.total);
-                document.getElementById('cache_ratio').textContent = (stats.cache_hit_ratio || 0).toFixed(1) + '%';
-
-                // Update health list with sparklines (Per Node)
-                const healthEl = document.getElementById('upstreamHealth');
-                if (stats.node_health) {
-                    healthEl.innerHTML = Object.entries(stats.node_health).map(([node, upstreams]) => {
-                        const nodeHtml = Object.entries(upstreams).map(([ip, lat]) => {
-                            const hist = (stats.node_health_hist && stats.node_health_hist[node]) ? stats.node_health_hist[node][ip] || [] : [];
-                            const maxLat = Math.max(...hist.filter(l => l > 0), 1);
-                            const sparkline = `<div class="sparkline">${hist.map(l => {
-                                const h = l === -1 ? 100 : (l / maxLat) * 100;
-                                return `<div class="spark-bar ${l === -1 ? 'fail' : ''}" style="height: ${h}%"></div>`;
-                            }).join('')}</div>`;
-
-                            return `
-                                <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.25rem 0; font-size: 0.8rem; border-bottom: 1px solid rgba(255,255,255,0.02);">
-                                    <div style="display: flex; align-items: center;">
-                                        <span style="opacity: 0.8">${escapeHtml(ip)}</span>
-                                        ${sparkline}
-                                    </div>
-                                    <span class="top-count" style="background: ${lat === -1 ? 'var(--danger)' : 'rgba(34, 197, 94, 0.1)'}; color: ${lat === -1 ? '#fff' : 'var(--success)'}">${lat === -1 ? 'DOWN' : lat.toFixed(1) + 'ms'}</span>
-                                </div>
-                            `;
-                        }).join('');
-
-                        return `
-                            <li style="margin-bottom: 1rem;">
-                                <div style="font-size: 0.7rem; color: var(--accent-color); text-transform: uppercase; margin-bottom: 0.3rem;">Node: ${escapeHtml(node)}</div>
-                                ${nodeHtml}
-                            </li>
-                        `;
-                    }).join('');
-                }
-
-                // Update type breakdown bars
-                const typeEl = document.getElementById('typeBreakdown');
-                if (stats.type_counts) {
-                    const total = Object.values(stats.type_counts).reduce((a, b) => a + b, 0);
-                    if (total === 0) {
-                        typeEl.innerHTML = '<div style="font-size: 0.75rem; color: var(--text-secondary);">No data</div>';
-                    } else {
-                        const sortedTypes = Object.entries(stats.type_counts).sort((a, b) => b[1] - a[1]).slice(0, 5);
-                        typeEl.innerHTML = sortedTypes.map(([type, count]) => {
-                            const pct = (count / total) * 100;
-                            return `
-                                <div style="font-size: 0.75rem;">
-                                    <div style="display: flex; justify-content: space-between; margin-bottom: 2px;">
-                                        <span>${escapeHtml(type)}</span>
-                                        <span style="opacity: 0.6">${count} (${pct.toFixed(1)}%)</span>
-                                    </div>
-                                    <div style="height: 4px; background: rgba(255,255,255,0.05); border-radius: 2px;">
-                                        <div style="height: 100%; background: var(--accent-color); width: ${pct}%; border-radius: 2px; opacity: 0.8"></div>
-                                    </div>
-                                </div>
-                            `;
-                        }).join('');
-                    }
-                }
-
-                // Update heatmap
-                const heatmapEl = document.getElementById('trafficHeatmap');
-                if (stats.heatmap) {
-                    const sortedHours = Object.entries(stats.heatmap).sort();
-                    const maxCount = Math.max(...sortedHours.map(h => h[1]), 1);
-                    heatmapEl.innerHTML = sortedHours.map(([hour, count]) => {
-                        const opacity = 0.2 + (count / maxCount) * 0.8;
-                        const color = count === 0 ? 'rgba(255,255,255,0.05)' : `rgba(56, 189, 248, ${opacity})`;
-                        return `<div class="heatmap-box" style="background: ${color}" title="${hour}: ${count} queries">${hour.split(':')[0]}</div>`;
-                    }).join('');
-                }
-
-                // Update node list
-                const nodeStats = document.getElementById('nodeStats');
-                if (stats.nodes) {
-                    nodeStats.innerHTML = Object.entries(stats.nodes).map(([name, s]) => `
-                        <li class="top-item">
-                            <span>${escapeHtml(name)}</span>
-                            <span><span class="top-count">${formatNumber(s.rpm)}</span> <span class="top-count" style="background: rgba(129, 140, 248, 0.1); color: #818cf8;">${formatNumber(s.rph)}</span></span>
-                        </li>
-                    `).join('');
-                } else {
-                    nodeStats.innerHTML = '';
-                }
-
-                // Update chart locally
-                rpmHistory.push(stats.rpm);
-                rpmHistory.shift();
-                renderMiniChart();
-            } catch (e) { console.error(e); }
-        }
-
-        async function simulateQuery() {
-            const domain = document.getElementById('simDomain').value;
-            const resBox = document.getElementById('simulatorResult');
-            resBox.style.display = 'block';
-            resBox.textContent = 'Querying...';
-            try {
-                const response = await fetch(`/api/simulate?domain=${domain}`);
-                const data = await response.json();
-                if (data.status === 'success') {
-                    resBox.innerHTML = `<strong>Results:</strong> ${data.ips.join(', ')}`;
-                } else {
-                    resBox.innerHTML = `<span style="color: var(--danger)">Error: ${data.error}</span>`;
-                }
-            } catch (e) { resBox.textContent = 'Error: ' + e.message; }
-        }
-
-        function renderEvents() {
-            const searchTerm = document.getElementById('searchInput').value.toLowerCase();
-            const tableBody = document.getElementById('eventTable');
-            
-            if (searchTerm === "") {
-                const filtered = allEvents.slice(0, 100);
-                tableBody.innerHTML = filtered.map(e => `<tr id="row-${e.id}">${createRowHtml(e)}</tr>`).join('');
-                return;
-            }
-
-            // Advanced Search Parsing
-            const parts = searchTerm.split(' ').filter(p => p.trim() !== '');
-            const filtered = allEvents.filter(e => {
-                return parts.every(p => {
-                    if (p.startsWith('node:')) return p.length > 5 && (e.node || 'local').toLowerCase().includes(p.substring(5));
-                    if (p.startsWith('type:')) return p.length > 5 && e.type.toLowerCase().includes(p.substring(5));
-                    if (p.startsWith('client:')) return p.length > 7 && e.client_ip.toLowerCase().includes(p.substring(7));
-                    if (p.startsWith('alias:')) return p.length > 6 && (e.alias || '').toLowerCase().includes(p.substring(6));
-                    return e.domain.toLowerCase().includes(p) || 
-                           e.client_ip.toLowerCase().includes(p) ||
-                           (e.alias || '').toLowerCase().includes(p) ||
-                           (e.node || 'local').toLowerCase().includes(p);
-                });
-            }).slice(0, 100);
-
-            tableBody.innerHTML = filtered.map(e => `<tr id="row-${e.id}">${createRowHtml(e)}</tr>`).join('');
-        }
-
-        function renderTopList(id, list) {
-            const el = document.getElementById(id);
-            el.innerHTML = list.map(item => {
-                let trendIcon = '';
-                if (item.trend === 'up') trendIcon = '<span class="trend-up">↑</span>';
-                if (item.trend === 'down') trendIcon = '<span class="trend-down">↓</span>';
-                if (item.trend === 'stable') trendIcon = '<span class="trend-stable">-</span>';
-
-                const aliasTag = item.alias ? `<span class="alias-tag">${escapeHtml(item.alias)}</span>` : '';
-
-                return `
-                    <li class="top-item">
-                        <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px;">
-                            ${escapeHtml(item.key)} ${trendIcon} ${aliasTag}
-                        </span>
-                        <span class="top-count">${formatNumber(item.count)}</span>
-                    </li>
-                `;
-            }).join('');
-        }
-
-        function updateMainStats() {
-            // Stats are now pulled from /api/stats for better accuracy
-            // This function is kept for any immediate local UI feedback if needed
-        }
-
-        function renderMiniChart() {
-            const chart = document.getElementById('miniChart');
-            const max = Math.max(...rpmHistory, 1);
-            chart.innerHTML = rpmHistory.map(h => {
-                const height = (h / max) * 100;
-                return `<div style="flex: 1; background: var(--accent-color); height: ${height}%; border-radius: 2px; opacity: 0.6"></div>`;
-            }).join('');
-        }
-
-        async function showClientStats(ip) {
-            const modal = document.getElementById('clientModal');
-            document.getElementById('modalTitle').textContent = `Stats for ${ip}`;
-            modal.style.display = 'flex';
-            
-            try {
-                const response = await fetch(`/api/client_stats?ip=${encodeURIComponent(ip)}`);
-                const data = await response.json();
-                
-                document.getElementById('modalRPM').textContent = data.rpm;
-                document.getElementById('modalRPH').textContent = data.rph;
-                
-                const charts = document.getElementById('modalCharts');
-                const max = Math.max(...data.rpm_history, 1);
-                charts.innerHTML = data.rpm_history.map(h => {
-                    const height = (h / max) * 100;
-                    return `<div style="flex: 1; background: var(--accent-color); height: ${height}%; border-radius: 4px; opacity: 0.8"></div>`;
-                }).join('');
-            } catch (e) { console.error(e); }
-        }
-
-        document.getElementById('freezeBtn').addEventListener('click', function() {
-            isFrozen = !isFrozen;
-            this.style.background = isFrozen ? 'var(--danger)' : 'rgba(255,255,255,0.1)';
-            this.textContent = isFrozen ? '▶️' : '⏸️';
-        });
-
-        document.getElementById('compactToggle').addEventListener('click', function() {
-            document.body.classList.toggle('compact');
-        });
-
-        document.getElementById('searchInput').addEventListener('input', renderEvents);
-
-        function updateVisibility() {
-            isTabVisible = document.visibilityState === 'visible';
-            if (statsInterval) clearInterval(statsInterval);
-            
-            const rate = isTabVisible ? 5000 : 60000;
-            statsInterval = setInterval(fetchStats, rate);
-            
-            if (isTabVisible) {
-                fetchAll(); // Catch up immediately
-            }
-        }
-
-        document.addEventListener('visibilitychange', updateVisibility);
-        
-        updateVisibility(); // Initial set
-        startStream();
-    </script>
-    <div id="clientModal" class="modal" onclick="if(event.target === this) this.style.display='none'">
+    <div id="clientModal" class="modal">
         <div class="modal-content">
-            <h2 id="modalTitle" style="margin-bottom: 1rem;">Client Stats</h2>
-            <div id="modalCharts" style="height: 200px; display: flex; align-items: flex-end; gap: 4px; margin-bottom: 1.5rem;"></div>
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
-                <div class="card" style="background: rgba(255,255,255,0.05)">
+            <h2 id="modalTitle" class="modal-title">Client Stats</h2>
+            <div id="modalCharts" class="modal-charts"></div>
+            <div class="modal-stats-grid">
+                <div class="card modal-stat-card">
                     <div class="stat-header">RPM</div>
                     <div class="stat-value" id="modalRPM">0</div>
                 </div>
-                <div class="card" style="background: rgba(255,255,255,0.05)">
+                <div class="card modal-stat-card">
                     <div class="stat-header">RPH</div>
                     <div class="stat-value" id="modalRPH">0</div>
                 </div>
             </div>
-            <button class="btn btn-primary" style="margin-top: 1.5rem; width: 100%;" onclick="document.getElementById('clientModal').style.display='none'">Close</button>
+            <button id="modalCloseBtn" class="btn btn-primary modal-close">Close</button>
         </div>
     </div>
+    <script nonce="{{.Nonce}}" src="static/js/index.js"></script>
 </body>
+
 </html>

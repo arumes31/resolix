@@ -74,7 +74,8 @@ func (bl *Blocklist) load() {
 		// Parse the line: could be "0.0.0.0 domain.com" or just "domain.com"
 		fields := strings.Fields(line)
 		var domain string
-		if len(fields) >= 2 {
+		switch {
+		case len(fields) >= 2:
 			// Hosts format: IP domain
 			ip := fields[0]
 			if ip == "0.0.0.0" || ip == "127.0.0.1" || ip == "::1" {
@@ -83,10 +84,10 @@ func (bl *Blocklist) load() {
 				// Not a blocking entry, skip
 				continue
 			}
-		} else if len(fields) == 1 {
+		case len(fields) == 1:
 			// Simple domain-per-line format
 			domain = fields[0]
-		} else {
+		default:
 			continue
 		}
 

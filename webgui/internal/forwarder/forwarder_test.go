@@ -196,7 +196,7 @@ func TestSendBatch_WithIngestSecret(t *testing.T) {
 }
 
 func TestSendBatch_ServerError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer server.Close()
@@ -273,7 +273,7 @@ func TestSendBatch_WithHealth(t *testing.T) {
 	}
 }
 
-func TestStop(t *testing.T) {
+func TestStop(_ *testing.T) {
 	cfg := &config.Config{Mode: "slave", MasterURL: "http://localhost:12345", NodeName: "test-node"}
 	fwd := NewForwarder(cfg)
 
@@ -298,7 +298,7 @@ func TestStart_MasterMode(t *testing.T) {
 func TestStart_StopDrain(t *testing.T) {
 	var receivedCount atomic.Int32
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		receivedCount.Add(1)
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -347,7 +347,7 @@ func TestRetryMechanism(t *testing.T) {
 	var attemptCount atomic.Int32
 
 	// Server that fails first 2 times, then succeeds
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		count := attemptCount.Add(1)
 		if count <= 2 {
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -500,7 +500,7 @@ func TestReportHealth_SlaveMode(t *testing.T) {
 	}
 }
 
-func TestReportHealth_MasterMode(t *testing.T) {
+func TestReportHealth_MasterMode(_ *testing.T) {
 	cfg := &config.Config{Mode: "master", NodeName: "test-node"}
 	fwd := NewForwarder(cfg)
 

@@ -72,7 +72,7 @@ func TestInternalRoutesUseWebAuthWithoutIngestSecret(t *testing.T) {
 	}
 }
 
-func TestBroadcastAndUnsubscribeAreSerialized(t *testing.T) {
+func TestBroadcastAndUnsubscribeAreSerialized(_ *testing.T) {
 	s := testServer(&config.Config{})
 	ch := s.Subscribe()
 	var wg sync.WaitGroup

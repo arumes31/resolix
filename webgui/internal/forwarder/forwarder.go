@@ -3,11 +3,12 @@ package forwarder
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
+	"math/big"
 	"net/http"
 	"os"
 	"runtime"
@@ -428,8 +429,11 @@ func calculateBackoff(attempt int) time.Duration {
 		seconds = 30
 	}
 	backoff := time.Duration(seconds) * time.Second
-	// Add jitter: 0-500ms
-	jitter := time.Duration(rand.Intn(500)) * time.Millisecond
+	// Add jitter: 0-500ms (crypto/rand; falls back to no jitter on error)
+	jitter := time.Duration(0)
+	if n, err := rand.Int(rand.Reader, big.NewInt(500)); err == nil {
+		jitter = time.Duration(n.Int64()) * time.Millisecond
+	}
 	return backoff + jitter
 }
 

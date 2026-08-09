@@ -73,6 +73,7 @@ const (
 	DefaultLogFile = ""
 
 	// Item 85-94: Distributed architecture defaults
+
 	// DefaultMaxRetryAttempts is the maximum number of retry attempts for forwarding.
 	DefaultMaxRetryAttempts = 6
 	// DefaultHeartbeatInterval is the default interval for slave heartbeats to master.
@@ -169,7 +170,6 @@ type clientAliasesProvider struct {
 	path    string
 	aliases map[string]string
 	mu      sync.RWMutex
-	cancel  context.CancelFunc
 }
 
 // newClientAliasesProvider creates a new provider and loads the initial aliases from the file.
@@ -236,7 +236,6 @@ func (p *clientAliasesProvider) load() {
 
 // startReload begins periodic reloading of the aliases file.
 func (p *clientAliasesProvider) startReload(ctx context.Context) {
-	ctx, p.cancel = context.WithCancel(ctx)
 	ticker := time.NewTicker(DefaultClientAliasesReloadInterval)
 	go func() {
 		defer ticker.Stop()
@@ -267,13 +266,6 @@ func (p *clientAliasesProvider) GetAllAliases() map[string]string {
 		result[k] = v
 	}
 	return result
-}
-
-// stop cancels the reload goroutine.
-func (p *clientAliasesProvider) stop() {
-	if p.cancel != nil {
-		p.cancel()
-	}
 }
 
 // GetClientAlias returns the alias for a given IP address.
@@ -323,6 +315,12 @@ func (c *Config) GetAllClientAliases() map[string]string {
 	return result
 }
 
+// sanitizeForLog strips CR/LF characters from an untrusted value before it is
+// written to the logs, preventing log injection (gosec G706).
+func sanitizeForLog(s string) string {
+	return strings.NewReplacer("\r", "", "\n", "").Replace(s)
+}
+
 // parseDurationEnv reads an environment variable and parses it as a duration.
 // Returns the default value if the variable is empty or cannot be parsed.
 func parseDurationEnv(key string, defaultVal time.Duration) time.Duration {
@@ -332,11 +330,11 @@ func parseDurationEnv(key string, defaultVal time.Duration) time.Duration {
 	}
 	d, err := time.ParseDuration(val)
 	if err != nil {
-		log.Printf("[WARN] Invalid %s '%s', falling back to %s: %v", key, val, defaultVal, err)
+		log.Printf("[WARN] Invalid %s '%s', falling back to %s: %v", key, sanitizeForLog(val), defaultVal, err) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
 		return defaultVal
 	}
 	if d <= 0 {
-		log.Printf("[WARN] Invalid %s '%s', falling back to %s: duration must be positive", key, val, defaultVal)
+		log.Printf("[WARN] Invalid %s '%s', falling back to %s: duration must be positive", key, sanitizeForLog(val), defaultVal) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
 		return defaultVal
 	}
 	return d
@@ -351,7 +349,7 @@ func parseInt64Env(key string, defaultVal int64) int64 {
 	}
 	n, err := strconv.ParseInt(val, 10, 64)
 	if err != nil || n < 0 {
-		log.Printf("[WARN] Invalid %s '%s', falling back to %d: %v", key, val, defaultVal, err)
+		log.Printf("[WARN] Invalid %s '%s', falling back to %d: %v", key, sanitizeForLog(val), defaultVal, err) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
 		return defaultVal
 	}
 	return n
@@ -366,41 +364,136 @@ func parseIntEnv(key string, defaultVal int) int {
 	}
 	n, err := strconv.Atoi(val)
 	if err != nil || n < 0 {
-		log.Printf("[WARN] Invalid %s '%s', falling back to %d: %v", key, val, defaultVal, err)
+		log.Printf("[WARN] Invalid %s '%s', falling back to %d: %v", key, sanitizeForLog(val), defaultVal, err) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
 		return defaultVal
 	}
 	return n
 }
 
-// LoadConfig reads configuration from environment variables.
-func LoadConfig() *Config {
+// resolveMode reads and validates the MODE environment variable.
+func resolveMode() string {
 	mode := strings.ToLower(os.Getenv("MODE"))
 	if mode == "" {
-		mode = "master"
+		return "master"
 	}
 	if mode != "master" && mode != "slave" {
-		log.Printf("[WARN] Invalid MODE '%s', falling back to master", mode)
-		mode = "master"
+		log.Printf("[WARN] Invalid MODE '%s', falling back to master", sanitizeForLog(mode)) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		return "master"
 	}
+	return mode
+}
 
+// resolveNodeName reads NODE_NAME, falling back to the OS hostname.
+func resolveNodeName() string {
 	nodeName := os.Getenv("NODE_NAME")
-	if nodeName == "" {
-		host, err := os.Hostname()
-		if err != nil {
-			log.Printf("[ERROR] Error getting hostname: %v", err)
-			nodeName = "unknown-node"
-		} else {
-			nodeName = host
-		}
+	if nodeName != "" {
+		return nodeName
 	}
+	host, err := os.Hostname()
+	if err != nil {
+		log.Printf("[ERROR] Error getting hostname: %v", err)
+		return "unknown-node"
+	}
+	return host
+}
 
+// resolvePort reads and validates the PORT environment variable.
+func resolvePort() string {
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = DefaultPort
-	} else if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
-		log.Printf("[WARN] Invalid PORT '%s', falling back to %s", port, DefaultPort)
-		port = DefaultPort
+		return DefaultPort
 	}
+	if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+		log.Printf("[WARN] Invalid PORT '%s', falling back to %s", sanitizeForLog(port), DefaultPort) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		return DefaultPort
+	}
+	return port
+}
+
+// validateMasterURL exits fatally when masterURL is set but invalid.
+func validateMasterURL(masterURL string) {
+	if masterURL == "" {
+		return
+	}
+	if !isValidMasterURL(masterURL) {
+		log.Fatalf("[FATAL] Invalid MASTER_URL: must start with http:// or https:// (got: %s)", sanitizeForLog(masterURL)) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+	}
+	if _, err := url.ParseRequestURI(masterURL); err != nil {
+		log.Fatalf("[FATAL] Invalid MASTER_URL: %v", err)
+	}
+}
+
+// loadEnvAliases parses the CLIENT_ALIASES environment variable
+// (comma-separated IP:Alias pairs) into a map.
+func loadEnvAliases() map[string]string {
+	aliases := make(map[string]string)
+	if a := os.Getenv("CLIENT_ALIASES"); a != "" {
+		for _, pair := range strings.Split(a, ",") {
+			parts := strings.Split(pair, ":")
+			if len(parts) == 2 {
+				key := strings.TrimSpace(parts[0])
+				val := strings.TrimSpace(parts[1])
+				if key == "" || val == "" {
+					log.Printf("[WARN] Invalid CLIENT_ALIASES mapping: %q", sanitizeForLog(pair)) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+					continue
+				}
+				aliases[key] = val
+			} else {
+				log.Printf("[WARN] Invalid CLIENT_ALIASES mapping: %q", sanitizeForLog(pair)) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+			}
+		}
+	}
+	return aliases
+}
+
+// parseTrustedProxies parses the TRUSTED_PROXIES environment variable
+// (comma-separated list) into a slice.
+func parseTrustedProxies() []string {
+	var trustedProxies []string
+	for _, proxy := range strings.Split(os.Getenv("TRUSTED_PROXIES"), ",") {
+		if proxy = strings.TrimSpace(proxy); proxy != "" {
+			trustedProxies = append(trustedProxies, proxy)
+		}
+	}
+	return trustedProxies
+}
+
+// normalizeBaseURL reads BASE_URL and ensures it starts with / and has no
+// trailing /.
+func normalizeBaseURL() string {
+	baseURL := os.Getenv("BASE_URL")
+	if baseURL == "" {
+		baseURL = DefaultBaseURL
+	}
+	// Ensure base URL starts with / and ends without /
+	if !strings.HasPrefix(baseURL, "/") {
+		baseURL = "/" + baseURL
+	}
+	baseURL = strings.TrimSuffix(baseURL, "/")
+	if baseURL == "" {
+		baseURL = "/"
+	}
+	return baseURL
+}
+
+// resolveLatencyThreshold reads and validates UPSTREAM_LATENCY_THRESHOLD.
+func resolveLatencyThreshold() int {
+	if lt := os.Getenv("UPSTREAM_LATENCY_THRESHOLD"); lt != "" {
+		if val, err := strconv.Atoi(lt); err == nil && val > 0 {
+			return val
+		}
+		log.Printf("[WARN] Invalid UPSTREAM_LATENCY_THRESHOLD '%s', falling back to %d", sanitizeForLog(lt), DefaultUpstreamLatencyThreshold) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+	}
+	return DefaultUpstreamLatencyThreshold
+}
+
+// LoadConfig reads configuration from environment variables.
+func LoadConfig() *Config {
+	mode := resolveMode()
+
+	nodeName := resolveNodeName()
+
+	port := resolvePort()
 
 	historyDir := os.Getenv("HISTORY_DIR")
 	if historyDir == "" {
@@ -418,40 +511,12 @@ func LoadConfig() *Config {
 	}
 
 	masterURL := strings.TrimSuffix(os.Getenv("MASTER_URL"), "/")
-	if masterURL != "" {
-		if !isValidMasterURL(masterURL) {
-			log.Fatalf("[FATAL] Invalid MASTER_URL: must start with http:// or https:// (got: %s)", masterURL)
-		}
-		if _, err := url.ParseRequestURI(masterURL); err != nil {
-			log.Fatalf("[FATAL] Invalid MASTER_URL: %v", err)
-		}
-	}
+	validateMasterURL(masterURL)
 
 	// Load client aliases from env var
-	aliases := make(map[string]string)
-	if a := os.Getenv("CLIENT_ALIASES"); a != "" {
-		for _, pair := range strings.Split(a, ",") {
-			parts := strings.Split(pair, ":")
-			if len(parts) == 2 {
-				key := strings.TrimSpace(parts[0])
-				val := strings.TrimSpace(parts[1])
-				if key == "" || val == "" {
-					log.Printf("[WARN] Invalid CLIENT_ALIASES mapping: %q", pair)
-					continue
-				}
-				aliases[key] = val
-			} else {
-				log.Printf("[WARN] Invalid CLIENT_ALIASES mapping: %q", pair)
-			}
-		}
-	}
+	aliases := loadEnvAliases()
 
-	var trustedProxies []string
-	for _, proxy := range strings.Split(os.Getenv("TRUSTED_PROXIES"), ",") {
-		if proxy = strings.TrimSpace(proxy); proxy != "" {
-			trustedProxies = append(trustedProxies, proxy)
-		}
-	}
+	trustedProxies := parseTrustedProxies()
 
 	// Load client aliases from file
 	clientAliasesFile := os.Getenv("CLIENT_ALIASES_FILE")
@@ -470,18 +535,7 @@ func LoadConfig() *Config {
 		logLevel = DefaultLogLevel
 	}
 
-	baseURL := os.Getenv("BASE_URL")
-	if baseURL == "" {
-		baseURL = DefaultBaseURL
-	}
-	// Ensure base URL starts with / and ends without /
-	if !strings.HasPrefix(baseURL, "/") {
-		baseURL = "/" + baseURL
-	}
-	baseURL = strings.TrimSuffix(baseURL, "/")
-	if baseURL == "" {
-		baseURL = "/"
-	}
+	baseURL := normalizeBaseURL()
 
 	// Load new configuration values
 	blocklistFile := os.Getenv("BLOCKLIST_FILE")
@@ -504,14 +558,7 @@ func LoadConfig() *Config {
 		dnsmasqPIDFile = DefaultDNSMasqPIDFile
 	}
 
-	latencyThreshold := DefaultUpstreamLatencyThreshold
-	if lt := os.Getenv("UPSTREAM_LATENCY_THRESHOLD"); lt != "" {
-		if val, err := strconv.Atoi(lt); err == nil && val > 0 {
-			latencyThreshold = val
-		} else {
-			log.Printf("[WARN] Invalid UPSTREAM_LATENCY_THRESHOLD '%s', falling back to %d", lt, DefaultUpstreamLatencyThreshold)
-		}
-	}
+	latencyThreshold := resolveLatencyThreshold()
 
 	// Parse configurable timeout values (Item 80)
 	sseKeepalive := parseDurationEnv("SSE_KEEPALIVE_INTERVAL", DefaultSSEKeepaliveInterval)
@@ -644,13 +691,15 @@ func (c *Config) VerifyConfig() ([]string, []string) {
 
 	// 1. Database path is writable
 	dbDir := filepath.Dir(c.FullDBPath())
-	if err := os.MkdirAll(dbDir, 0755); err != nil {
+	if err := os.MkdirAll(dbDir, 0750); err != nil {
 		errs = append(errs, fmt.Sprintf("Cannot create database directory %s: %v", dbDir, err))
 	} else {
-		testFile := filepath.Join(dbDir, ".write_test")
-		if f, err := os.Create(testFile); err != nil {
+		// CreateTemp picks a random name inside the trusted config directory,
+		// avoiding a predictable-path write (gosec G304).
+		if f, err := os.CreateTemp(dbDir, ".write_test*"); err != nil {
 			errs = append(errs, fmt.Sprintf("Database directory %s is not writable: %v", dbDir, err))
 		} else {
+			testFile := f.Name()
 			_ = f.Close()
 			_ = os.Remove(testFile)
 		}

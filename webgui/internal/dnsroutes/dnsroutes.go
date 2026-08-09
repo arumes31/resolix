@@ -248,7 +248,7 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) (err error) {
 
 // LoadFromFile loads routes from a specific file (used for initial load from upstreams file).
 func LoadFromFile(path string) map[string]string {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- path comes from trusted config (upstreams/routes file settings), not from request input
 	if err != nil {
 		return nil
 	}
@@ -265,12 +265,12 @@ func SaveUpstreams(path string, upstreams []string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	return os.WriteFile(path, data, 0600)
 }
 
 // LoadUpstreams reads the upstream server list from a JSON file.
 func LoadUpstreams(path string) []string {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- path comes from trusted config (upstreams file setting), not from request input
 	if err != nil {
 		return nil
 	}
@@ -290,7 +290,7 @@ func LoadUpstreams(path string) []string {
 
 // ReadLines reads a file and returns non-empty, non-comment lines.
 func ReadLines(path string) []string {
-	file, err := os.Open(path)
+	file, err := os.Open(path) // #nosec G304 -- path comes from trusted config (blocklist/upstreams file settings), not from request input
 	if err != nil {
 		return nil
 	}

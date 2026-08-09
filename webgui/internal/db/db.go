@@ -15,7 +15,7 @@ import (
 func InitDB(fullDBPath string) (*sql.DB, error) {
 	// Ensure the directory exists before opening the database
 	dbDir := filepath.Dir(fullDBPath)
-	if err := os.MkdirAll(dbDir, 0755); err != nil {
+	if err := os.MkdirAll(dbDir, 0750); err != nil {
 		return nil, fmt.Errorf("failed to create database directory %s: %w", dbDir, err)
 	}
 

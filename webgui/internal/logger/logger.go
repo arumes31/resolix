@@ -85,7 +85,7 @@ func EnableFileLogging(path string) error {
 	fileMu.Lock()
 	defer fileMu.Unlock()
 
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600) // #nosec G304 -- log file path comes from trusted config (LOG_FILE env or built-in default), not from request input
 	if err != nil {
 		return fmt.Errorf("failed to open log file %s: %w", path, err)
 	}

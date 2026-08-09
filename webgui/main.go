@@ -18,7 +18,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -130,7 +129,7 @@ func generateEnvFile() {
 		logger.Info(".env.example not found, generating .env from defaults")
 	}
 
-	if err := os.WriteFile(envPath, []byte(content), 0600); err != nil {
+	if err := os.WriteFile(envPath, []byte(content), 0600); err != nil { // #nosec G703 -- path is the hardcoded constant ".env" in the working directory, never user input
 		logger.Warning("Failed to generate .env file: %v", err)
 	} else {
 		logger.Info("Generated default .env file at %s", envPath)
@@ -381,53 +380,7 @@ func main() {
 	}()
 
 	// Log Ingestion
-	go func() {
-		linesCh := make(chan []byte)
-		go func() {
-			logger.Info("Log ingestion scanner started on stdin")
-			scanner := bufio.NewScanner(os.Stdin)
-			for scanner.Scan() {
-				buf := scanner.Bytes()
-				line := make([]byte, len(buf))
-				copy(line, buf)
-				linesCh <- line
-			}
-			if err := scanner.Err(); err != nil {
-				logger.Warning("stdin scan error: %v", err)
-			}
-			logger.Info("Log ingestion scanner reached EOF")
-			close(linesCh)
-		}()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case line, ok := <-linesCh:
-				if !ok {
-					logger.Info("Log ingestion loop exiting: channel closed")
-					return
-				}
-				isData := bytes.Contains(line, []byte("query[")) || bytes.Contains(line, []byte("reply"))
-				if isData {
-					if cfg.Debug {
-						logger.Debug("[INGEST] %s", string(line))
-					}
-				} else {
-					// Always print non-query/reply lines as they are likely errors or important info
-					logger.Info("[DNSMASQ] %s", string(line))
-				}
-
-				if cfg.Mode == "slave" {
-					fwd.Enqueue(string(line))
-				}
-				ev := prs.ParseLogBytes(line, cfg.NodeName)
-				if ev != nil {
-					srv.BroadcastEvent(*ev)
-				}
-			}
-		}
-	}()
+	go startLogIngestion(ctx, cfg, fwd, prs, srv)
 
 	// Start HTTP server and report completion so shutdown can wait before
 	// closing storage used by in-flight handlers.
@@ -472,21 +425,7 @@ func main() {
 	// Step 5: Wait for HTTP handlers to finish before closing storage.
 	logger.Info("Shutdown step 5: Waiting for HTTP server to finish...")
 	if !serverStopped {
-		timer := time.NewTimer(cfg.HTTPShutdownTimeout)
-		select {
-		case err := <-serverDone:
-			if err != nil && !errors.Is(err, http.ErrServerClosed) {
-				logger.Warning("HTTP server shutdown error: %v", err)
-			}
-		case <-timer.C:
-			logger.Warning("HTTP server did not stop within %s", cfg.HTTPShutdownTimeout)
-		}
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
+		waitForHTTPServer(cfg, serverDone)
 	}
 
 	// Step 6: Flush pending batch buffers to SQLite
@@ -506,6 +445,77 @@ func main() {
 	logger.Info("Graceful shutdown complete")
 }
 
+// startLogIngestion reads dnsmasq log lines from stdin, mirrors them to the
+// logs, forwards them to the master in slave mode, and broadcasts parsed
+// events to SSE subscribers. It returns when ctx is canceled or stdin closes.
+func startLogIngestion(ctx context.Context, cfg *config.Config, fwd *forwarder.Forwarder, prs *parser.Parser, srv *api.Server) {
+	linesCh := make(chan []byte)
+	go func() {
+		logger.Info("Log ingestion scanner started on stdin")
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			buf := scanner.Bytes()
+			line := make([]byte, len(buf))
+			copy(line, buf)
+			linesCh <- line
+		}
+		if err := scanner.Err(); err != nil {
+			logger.Warning("stdin scan error: %v", err)
+		}
+		logger.Info("Log ingestion scanner reached EOF")
+		close(linesCh)
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case line, ok := <-linesCh:
+			if !ok {
+				logger.Info("Log ingestion loop exiting: channel closed")
+				return
+			}
+			isData := bytes.Contains(line, []byte("query[")) || bytes.Contains(line, []byte("reply"))
+			if isData {
+				if cfg.Debug {
+					logger.Debug("[INGEST] %s", string(line))
+				}
+			} else {
+				// Always print non-query/reply lines as they are likely errors or important info
+				logger.Info("[DNSMASQ] %s", string(line))
+			}
+
+			if cfg.Mode == "slave" {
+				fwd.Enqueue(string(line))
+			}
+			ev := prs.ParseLogBytes(line, cfg.NodeName)
+			if ev != nil {
+				srv.BroadcastEvent(*ev)
+			}
+		}
+	}
+}
+
+// waitForHTTPServer waits for the HTTP server goroutine to finish, giving up
+// after cfg.HTTPShutdownTimeout.
+func waitForHTTPServer(cfg *config.Config, serverDone chan error) {
+	timer := time.NewTimer(cfg.HTTPShutdownTimeout)
+	select {
+	case err := <-serverDone:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Warning("HTTP server shutdown error: %v", err)
+		}
+	case <-timer.C:
+		logger.Warning("HTTP server did not stop within %s", cfg.HTTPShutdownTimeout)
+	}
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+}
+
 // init ensures the working directory is set correctly for .env generation.
 func init() {
 	// If running from a different directory, try to find the project root
@@ -513,26 +523,8 @@ func init() {
 	if _, err := os.Stat(".env.example"); err != nil {
 		// Check if we're in the webgui/ subdirectory
 		if _, err := os.Stat(filepath.Join("..", ".env.example")); err == nil {
-			if err := os.Chdir(".."); err == nil {
-				// Successfully changed to project root
-			}
+			// Best effort: move to the project root; failure is non-fatal.
+			_ = os.Chdir("..")
 		}
 	}
-}
-
-// ensureBaseURLPrefix is a helper to ensure URLs have the proper base URL prefix.
-// This is used by template functions to generate correct URL paths.
-func ensureBaseURLPrefix(baseURL, path string) string {
-	if baseURL == "/" {
-		return path
-	}
-	return baseURL + path
-}
-
-// stripBaseURLPrefix removes the base URL prefix from a path.
-func stripBaseURLPrefix(baseURL, path string) string {
-	if baseURL == "/" {
-		return path
-	}
-	return strings.TrimPrefix(path, baseURL)
 }

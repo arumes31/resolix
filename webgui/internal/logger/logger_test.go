@@ -18,7 +18,7 @@ func TestEnableFileLoggingReplacesAndClosesPreviousFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer CloseFile()
-	data, err := os.ReadFile(first)
+	data, err := os.ReadFile(first) // #nosec G304 -- test reads a file it just created under t.TempDir()
 	if err != nil {
 		t.Fatal(err)
 	}

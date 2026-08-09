@@ -284,6 +284,12 @@ func (s *Server) isHTTPS(r *http.Request) bool {
 	return strings.EqualFold(strings.TrimSpace(proto), "https")
 }
 
+// sanitizeLogValue strips CR/LF characters from an untrusted value before it
+// is written to the logs, preventing log injection (gosec G706).
+func sanitizeLogValue(s string) string {
+	return strings.NewReplacer("\r", "", "\n", "").Replace(s)
+}
+
 // clientIP extracts the client IP from the request. Forwarded headers are
 // honored only when the immediate peer is explicitly trusted.
 func (s *Server) clientIP(r *http.Request) string {
@@ -448,12 +454,12 @@ func (s *Server) Unsubscribe(ch chan models.QueryEvent) {
 func (s *Server) BroadcastEvent(e models.QueryEvent) {
 	// Item 59: Enrich with reverse DNS hostname
 	s.fieldsMu.RLock()
-	resolver := s.resolver
+	res := s.resolver
 	bl := s.blocklist
 	s.fieldsMu.RUnlock()
 
-	if resolver != nil && e.ClientIP != "" {
-		if hostname := resolver.GetHostname(e.ClientIP); hostname != "" {
+	if res != nil && e.ClientIP != "" {
+		if hostname := res.GetHostname(e.ClientIP); hostname != "" {
 			e.ClientHostname = hostname
 		}
 	}
@@ -817,7 +823,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Set CSRF cookie (HttpOnly, Secure if HTTPS, SameSite=Strict)
-		http.SetCookie(w, &http.Cookie{
+		http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via isHTTPS(r): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
 			Name:     csrfCookieName,
 			Value:    csrfToken,
 			Path:     "/",
@@ -876,7 +882,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			// Successful login — reset rate limiter for this IP
 			s.resetRateLimit(ip)
 
-			http.SetCookie(w, &http.Cookie{
+			http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via isHTTPS(r): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
 				Name:     sessionCookieName,
 				Value:    sessionToken,
 				Path:     "/",
@@ -897,7 +903,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
-		http.SetCookie(w, &http.Cookie{
+		http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via isHTTPS(r): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
 			Name:     csrfCookieName,
 			Value:    csrfToken,
 			Path:     "/",
@@ -923,7 +929,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if cookie, err := r.Cookie(sessionCookieName); err == nil {
 		s.deleteSession(cookie.Value)
 	}
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via isHTTPS(r): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
 		Name:     sessionCookieName,
 		Value:    "",
 		Path:     "/",
@@ -933,7 +939,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteStrictMode,
 	})
 	// Also clear the CSRF cookie
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via isHTTPS(r): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
 		Name:     csrfCookieName,
 		Value:    "",
 		Path:     "/",
@@ -1294,7 +1300,7 @@ func (s *Server) handleCacheClear(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	pidFile := s.cfg.DNSMasqPIDFile
-	data, err := os.ReadFile(pidFile)
+	data, err := os.ReadFile(pidFile) // #nosec G304 -- PID file path comes from trusted config (DNSMASQ_PID_FILE env or built-in default), not from request input
 	if err != nil {
 		w.WriteHeader(http.StatusNotFound)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1521,8 +1527,8 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		s.store.SetUpstreamHealth(hb.Node, hb.Health)
 	}
 
-	log.Printf("[INFO] Heartbeat received from node %s (v%s, %d goroutines, %.1fMB mem)",
-		hb.Node, hb.Version, hb.Goroutines, hb.MemoryMB)
+	log.Printf("[INFO] Heartbeat received from node %s (v%s, %d goroutines, %.1fMB mem)", // #nosec G706 -- CR/LF stripped by sanitizeLogValue; gosec taint analysis cannot see through the helper
+		sanitizeLogValue(hb.Node), sanitizeLogValue(hb.Version), hb.Goroutines, hb.MemoryMB)
 
 	w.WriteHeader(http.StatusNoContent)
 }

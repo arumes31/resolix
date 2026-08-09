@@ -2,6 +2,7 @@ package filter
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -143,9 +144,22 @@ func (e *Engine) fetchSource(src *Source) {
 		return
 	}
 
-	block, allow, readErr := parseRulesCapped(io.LimitReader(resp.Body, maxFetchBytes), src.AllowOnly)
+	counter := &countingReader{r: io.LimitReader(resp.Body, int64(maxFetchBytes)+1)}
+	body, readErr := io.ReadAll(counter)
 	if readErr != nil {
-		e.setRules(src, nil, nil, readErr.Error())
+		e.setSourceError(src, readErr.Error())
+		log.Printf("[WARN] filter: parse failed for %s (keeping last good): %v", src.Name, readErr)
+		return
+	}
+	if counter.n > maxFetchBytes {
+		readErr = fmt.Errorf("subscription exceeds %d-byte limit", maxFetchBytes)
+		e.setSourceError(src, readErr.Error())
+		log.Printf("[WARN] filter: update failed for %s (keeping last good): %v", src.Name, readErr)
+		return
+	}
+	block, allow, readErr := parseRulesCapped(bytes.NewReader(body), src.AllowOnly)
+	if readErr != nil {
+		e.setSourceError(src, readErr.Error())
 		log.Printf("[WARN] filter: parse failed for %s (keeping last good): %v", src.Name, readErr)
 		return
 	}
@@ -156,6 +170,17 @@ func (e *Engine) fetchSource(src *Source) {
 	e.mu.Unlock()
 	e.setRules(src, block, allow, "")
 	log.Printf("[INFO] filter: updated %s — %d rules (%d exceptions)", src.Name, len(block), len(allow))
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	r.n += int64(n)
+	return n, err
 }
 
 // StartUpdateLoop performs an initial update of all sources and then

@@ -1,8 +1,8 @@
 // Package dnsserver implements the in-process DNS server that replaces
 // dnsmasq. It serves UDP and TCP listeners and answers queries through an
-// ordered pipeline: policy short-circuits (refuse-ANY, AAAA-disable) →
-// typed rewrites → safe-search → filter → cache lookup → strict-order
-// upstream forwarding → bogus-NXDOMAIN conversion → cache store → respond.
+// ordered pipeline: refuse-ANY/AAAA-disable → typed rewrites → private PTR →
+// safe-search → filter → blocked services → cache → client upstreams →
+// domain route → global pool → bogus-NXDOMAIN → cache store → respond.
 // Every answered query is emitted as a models.QueryEvent into the existing
 // Store/SSE pipeline.
 package dnsserver
@@ -675,6 +675,7 @@ func (s *Server) resolveViaCacheOrUpstream(r *dns.Msg, resp *dns.Msg, key cacheK
 		resp.AuthenticatedData = ent.authenticatedData
 		resp.Answer = withTTL(ent.answers, remaining)
 		resp.Ns = withTTL(ent.authority, remaining)
+		resp.Extra = responseExtra(r, nil)
 		return resolution{upstream: "System Cache", cacheHit: true}
 	}
 
@@ -686,6 +687,7 @@ func (s *Server) resolveViaCacheOrUpstream(r *dns.Msg, resp *dns.Msg, key cacheK
 			resp.AuthenticatedData = ent.authenticatedData
 			resp.Answer = withTTL(ent.answers, 1)
 			resp.Ns = withTTL(ent.authority, 1)
+			resp.Extra = responseExtra(r, nil)
 			s.refreshAsync(key, r, specs)
 			return resolution{upstream: "System Cache (stale)", cacheHit: true}
 		}
@@ -710,11 +712,34 @@ func (s *Server) resolveViaCacheOrUpstream(r *dns.Msg, resp *dns.Msg, key cacheK
 	resp.AuthenticatedData = m.AuthenticatedData
 	resp.Answer = m.Answer
 	resp.Ns = m.Ns
-	resp.Extra = m.Extra
+	resp.Extra = responseExtra(r, m.Extra)
 
 	// Stage: cache store.
 	s.storeInCache(key, m)
 	return resolution{upstream: usedUpstream}
+}
+
+// responseExtra preserves non-OPT additional records from upstream and
+// creates an OPT record from the current client's EDNS request. Upstream OPT
+// records are hop-by-hop and must not be relayed or cached for another client.
+func responseExtra(request *dns.Msg, upstreamExtra []dns.RR) []dns.RR {
+	extra := make([]dns.RR, 0, len(upstreamExtra)+1)
+	for _, rr := range upstreamExtra {
+		if _, ok := rr.(*dns.OPT); !ok {
+			extra = append(extra, dns.Copy(rr))
+		}
+	}
+	requestOPT := request.IsEdns0()
+	if requestOPT == nil {
+		return extra
+	}
+	opt := new(dns.OPT)
+	opt.Hdr.Name = "."
+	opt.Hdr.Rrtype = dns.TypeOPT
+	opt.SetUDPSize(requestOPT.UDPSize())
+	opt.SetVersion(requestOPT.Version())
+	opt.SetDo(requestOPT.Do())
+	return append(extra, opt)
 }
 
 // refreshAsync repopulates a stale cache entry in the background,

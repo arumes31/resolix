@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/miekg/dns"
+	"golang.org/x/net/publicsuffix"
 )
 
 // Safe-search engine identifiers and their restricted targets.
@@ -89,7 +90,7 @@ func New(cfg Config) *Policy {
 
 // Enabled reports whether any policy feature is active.
 func (p *Policy) Enabled() bool {
-	return len(p.engines) > 0 || len(p.bogusNets) > 0 || p.AAAADisabled || p.RefuseANY
+	return p != nil && (len(p.engines) > 0 || len(p.bogusNets) > 0 || p.AAAADisabled || p.RefuseANY)
 }
 
 // RefuseANYEnabled reports whether QTYPE ANY should be refused.
@@ -139,8 +140,7 @@ func SafeSearchTargetFor(engines map[string]bool, domain string) string {
 		return ""
 	}
 	if engines["google"] {
-		// google.com and every www.google.<TLD> / google.<TLD> variant.
-		if domain == "google.com" || strings.HasPrefix(domain, "www.google.") || strings.HasPrefix(domain, "google.") {
+		if isGoogleSearchHost(domain) {
 			return googleTarget
 		}
 	}
@@ -156,6 +156,29 @@ func SafeSearchTargetFor(engines map[string]bool, domain string) string {
 		}
 	}
 	return ""
+}
+
+// isGoogleSearchHost accepts only google.<TLD> and www.google.<TLD>, where
+// the public suffix has one or two lowercase alphabetic labels. Requiring
+// Google to be the registrable label rejects nested attacker-owned domains.
+func isGoogleSearchHost(domain string) bool {
+	domain = strings.TrimPrefix(domain, "www.")
+	labels := strings.Split(domain, ".")
+	if len(labels) < 2 || len(labels) > 3 || labels[0] != "google" {
+		return false
+	}
+	for _, label := range labels[1:] {
+		if label == "" {
+			return false
+		}
+		for _, c := range label {
+			if c < 'a' || c > 'z' {
+				return false
+			}
+		}
+	}
+	registrable, err := publicsuffix.EffectiveTLDPlusOne(domain)
+	return err == nil && registrable == domain
 }
 
 // IsBogusAnswer reports whether every A/AAAA record in the answer section

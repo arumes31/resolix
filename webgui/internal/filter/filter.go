@@ -1,6 +1,7 @@
 package filter
 
 import (
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,21 +44,33 @@ type Source struct {
 
 // Engine is the filter rule engine. It is safe for concurrent use.
 type Engine struct {
-	mu         sync.RWMutex
-	sources    []*Source
-	blockRules map[*Source][]Rule
-	allowRules map[*Source][]Rule
+	mu               sync.RWMutex
+	sources          []*Source
+	blockRules       map[*Source][]Rule
+	allowRules       map[*Source][]Rule
+	blockDomainIndex map[string][]indexedRule
+	allowDomainIndex map[string][]indexedRule
+	blockRegexRules  []indexedRule
+	allowRegexRules  []indexedRule
 
 	pausedUntil  atomic.Int64 // unix seconds; 0 = protection enabled
 	blockedTotal atomic.Int64
 	allowedTotal atomic.Int64
 }
 
+type indexedRule struct {
+	rule   Rule
+	source *Source
+	order  int
+}
+
 // New creates an empty filter engine.
 func New() *Engine {
 	return &Engine{
-		blockRules: make(map[*Source][]Rule),
-		allowRules: make(map[*Source][]Rule),
+		blockRules:       make(map[*Source][]Rule),
+		allowRules:       make(map[*Source][]Rule),
+		blockDomainIndex: make(map[string][]indexedRule),
+		allowDomainIndex: make(map[string][]indexedRule),
 	}
 }
 
@@ -68,27 +81,42 @@ func (e *Engine) Match(domain string) Result {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	for _, src := range e.sources {
-		for _, r := range e.allowRules[src] {
-			if r.matches(domain) {
-				e.allowedTotal.Add(1)
-				return Result{Allowed: true, Rule: r.Raw, Source: src.Name}
-			}
-		}
+	if match, ok := firstIndexedMatch(domain, e.allowDomainIndex, e.allowRegexRules); ok {
+		e.allowedTotal.Add(1)
+		return Result{Allowed: true, Rule: match.rule.Raw, Source: match.source.Name}
 	}
-	for _, src := range e.sources {
-		for _, r := range e.blockRules[src] {
-			if r.matches(domain) {
-				e.blockedTotal.Add(1)
-				reason := ReasonBlocklist
-				if r.kind == kindRegex {
-					reason = ReasonRegex
-				}
-				return Result{Blocked: true, Rule: r.Raw, Source: src.Name, Reason: reason}
-			}
+	if match, ok := firstIndexedMatch(domain, e.blockDomainIndex, e.blockRegexRules); ok {
+		e.blockedTotal.Add(1)
+		reason := ReasonBlocklist
+		if match.rule.kind == kindRegex {
+			reason = ReasonRegex
 		}
+		return Result{Blocked: true, Rule: match.rule.Raw, Source: match.source.Name, Reason: reason}
 	}
 	return Result{}
+}
+
+func firstIndexedMatch(domain string, domains map[string][]indexedRule, regex []indexedRule) (indexedRule, bool) {
+	var first indexedRule
+	found := false
+	for candidate := domain; candidate != ""; {
+		for _, match := range domains[candidate] {
+			if !found || match.order < first.order {
+				first, found = match, true
+			}
+		}
+		dot := strings.IndexByte(candidate, '.')
+		if dot < 0 {
+			break
+		}
+		candidate = candidate[dot+1:]
+	}
+	for _, match := range regex {
+		if match.rule.matches(domain) && (!found || match.order < first.order) {
+			first, found = match, true
+		}
+	}
+	return first, found
 }
 
 // Pause disables protection for the given number of minutes; minutes <= 0
@@ -140,9 +168,44 @@ func (e *Engine) setRules(src *Source, block, allow []Rule, loadErr string) {
 	if loadErr == "" {
 		e.blockRules[src] = block
 		e.allowRules[src] = allow
+		e.rebuildIndexesLocked()
 		src.RuleCount = len(block)
 		src.AllowRuleCount = len(allow)
 		src.LastUpdate = time.Now()
 	}
 	src.LastError = loadErr
+}
+
+func (e *Engine) rebuildIndexesLocked() {
+	e.blockDomainIndex = make(map[string][]indexedRule)
+	e.allowDomainIndex = make(map[string][]indexedRule)
+	e.blockRegexRules = nil
+	e.allowRegexRules = nil
+	blockOrder, allowOrder := 0, 0
+	for _, src := range e.sources {
+		for _, rule := range e.allowRules[src] {
+			match := indexedRule{rule: rule, source: src, order: allowOrder}
+			allowOrder++
+			if rule.kind == kindRegex {
+				e.allowRegexRules = append(e.allowRegexRules, match)
+			} else {
+				e.allowDomainIndex[rule.domain] = append(e.allowDomainIndex[rule.domain], match)
+			}
+		}
+		for _, rule := range e.blockRules[src] {
+			match := indexedRule{rule: rule, source: src, order: blockOrder}
+			blockOrder++
+			if rule.kind == kindRegex {
+				e.blockRegexRules = append(e.blockRegexRules, match)
+			} else {
+				e.blockDomainIndex[rule.domain] = append(e.blockDomainIndex[rule.domain], match)
+			}
+		}
+	}
+}
+
+func (e *Engine) setSourceError(src *Source, loadErr string) {
+	e.mu.Lock()
+	src.LastError = loadErr
+	e.mu.Unlock()
 }

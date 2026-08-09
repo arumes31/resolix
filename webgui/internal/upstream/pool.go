@@ -356,7 +356,9 @@ func (p *Pool) weightedOrder(candidates []Resolver) []Resolver {
 	weights := make([]float64, len(candidates))
 	for i, r := range candidates {
 		st := p.statFor(r.String())
+		p.statsMu.Lock()
 		ewma := st.ewmaMS
+		p.statsMu.Unlock()
 		if ewma <= 0 {
 			ewma = 1
 		}
@@ -562,7 +564,7 @@ func (p *Pool) synthesizeDNS64(r Resolver, name string) []dns.RR {
 		}
 		for _, prefix := range p.dns64Prefixes {
 			ones, _ := prefix.Mask.Size()
-			if ones > 96 {
+			if ones != 96 {
 				continue
 			}
 			v6 := make([]byte, 16)

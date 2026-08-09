@@ -3,6 +3,7 @@ package rewrites
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/miekg/dns"
@@ -190,6 +191,7 @@ func TestValidate(t *testing.T) {
 		{"example.com", TypeCNAME, ""},
 		{"example.com", TypeMX, "garbage"},
 		{"example.com", TypeTXT, ""},
+		{"example.com", TypeTXT, strings.Repeat("é", 128)},
 		{"example.com", TypeSRV, "1 2 3"},
 		{"example.com", "WKS", "x"},
 	}

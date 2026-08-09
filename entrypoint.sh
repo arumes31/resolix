@@ -84,7 +84,8 @@ elif command -v ss >/dev/null; then
 fi
 
 # Start Web GUI with the embedded DNS server (dnsmasq is no longer used)
-echo "Starting Web GUI (embedded DNS server on ${TAILSCALE_IP}:${DNS_LISTEN_PORT:-53})..."
+DNS_EFFECTIVE_ADDR=${DNS_LISTEN_ADDR:-${TAILSCALE_IP:-0.0.0.0}}
+echo "Starting Web GUI (embedded DNS server on ${DNS_EFFECTIVE_ADDR}:${DNS_LISTEN_PORT:-53})..."
 /usr/bin/webgui &
 WEBGUI_PID=$!
 

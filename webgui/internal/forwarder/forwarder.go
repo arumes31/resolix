@@ -592,7 +592,7 @@ func (f *Forwarder) requeueBatch(events []models.QueryEvent) {
 		f.backlogTotalSize += size
 	}
 	if kept < len(events) {
-		log.Printf("[WARN] Backlog byte limit (%d) reached, dropping %d oldest events of failed batch", f.cfg.MaxBacklogSize, len(events)-kept)
+		log.Printf("[WARN] Backlog byte limit (%d) reached, dropping %d newest events of failed batch", f.cfg.MaxBacklogSize, len(events)-kept)
 	}
 	f.backlog = append(events[:kept:kept], f.backlog...)
 }

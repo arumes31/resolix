@@ -3,6 +3,7 @@ package dnsserver
 import (
 	"log"
 	"net"
+	"strconv"
 	"strings"
 )
 
@@ -22,7 +23,7 @@ func ParseStaticHosts(domainsEnv string) map[string]net.IP {
 			log.Printf("[WARN] Invalid DOMAINS entry (want domain:ip): %q", pair)
 			continue
 		}
-		domain = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(domain), "."))
+		domain = strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(domain), "."), "."))
 		ip := net.ParseIP(strings.TrimSpace(ipStr))
 		if domain == "" || ip == nil || ip.To4() == nil {
 			log.Printf("[WARN] Invalid DOMAINS entry (IPv4 only): %q", pair)
@@ -64,7 +65,10 @@ func normalizeUpstream(raw string) (string, bool) {
 	}
 	// dnsmasq-style ip#port
 	if host, port, ok := strings.Cut(raw, "#"); ok {
-		raw = host + ":" + port
+		if net.ParseIP(host) == nil || !validPort(port) {
+			return "", false
+		}
+		raw = net.JoinHostPort(host, port)
 	}
 	host, port, err := net.SplitHostPort(raw)
 	if err != nil {
@@ -74,10 +78,15 @@ func normalizeUpstream(raw string) (string, bool) {
 		}
 		return net.JoinHostPort(raw, "53"), true
 	}
-	if net.ParseIP(host) == nil || port == "" {
+	if net.ParseIP(host) == nil || !validPort(port) {
 		return "", false
 	}
 	return net.JoinHostPort(host, port), true
+}
+
+func validPort(port string) bool {
+	n, err := strconv.Atoi(port)
+	return err == nil && n > 0 && n <= 65535
 }
 
 // normalizeName lowercases a DNS name and strips the trailing dot.

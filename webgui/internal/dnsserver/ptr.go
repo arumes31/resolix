@@ -48,6 +48,9 @@ func arpaToIP(name string) net.IP {
 		}
 		ip := make(net.IP, 4)
 		for i, l := range labels {
+			if len(l) == 0 || len(l) > 3 {
+				return nil
+			}
 			var v int
 			for _, c := range l {
 				if c < '0' || c > '9' {

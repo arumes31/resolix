@@ -22,15 +22,16 @@ services:
       - DOH_AUTH_TOKEN=${DOH_AUTH_TOKEN:-}
       - DOT_ENABLED=${DOT_ENABLED:-false}
       - DOT_PORT=${DOT_PORT:-853}
-      - TLS_CERT_FILE=${TLS_CERT_FILE:-}
-      - TLS_KEY_FILE=${TLS_KEY_FILE:-}
+      - TLS_CERT_FILE=${TLS_CERT_FILE:-/etc/tailscale-dnsrewrite/tls.crt}
+      - TLS_KEY_FILE=${TLS_KEY_FILE:-/etc/tailscale-dnsrewrite/tls.key}
     ports:
       - "127.0.0.1:${PORT:-35353}:35353"
+      - "${DOT_PORT:-853}:${DOT_PORT:-853}/tcp"
     volumes:
       - ./history:/var/lib/tailscale-dnsrewrite
       - ./tailscale:/var/lib/tailscale
       # Mount certificates when DOT_ENABLED=true:
-      # - ./certs:/etc/tailscale-dnsrewrite/certs:ro
+      # - ./certs:/etc/tailscale-dnsrewrite:ro
     sysctls:
       - net.core.somaxconn=1024
       - net.ipv4.tcp_fastopen=3

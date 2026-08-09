@@ -51,7 +51,10 @@ func (s *Schedule) Active(now time.Time) bool {
 		if err1 != nil || err2 != nil {
 			continue
 		}
-		if end <= start { // overnight window
+		if end == start {
+			continue
+		}
+		if end < start { // overnight window
 			if mins >= start || mins < end {
 				return true
 			}

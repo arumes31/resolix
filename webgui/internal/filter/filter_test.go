@@ -149,6 +149,20 @@ func TestEngineRegexReason(t *testing.T) {
 	}
 }
 
+func TestEngineIndexPreservesRuleAndSourceOrder(t *testing.T) {
+	e := New()
+	first := e.AddFileSource(writeTempList(t, "/^ads\\./\n||ads.example.com^\n"), false)
+	e.AddFileSource(writeTempList(t, "||example.com^\n"), false)
+
+	res := e.Match("ads.example.com")
+	if !res.Blocked || res.Rule != "/^ads\\./" || res.Source != first.Name || res.Reason != ReasonRegex {
+		t.Fatalf("ordered indexed match = %+v", res)
+	}
+	if len(e.blockDomainIndex["ads.example.com"]) != 1 || len(e.blockRegexRules) != 1 {
+		t.Fatalf("indexes were not built: domains=%v regex=%d", e.blockDomainIndex, len(e.blockRegexRules))
+	}
+}
+
 func TestEnginePauseResume(t *testing.T) {
 	e := New()
 	if e.Paused() {

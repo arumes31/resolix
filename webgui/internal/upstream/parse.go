@@ -87,7 +87,7 @@ func Parse(raw string) (Spec, error) {
 	// Plain formats: ip, ip:port, ip#port (dnsmasq style).
 	normalized := raw
 	if host, port, ok := strings.Cut(raw, "#"); ok {
-		normalized = host + ":" + port
+		normalized = net.JoinHostPort(host, port)
 	}
 	host, port, err := net.SplitHostPort(normalized)
 	if err != nil {

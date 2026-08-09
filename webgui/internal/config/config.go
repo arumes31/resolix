@@ -650,15 +650,15 @@ func resolveBlocking() (mode, ip4, ip6 string) {
 		log.Printf("[WARN] Invalid BLOCKING_MODE '%s', falling back to %s", sanitizeForLog(mode), DefaultBlockingMode) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
 		mode = DefaultBlockingMode
 	}
-	ip4 = os.Getenv("BLOCK_CUSTOM_IP4")
-	if ip4 == "" || net.ParseIP(ip4) == nil {
+	ip4 = strings.TrimSpace(os.Getenv("BLOCK_CUSTOM_IP4"))
+	if parsed := net.ParseIP(ip4); ip4 == "" || parsed == nil || parsed.To4() == nil {
 		if ip4 != "" {
 			log.Printf("[WARN] Invalid BLOCK_CUSTOM_IP4 '%s', falling back to %s", sanitizeForLog(ip4), DefaultBlockCustomIP4) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
 		}
 		ip4 = DefaultBlockCustomIP4
 	}
-	ip6 = os.Getenv("BLOCK_CUSTOM_IP6")
-	if ip6 == "" || net.ParseIP(ip6) == nil {
+	ip6 = strings.TrimSpace(os.Getenv("BLOCK_CUSTOM_IP6"))
+	if parsed := net.ParseIP(ip6); ip6 == "" || parsed == nil || parsed.To4() != nil {
 		if ip6 != "" {
 			log.Printf("[WARN] Invalid BLOCK_CUSTOM_IP6 '%s', falling back to %s", sanitizeForLog(ip6), DefaultBlockCustomIP6) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
 		}

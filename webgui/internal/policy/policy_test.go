@@ -20,6 +20,8 @@ func TestSafeSearchTargets(t *testing.T) {
 		{"www.google.de", googleTarget},
 		{"www.google.co.uk", googleTarget},
 		{"google.fr", googleTarget},
+		{"google.evil.example", ""},
+		{"google.com.attacker.example", ""},
 		{"mail.google.com", ""}, // not a search frontend
 		// bing
 		{"www.bing.com", bingTarget},
@@ -106,7 +108,7 @@ func TestPolicyFlags(t *testing.T) {
 		t.Error("flags should be disabled")
 	}
 	var nilPolicy *Policy
-	if nilPolicy.AAAADisabledEnabled() || nilPolicy.RefuseANYEnabled() || nilPolicy.IsBogusAnswer(nil) {
+	if nilPolicy.Enabled() || nilPolicy.AAAADisabledEnabled() || nilPolicy.RefuseANYEnabled() || nilPolicy.IsBogusAnswer(nil) {
 		t.Error("nil policy must be inert")
 	}
 }

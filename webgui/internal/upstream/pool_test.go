@@ -218,7 +218,10 @@ func TestPoolDNS64(t *testing.T) {
 		_ = w.WriteMsg(m)
 	})
 
-	pool := NewPool(PoolConfig{Mode: ModeStrict, PrimarySpecs: []string{addr}, DNS64: true})
+	pool := NewPool(PoolConfig{
+		Mode: ModeStrict, PrimarySpecs: []string{addr}, DNS64: true,
+		DNS64Prefixes: []string{"64:ff9b::/64", "64:ff9b::/96"},
+	})
 	q := new(dns.Msg)
 	q.SetQuestion("example.org.", dns.TypeAAAA)
 	resp, _, err := pool.Exchange(q)

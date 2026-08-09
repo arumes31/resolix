@@ -50,12 +50,15 @@ import (
 )
 
 const (
-	sessionCookieName = "ts_dns_session"
-	csrfCookieName    = "ts_dns_csrf"
-	csrfTokenBytes    = 32
-	sessionTokenBytes = 32
-	sessionLifetime   = 7 * 24 * time.Hour
+	sessionCookieName   = "ts_dns_session"
+	csrfCookieName      = "ts_dns_csrf"
+	csrfTokenBytes      = 32
+	sessionTokenBytes   = 32
+	sessionLifetime     = 7 * 24 * time.Hour
+	maxIngestFutureSkew = 5 * time.Minute
 )
+
+var userRulesMu sync.Mutex
 
 // rateLimitEntry tracks failed login attempts for a single IP.
 type rateLimitEntry struct {
@@ -1365,9 +1368,11 @@ func (s *Server) handleIngestEvents(w http.ResponseWriter, r *http.Request, body
 	}
 
 	node := ""
+	now := time.Now()
+	maxUnixTime := now.Add(maxIngestFutureSkew).Unix()
 	for i := range events {
-		if events[i].UnixTime == 0 {
-			events[i].UnixTime = time.Now().Unix()
+		if events[i].UnixTime <= 0 || events[i].UnixTime > maxUnixTime {
+			events[i].UnixTime = now.Unix()
 		}
 		if node == "" {
 			node = events[i].Node
@@ -1827,14 +1832,17 @@ func (s *Server) handleQuerylogAction(w http.ResponseWriter, r *http.Request, bl
 	blockRule := "||" + domain + "^"
 	exceptRule := "@@||" + domain + "^"
 
+	userRulesMu.Lock()
+	defer userRulesMu.Unlock()
+
 	var action, rule string
 	if block {
 		// Blocking: drop any stale exception and add the block rule.
-		if _, err := modifyUserRule(path, exceptRule, true); err != nil {
+		if _, err := modifyUserRuleLocked(path, exceptRule, true); err != nil {
 			http.Error(w, "Failed to update user rules: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		if _, err := modifyUserRule(path, blockRule, false); err != nil {
+		if _, err := modifyUserRuleLocked(path, blockRule, false); err != nil {
 			http.Error(w, "Failed to update user rules: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -1842,7 +1850,7 @@ func (s *Server) handleQuerylogAction(w http.ResponseWriter, r *http.Request, bl
 	} else {
 		// Unblocking: remove the user block rule when it came from this
 		// file; otherwise add an exception rule.
-		removed, err := modifyUserRule(path, blockRule, true)
+		removed, err := modifyUserRuleLocked(path, blockRule, true)
 		if err != nil {
 			http.Error(w, "Failed to update user rules: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -1850,7 +1858,7 @@ func (s *Server) handleQuerylogAction(w http.ResponseWriter, r *http.Request, bl
 		if removed {
 			action, rule = "unblocked", blockRule
 		} else {
-			if _, err := modifyUserRule(path, exceptRule, false); err != nil {
+			if _, err := modifyUserRuleLocked(path, exceptRule, false); err != nil {
 				http.Error(w, "Failed to update user rules: "+err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -1869,6 +1877,12 @@ func (s *Server) handleQuerylogAction(w http.ResponseWriter, r *http.Request, bl
 // modifyUserRule adds or removes an exact rule line in the user rules file.
 // It returns whether the file changed.
 func modifyUserRule(path, ruleLine string, remove bool) (bool, error) {
+	userRulesMu.Lock()
+	defer userRulesMu.Unlock()
+	return modifyUserRuleLocked(path, ruleLine, remove)
+}
+
+func modifyUserRuleLocked(path, ruleLine string, remove bool) (bool, error) {
 	data, err := os.ReadFile(path) // #nosec G304 G703 -- path derived from trusted HistoryDir config plus a constant filename, not request input
 	if err != nil && !os.IsNotExist(err) {
 		return false, err

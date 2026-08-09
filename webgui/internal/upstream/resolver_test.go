@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -210,5 +211,29 @@ func TestDoHResolver(t *testing.T) {
 	}
 	if len(resp.Answer) != 1 || resp.Answer[0].(*dns.A).A.String() != testAnswerIP {
 		t.Fatalf("DoH answer = %v", resp.Answer)
+	}
+}
+
+func TestDoHHTTPClientConcurrentInitialization(t *testing.T) {
+	spec, err := Parse("https://1.1.1.1/dns-query")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &dohResolver{spec: spec}
+	clients := make(chan *http.Client, 32)
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			clients <- r.httpClient()
+		}()
+	}
+	wg.Wait()
+	close(clients)
+	for client := range clients {
+		if client != r.client {
+			t.Fatal("concurrent initialization returned different clients")
+		}
 	}
 }

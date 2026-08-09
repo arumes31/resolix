@@ -1,6 +1,7 @@
 package dnsserver
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -33,24 +34,36 @@ func TestOptimisticCache(t *testing.T) {
 	// Shorten the cached TTL by pre-seeding via a 1s-TTL upstream response:
 	// clamp with min=1 keeps TTL 1.
 	client := &dns.Client{Timeout: 2 * time.Second}
-	query := func() *dns.Msg {
-		t.Helper()
+	query := func() (*dns.Msg, error) {
 		m := new(dns.Msg)
 		m.SetQuestion("example.org.", dns.TypeA)
 		resp, _, err := client.Exchange(m, serverAddr)
 		if err != nil {
-			t.Fatalf("query: %v", err)
+			return nil, err
 		}
-		return resp
+		return resp, nil
+	}
+	nextEvent := func() models.QueryEvent {
+		t.Helper()
+		select {
+		case ev := <-events:
+			return ev
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for query event")
+			return models.QueryEvent{}
+		}
 	}
 
 	// Prime the cache (upstream TTL 120 → clamped [1,600] stays 120;
 	// override by storing a short-lived entry directly).
-	resp := query()
+	resp, err := query()
+	if err != nil {
+		t.Fatalf("prime query: %v", err)
+	}
 	if len(resp.Answer) != 1 {
 		t.Fatalf("prime answer = %v", resp.Answer)
 	}
-	<-events
+	_ = nextEvent()
 	if hits.Load() != 1 {
 		t.Fatalf("prime upstream hits = %d", hits.Load())
 	}
@@ -70,19 +83,28 @@ func TestOptimisticCache(t *testing.T) {
 	// Stale query: answered from cache (TTL 1) while a background refresh
 	// fires. Multiple concurrent stale queries trigger exactly one refresh.
 	var wg sync.WaitGroup
+	errs := make(chan error, 3)
 	for i := 0; i < 3; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			resp := query()
+			resp, err := query()
+			if err != nil {
+				errs <- err
+				return
+			}
 			if len(resp.Answer) != 1 || resp.Answer[0].Header().Ttl != 1 {
-				t.Errorf("stale answer = %v, want TTL 1", resp.Answer)
+				errs <- fmt.Errorf("stale answer = %v, want TTL 1", resp.Answer)
 			}
 		}()
 	}
 	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
 	for i := 0; i < 3; i++ {
-		ev := <-events
+		ev := nextEvent()
 		if ev.Upstream != "System Cache (stale)" {
 			t.Errorf("stale event upstream = %q", ev.Upstream)
 		}
@@ -98,11 +120,14 @@ func TestOptimisticCache(t *testing.T) {
 	}
 
 	// Entry is fresh again.
-	resp = query()
+	resp, err = query()
+	if err != nil {
+		t.Fatalf("post-refresh query: %v", err)
+	}
 	if ttl := resp.Answer[0].Header().Ttl; ttl <= 1 {
 		t.Errorf("post-refresh TTL = %d, want fresh", ttl)
 	}
-	<-events
+	_ = nextEvent()
 	if hits.Load() != 2 {
 		t.Errorf("post-refresh hits = %d, want 2 (cache was fresh)", hits.Load())
 	}

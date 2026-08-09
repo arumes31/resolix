@@ -452,8 +452,10 @@ func main() {
 		}
 	}()
 
-	// Embedded DNS server (replaces dnsmasq). Pipeline: static rewrites →
-	// filter → cache → strict-order upstream forward → cache store → respond.
+	// Embedded DNS server (replaces dnsmasq). Pipeline: refuse-ANY/AAAA-disable
+	// → typed rewrites → private PTR → safe-search → filter → blocked services
+	// → cache → client upstreams → route → global pool → bogus-NXDOMAIN →
+	// cache store → respond.
 	// Each answered query becomes a QueryEvent fed into Store + SSE (and the
 	// forwarder in slave mode). dnsDone closes when both listeners have
 	// stopped, so shutdown can archive after events have ceased.
@@ -584,7 +586,7 @@ func main() {
 	// Step 6: Flush pending batch buffers to SQLite. Wait for the DNS
 	// listeners to stop first so no in-flight query races the archive.
 	logger.Info("Shutdown step 6: Waiting for DNS server to stop...")
-	<-dnsDone
+	waitForDNSServer(cfg, dnsDone)
 	logger.Info("Shutdown step 6: Flushing pending batch buffers to SQLite...")
 	archived := store.ArchiveStep(time.Now())
 	logger.Info("Shutdown step 6: Archived %d events to SQLite", archived)
@@ -656,7 +658,13 @@ func setupClientsRegistry(ctx context.Context, cfg *config.Config, srv *api.Serv
 	reg, err := clients.Load(cfg.FullClientsPath())
 	if err != nil {
 		logger.Warning("Failed to load clients registry: %v", err)
-		reg, _ = clients.Load("") // in-memory fallback
+		reg, err = clients.Load("") // in-memory fallback
+		if err != nil || reg == nil {
+			logger.Fatal("Failed to initialize fallback clients registry: %v", err)
+		}
+	}
+	if reg == nil {
+		logger.Fatal("Clients registry initialization returned nil")
 	}
 	reg.StartReload(ctx)
 	srv.SetClients(reg)
@@ -669,7 +677,13 @@ func loadRewritesStore(cfg *config.Config) *rewrites.Store {
 	rwStore, err := rewrites.Load(cfg.FullRewritesPath(), cfg.Domains)
 	if err != nil {
 		logger.Warning("Failed to load rewrites store: %v", err)
-		rwStore, _ = rewrites.Load("", cfg.Domains) // in-memory fallback
+		rwStore, err = rewrites.Load("", cfg.Domains) // in-memory fallback
+		if err != nil || rwStore == nil {
+			logger.Fatal("Failed to initialize fallback rewrites store: %v", err)
+		}
+	}
+	if rwStore == nil {
+		logger.Fatal("Rewrites store initialization returned nil")
 	}
 	return rwStore
 }
@@ -744,6 +758,21 @@ func waitForHTTPServer(cfg *config.Config, serverDone chan error) {
 		}
 	case <-timer.C:
 		logger.Warning("HTTP server did not stop within %s", cfg.HTTPShutdownTimeout)
+	}
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+}
+
+func waitForDNSServer(cfg *config.Config, dnsDone <-chan struct{}) {
+	timer := time.NewTimer(cfg.HTTPShutdownTimeout)
+	select {
+	case <-dnsDone:
+	case <-timer.C:
+		logger.Warning("DNS server did not stop within %s", cfg.HTTPShutdownTimeout)
 	}
 	if !timer.Stop() {
 		select {

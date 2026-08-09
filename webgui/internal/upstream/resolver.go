@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/miekg/dns"
@@ -102,9 +103,10 @@ func (r *dnsResolver) exchange(addr string, m *dns.Msg) (*dns.Msg, error) {
 // URL keeps the original hostname (correct TLS ServerName and Host header);
 // dialing is redirected to literal or bootstrap-resolved IPs.
 type dohResolver struct {
-	spec   Spec
-	boot   *bootstrapper
-	client *http.Client
+	spec       Spec
+	boot       *bootstrapper
+	clientOnce sync.Once
+	client     *http.Client
 }
 
 func (r *dohResolver) String() string { return r.spec.Raw }
@@ -147,23 +149,22 @@ func (r *dohResolver) Exchange(m *dns.Msg) (*dns.Msg, error) {
 // httpClient returns the DoH HTTP client, building the default one lazily.
 // The dial redirect maps the URL hostname to the literal/bootstrapped IPs.
 func (r *dohResolver) httpClient() *http.Client {
-	if r.client != nil {
-		return r.client
-	}
 	if testHTTPClient != nil {
 		return testHTTPClient
 	}
-	transport := &http.Transport{
-		TLSClientConfig: tlsConfigFor(r.spec.Host),
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			addrs, err := r.spec.dialAddrs(r.boot)
-			if err != nil {
-				return nil, err
-			}
-			d := net.Dialer{}
-			return d.DialContext(ctx, network, addrs[0])
-		},
-	}
-	r.client = &http.Client{Timeout: dohTimeout, Transport: transport}
+	r.clientOnce.Do(func() {
+		transport := &http.Transport{
+			TLSClientConfig: tlsConfigFor(r.spec.Host),
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				addrs, err := r.spec.dialAddrs(r.boot)
+				if err != nil {
+					return nil, err
+				}
+				d := net.Dialer{}
+				return d.DialContext(ctx, network, addrs[0])
+			},
+		}
+		r.client = &http.Client{Timeout: dohTimeout, Transport: transport}
+	})
 	return r.client
 }

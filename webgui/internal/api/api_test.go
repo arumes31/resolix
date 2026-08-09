@@ -1,10 +1,14 @@
 package api
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"testing/fstest"
@@ -13,6 +17,7 @@ import (
 	"tailscale-dnsrewrite/webgui/internal/blocklist"
 	"tailscale-dnsrewrite/webgui/internal/config"
 	"tailscale-dnsrewrite/webgui/internal/models"
+	"tailscale-dnsrewrite/webgui/internal/storage"
 )
 
 func testServer(cfg *config.Config) *Server {
@@ -97,6 +102,66 @@ func TestBroadcastAndUnsubscribeAreSerialized(_ *testing.T) {
 func TestEscapePrometheusLabel(t *testing.T) {
 	if got, want := escapePrometheusLabel("a\\b\n\"c"), `a\\b\n\"c`; got != want {
 		t.Fatalf("escapePrometheusLabel() = %q; want %q", got, want)
+	}
+}
+
+func TestHandleIngestEventsNormalizesInvalidTimestamps(t *testing.T) {
+	cfg := &config.Config{MaxEvents: 10}
+	s := testServer(cfg)
+	s.store = storage.NewStore(cfg)
+	now := time.Now().Unix()
+	events := []models.QueryEvent{
+		{Domain: "negative.example", UnixTime: -1},
+		{Domain: "future.example", UnixTime: now + int64((24 * time.Hour).Seconds())},
+		{Domain: "valid.example", UnixTime: now - 60},
+	}
+	body, err := json.Marshal(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/ingest", bytes.NewReader(body))
+	s.handleIngestEvents(rec, req, body)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	got := s.store.GetOrderedEvents(10)
+	byDomain := make(map[string]int64, len(got))
+	for _, event := range got {
+		byDomain[event.Domain] = event.UnixTime
+	}
+	if byDomain["negative.example"] < now || byDomain["future.example"] < now {
+		t.Fatalf("invalid timestamps were not normalized: %v", byDomain)
+	}
+	if byDomain["valid.example"] != now-60 {
+		t.Fatalf("valid timestamp changed to %d", byDomain["valid.example"])
+	}
+}
+
+func TestModifyUserRuleConcurrentUpdatesDoNotOverwrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "user_rules.txt")
+	const count = 32
+	var wg sync.WaitGroup
+	for i := range count {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rule := fmt.Sprintf("||domain-%d.example^", i)
+			if _, err := modifyUserRule(path, rule, false); err != nil {
+				t.Errorf("modifyUserRule: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	data, err := os.ReadFile(path) // #nosec G304 -- path is created under t.TempDir by this test
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range count {
+		rule := fmt.Sprintf("||domain-%d.example^", i)
+		if !strings.Contains(string(data), rule+"\n") {
+			t.Errorf("missing rule %q", rule)
+		}
 	}
 }
 

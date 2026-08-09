@@ -142,6 +142,13 @@ func TestScheduleActive(t *testing.T) {
 	if on.Active(mon("12:00")) {
 		t.Error("midday must be inactive for overnight window")
 	}
+
+	equal := &Schedule{Days: map[string][]TimeRange{
+		"mon": {{Start: "09:00", End: "09:00"}},
+	}}
+	if equal.Active(mon("09:00")) || equal.Active(mon("12:00")) {
+		t.Error("equal schedule endpoints must be inactive")
+	}
 }
 
 func TestRegistryHotReload(t *testing.T) {

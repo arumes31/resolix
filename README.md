@@ -86,6 +86,8 @@ docker-compose -f docker-compose.example.yaml up -d
 | `ALLOWLIST_FILE` | Local exceptions-only filter list path | - |
 | `FILTER_UPDATE_INTERVAL` | Filter subscription refresh interval | `24h` |
 | `BLOCKING_MODE` | Blocked response mode (`nxdomain`, `null_ip`, `refused`, `custom_ip`) | `nxdomain` |
+| `BLOCK_CUSTOM_IP4` | IPv4 answer used by `custom_ip` blocking mode | `0.0.0.0` |
+| `BLOCK_CUSTOM_IP6` | IPv6 answer used by `custom_ip` blocking mode | `::` |
 | `REWRITES_FILE` | Typed rewrites JSON persistence file (`DOMAINS` seeds it on first boot) | `rewrites.json` |
 | `SAFE_SEARCH` | Comma-separated safe-search engines (`google`, `bing`, `ddg`, `youtube`) | - |
 | `BOGUS_NXDOMAIN` | CIDR/IP list; answers fully inside become NXDOMAIN (anti-poisoning) | - |
@@ -211,7 +213,7 @@ This endpoint does **not** require authentication and performs no database queri
 ## 🛠️ How It Works
 
 1. **Tailscale Connection**: The container joins your Tailnet and gets a unique IP.
-2. **DNS Logic**: An embedded Go DNS server (miekg/dns) listens on the Tailscale IP port 53 — dnsmasq is no longer used. The pipeline: policy short-circuits → typed rewrites → safe search → filter → cache → upstream pool (UDP/TCP/DoT/DoH with `load_balance`/`parallel`/`strict` modes, per-domain routes, fallback upstreams).
+2. **DNS Logic**: An embedded Go DNS server (miekg/dns) listens on the Tailscale IP port 53 — dnsmasq is no longer used. The pipeline is: refuse-ANY/AAAA-disable → typed rewrites → private PTR → safe search → filter → blocked services → cache → client upstreams → domain route → global upstream pool → bogus-NXDOMAIN → cache store → response. The upstream pool supports UDP/TCP/DoT/DoH and defaults to `load_balance`; `parallel` and `strict` are opt-in modes.
 3. **In-Process Events**: Every answered query becomes a structured event fed directly into the Web GUI's RAM buffer and SSE stream (no log pipe).
 4. **Persistent Storage**: Events are batched and persisted to a local SQLite database every 30 seconds, ensuring zero data loss and instant dashboard responsiveness.
 

@@ -245,6 +245,8 @@ func TestArpaToIP(t *testing.T) {
 		{"1.2.168.192.in-addr.arpa", "192.168.2.1"},
 		{"1.2.168.192.in-addr.arpa.", "192.168.2.1"},
 		{"8.8.8.8.in-addr.arpa", "8.8.8.8"},
+		{".2.168.192.in-addr.arpa", ""},
+		{"0001.2.168.192.in-addr.arpa", ""},
 		{"bad.in-addr.arpa", ""},
 		{"1.2.3.in-addr.arpa", ""},
 		{"example.com", ""},

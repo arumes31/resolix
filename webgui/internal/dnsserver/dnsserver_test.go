@@ -116,6 +116,81 @@ func TestEndToEndPipeline(t *testing.T) {
 	assertCacheHitPhase(t, query, nextEvent, &upstreamHits)
 }
 
+func TestUpstreamOPTIsRebuiltPerClientAcrossCache(t *testing.T) {
+	var hits atomic.Int32
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		hits.Add(1)
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Answer = []dns.RR{aRecord(r.Question[0].Name, "93.184.216.34", 120)}
+		m.Extra = []dns.RR{
+			&dns.TXT{Hdr: dns.RR_Header{Name: "meta.example.", Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 120}, Txt: []string{"kept"}},
+			&dns.OPT{Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT, Class: 4096}},
+		}
+		_ = w.WriteMsg(m)
+	})}
+	go func() { _ = fake.ActivateAndServe() }()
+	t.Cleanup(func() { _ = fake.Shutdown() })
+
+	srv := New(Config{Upstreams: []string{pc.LocalAddr().String()}}, func(models.QueryEvent, bool) {})
+	query := func(size uint16, do bool) *dns.Msg {
+		m := new(dns.Msg)
+		m.SetQuestion("opt.example.", dns.TypeA)
+		m.SetEdns0(size, do)
+		resp, drop := srv.Resolve(m, "192.0.2.1")
+		if drop || resp == nil {
+			t.Fatal("query was unexpectedly dropped")
+		}
+		return resp
+	}
+	assertOPT := func(resp *dns.Msg, size uint16, do bool) {
+		t.Helper()
+		count := 0
+		for _, rr := range resp.Extra {
+			if opt, ok := rr.(*dns.OPT); ok {
+				count++
+				if opt.UDPSize() != size || opt.Do() != do {
+					t.Errorf("OPT = size %d DO %v, want %d/%v", opt.UDPSize(), opt.Do(), size, do)
+				}
+			}
+		}
+		if count != 1 {
+			t.Errorf("OPT count = %d, want 1", count)
+		}
+	}
+
+	first := query(1232, true)
+	assertOPT(first, 1232, true)
+	if len(first.Extra) != 2 {
+		t.Fatalf("uncached extras = %v, want TXT plus client OPT", first.Extra)
+	}
+	second := query(512, false)
+	assertOPT(second, 512, false)
+	if hits.Load() != 1 {
+		t.Fatalf("upstream hits = %d, want cache hit on second query", hits.Load())
+	}
+}
+
+func TestStaticHostAndUpstreamNormalization(t *testing.T) {
+	hosts := ParseStaticHosts(" Example.COM.:192.0.2.10 ")
+	if got := hosts["example.com"]; got == nil || got.String() != "192.0.2.10" {
+		t.Fatalf("trailing-dot static host = %v", got)
+	}
+
+	if got, ok := normalizeUpstream("2001:db8::1#5353"); !ok || got != "[2001:db8::1]:5353" {
+		t.Fatalf("IPv6 #port normalization = %q/%v", got, ok)
+	}
+	for _, input := range []string{"127.0.0.1#", "127.0.0.1#0", "127.0.0.1#65536", "127.0.0.1#nope"} {
+		if got, ok := normalizeUpstream(input); ok {
+			t.Errorf("normalizeUpstream(%q) = %q, want invalid", input, got)
+		}
+	}
+}
+
 // assertStaticRewritePhase verifies that a subdomain of a static host is
 // answered locally without touching the upstream.
 func assertStaticRewritePhase(t *testing.T, query func(string) *dns.Msg, nextEvent func() models.QueryEvent, upstreamHits *atomic.Int32) {

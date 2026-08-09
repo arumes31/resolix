@@ -200,6 +200,9 @@ func Validate(domain, typ, value string) error {
 		if value == "" {
 			return fmt.Errorf("type TXT requires a non-empty value")
 		}
+		if len(value) > 255 {
+			return fmt.Errorf("type TXT value must not exceed 255 bytes")
+		}
 	case TypeSRV:
 		rw := Rewrite{Type: typ, Value: value}
 		if rw.BuildRR("_sip._tcp.example.com.", dns.TypeSRV) == nil {

@@ -60,6 +60,22 @@ func TestResolveDoHPath(t *testing.T) {
 	}
 }
 
+func TestResolveBlockingTrimsAndValidatesAddressFamilies(t *testing.T) {
+	t.Setenv("BLOCK_CUSTOM_IP4", " 192.0.2.10 ")
+	t.Setenv("BLOCK_CUSTOM_IP6", " 2001:db8::10 ")
+	_, ip4, ip6 := resolveBlocking()
+	if ip4 != "192.0.2.10" || ip6 != "2001:db8::10" {
+		t.Fatalf("trimmed custom IPs = %q/%q", ip4, ip6)
+	}
+
+	t.Setenv("BLOCK_CUSTOM_IP4", "2001:db8::1")
+	t.Setenv("BLOCK_CUSTOM_IP6", "192.0.2.1")
+	_, ip4, ip6 = resolveBlocking()
+	if ip4 != DefaultBlockCustomIP4 || ip6 != DefaultBlockCustomIP6 {
+		t.Fatalf("wrong-family fallbacks = %q/%q", ip4, ip6)
+	}
+}
+
 func TestVerifyStep6Config(t *testing.T) {
 	base := func() *Config {
 		return &Config{Port: DefaultPort, HistoryDir: t.TempDir(), DBPath: DefaultDBPath}

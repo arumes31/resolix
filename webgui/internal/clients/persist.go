@@ -63,6 +63,9 @@ func (r *Registry) StartReload(ctx context.Context) {
 
 // reload re-reads the registry file, keeping the current set on errors.
 func (r *Registry) reload() {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+
 	fresh, err := Load(r.path)
 	if err != nil {
 		log.Printf("[WARN] clients: reload failed (keeping current): %v", err)

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -116,6 +117,38 @@ func TestSubscriptionFailureKeepsLastGood(t *testing.T) {
 	}
 	if !e.Match("stable.example.com").Blocked {
 		t.Error("last good rules lost after failed fetch")
+	}
+}
+
+func TestOversizedSubscriptionKeepsLastGoodAndMetadata(t *testing.T) {
+	var oversized atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if oversized.Load() {
+			w.Header().Set("ETag", `"v2"`)
+			_, _ = w.Write([]byte(strings.Repeat("x", maxFetchBytes+1)))
+			return
+		}
+		w.Header().Set("ETag", `"v1"`)
+		_, _ = fmt.Fprintln(w, "||stable.example.com^")
+	}))
+	defer server.Close()
+
+	e := New()
+	e.AddURLSource(server.URL, false)
+	e.UpdateAll()
+	src := e.findSource(server.URL)
+	lastUpdate, etag := src.LastUpdate, src.etag
+	oversized.Store(true)
+	e.UpdateAll()
+
+	if src.LastError == "" {
+		t.Fatal("oversized response did not record an error")
+	}
+	if !e.Match("stable.example.com").Blocked {
+		t.Fatal("oversized response replaced the last good rules")
+	}
+	if !src.LastUpdate.Equal(lastUpdate) || src.etag != etag {
+		t.Fatalf("success metadata changed: update=%v/%v etag=%q/%q", src.LastUpdate, lastUpdate, src.etag, etag)
 	}
 }
 

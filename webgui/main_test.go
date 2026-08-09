@@ -38,6 +38,23 @@ func setupTest() (*config.Config, *storage.Store, *parser.Parser, *api.Server) {
 	return cfg, store, prs, srv
 }
 
+func TestWaitForDNSServerIsBounded(t *testing.T) {
+	cfg := &config.Config{HTTPShutdownTimeout: 20 * time.Millisecond}
+	start := time.Now()
+	waitForDNSServer(cfg, make(chan struct{}))
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("DNS shutdown wait took %s", elapsed)
+	}
+
+	done := make(chan struct{})
+	close(done)
+	start = time.Now()
+	waitForDNSServer(cfg, done)
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("closed DNS shutdown wait took %s", elapsed)
+	}
+}
+
 func TestParseLogBytes(t *testing.T) {
 	_, store, prs, _ := setupTest()
 	defer func() { _ = os.RemoveAll(store.GetConfig().HistoryDir) }()

@@ -253,7 +253,12 @@ func remoteIP(r *http.Request) string {
 }
 
 func (s *Server) isTrustedProxy(r *http.Request) bool {
-	ip := net.ParseIP(remoteIP(r))
+	return s.isTrustedProxyIP(remoteIP(r))
+}
+
+// isTrustedProxyIP reports whether the given IP string belongs to a trusted proxy.
+func (s *Server) isTrustedProxyIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		return false
 	}
@@ -284,6 +289,13 @@ func (s *Server) isHTTPS(r *http.Request) bool {
 	return strings.EqualFold(strings.TrimSpace(proto), "https")
 }
 
+// cookieSecure reports whether cookies must be marked Secure: either forced
+// via the COOKIE_SECURE configuration override, or the request came in over
+// HTTPS (isHTTPS).
+func (s *Server) cookieSecure(r *http.Request) bool {
+	return s.cfg.CookieSecure || s.isHTTPS(r)
+}
+
 // sanitizeLogValue strips CR/LF characters from an untrusted value before it
 // is written to the logs, preventing log injection (gosec G706).
 func sanitizeLogValue(s string) string {
@@ -291,11 +303,18 @@ func sanitizeLogValue(s string) string {
 }
 
 // clientIP extracts the client IP from the request. Forwarded headers are
-// honored only when the immediate peer is explicitly trusted.
+// honored only when the immediate peer is explicitly trusted; the
+// X-Forwarded-For list is then walked right-to-left and the first address
+// that is not itself a trusted proxy is returned.
 func (s *Server) clientIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" && s.isTrustedProxy(r) {
-		parts := strings.SplitN(xff, ",", 2)
-		return strings.TrimSpace(parts[0])
+		parts := strings.Split(xff, ",")
+		for i := len(parts) - 1; i >= 0; i-- {
+			ip := strings.TrimSpace(parts[i])
+			if ip != "" && !s.isTrustedProxyIP(ip) {
+				return ip
+			}
+		}
 	}
 	return remoteIP(r)
 }
@@ -619,7 +638,9 @@ func (s *Server) SetupMux() http.Handler {
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/login", s.handleLogin)
 	mux.HandleFunc("/logout", s.handleLogout)
-	mux.HandleFunc("/metrics", s.handleMetrics)
+
+	// Metrics can leak internal state; require authentication.
+	mux.Handle("/metrics", s.authMiddleware(http.HandlerFunc(s.handleMetrics)))
 
 	// Protected routes
 	mux.Handle("/", s.authMiddleware(http.HandlerFunc(s.handleRoot)))
@@ -703,7 +724,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 }
 
 // handleMetrics exposes Prometheus-format metrics on the /metrics endpoint.
-// No authentication is required (standard Prometheus practice).
+// The route is protected by authMiddleware (see SetupMux).
 func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 
@@ -823,12 +844,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Set CSRF cookie (HttpOnly, Secure if HTTPS, SameSite=Strict)
-		http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via isHTTPS(r): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
+		http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via cookieSecure(r) (COOKIE_SECURE override or HTTPS request): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
 			Name:     csrfCookieName,
 			Value:    csrfToken,
 			Path:     "/",
 			HttpOnly: true,
-			Secure:   s.isHTTPS(r),
+			Secure:   s.cookieSecure(r),
 			SameSite: http.SameSiteStrictMode,
 			MaxAge:   86400 * 7, // 1 week, matches session cookie
 		})
@@ -882,12 +903,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			// Successful login — reset rate limiter for this IP
 			s.resetRateLimit(ip)
 
-			http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via isHTTPS(r): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
+			http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via cookieSecure(r) (COOKIE_SECURE override or HTTPS request): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
 				Name:     sessionCookieName,
 				Value:    sessionToken,
 				Path:     "/",
 				HttpOnly: true,
-				Secure:   s.isHTTPS(r),
+				Secure:   s.cookieSecure(r),
 				MaxAge:   86400 * 7, // 1 week
 				SameSite: http.SameSiteStrictMode,
 			})
@@ -903,12 +924,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
-		http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via isHTTPS(r): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
+		http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via cookieSecure(r) (COOKIE_SECURE override or HTTPS request): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
 			Name:     csrfCookieName,
 			Value:    csrfToken,
 			Path:     "/",
 			HttpOnly: true,
-			Secure:   s.isHTTPS(r),
+			Secure:   s.cookieSecure(r),
 			SameSite: http.SameSiteStrictMode,
 			MaxAge:   int(sessionLifetime.Seconds()),
 		})
@@ -929,22 +950,22 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if cookie, err := r.Cookie(sessionCookieName); err == nil {
 		s.deleteSession(cookie.Value)
 	}
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via isHTTPS(r): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via cookieSecure(r) (COOKIE_SECURE override or HTTPS request): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
 		Name:     sessionCookieName,
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   s.isHTTPS(r),
+		Secure:   s.cookieSecure(r),
 		MaxAge:   -1,
 		SameSite: http.SameSiteStrictMode,
 	})
 	// Also clear the CSRF cookie
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via isHTTPS(r): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via cookieSecure(r) (COOKIE_SECURE override or HTTPS request): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
 		Name:     csrfCookieName,
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   s.isHTTPS(r),
+		Secure:   s.cookieSecure(r),
 		MaxAge:   -1,
 		SameSite: http.SameSiteStrictMode,
 	})
@@ -1019,17 +1040,24 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		s.store.SetUpstreamHealth(payload.Node, payload.Health)
 	}
 
-	// Item 88: Update node status from version headers on ingest
+	// Item 88: Update node status from version headers on ingest, merging the
+	// header-derived fields into the existing status so heartbeat-provided
+	// values (MemoryMB, Goroutines, DBSizeMB, UpstreamHealth) are preserved.
 	if payload.Node != "" {
-		nodeVersion := r.Header.Get("X-Node-Version")
-		goVersion := r.Header.Get("X-Go-Version")
-		buildInfo := r.Header.Get("X-Node-Build")
-		s.store.SetNodeStatus(payload.Node, models.NodeStatus{
-			Name:      payload.Node,
-			Version:   nodeVersion,
-			GoVersion: goVersion,
-			BuildInfo: buildInfo,
-		})
+		status := models.NodeStatus{Name: payload.Node}
+		if existing := s.store.GetNodeStatus(payload.Node); existing != nil {
+			status = *existing
+		}
+		if v := r.Header.Get("X-Node-Version"); v != "" {
+			status.Version = v
+		}
+		if v := r.Header.Get("X-Go-Version"); v != "" {
+			status.GoVersion = v
+		}
+		if v := r.Header.Get("X-Node-Build"); v != "" {
+			status.BuildInfo = v
+		}
+		s.store.SetNodeStatus(payload.Node, status)
 	}
 
 	w.WriteHeader(http.StatusNoContent)
@@ -1133,6 +1161,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Clear the HTTP server write deadline: SSE is a long-lived response and
+	// would otherwise be cut off by the server's WriteTimeout.
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Time{}); err != nil {
+		log.Printf("[WARN] SSE: unable to clear write deadline: %v", err)
+	}
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1145,6 +1179,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	notify := r.Context().Done()
 	keepalive := s.cfg.SSEKeepaliveInterval
+	if keepalive <= 0 {
+		keepalive = config.DefaultSSEKeepaliveInterval
+	}
 	timer := time.NewTimer(keepalive)
 	defer timer.Stop()
 

@@ -104,15 +104,18 @@ type Config struct {
 	IngestSecret     string
 	WebUsername      string
 	WebPassword      string
-	ScanLimit        int
-	MaxBacklogSize   int64
-	UpstreamDNS      string
-	clientAliases    map[string]string
-	clientAliasesMu  sync.RWMutex
-	TrustedProxies   []string
-	Debug            bool
-	LogLevel         string
-	BaseURL          string
+	// CookieSecure forces the Secure attribute on session/CSRF cookies
+	// (COOKIE_SECURE override for TLS-terminating proxies).
+	CookieSecure    bool
+	ScanLimit       int
+	MaxBacklogSize  int64
+	UpstreamDNS     string
+	clientAliases   map[string]string
+	clientAliasesMu sync.RWMutex
+	TrustedProxies  []string
+	Debug           bool
+	LogLevel        string
+	BaseURL         string
 
 	// ClientAliasesFile is the path to a file with IP=Alias entries.
 	ClientAliasesFile string
@@ -305,12 +308,19 @@ func (c *Config) SetClientAliases(aliases map[string]string) {
 }
 
 // GetAllClientAliases returns a copy of the configured client aliases.
+// File-based provider aliases are merged over the env var aliases, matching
+// GetClientAlias precedence (provider values override environment aliases).
 func (c *Config) GetAllClientAliases() map[string]string {
 	c.clientAliasesMu.RLock()
-	defer c.clientAliasesMu.RUnlock()
 	result := maps.Clone(c.clientAliases)
+	c.clientAliasesMu.RUnlock()
 	if result == nil {
 		result = make(map[string]string)
+	}
+	if c.aliasesProvider != nil {
+		for k, v := range c.aliasesProvider.GetAllAliases() {
+			result[k] = v
+		}
 	}
 	return result
 }
@@ -459,10 +469,15 @@ func parseTrustedProxies() []string {
 }
 
 // normalizeBaseURL reads BASE_URL and ensures it starts with / and has no
-// trailing /.
+// trailing /. Values that would become protocol-relative redirect targets
+// ("//host") or contain a leading backslash are rejected.
 func normalizeBaseURL() string {
 	baseURL := os.Getenv("BASE_URL")
 	if baseURL == "" {
+		baseURL = DefaultBaseURL
+	}
+	if strings.HasPrefix(baseURL, "//") || strings.HasPrefix(baseURL, "\\") {
+		log.Printf("[WARN] Invalid BASE_URL '%s', falling back to %s", sanitizeForLog(baseURL), DefaultBaseURL) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
 		baseURL = DefaultBaseURL
 	}
 	// Ensure base URL starts with / and ends without /
@@ -597,6 +612,7 @@ func LoadConfig() *Config {
 		IngestSecret:               os.Getenv("INGEST_SECRET"),
 		WebUsername:                os.Getenv("WEB_USERNAME"),
 		WebPassword:                os.Getenv("WEB_PASSWORD"),
+		CookieSecure:               strings.ToLower(os.Getenv("COOKIE_SECURE")) == "true",
 		ScanLimit:                  DefaultScanLimit,
 		MaxBacklogSize:             DefaultMaxBacklogSize,
 		UpstreamDNS:                os.Getenv("UPSTREAM_DNS"),

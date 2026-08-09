@@ -142,12 +142,25 @@ func (bl *Blocklist) Stop() {
 	}
 }
 
-// IsBlocked checks if a domain is in the blocklist.
+// IsBlocked checks if a domain is in the blocklist. A domain is blocked when
+// it matches an entry exactly or any of its parent-domain suffixes is listed
+// (e.g. example.com also covers ads.example.com). Suffix checks respect
+// domain-label boundaries, so badexample.com does NOT match example.com.
 func (bl *Blocklist) IsBlocked(domain string) bool {
 	bl.mu.RLock()
 	defer bl.mu.RUnlock()
 	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
-	return bl.domains[domain]
+	for d := domain; d != ""; {
+		if bl.domains[d] {
+			return true
+		}
+		dot := strings.IndexByte(d, '.')
+		if dot < 0 {
+			break
+		}
+		d = d[dot+1:]
+	}
+	return false
 }
 
 // Count returns the number of blocked domains.

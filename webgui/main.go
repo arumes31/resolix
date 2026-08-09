@@ -12,6 +12,7 @@ import (
 	"embed"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"html/template"
 	"io/fs"
 	"net/http"
@@ -40,21 +41,24 @@ var Version = "2.0.0" // Changed from const to var for -ldflags build-time setti
 var embedFS embed.FS
 
 // generateNonce creates a cryptographically random base64-encoded nonce.
-func generateNonce() string {
+func generateNonce() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		// Fallback to timestamp-based nonce if crypto/rand fails
-		logger.Warning("crypto/rand failed, using fallback nonce: %v", err)
-		return base64.StdEncoding.EncodeToString([]byte(time.Now().Format("20060102150405.000000000")))
+		return "", fmt.Errorf("generate CSP nonce: %w", err)
 	}
-	return base64.StdEncoding.EncodeToString(b)
+	return base64.StdEncoding.EncodeToString(b), nil
 }
 
 // cspMiddleware generates a nonce per request, sets CSP headers, and injects
 // the nonce into the request context for template rendering.
 func cspMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		nonce := generateNonce()
+		nonce, err := generateNonce()
+		if err != nil {
+			logger.Error("Failed to generate CSP nonce: %v", err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
 
 		// Set Content-Security-Policy HTTP header
 		csp := "default-src 'self'; " +
@@ -379,8 +383,12 @@ func main() {
 		}
 	}()
 
-	// Log Ingestion
-	go startLogIngestion(ctx, cfg, fwd, prs, srv)
+	// Log Ingestion — ingestDone closes when the parser loop has fully exited.
+	ingestDone := make(chan struct{})
+	go func() {
+		defer close(ingestDone)
+		startLogIngestion(ctx, cfg, fwd, prs, srv)
+	}()
 
 	// Start HTTP server and report completion so shutdown can wait before
 	// closing storage used by in-flight handlers.
@@ -428,7 +436,10 @@ func main() {
 		waitForHTTPServer(cfg, serverDone)
 	}
 
-	// Step 6: Flush pending batch buffers to SQLite
+	// Step 6: Flush pending batch buffers to SQLite. Wait for the ingestion
+	// parser loop to exit first so no in-flight parse races the archive.
+	logger.Info("Shutdown step 6: Waiting for log ingestion to stop...")
+	<-ingestDone
 	logger.Info("Shutdown step 6: Flushing pending batch buffers to SQLite...")
 	archived := store.ArchiveStep(time.Now())
 	logger.Info("Shutdown step 6: Archived %d events to SQLite", archived)
@@ -457,7 +468,13 @@ func startLogIngestion(ctx context.Context, cfg *config.Config, fwd *forwarder.F
 			buf := scanner.Bytes()
 			line := make([]byte, len(buf))
 			copy(line, buf)
-			linesCh <- line
+			// Cancellation-aware send: never stay blocked on a full channel
+			// while the parser loop is shutting down.
+			select {
+			case linesCh <- line:
+			case <-ctx.Done():
+				return
+			}
 		}
 		if err := scanner.Err(); err != nil {
 			logger.Warning("stdin scan error: %v", err)

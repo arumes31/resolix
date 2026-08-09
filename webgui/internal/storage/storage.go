@@ -1032,7 +1032,7 @@ func (s *Store) startVacuum(ctx context.Context) {
 				}
 				log.Printf("Database VACUUM started")
 				start := time.Now()
-				_, err := s.db.Exec("VACUUM;")
+				_, err := s.db.ExecContext(ctx, "VACUUM;")
 				if err != nil {
 					log.Printf("Database VACUUM failed: %v", err)
 				} else {
@@ -1063,7 +1063,7 @@ func (s *Store) startWALCheckpoint(ctx context.Context) {
 					return
 				}
 				var busy, logFrames, checkpointed int
-				row := s.db.QueryRow("PRAGMA wal_checkpoint(TRUNCATE);")
+				row := s.db.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE);")
 				if err := row.Scan(&busy, &logFrames, &checkpointed); err != nil {
 					log.Printf("WAL checkpoint failed: %v", err)
 				} else {

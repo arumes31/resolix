@@ -79,6 +79,10 @@ docker-compose -f docker-compose.example.yaml up -d
 | `DB_PATH` | SQLite database file name or absolute path | `dns.db` |
 | `CLIENT_ALIASES_FILE` | Path to a file with `IP=Alias` mappings (reloaded every 30s) | - |
 | `CLIENT_ALIASES` | Comma-separated `IP:Alias` mappings (alternative to file) | - |
+| `TRUSTED_PROXIES` | Comma-separated proxy IPs/CIDRs whose `X-Forwarded-*` headers are honored | - |
+| `COOKIE_SECURE` | Force the `Secure` attribute on session/CSRF cookies (`true`/`false`) | `false` |
+
+> **Note on cookies and reverse proxies**: Session cookies are marked `Secure` automatically when the request arrives over HTTPS. When running behind a TLS-terminating reverse proxy, either list the proxy in `TRUSTED_PROXIES` (so `X-Forwarded-Proto` is honored) or set `COOKIE_SECURE=true` — otherwise browsers will refuse the non-Secure cookie over HTTPS and login will fail.
 
 ### Performance Optimization
 

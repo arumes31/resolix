@@ -13,8 +13,8 @@ RUN go mod download
 # Copy source code
 COPY webgui/ .
 
-# Build the application (Improvement 45: Binary size reduction)
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o webgui .
+# Build the application (Improvement 45: Binary size reduction; inject release version)
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.Version=v2.2.0" -o webgui .
 
 # Stage 2: Final Image
 FROM alpine:3.23

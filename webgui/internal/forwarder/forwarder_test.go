@@ -105,11 +105,9 @@ func TestEnqueue_MaxBacklogSize(t *testing.T) {
 	totalSize := fwd.backlogTotalSize
 	fwd.backlogMu.Unlock()
 
-	// The backlog should have stopped accepting new items once the limit was reached.
-	// The total size should not significantly exceed MaxBacklogSize (at most one
-	// line over the limit since the check happens before adding).
-	if totalSize > cfg.MaxBacklogSize+100 {
-		t.Errorf("expected backlog total size to stay near MaxBacklogSize=%d, got size=%d count=%d", cfg.MaxBacklogSize, totalSize, count)
+	// The backlog must never exceed MaxBacklogSize in bytes.
+	if totalSize > cfg.MaxBacklogSize {
+		t.Errorf("expected backlog total size <= MaxBacklogSize=%d, got size=%d count=%d", cfg.MaxBacklogSize, totalSize, count)
 	}
 	// The count should be much less than 200 since items were dropped
 	if count >= 200 {
@@ -346,8 +344,14 @@ func TestStart_StopDrain(t *testing.T) {
 func TestRetryMechanism(t *testing.T) {
 	var attemptCount atomic.Int32
 
-	// Server that fails first 2 times, then succeeds
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	// Server that fails first 2 ingest attempts, then succeeds.
+	// Only POST /api/ingest requests are counted so concurrent startup
+	// heartbeat/sync requests cannot skew the retry count.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/ingest" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		count := attemptCount.Add(1)
 		if count <= 2 {
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -395,17 +399,22 @@ func TestRetryMechanism(t *testing.T) {
 }
 
 func TestBatchSizeLimit(t *testing.T) {
-	var receivedBatch []string
+	var batchSizes []int
 	var mu sync.Mutex
 
+	// Record only POST /api/ingest batches so heartbeat/sync requests are ignored.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/ingest" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		var payload struct {
 			Node  string   `json:"node"`
 			Batch []string `json:"batch"`
 		}
 		_ = decodeJSONBody(r, &payload)
 		mu.Lock()
-		receivedBatch = payload.Batch
+		batchSizes = append(batchSizes, len(payload.Batch))
 		mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -444,12 +453,19 @@ func TestBatchSizeLimit(t *testing.T) {
 	}
 
 	mu.Lock()
-	batchLen := len(receivedBatch)
+	sizes := append([]int(nil), batchSizes...)
 	mu.Unlock()
 
-	// Batch should be limited to 100
-	if batchLen > 100 {
-		t.Errorf("expected batch size <= 100, got %d", batchLen)
+	// A full batch should reach exactly the 100-line limit
+	found := false
+	for _, n := range sizes {
+		if n == 100 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected a received batch of exactly 100 lines, got batch sizes %v", sizes)
 	}
 }
 
@@ -528,7 +544,7 @@ func TestCalculateBackoff(t *testing.T) {
 		t.Run(fmt.Sprintf("attempt_%d", tt.attempt), func(t *testing.T) {
 			// Run multiple times to account for jitter
 			for i := 0; i < 10; i++ {
-				backoff := calculateBackoff(tt.attempt)
+				backoff := calculateBackoff(tt.attempt, time.Second)
 				if backoff < tt.minTime || backoff > tt.maxTime {
 					t.Errorf("calculateBackoff(%d) = %v, want between %v and %v",
 						tt.attempt, backoff, tt.minTime, tt.maxTime)

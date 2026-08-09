@@ -65,7 +65,9 @@ func TestParseLogBytes(t *testing.T) {
 	if events[0].Upstream != "8.8.8.8" {
 		t.Errorf("Expected upstream 8.8.8.8 in event, got %s", events[0].Upstream)
 	}
-	if events[0].Latency.Valid && events[0].Latency.Float64 < 0 {
+	if !events[0].Latency.Valid {
+		t.Error("Expected reply parsing to produce a latency value")
+	} else if events[0].Latency.Float64 < 0 {
 		t.Error("Latency should be >= 0")
 	}
 

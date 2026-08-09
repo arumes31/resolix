@@ -119,8 +119,8 @@ func (f *Forwarder) Enqueue(line string) {
 	f.backlogMu.Lock()
 	defer f.backlogMu.Unlock()
 
-	// Enforce a maximum backlog size to prevent OOM (only when limit is configured)
-	if f.cfg.MaxBacklogSize > 0 && f.backlogTotalSize >= f.cfg.MaxBacklogSize {
+	// Enforce a maximum backlog size in bytes to prevent OOM (only when limit is configured)
+	if f.cfg.MaxBacklogSize > 0 && f.backlogTotalSize+int64(len(line)) > f.cfg.MaxBacklogSize {
 		return
 	}
 
@@ -416,19 +416,22 @@ func (f *Forwarder) syncUpstreamHealth(client *http.Client) {
 }
 
 // calculateBackoff computes the backoff duration with exponential growth and jitter (Item 86).
-// Sequence: 1s, 2s, 4s, 8s, 16s, 30s (capped) with 0-500ms random jitter.
-func calculateBackoff(attempt int) time.Duration {
+// Sequence: initial, 2x, 4x, 8x, 16x, 30s (capped) with 0-500ms random jitter.
+// A non-positive initial interval falls back to 1s, preserving the original progression.
+func calculateBackoff(attempt int, initial time.Duration) time.Duration {
+	if initial <= 0 {
+		initial = 1 * time.Second
+	}
 	if attempt <= 0 {
-		return 1 * time.Second
+		return initial
 	}
 	if attempt > 6 {
 		attempt = 6
 	}
-	seconds := 1 << uint(attempt-1) // 2^(attempt-1)
-	if seconds > 30 {
-		seconds = 30
+	backoff := initial * (1 << uint(attempt-1)) // initial * 2^(attempt-1)
+	if backoff > 30*time.Second {
+		backoff = 30 * time.Second
 	}
-	backoff := time.Duration(seconds) * time.Second
 	// Add jitter: 0-500ms (crypto/rand; falls back to no jitter on error)
 	jitter := time.Duration(0)
 	if n, err := rand.Int(rand.Reader, big.NewInt(500)); err == nil {
@@ -516,15 +519,11 @@ func (f *Forwarder) Start() error {
 				continue
 			}
 
-			f.backlogMu.Lock()
-			f.backlog = append(lines, f.backlog...)
-			for i := 0; i < len(lines); i++ {
-				f.backlogTotalSize += int64(len(lines[i]))
-			}
-			f.backlogMu.Unlock()
+			f.requeueBatch(lines)
 
 			backoffAttempt++
-			waitDur := calculateBackoff(backoffAttempt)
+			// Item 80: use the configured initial retry interval (falls back to 1s when unset/invalid)
+			waitDur := calculateBackoff(backoffAttempt, safeInterval(f.cfg.ForwarderRetryInterval, time.Second))
 
 			if draining {
 				rem := time.Until(drainEnd)
@@ -548,6 +547,35 @@ func (f *Forwarder) Start() error {
 			}
 		}
 	}
+}
+
+// requeueBatch prepends a failed batch back onto the backlog, honoring the
+// configured byte limit (the oldest overflow lines are dropped).
+func (f *Forwarder) requeueBatch(lines []string) {
+	f.backlogMu.Lock()
+	defer f.backlogMu.Unlock()
+
+	if f.cfg.MaxBacklogSize <= 0 {
+		f.backlog = append(lines, f.backlog...)
+		for i := 0; i < len(lines); i++ {
+			f.backlogTotalSize += int64(len(lines[i]))
+		}
+		return
+	}
+
+	// Re-queue only what fits within the byte limit; drop the oldest overflow
+	kept := 0
+	for _, line := range lines {
+		if f.backlogTotalSize+int64(len(line)) > f.cfg.MaxBacklogSize {
+			break
+		}
+		kept++
+		f.backlogTotalSize += int64(len(line))
+	}
+	if kept < len(lines) {
+		log.Printf("[WARN] Backlog byte limit (%d) reached, dropping %d oldest lines of failed batch", f.cfg.MaxBacklogSize, len(lines)-kept)
+	}
+	f.backlog = append(lines[:kept:kept], f.backlog...)
 }
 
 // startHeartbeat sends periodic heartbeats to the master (Item 92).

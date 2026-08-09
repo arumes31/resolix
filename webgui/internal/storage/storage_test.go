@@ -15,7 +15,8 @@ import (
 	"tailscale-dnsrewrite/webgui/internal/models"
 )
 
-// newTestStore creates a Store with an in-memory SQLite database for testing.
+// newTestStore creates a Store with an on-disk SQLite database in a temporary
+// directory for testing.
 func newTestStore(t *testing.T) (*Store, func()) {
 	t.Helper()
 	cfg := &config.Config{
@@ -598,6 +599,6 @@ func TestBandwidthSaved(t *testing.T) {
 }
 
 func TestMain(m *testing.M) {
-	// Suppress log output during tests
+	// Run the storage test suite; log output is not suppressed.
 	os.Exit(m.Run())
 }

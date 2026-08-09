@@ -24,8 +24,11 @@ type Route struct {
 type DNSRoutes struct {
 	path   string
 	routes []Route
-	mu     sync.RWMutex
-	cancel context.CancelFunc
+	// mu guards routes; writeMu serializes concurrent SetRoutes calls
+	// (file persistence + swap) without blocking readers.
+	mu      sync.RWMutex
+	writeMu sync.Mutex
+	cancel  context.CancelFunc
 }
 
 // New creates a new DNSRoutes from the given JSON config file path and loads it immediately.
@@ -174,9 +177,11 @@ func (dr *DNSRoutes) Count() int {
 }
 
 // SetRoutes updates the routes and saves them to the file.
+// Normalization, serialization, and file persistence happen outside dr.mu
+// (serialized by writeMu); dr.mu is only held while swapping dr.routes.
 func (dr *DNSRoutes) SetRoutes(routesMap map[string]string) error {
-	dr.mu.Lock()
-	defer dr.mu.Unlock()
+	dr.writeMu.Lock()
+	defer dr.writeMu.Unlock()
 
 	newRoutes := make([]Route, 0, len(routesMap))
 	for pattern, upstream := range routesMap {
@@ -199,7 +204,9 @@ func (dr *DNSRoutes) SetRoutes(routesMap map[string]string) error {
 		logger.Info("Saved %d DNS routes to %s", len(routesMap), dr.path)
 	}
 
+	dr.mu.Lock()
 	dr.routes = newRoutes
+	dr.mu.Unlock()
 
 	return nil
 }

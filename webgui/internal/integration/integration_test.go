@@ -1,6 +1,7 @@
 // Package integration provides integration tests for the full log ingestion
 // pipeline: parse → add event → archive → query stats. It also tests
-// concurrent access patterns and SSE broadcast behavior.
+// concurrent access patterns. SSE broadcast behavior is covered by
+// api-package tests exercising api.Server.BroadcastEvent.
 package integration
 
 import (
@@ -8,12 +9,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"tailscale-dnsrewrite/webgui/internal/config"
-	"tailscale-dnsrewrite/webgui/internal/models"
 	"tailscale-dnsrewrite/webgui/internal/parser"
 	"tailscale-dnsrewrite/webgui/internal/storage"
 )
@@ -317,79 +316,6 @@ func TestConcurrentIngestion(t *testing.T) {
 	}
 	if total != int64(workers*eventsPerWorker) {
 		t.Errorf("expected %d rows in SQLite, got %d", workers*eventsPerWorker, total)
-	}
-}
-
-// TestSSEBroadcast tests the SSE broadcast mechanism via the store.
-func TestSSEBroadcast(t *testing.T) {
-	cfg := &config.Config{
-		MaxEvents:                1000,
-		HistoryDir:               t.TempDir(),
-		DBPath:                   "sse.db",
-		HistoryRetention:         72 * time.Hour,
-		UpstreamLatencyThreshold: 200,
-	}
-	store := storage.NewStore(cfg)
-	store.Init()
-	defer store.Close()
-
-	// Simulate SSE subscriber channels
-	const numSubscribers = 5
-	channels := make([]chan models.QueryEvent, numSubscribers)
-	for i := 0; i < numSubscribers; i++ {
-		ch := make(chan models.QueryEvent, 100)
-		channels[i] = ch
-	}
-
-	// Add events and broadcast to channels
-	now := time.Now().Unix()
-	const numEvents = 10
-	for i := 0; i < numEvents; i++ {
-		ev := models.QueryEvent{
-			UnixTime: now + int64(i),
-			Type:     "A",
-			Domain:   fmt.Sprintf("sse-test-%d.com", i),
-			ClientIP: "192.168.1.1",
-			Node:     "sse-node",
-		}
-		store.AddEvent(ev)
-
-		// Broadcast to all subscriber channels
-		for _, ch := range channels {
-			select {
-			case ch <- ev:
-			default:
-				t.Log("Warning: subscriber channel full, dropping event")
-			}
-		}
-	}
-
-	// Verify all subscribers received all events
-	var receivedCount atomic.Int64
-	var wg sync.WaitGroup
-	for i, ch := range channels {
-		wg.Add(1)
-		go func(idx int, c chan models.QueryEvent) {
-			defer wg.Done()
-			count := 0
-			for count < numEvents {
-				select {
-				case ev := <-c:
-					count++
-					receivedCount.Add(1)
-					_ = ev
-				case <-time.After(2 * time.Second):
-					t.Errorf("subscriber %d timed out after %d events", idx, count)
-					return
-				}
-			}
-		}(i, ch)
-	}
-	wg.Wait()
-
-	total := receivedCount.Load()
-	if total != int64(numSubscribers*numEvents) {
-		t.Errorf("expected %d total received events, got %d", numSubscribers*numEvents, total)
 	}
 }
 

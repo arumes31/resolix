@@ -14,6 +14,11 @@ const (
 	cacheTTL = 5 * time.Minute
 	// queueSize is the buffer capacity of the work queue channel.
 	queueSize = 100
+	// workerCount is the number of concurrent lookup worker goroutines.
+	workerCount = 4
+	// lookupTimeout bounds a single reverse DNS lookup so stalled requests
+	// do not occupy a worker for long.
+	lookupTimeout = 2 * time.Second
 )
 
 // cacheEntry stores a resolved hostname with its resolution timestamp.
@@ -36,19 +41,21 @@ func New() *Resolver {
 	}
 }
 
-// Start launches the background worker goroutine for reverse DNS lookups.
+// Start launches the background worker goroutines for reverse DNS lookups.
 func (r *Resolver) Start(ctx context.Context) {
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case ip := <-r.queue:
-				r.lookup(ip)
+	for i := 0; i < workerCount; i++ {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case ip := <-r.queue:
+					r.lookup(ip)
+				}
 			}
-		}
-	}()
-	logger.Info("Reverse DNS resolver started")
+		}()
+	}
+	logger.Info("Reverse DNS resolver started (%d workers)", workerCount)
 }
 
 // Queue adds an IP address to the lookup work queue.
@@ -98,7 +105,7 @@ func (r *Resolver) lookup(ip string) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
 	defer cancel()
 
 	names, err := net.DefaultResolver.LookupAddr(ctx, ip)

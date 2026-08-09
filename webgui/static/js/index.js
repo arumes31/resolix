@@ -32,6 +32,13 @@ function applyDynamicStyles(root) {
     });
 }
 
+// Base URL prefix for API requests (empty for root deployments)
+const apiBase = (document.body.dataset.baseUrl || '/').replace(/\/$/, '');
+
+function apiPath(path) {
+    return apiBase + path;
+}
+
 let allEvents = [];
 let rpmHistory = Array(20).fill(0);
 let lastEventTimestamp = 0;
@@ -43,7 +50,7 @@ let nodeStatusInterval = null;
 
 // Stream handler
 function startStream() {
-    const eventSource = new EventSource('/api/stream');
+    const eventSource = new EventSource(apiPath('/api/stream'));
     eventSource.onmessage = (event) => {
         try {
             const newEvent = JSON.parse(event.data);
@@ -135,7 +142,7 @@ async function fetchAll() {
 
 async function fetchEvents() {
     try {
-        const response = await fetch(`/api/events`);
+        const response = await fetch(apiPath('/api/events'));
         if (!response.ok) throw new Error('API down');
         const newEvents = await response.json();
 
@@ -155,7 +162,7 @@ async function fetchEvents() {
 
 async function fetchStats() {
     try {
-        const response = await fetch('/api/stats');
+        const response = await fetch(apiPath('/api/stats'));
         const stats = await response.json();
         renderTopList('topDomains', stats.top_domains);
         renderTopList('topClients', stats.top_clients);
@@ -233,7 +240,7 @@ async function fetchStats() {
             const maxCount = Math.max(...sortedHours.map(h => h[1]), 1);
             heatmapEl.innerHTML = sortedHours.map(([hour, count]) => {
                 const level = count === 0 ? 0 : Math.max(1, Math.ceil((count / maxCount) * 10));
-                return `<div class="heatmap-box heatmap-level-${level}" title="${hour}: ${count} queries">${hour.split(':')[0]}</div>`;
+                return `<div class="heatmap-box heatmap-level-${level}" title="${escapeHtml(hour)}: ${count} queries">${escapeHtml(hour.split(':')[0])}</div>`;
             }).join('');
         }
 
@@ -258,7 +265,7 @@ async function fetchStats() {
 }
 async function fetchNodeStatus() {
     try {
-        const response = await fetch('/api/nodes');
+        const response = await fetch(apiPath('/api/nodes'));
         if (!response.ok) return;
         const nodes = await response.json();
         const container = document.getElementById('nodeCards');
@@ -324,10 +331,10 @@ async function simulateQuery() {
     resBox.classList.add('visible');
     resBox.textContent = 'Querying...';
     try {
-        const response = await fetch(`/api/simulate?domain=${domain}`);
+        const response = await fetch(apiPath(`/api/simulate?domain=${encodeURIComponent(domain)}`));
         const data = await response.json();
         if (data.status === 'success') {
-            resBox.innerHTML = `<strong>Results:</strong> ${data.ips.join(', ')}`;
+            resBox.innerHTML = `<strong>Results:</strong> ${data.ips.map(escapeHtml).join(', ')}`;
         } else {
             resBox.innerHTML = `<span class="sim-error">Error: ${escapeHtml(data.error)}</span>`;
         }
@@ -404,7 +411,7 @@ async function showClientStats(ip) {
     modal.classList.add('open');
 
     try {
-        const response = await fetch(`/api/client_stats?ip=${encodeURIComponent(ip)}`);
+        const response = await fetch(apiPath(`/api/client_stats?ip=${encodeURIComponent(ip)}`));
         const data = await response.json();
 
         document.getElementById('modalRPM').textContent = data.rpm;

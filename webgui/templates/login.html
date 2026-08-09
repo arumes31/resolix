@@ -4,9 +4,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'nonce-{{.Nonce}}'; style-src 'self' 'nonce-{{.Nonce}}'; font-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';">
     <title>Login | Tailscale DNS Monitor</title>
-    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
-    <link rel="stylesheet" href="/static/css/login.css">
+    <link rel="icon" type="image/svg+xml" href="static/favicon.svg">
+    <link rel="stylesheet" href="static/css/login.css">
     <script nonce="{{.Nonce}}" src="static/js/login.js"></script>
 </head>
 

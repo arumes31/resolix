@@ -32,11 +32,13 @@ import (
 	"tailscale-dnsrewrite/webgui/internal/blocklist"
 	"tailscale-dnsrewrite/webgui/internal/config"
 	"tailscale-dnsrewrite/webgui/internal/dnsroutes"
+	"tailscale-dnsrewrite/webgui/internal/dnsserver"
 	apperr "tailscale-dnsrewrite/webgui/internal/errors"
 	"tailscale-dnsrewrite/webgui/internal/filter"
 	"tailscale-dnsrewrite/webgui/internal/models"
 	"tailscale-dnsrewrite/webgui/internal/parser"
 	"tailscale-dnsrewrite/webgui/internal/resolver"
+	"tailscale-dnsrewrite/webgui/internal/rewrites"
 	"tailscale-dnsrewrite/webgui/internal/storage"
 )
 
@@ -155,6 +157,10 @@ type Server struct {
 	// Filter engine (Step 2: rule-based filtering with subscriptions)
 	filterEngine *filter.Engine
 
+	// Typed rewrites store (Step 3) and DNS server (pipeline metrics)
+	rewritesStore *rewrites.Store
+	dnsServer     *dnsserver.Server
+
 	// DNS routes (Item 66)
 	dnsRoutes *dnsroutes.DNSRoutes
 
@@ -231,11 +237,32 @@ func (s *Server) SetFilter(eng *filter.Engine) {
 	s.filterEngine = eng
 }
 
+// SetRewritesStore configures the typed-rewrites store for the CRUD API.
+func (s *Server) SetRewritesStore(store *rewrites.Store) {
+	s.fieldsMu.Lock()
+	defer s.fieldsMu.Unlock()
+	s.rewritesStore = store
+}
+
+// SetDNSServer configures the DNS server for pipeline metrics.
+func (s *Server) SetDNSServer(srv *dnsserver.Server) {
+	s.fieldsMu.Lock()
+	defer s.fieldsMu.Unlock()
+	s.dnsServer = srv
+}
+
 // getFilter returns the configured filter engine (may be nil).
 func (s *Server) getFilter() *filter.Engine {
 	s.fieldsMu.RLock()
 	defer s.fieldsMu.RUnlock()
 	return s.filterEngine
+}
+
+// getDNSServer returns the configured DNS server (may be nil).
+func (s *Server) getDNSServer() *dnsserver.Server {
+	s.fieldsMu.RLock()
+	defer s.fieldsMu.RUnlock()
+	return s.dnsServer
 }
 
 // isBcryptHash returns true if the string looks like a bcrypt hash.
@@ -674,6 +701,9 @@ func (s *Server) SetupMux() http.Handler {
 	mux.Handle("/api/filtering/pause", s.authMiddleware(http.HandlerFunc(s.handleFilteringPause)))
 	mux.Handle("/api/filtering/status", s.authMiddleware(http.HandlerFunc(s.handleFilteringStatus)))
 
+	// Typed DNS rewrites CRUD
+	mux.Handle("/api/rewrites", s.authMiddleware(http.HandlerFunc(s.handleRewrites)))
+
 	// Item 62: Upstream configuration editor
 	mux.Handle("/api/upstreams", s.authMiddleware(http.HandlerFunc(s.handleUpstreams)))
 
@@ -833,6 +863,20 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 			paused = 1
 		}
 		fmt.Fprintf(&buf, "filter_paused %d\n", paused)
+	}
+
+	// DNS pipeline counters (rewrites / safe-search / bogus-NXDOMAIN)
+	if dnsSrv := s.getDNSServer(); dnsSrv != nil {
+		rewriteHits, safeSearchHits, bogusNXHits := dnsSrv.Stats()
+		fmt.Fprintf(&buf, "# HELP rewrites_hits_total Queries answered by typed rewrites\n")
+		fmt.Fprintf(&buf, "# TYPE rewrites_hits_total counter\n")
+		fmt.Fprintf(&buf, "rewrites_hits_total %d\n", rewriteHits)
+		fmt.Fprintf(&buf, "# HELP safesearch_hits_total Queries rewritten by safe search\n")
+		fmt.Fprintf(&buf, "# TYPE safesearch_hits_total counter\n")
+		fmt.Fprintf(&buf, "safesearch_hits_total %d\n", safeSearchHits)
+		fmt.Fprintf(&buf, "# HELP bogus_nxdomain_total Upstream answers converted to NXDOMAIN (bogus ranges)\n")
+		fmt.Fprintf(&buf, "# TYPE bogus_nxdomain_total counter\n")
+		fmt.Fprintf(&buf, "bogus_nxdomain_total %d\n", bogusNXHits)
 	}
 
 	_, _ = buf.WriteTo(w)
@@ -1409,6 +1453,62 @@ func (s *Server) handleFilteringPause(w http.ResponseWriter, r *http.Request) {
 		resp["paused_until"] = until.Format(time.RFC3339)
 	}
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// ===== Typed Rewrites CRUD =====
+
+// handleRewrites dispatches GET (list), POST (add), and DELETE (?id=) for
+// typed DNS rewrites. Changes take effect live in the DNS pipeline.
+func (s *Server) handleRewrites(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	s.fieldsMu.RLock()
+	store := s.rewritesStore
+	s.fieldsMu.RUnlock()
+	if store == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "rewrites store is not configured",
+		})
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":   "ok",
+			"rewrites": store.List(),
+		})
+	case http.MethodPost:
+		var req struct {
+			Domain string `json:"domain"`
+			Type   string `json:"type"`
+			Value  string `json:"value"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+		rw, err := store.Add(req.Domain, req.Type, req.Value)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid rewrite: %v", err), http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "rewrite": rw})
+	case http.MethodDelete:
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			http.Error(w, "Missing id parameter", http.StatusBadRequest)
+			return
+		}
+		if !store.Delete(id) {
+			http.Error(w, "Rewrite not found", http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 // ===== Item 62: Upstream Configuration Editor =====

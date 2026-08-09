@@ -32,7 +32,9 @@ import (
 	"tailscale-dnsrewrite/webgui/internal/logger"
 	"tailscale-dnsrewrite/webgui/internal/models"
 	"tailscale-dnsrewrite/webgui/internal/parser"
+	"tailscale-dnsrewrite/webgui/internal/policy"
 	"tailscale-dnsrewrite/webgui/internal/resolver"
+	"tailscale-dnsrewrite/webgui/internal/rewrites"
 	"tailscale-dnsrewrite/webgui/internal/storage"
 )
 
@@ -227,6 +229,16 @@ DB_PATH=dns.db
 # BLOCK_CUSTOM_IP4=0.0.0.0
 # BLOCK_CUSTOM_IP6=::
 
+# Typed DNS rewrites (A/AAAA/CNAME/PTR/MX/TXT/SRV + RCODE), managed via
+# /api/rewrites and persisted here. DOMAINS seeds it on first boot only.
+# REWRITES_FILE=rewrites.json
+
+# Policy features
+# SAFE_SEARCH=google,bing,ddg,youtube
+# BOGUS_NXDOMAIN=10.0.0.0/8,192.0.2.33 (answers fully inside these become NXDOMAIN)
+# AAAA_DISABLED=true (AAAA queries get NOERROR-empty answers)
+# REFUSE_ANY=true (default; QTYPE ANY is refused)
+
 # Upstream latency alert threshold in milliseconds (Item 68, default: 200)
 # UPSTREAM_LATENCY_THRESHOLD=200
 
@@ -414,11 +426,29 @@ func main() {
 	// actually block) plus URL subscriptions with conditional auto-update.
 	filterEng := setupFilterEngine(ctx, cfg, srv)
 
+	// Typed rewrites store (Step 3): loaded from the persistence file, or
+	// seeded from the DOMAINS env on first boot only.
+	rwStore, err := rewrites.Load(cfg.FullRewritesPath(), cfg.Domains)
+	if err != nil {
+		logger.Warning("Failed to load rewrites store: %v", err)
+		rwStore, _ = rewrites.Load("", cfg.Domains) // in-memory fallback
+	}
+	srv.SetRewritesStore(rwStore)
+
+	// Policy (Step 3): safe search, bogus NXDOMAIN, AAAA disable, refuse ANY.
+	pol := policy.New(policy.Config{
+		SafeSearch:   splitListEnv(cfg.SafeSearch),
+		BogusNets:    splitListEnv(cfg.BogusNXDOMAIN),
+		AAAADisabled: cfg.AAAADisabled,
+		RefuseANY:    cfg.RefuseANY,
+	})
+
 	dnsSrv := dnsserver.New(dnsserver.Config{
 		Addr:           cfg.DNSListenAddr,
 		Port:           cfg.DNSListenPort,
 		Upstreams:      strings.Fields(cfg.UpstreamDNS),
-		StaticHosts:    dnsserver.ParseStaticHosts(cfg.Domains),
+		Rewrites:       rwStore,
+		Policy:         pol,
 		NodeName:       cfg.NodeName,
 		Filter:         filterEng,
 		BlockingMode:   cfg.BlockingMode,
@@ -432,6 +462,7 @@ func main() {
 		}
 	})
 	dnsDone := make(chan struct{})
+	srv.SetDNSServer(dnsSrv)
 	go func() {
 		defer close(dnsDone)
 		logger.Info("DNS server listening on %s (UDP+TCP)", dnsSrv.ListenAddr())

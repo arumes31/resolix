@@ -65,6 +65,8 @@ const (
 	DefaultBlockCustomIP4 = "0.0.0.0"
 	// DefaultBlockCustomIP6 is the default AAAA answer in custom_ip blocking mode.
 	DefaultBlockCustomIP6 = "::"
+	// DefaultRewritesFile is the default DNS rewrites persistence file name.
+	DefaultRewritesFile = "rewrites.json"
 	// DefaultUpstreamLatencyThreshold is the default latency alert threshold in milliseconds.
 	DefaultUpstreamLatencyThreshold = 200
 
@@ -168,6 +170,16 @@ type Config struct {
 	// BlockCustomIP4/IP6 are the answer addresses in custom_ip mode.
 	BlockCustomIP4 string
 	BlockCustomIP6 string
+	// RewritesFile is the typed-rewrites JSON persistence file.
+	RewritesFile string
+	// SafeSearch lists enabled safe-search engines (comma-separated).
+	SafeSearch string
+	// BogusNXDOMAIN lists bogus-answer CIDRs/IPs (comma/space-separated).
+	BogusNXDOMAIN string
+	// AAAADisabled makes AAAA queries return NODATA.
+	AAAADisabled bool
+	// RefuseANY refuses QTYPE ANY queries (default true).
+	RefuseANY bool
 	// UpstreamLatencyThreshold is the latency threshold in ms for alerting.
 	UpstreamLatencyThreshold int
 
@@ -634,6 +646,11 @@ func LoadConfig() *Config {
 		dnsRoutesFile = DefaultDNSRoutesFile
 	}
 
+	rewritesFile := os.Getenv("REWRITES_FILE")
+	if rewritesFile == "" {
+		rewritesFile = DefaultRewritesFile
+	}
+
 	dnsmasqPIDFile := os.Getenv("DNSMASQ_PID_FILE")
 	if dnsmasqPIDFile == "" {
 		dnsmasqPIDFile = DefaultDNSMasqPIDFile
@@ -721,6 +738,11 @@ func LoadConfig() *Config {
 		BlockingMode:               blockingMode,
 		BlockCustomIP4:             blockCustomIP4,
 		BlockCustomIP6:             blockCustomIP6,
+		RewritesFile:               rewritesFile,
+		SafeSearch:                 os.Getenv("SAFE_SEARCH"),
+		BogusNXDOMAIN:              os.Getenv("BOGUS_NXDOMAIN"),
+		AAAADisabled:               strings.ToLower(os.Getenv("AAAA_DISABLED")) == "true",
+		RefuseANY:                  strings.ToLower(os.Getenv("REFUSE_ANY")) != "false",
 		UpstreamLatencyThreshold:   latencyThreshold,
 		SSEKeepaliveInterval:       sseKeepalive,
 		BatchArchiveInterval:       batchArchive,
@@ -780,6 +802,17 @@ func (c *Config) FullDNSRoutesPath() string {
 		return c.DNSRoutesFile
 	}
 	return filepath.Join(c.HistoryDir, c.DNSRoutesFile)
+}
+
+// FullRewritesPath returns the complete rewrites file path.
+func (c *Config) FullRewritesPath() string {
+	if c.RewritesFile == "" {
+		return ""
+	}
+	if filepath.IsAbs(c.RewritesFile) {
+		return c.RewritesFile
+	}
+	return filepath.Join(c.HistoryDir, c.RewritesFile)
 }
 
 // FullBlocklistPath returns the complete blocklist file path.

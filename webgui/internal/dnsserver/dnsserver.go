@@ -1,8 +1,10 @@
 // Package dnsserver implements the in-process DNS server that replaces
 // dnsmasq. It serves UDP and TCP listeners and answers queries through an
-// ordered pipeline: static rewrites → cache lookup → strict-order upstream
-// forwarding → cache store → respond. Every answered query is emitted as a
-// models.QueryEvent into the existing Store/SSE pipeline.
+// ordered pipeline: policy short-circuits (refuse-ANY, AAAA-disable) →
+// typed rewrites → safe-search → filter → cache lookup → strict-order
+// upstream forwarding → bogus-NXDOMAIN conversion → cache store → respond.
+// Every answered query is emitted as a models.QueryEvent into the existing
+// Store/SSE pipeline.
 package dnsserver
 
 import (
@@ -12,12 +14,15 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
 
 	"tailscale-dnsrewrite/webgui/internal/filter"
 	"tailscale-dnsrewrite/webgui/internal/models"
+	"tailscale-dnsrewrite/webgui/internal/policy"
+	"tailscale-dnsrewrite/webgui/internal/rewrites"
 )
 
 const (
@@ -32,6 +37,8 @@ const (
 	upstreamTimeout = 5 * time.Second
 	// staticTTL is the TTL for static rewrite answers (dnsmasq local-ttl).
 	staticTTL = 60
+	// maxChainDepth caps CNAME/safe-search chase chains to avoid loops.
+	maxChainDepth = 8
 )
 
 // Config holds the DNS server configuration.
@@ -57,6 +64,10 @@ type Config struct {
 	// BlockCustomIP4/IP6 are the answer addresses in custom_ip mode.
 	BlockCustomIP4 string
 	BlockCustomIP6 string
+	// Rewrites is the typed-rewrite store (nil = fall back to StaticHosts).
+	Rewrites *rewrites.Store
+	// Policy holds safe-search / bogus-NXDOMAIN / AAAA / ANY policy (nil = off).
+	Policy *policy.Policy
 }
 
 // Server is the embedded DNS server.
@@ -68,6 +79,10 @@ type Server struct {
 	udp       *dns.Server
 	tcp       *dns.Server
 	client    *dns.Client
+
+	rewriteHits    atomic.Int64
+	safeSearchHits atomic.Int64
+	bogusNXHits    atomic.Int64
 }
 
 // New creates a DNS server. emit is invoked synchronously for every answered
@@ -158,6 +173,15 @@ func (s *Server) StartOn(ctx context.Context, udpConn net.PacketConn, tcpLn net.
 	}
 }
 
+// resolution describes how a query was answered, for event emission.
+type resolution struct {
+	upstream    string
+	cacheHit    bool
+	blocked     bool
+	matchedRule string
+	blockReason string
+}
+
 // ServeDNS handles a single DNS request through the ordered pipeline.
 func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	start := time.Now()
@@ -166,58 +190,183 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	resp.SetReply(r)
 	resp.RecursionAvailable = true
 
-	var (
-		upstream    string
-		cacheHit    bool
-		blocked     bool
-		matchedRule string
-		blockReason string
-	)
-
-	if len(r.Question) == 0 {
-		resp.Rcode = dns.RcodeFormatError
-	} else {
-		question := r.Question[0]
-		domain := normalizeName(question.Name)
-
-		// Stage 1: static rewrites (DOMAINS).
-		if question.Qtype == dns.TypeA {
-			if ip := matchStatic(s.staticHosts(), domain); ip != nil {
-				resp.Answer = []dns.RR{&dns.A{
-					Hdr: dns.RR_Header{
-						Name:   question.Name,
-						Rrtype: dns.TypeA,
-						Class:  dns.ClassINET,
-						Ttl:    staticTTL,
-					},
-					A: ip,
-				}}
-				upstream = "Local Override"
-			}
-		}
-
-		// Stage 2: filter. Exceptions continue down the pipeline; blocked
-		// queries get a blocking-mode response and are NOT cached (they are
-		// cheap to regenerate and must not poison the forwarded-answer cache).
-		if upstream == "" && s.cfg.Filter != nil && !s.cfg.Filter.Paused() {
-			if res := s.cfg.Filter.Match(domain); res.Blocked && !res.Allowed {
-				resp = s.blockedResponse(r, question)
-				blocked, matchedRule, blockReason = true, res.Rule, res.Reason
-				upstream = "Filtered"
-			}
-		}
-
-		// Stages 3-4: cache lookup → strict-order forward → cache store.
-		if upstream == "" {
-			key := cacheKey{name: domain, qtype: question.Qtype}
-			upstream, cacheHit = s.resolveViaCacheOrUpstream(r, resp, key)
-		}
-	}
-
+	res := s.resolve(r, resp, 0)
 	_ = w.WriteMsg(resp)
 	if s.emit != nil {
-		s.emit(s.buildEvent(r, resp, w, upstream, cacheHit, blocked, matchedRule, blockReason, start))
+		s.emit(s.buildEvent(r, resp, w, res, start))
 	}
+}
+
+// resolve runs the request pipeline and fills resp.
+//
+// Order: refuse-ANY / AAAA-disable short-circuits → typed rewrites →
+// safe-search → filter → cache → strict-order forward → bogus-NXDOMAIN
+// conversion → cache store. depth bounds CNAME/safe-search chase chains.
+func (s *Server) resolve(r *dns.Msg, resp *dns.Msg, depth int) resolution {
+	if len(r.Question) == 0 {
+		resp.Rcode = dns.RcodeFormatError
+		return resolution{}
+	}
+	q := r.Question[0]
+	domain := normalizeName(q.Name)
+
+	// Early policy short-circuits (before rewrites).
+	if s.cfg.Policy != nil {
+		if s.cfg.Policy.RefuseANY && q.Qtype == dns.TypeANY {
+			resp.Rcode = dns.RcodeRefused
+			return resolution{upstream: "Policy", matchedRule: "REFUSE_ANY", blockReason: policy.ReasonRefusedANY}
+		}
+		if s.cfg.Policy.AAAADisabled && q.Qtype == dns.TypeAAAA {
+			// NODATA: NOERROR with an empty answer section.
+			return resolution{upstream: "Policy", matchedRule: "AAAA_DISABLED", blockReason: policy.ReasonAAAADisabled}
+		}
+	}
+
+	// Stage 1: typed rewrites (short-circuit, pre-cache).
+	if res, handled := s.stageRewrites(r, q, resp, depth); handled {
+		return res
+	}
+
+	// Stage 2: safe search (CNAME to the restricted variant, chased below).
+	if res, handled := s.stageSafeSearch(r, q, resp, depth); handled {
+		return res
+	}
+
+	// Stage 3: filter. Blocked responses are NOT cached (cheap to
+	// regenerate; must not poison the forwarded-answer cache).
+	if s.cfg.Filter != nil && !s.cfg.Filter.Paused() {
+		if f := s.cfg.Filter.Match(domain); f.Blocked && !f.Allowed {
+			blockedResp := s.blockedResponse(r, q)
+			resp.Rcode = blockedResp.Rcode
+			resp.Answer = blockedResp.Answer
+			return resolution{upstream: "Filtered", blocked: true, matchedRule: f.Rule, blockReason: f.Reason}
+		}
+	}
+
+	// Stage 4: cache → forward → bogus-NXDOMAIN → cache store.
+	key := cacheKey{name: domain, qtype: q.Qtype}
+	return s.resolveViaCacheOrUpstream(r, resp, key)
+}
+
+// stageRewrites applies typed rewrites from the store (or the legacy
+// StaticHosts fallback). handled is true when a rewrite answered the query.
+func (s *Server) stageRewrites(_ *dns.Msg, q dns.Question, resp *dns.Msg, depth int) (resolution, bool) {
+	domain := normalizeName(q.Name)
+
+	if s.cfg.Rewrites == nil {
+		// Legacy fallback: StaticHosts map (used when no store is wired).
+		if q.Qtype == dns.TypeA {
+			if ip := matchStatic(s.staticHosts(), domain); ip != nil {
+				resp.Answer = []dns.RR{&dns.A{
+					Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: staticTTL},
+					A:   ip,
+				}}
+				return resolution{upstream: "Local Override"}, true
+			}
+		}
+		return resolution{}, false
+	}
+
+	entries := s.cfg.Rewrites.Lookup(domain)
+	if len(entries) == 0 {
+		return resolution{}, false
+	}
+	s.rewriteHits.Add(1)
+
+	// RCODE rewrites take precedence over record rewrites.
+	for _, e := range entries {
+		switch e.Type {
+		case rewrites.TypeNXDOMAIN:
+			resp.Rcode = dns.RcodeNameError
+			return resolution{upstream: "Rewrite", matchedRule: e.String(), blockReason: "Rewrite"}, true
+		case rewrites.TypeREFUSED:
+			resp.Rcode = dns.RcodeRefused
+			return resolution{upstream: "Rewrite", matchedRule: e.String(), blockReason: "Rewrite"}, true
+		case rewrites.TypeNOERROR:
+			return resolution{upstream: "Rewrite", matchedRule: e.String(), blockReason: "Rewrite"}, true
+		}
+	}
+
+	// Records matching the question type. CNAME entries are handled by the
+	// chase below (except for explicit CNAME questions).
+	var answers []dns.RR
+	matched := ""
+	for _, e := range entries {
+		if e.Type == rewrites.TypeCNAME && q.Qtype != dns.TypeCNAME {
+			continue
+		}
+		if rr := e.BuildRR(q.Name, q.Qtype); rr != nil {
+			answers = append(answers, rr)
+			matched = e.String()
+		}
+	}
+	if len(answers) > 0 {
+		resp.Answer = answers
+		return resolution{upstream: "Rewrite", matchedRule: matched, blockReason: "Rewrite"}, true
+	}
+
+	// CNAME rewrites chase the target through the rest of the pipeline.
+	if q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA || q.Qtype == dns.TypeCNAME {
+		for _, e := range entries {
+			if e.Type != rewrites.TypeCNAME {
+				continue
+			}
+			return s.chaseCNAME(q, resp, e.Value, e.String(), "Rewrite", "Rewrite", depth), true
+		}
+	}
+
+	// The rewrite set covers this domain but not the qtype → NODATA.
+	return resolution{upstream: "Rewrite", matchedRule: entries[0].String(), blockReason: "Rewrite"}, true
+}
+
+// stageSafeSearch rewrites configured safe-search domains to their
+// restricted variants (pre-cache, like rewrites).
+func (s *Server) stageSafeSearch(_ *dns.Msg, q dns.Question, resp *dns.Msg, depth int) (resolution, bool) {
+	if s.cfg.Policy == nil {
+		return resolution{}, false
+	}
+	target := s.cfg.Policy.SafeSearchTarget(normalizeName(q.Name))
+	if target == "" {
+		return resolution{}, false
+	}
+	s.safeSearchHits.Add(1)
+
+	// Address-type queries chase the restricted target through the rest of
+	// the pipeline and return both the CNAME and the target's records.
+	if q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA || q.Qtype == dns.TypeCNAME {
+		return s.chaseCNAME(q, resp, target, "SafeSearch", "SafeSearch", policy.ReasonSafeSearch, depth), true
+	}
+	// Other types get just the CNAME record.
+	resp.Answer = []dns.RR{&dns.CNAME{
+		Hdr:    dns.RR_Header{Name: q.Name, Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: staticTTL},
+		Target: dns.Fqdn(target),
+	}}
+	return resolution{upstream: "SafeSearch", matchedRule: "SafeSearch", blockReason: policy.ReasonSafeSearch}, true
+}
+
+// chaseCNAME appends the CNAME record and resolves the target through the
+// rest of the pipeline (filter/cache/forward), merging the answers.
+func (s *Server) chaseCNAME(q dns.Question, resp *dns.Msg, target, rule, label, reason string, depth int) resolution {
+	if depth >= maxChainDepth {
+		resp.Rcode = dns.RcodeServerFailure
+		return resolution{upstream: label, matchedRule: rule + " (chain depth exceeded)", blockReason: reason}
+	}
+	fqdn := dns.Fqdn(target)
+	cname := &dns.CNAME{
+		Hdr:    dns.RR_Header{Name: q.Name, Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: staticTTL},
+		Target: fqdn,
+	}
+	sub := new(dns.Msg)
+	sub.SetQuestion(fqdn, q.Qtype)
+	subResp := new(dns.Msg)
+	subResp.SetReply(sub)
+	subResp.RecursionAvailable = true
+	s.resolve(sub, subResp, depth+1)
+
+	resp.Rcode = subResp.Rcode
+	resp.Answer = append([]dns.RR{cname}, subResp.Answer...)
+	resp.Ns = subResp.Ns
+	return resolution{upstream: label, matchedRule: rule, blockReason: reason}
 }
 
 // blockedResponse builds the response for a filtered query according to the
@@ -275,23 +424,32 @@ func (s *Server) staticHosts() map[string]net.IP {
 	return s.cfg.StaticHosts
 }
 
-// resolveViaCacheOrUpstream runs the cache → forward → cache-store stages.
-// It fills resp on success and returns the upstream label for the event.
-func (s *Server) resolveViaCacheOrUpstream(r *dns.Msg, resp *dns.Msg, key cacheKey) (string, bool) {
+// resolveViaCacheOrUpstream runs the cache → forward → bogus-NXDOMAIN →
+// cache-store stages. It fills resp on success.
+func (s *Server) resolveViaCacheOrUpstream(r *dns.Msg, resp *dns.Msg, key cacheKey) resolution {
 	// Stage: cache lookup.
 	if ent, remaining, ok := s.cache.get(key); ok {
 		resp.Rcode = ent.rcode
 		resp.Answer = withTTL(ent.answers, remaining)
 		resp.Ns = withTTL(ent.authority, remaining)
-		return "System Cache", true
+		return resolution{upstream: "System Cache", cacheHit: true}
 	}
 
 	// Stage: forward to upstreams in strict order (first success wins).
 	upstream, m := s.forward(r)
 	if m == nil {
 		resp.Rcode = dns.RcodeServerFailure
-		return upstream, false
+		return resolution{upstream: upstream}
 	}
+
+	// Stage: bogus-NXDOMAIN conversion (anti-poisoning) — runs before the
+	// cache store so converted answers never poison the cache.
+	if s.cfg.Policy != nil && s.cfg.Policy.IsBogusAnswer(m.Answer) {
+		s.bogusNXHits.Add(1)
+		resp.Rcode = dns.RcodeNameError
+		return resolution{upstream: upstream, matchedRule: "BOGUS_NXDOMAIN", blockReason: policy.ReasonBogusNX}
+	}
+
 	resp.Rcode = m.Rcode
 	resp.Answer = m.Answer
 	resp.Ns = m.Ns
@@ -299,7 +457,7 @@ func (s *Server) resolveViaCacheOrUpstream(r *dns.Msg, resp *dns.Msg, key cacheK
 
 	// Stage: cache store.
 	s.storeInCache(key, m)
-	return upstream, false
+	return resolution{upstream: upstream}
 }
 
 // forward tries each upstream in strict order and returns the first
@@ -375,14 +533,14 @@ func withTTL(rrs []dns.RR, ttl uint32) []dns.RR {
 }
 
 // buildEvent assembles the QueryEvent for an answered query.
-func (s *Server) buildEvent(r, resp *dns.Msg, w dns.ResponseWriter, upstream string, cacheHit, blocked bool, matchedRule, blockReason string, start time.Time) models.QueryEvent {
+func (s *Server) buildEvent(r, resp *dns.Msg, w dns.ResponseWriter, res resolution, start time.Time) models.QueryEvent {
 	ev := models.QueryEvent{
 		UnixTime:    time.Now().Unix(),
 		Node:        s.cfg.NodeName,
-		Upstream:    upstream,
-		Blocked:     blocked,
-		MatchedRule: matchedRule,
-		BlockReason: blockReason,
+		Upstream:    res.upstream,
+		Blocked:     res.blocked,
+		MatchedRule: res.matchedRule,
+		BlockReason: res.blockReason,
 	}
 	if len(r.Question) > 0 {
 		ev.Type = dns.TypeToString[r.Question[0].Qtype]
@@ -392,11 +550,17 @@ func (s *Server) buildEvent(r, resp *dns.Msg, w dns.ResponseWriter, upstream str
 	ev.ResponseCode = dns.RcodeToString[resp.Rcode]
 
 	latencyMs := float64(time.Since(start).Microseconds()) / 1000.0
-	if cacheHit {
+	if res.cacheHit {
 		latencyMs = 0
 	}
 	ev.Latency = sql.NullFloat64{Float64: latencyMs, Valid: true}
 	return ev
+}
+
+// Stats returns the pipeline hit counters for metrics:
+// rewrites, safe-search, and bogus-NXDOMAIN conversions.
+func (s *Server) Stats() (rewriteHits, safeSearchHits, bogusNXHits int64) {
+	return s.rewriteHits.Load(), s.safeSearchHits.Load(), s.bogusNXHits.Load()
 }
 
 // clientIPFromRemote extracts the IP part of a DNS client address.

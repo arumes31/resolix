@@ -86,6 +86,11 @@ docker-compose -f docker-compose.example.yaml up -d
 | `ALLOWLIST_FILE` | Local exceptions-only filter list path | - |
 | `FILTER_UPDATE_INTERVAL` | Filter subscription refresh interval | `24h` |
 | `BLOCKING_MODE` | Blocked response mode (`nxdomain`, `null_ip`, `refused`, `custom_ip`) | `nxdomain` |
+| `REWRITES_FILE` | Typed rewrites JSON persistence file (`DOMAINS` seeds it on first boot) | `rewrites.json` |
+| `SAFE_SEARCH` | Comma-separated safe-search engines (`google`, `bing`, `ddg`, `youtube`) | - |
+| `BOGUS_NXDOMAIN` | CIDR/IP list; answers fully inside become NXDOMAIN (anti-poisoning) | - |
+| `AAAA_DISABLED` | Return NOERROR-empty for AAAA queries | `false` |
+| `REFUSE_ANY` | Refuse QTYPE ANY queries | `true` |
 | `TRUSTED_PROXIES` | Comma-separated proxy IPs/CIDRs whose `X-Forwarded-*` headers are honored | - |
 | `COOKIE_SECURE` | Force the `Secure` attribute on session/CSRF cookies (`true`/`false`) | `false` |
 

@@ -67,6 +67,11 @@ const (
 	DefaultBlockCustomIP6 = "::"
 	// DefaultRewritesFile is the default DNS rewrites persistence file name.
 	DefaultRewritesFile = "rewrites.json"
+
+	// minCacheTTLDefault/maxCacheTTLDefault are the default cache TTL bounds
+	// in seconds (dnsmasq local-ttl=60 / max-ttl=600).
+	minCacheTTLDefault = 60
+	maxCacheTTLDefault = 600
 	// DefaultUpstreamLatencyThreshold is the default latency alert threshold in milliseconds.
 	DefaultUpstreamLatencyThreshold = 200
 
@@ -180,6 +185,22 @@ type Config struct {
 	AAAADisabled bool
 	// RefuseANY refuses QTYPE ANY queries (default true).
 	RefuseANY bool
+	// UpstreamMode selects pool behavior: load_balance (default) | parallel | strict.
+	UpstreamMode string
+	// FallbackDNS lists fallback upstreams used only when all primaries fail.
+	FallbackDNS string
+	// BootstrapDNS lists plain UDP resolvers for hostname upstreams.
+	BootstrapDNS string
+	// ECSClientSubnet is the EDNS0 client subnet attached to upstream queries.
+	ECSClientSubnet string
+	// DNS64 enables AAAA synthesis; DNS64Prefixes overrides the prefix list.
+	DNS64         bool
+	DNS64Prefixes string
+	// CacheMinTTL/CacheMaxTTL override cache TTL bounds (seconds).
+	CacheMinTTL int
+	CacheMaxTTL int
+	// CacheOptimistic serves stale entries while refreshing in background.
+	CacheOptimistic bool
 	// UpstreamLatencyThreshold is the latency threshold in ms for alerting.
 	UpstreamLatencyThreshold int
 
@@ -674,6 +695,23 @@ func LoadConfig() *Config {
 	// Filter engine blocking settings
 	blockingMode, blockCustomIP4, blockCustomIP6 := resolveBlocking()
 
+	// Upstream pool settings
+	upstreamMode := strings.ToLower(strings.TrimSpace(os.Getenv("UPSTREAM_MODE")))
+	switch upstreamMode {
+	case "":
+		upstreamMode = "load_balance"
+	case "load_balance", "parallel", "strict":
+	default:
+		log.Printf("[WARN] Invalid UPSTREAM_MODE '%s', falling back to load_balance", sanitizeForLog(upstreamMode)) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		upstreamMode = "load_balance"
+	}
+	cacheMinTTL := parseIntEnv("CACHE_MIN_TTL", minCacheTTLDefault)
+	cacheMaxTTL := parseIntEnv("CACHE_MAX_TTL", maxCacheTTLDefault)
+	if cacheMaxTTL < cacheMinTTL {
+		log.Printf("[WARN] CACHE_MAX_TTL %d < CACHE_MIN_TTL %d, using defaults %d/%d", cacheMaxTTL, cacheMinTTL, minCacheTTLDefault, maxCacheTTLDefault)
+		cacheMinTTL, cacheMaxTTL = minCacheTTLDefault, maxCacheTTLDefault
+	}
+
 	latencyThreshold := resolveLatencyThreshold()
 
 	// Parse configurable timeout values (Item 80)
@@ -743,6 +781,15 @@ func LoadConfig() *Config {
 		BogusNXDOMAIN:              os.Getenv("BOGUS_NXDOMAIN"),
 		AAAADisabled:               strings.ToLower(os.Getenv("AAAA_DISABLED")) == "true",
 		RefuseANY:                  strings.ToLower(os.Getenv("REFUSE_ANY")) != "false",
+		UpstreamMode:               upstreamMode,
+		FallbackDNS:                os.Getenv("FALLBACK_DNS"),
+		BootstrapDNS:               os.Getenv("BOOTSTRAP_DNS"),
+		ECSClientSubnet:            os.Getenv("ECS_CLIENT_SUBNET"),
+		DNS64:                      strings.ToLower(os.Getenv("DNS64")) == "true",
+		DNS64Prefixes:              os.Getenv("DNS64_PREFIXES"),
+		CacheMinTTL:                cacheMinTTL,
+		CacheMaxTTL:                cacheMaxTTL,
+		CacheOptimistic:            strings.ToLower(os.Getenv("CACHE_OPTIMISTIC")) == "true",
 		UpstreamLatencyThreshold:   latencyThreshold,
 		SSEKeepaliveInterval:       sseKeepalive,
 		BatchArchiveInterval:       batchArchive,

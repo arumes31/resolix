@@ -33,21 +33,46 @@ func (e *cacheEntry) remainingTTL(now time.Time) int64 {
 // cache is a bounded in-memory DNS response cache with LRU eviction,
 // mirroring the dnsmasq cache-size=25000 behavior.
 type cache struct {
-	mu    sync.Mutex
-	cap   int
-	ll    *list.List // front = most recently used
-	items map[cacheKey]*list.Element
+	mu         sync.Mutex
+	cap        int
+	minTTL     uint32
+	maxTTL     uint32
+	optimistic bool
+	ll         *list.List // front = most recently used
+	items      map[cacheKey]*list.Element
 }
 
-func newCache(capacity int) *cache {
+func newCache(capacity int, minTTL, maxTTL uint32) *cache {
 	if capacity <= 0 {
 		capacity = defaultCacheSize
 	}
-	return &cache{
-		cap:   capacity,
-		ll:    list.New(),
-		items: make(map[cacheKey]*list.Element),
+	if minTTL == 0 {
+		minTTL = minCacheTTL
 	}
+	if maxTTL == 0 {
+		maxTTL = maxCacheTTL
+	}
+	if minTTL > maxTTL {
+		minTTL, maxTTL = maxTTL, minTTL
+	}
+	return &cache{
+		cap:    capacity,
+		minTTL: minTTL,
+		maxTTL: maxTTL,
+		ll:     list.New(),
+		items:  make(map[cacheKey]*list.Element),
+	}
+}
+
+// clamp bounds a TTL to the cache's [minTTL, maxTTL] range.
+func (c *cache) clamp(ttl uint32) uint32 {
+	if ttl < c.minTTL {
+		return c.minTTL
+	}
+	if ttl > c.maxTTL {
+		return c.maxTTL
+	}
+	return ttl
 }
 
 // get returns a fresh copy of the cached entry with its remaining TTL, or
@@ -65,7 +90,11 @@ func (c *cache) get(key cacheKey) (*cacheEntry, uint32, bool) {
 	ent := en.value
 	remaining := ent.remainingTTL(time.Now())
 	if remaining <= 0 {
-		c.removeElement(el)
+		// Optimistic mode keeps expired entries so getStale can serve them
+		// while a background refresh repopulates the cache.
+		if !c.optimistic {
+			c.removeElement(el)
+		}
 		return nil, 0, false
 	}
 	c.ll.MoveToFront(el)
@@ -83,6 +112,25 @@ func (c *cache) get(key cacheKey) (*cacheEntry, uint32, bool) {
 		remaining = math.MaxUint32
 	}
 	return out, uint32(remaining), true
+}
+
+// getStale returns a copy of the entry regardless of expiry (for optimistic
+// caching), or (nil, false) when the key is absent entirely.
+func (c *cache) getStale(key cacheKey) (*cacheEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, ok := c.items[key]
+	if !ok {
+		return nil, false
+	}
+	ent := el.Value.(entry).value
+	return &cacheEntry{
+		answers:   copyRRs(ent.answers),
+		authority: copyRRs(ent.authority),
+		rcode:     ent.rcode,
+		storedAt:  ent.storedAt,
+		ttl:       ent.ttl,
+	}, true
 }
 
 // set stores an entry, evicting the least recently used entry when full.

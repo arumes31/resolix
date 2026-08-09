@@ -36,6 +36,7 @@ import (
 	"tailscale-dnsrewrite/webgui/internal/resolver"
 	"tailscale-dnsrewrite/webgui/internal/rewrites"
 	"tailscale-dnsrewrite/webgui/internal/storage"
+	"tailscale-dnsrewrite/webgui/internal/upstream"
 )
 
 // Version represents the current application version.
@@ -239,6 +240,17 @@ DB_PATH=dns.db
 # AAAA_DISABLED=true (AAAA queries get NOERROR-empty answers)
 # REFUSE_ANY=true (default; QTYPE ANY is refused)
 
+# Upstream pool (Step 4): schemes udp:// tcp:// tls:// https:// (DoT/DoH)
+# UPSTREAM_MODE=load_balance (default) | parallel | strict
+# FALLBACK_DNS=9.9.9.9 (used only when all primary upstreams fail)
+# BOOTSTRAP_DNS=8.8.8.8 (plain UDP; required for hostname upstreams like tls://dns.google)
+# ECS_CLIENT_SUBNET=192.0.2.0/24 (EDNS0 client subnet sent to upstreams)
+# DNS64=true (synthesize AAAA from A on empty AAAA answers)
+# DNS64_PREFIXES=64:ff9b::/96
+# CACHE_OPTIMISTIC=true (serve stale entries while refreshing in background)
+# CACHE_MIN_TTL=60
+# CACHE_MAX_TTL=600
+
 # Upstream latency alert threshold in milliseconds (Item 68, default: 200)
 # UPSTREAM_LATENCY_THRESHOLD=200
 
@@ -366,8 +378,20 @@ func main() {
 	}
 	staticHandler := http.FileServer(http.FS(staticFS))
 
-	// Initialize health checker
-	checker := health.NewChecker(cfg, cfg.UpstreamDNS)
+	// Upstream specs: upstreams.json overrides env upstreams when the file
+	// contains entries (hot-reloaded below and after API saves).
+	loadSpecs := func() []string {
+		if p := cfg.FullUpstreamsPath(); p != "" {
+			if list := dnsroutes.LoadUpstreams(p); len(list) > 0 {
+				return list
+			}
+		}
+		return strings.Fields(cfg.UpstreamDNS)
+	}
+	upstreamSpecs := loadSpecs()
+
+	// Initialize health checker (UDP probe; covers plain-IP upstreams only)
+	checker := health.NewChecker(cfg, strings.Join(upstreamSpecs, " "))
 	go checker.Start(ctx, func(_ []string, latencies map[string]float64) {
 		store.SetUpstreamHealth(cfg.NodeName, latencies)
 		if cfg.Mode == "slave" {
@@ -428,11 +452,7 @@ func main() {
 
 	// Typed rewrites store (Step 3): loaded from the persistence file, or
 	// seeded from the DOMAINS env on first boot only.
-	rwStore, err := rewrites.Load(cfg.FullRewritesPath(), cfg.Domains)
-	if err != nil {
-		logger.Warning("Failed to load rewrites store: %v", err)
-		rwStore, _ = rewrites.Load("", cfg.Domains) // in-memory fallback
-	}
+	rwStore := loadRewritesStore(cfg)
 	srv.SetRewritesStore(rwStore)
 
 	// Policy (Step 3): safe search, bogus NXDOMAIN, AAAA disable, refuse ANY.
@@ -443,17 +463,25 @@ func main() {
 		RefuseANY:    cfg.RefuseANY,
 	})
 
+	// Upstream pool (Step 4): modes, fallback, bootstrap, ECS, DNS64.
+	pool := setupUpstreamPool(ctx, cfg, store, srv, loadSpecs, upstreamSpecs)
+
 	dnsSrv := dnsserver.New(dnsserver.Config{
-		Addr:           cfg.DNSListenAddr,
-		Port:           cfg.DNSListenPort,
-		Upstreams:      strings.Fields(cfg.UpstreamDNS),
-		Rewrites:       rwStore,
-		Policy:         pol,
-		NodeName:       cfg.NodeName,
-		Filter:         filterEng,
-		BlockingMode:   cfg.BlockingMode,
-		BlockCustomIP4: cfg.BlockCustomIP4,
-		BlockCustomIP6: cfg.BlockCustomIP6,
+		Addr:            cfg.DNSListenAddr,
+		Port:            cfg.DNSListenPort,
+		Upstreams:       upstreamSpecs,
+		Rewrites:        rwStore,
+		Policy:          pol,
+		Pool:            pool,
+		Routes:          dr,
+		CacheMinTTL:     cfg.CacheMinTTL,
+		CacheMaxTTL:     cfg.CacheMaxTTL,
+		CacheOptimistic: cfg.CacheOptimistic,
+		NodeName:        cfg.NodeName,
+		Filter:          filterEng,
+		BlockingMode:    cfg.BlockingMode,
+		BlockCustomIP4:  cfg.BlockCustomIP4,
+		BlockCustomIP6:  cfg.BlockCustomIP6,
 	}, func(ev models.QueryEvent) {
 		store.AddEvent(ev)
 		srv.BroadcastEvent(ev)
@@ -558,11 +586,74 @@ func setupFilterEngine(ctx context.Context, cfg *config.Config, srv *api.Server)
 	return eng
 }
 
+// loadRewritesStore loads the typed rewrites store, seeding from the DOMAINS
+// env on first boot; falls back to an in-memory store on load errors.
+func loadRewritesStore(cfg *config.Config) *rewrites.Store {
+	rwStore, err := rewrites.Load(cfg.FullRewritesPath(), cfg.Domains)
+	if err != nil {
+		logger.Warning("Failed to load rewrites store: %v", err)
+		rwStore, _ = rewrites.Load("", cfg.Domains) // in-memory fallback
+	}
+	return rwStore
+}
+
+// setupUpstreamPool builds the upstream pool, wires health data and the API
+// reload callback, and starts the upstreams.json hot-reload poller.
+func setupUpstreamPool(ctx context.Context, cfg *config.Config, store *storage.Store, srv *api.Server, loadSpecs func() []string, current []string) *upstream.Pool {
+	pool := upstream.NewPool(upstream.PoolConfig{
+		Mode:             cfg.UpstreamMode,
+		PrimarySpecs:     current,
+		FallbackSpecs:    strings.Fields(cfg.FallbackDNS),
+		BootstrapServers: strings.Fields(cfg.BootstrapDNS),
+		ECSClientSubnet:  cfg.ECSClientSubnet,
+		DNS64:            cfg.DNS64,
+		DNS64Prefixes:    strings.Fields(cfg.DNS64Prefixes),
+	})
+	pool.SetHealthProvider(func() map[string]float64 {
+		return store.GetUpstreamHealth()[cfg.NodeName]
+	})
+	srv.SetUpstreamReloadFunc(func() {
+		pool.SetPrimarySpecs(loadSpecs())
+	})
+
+	// Hot-reload upstreams.json: poll for changes (covers external edits).
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if specs := loadSpecs(); !equalStringSlices(specs, current) {
+					logger.Info("Upstream list changed, reloading pool (%d upstreams)", len(specs))
+					pool.SetPrimarySpecs(specs)
+					current = specs
+				}
+			}
+		}
+	}()
+	return pool
+}
+
 // splitListEnv splits a space/comma-separated env list into trimmed entries.
 func splitListEnv(v string) []string {
 	return strings.FieldsFunc(v, func(r rune) bool {
 		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
 	})
+}
+
+// equalStringSlices reports whether two string slices are equal.
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // waitForHTTPServer waits for the HTTP server goroutine to finish, giving up

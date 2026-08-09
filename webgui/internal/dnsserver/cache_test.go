@@ -48,7 +48,7 @@ func TestClampTTL(t *testing.T) {
 }
 
 func TestCacheSetGetExpiry(t *testing.T) {
-	c := newCache(10)
+	c := newCache(10, 0, 0)
 	key := cacheKey{name: "example.com", qtype: dns.TypeA}
 
 	if _, _, ok := c.get(key); ok {
@@ -104,7 +104,7 @@ func TestCacheTTLDecrementOnResponse(t *testing.T) {
 }
 
 func TestCacheLRUEviction(t *testing.T) {
-	c := newCache(2)
+	c := newCache(2, 0, 0)
 	mk := func(name string) cacheKey { return cacheKey{name: name, qtype: dns.TypeA} }
 	put := func(name string) {
 		c.set(mk(name), &cacheEntry{

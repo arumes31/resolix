@@ -14,15 +14,18 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
 
+	"tailscale-dnsrewrite/webgui/internal/dnsroutes"
 	"tailscale-dnsrewrite/webgui/internal/filter"
 	"tailscale-dnsrewrite/webgui/internal/models"
 	"tailscale-dnsrewrite/webgui/internal/policy"
 	"tailscale-dnsrewrite/webgui/internal/rewrites"
+	"tailscale-dnsrewrite/webgui/internal/upstream"
 )
 
 const (
@@ -68,6 +71,14 @@ type Config struct {
 	Rewrites *rewrites.Store
 	// Policy holds safe-search / bogus-NXDOMAIN / AAAA / ANY policy (nil = off).
 	Policy *policy.Policy
+	// Pool is the upstream pool (nil = legacy strict-order Upstreams path).
+	Pool *upstream.Pool
+	// Routes provides per-domain upstream routing (nil = no routes).
+	Routes *dnsroutes.DNSRoutes
+	// CacheMinTTL/CacheMaxTTL override cache TTL bounds (0 = 60/600).
+	CacheMinTTL     int
+	CacheMaxTTL     int
+	CacheOptimistic bool
 }
 
 // Server is the embedded DNS server.
@@ -83,19 +94,25 @@ type Server struct {
 	rewriteHits    atomic.Int64
 	safeSearchHits atomic.Int64
 	bogusNXHits    atomic.Int64
+
+	// refreshInFlight tracks optimistic-cache background refreshes (single-flight).
+	refreshMu       sync.Mutex
+	refreshInFlight map[cacheKey]bool
 }
 
 // New creates a DNS server. emit is invoked synchronously for every answered
 // query (typically Store.AddEvent + Server.BroadcastEvent wiring from main).
 func New(cfg Config, emit func(models.QueryEvent)) *Server {
 	s := &Server{
-		cfg:   cfg,
-		cache: newCache(cfg.CacheSize),
-		emit:  emit,
+		cfg:             cfg,
+		cache:           newCache(cfg.CacheSize, uint32(cfg.CacheMinTTL), uint32(cfg.CacheMaxTTL)), // #nosec G115 -- CacheMinTTL/MaxTTL are validated non-negative in config
+		emit:            emit,
+		refreshInFlight: make(map[cacheKey]bool),
 		client: &dns.Client{
 			Timeout: upstreamTimeout,
 		},
 	}
+	s.cache.optimistic = cfg.CacheOptimistic
 	for _, raw := range cfg.Upstreams {
 		if addr, ok := normalizeUpstream(raw); ok {
 			s.upstreams = append(s.upstreams, addr)
@@ -435,11 +452,23 @@ func (s *Server) resolveViaCacheOrUpstream(r *dns.Msg, resp *dns.Msg, key cacheK
 		return resolution{upstream: "System Cache", cacheHit: true}
 	}
 
+	// Optimistic caching: serve the stale entry with TTL 1 and refresh in
+	// the background (single-flight per key).
+	if s.cfg.CacheOptimistic {
+		if ent, ok := s.cache.getStale(key); ok {
+			resp.Rcode = ent.rcode
+			resp.Answer = withTTL(ent.answers, 1)
+			resp.Ns = withTTL(ent.authority, 1)
+			s.refreshAsync(key, r)
+			return resolution{upstream: "System Cache (stale)", cacheHit: true}
+		}
+	}
+
 	// Stage: forward to upstreams in strict order (first success wins).
-	upstream, m := s.forward(r)
+	usedUpstream, m := s.forward(r)
 	if m == nil {
 		resp.Rcode = dns.RcodeServerFailure
-		return resolution{upstream: upstream}
+		return resolution{upstream: usedUpstream}
 	}
 
 	// Stage: bogus-NXDOMAIN conversion (anti-poisoning) — runs before the
@@ -447,7 +476,7 @@ func (s *Server) resolveViaCacheOrUpstream(r *dns.Msg, resp *dns.Msg, key cacheK
 	if s.cfg.Policy != nil && s.cfg.Policy.IsBogusAnswer(m.Answer) {
 		s.bogusNXHits.Add(1)
 		resp.Rcode = dns.RcodeNameError
-		return resolution{upstream: upstream, matchedRule: "BOGUS_NXDOMAIN", blockReason: policy.ReasonBogusNX}
+		return resolution{upstream: usedUpstream, matchedRule: "BOGUS_NXDOMAIN", blockReason: policy.ReasonBogusNX}
 	}
 
 	resp.Rcode = m.Rcode
@@ -457,28 +486,70 @@ func (s *Server) resolveViaCacheOrUpstream(r *dns.Msg, resp *dns.Msg, key cacheK
 
 	// Stage: cache store.
 	s.storeInCache(key, m)
-	return resolution{upstream: upstream}
+	return resolution{upstream: usedUpstream}
 }
 
-// forward tries each upstream in strict order and returns the first
-// successful response (any rcode counts as success; transport errors and
-// timeouts move to the next upstream).
+// refreshAsync repopulates a stale cache entry in the background,
+// single-flight per key. No event is emitted (not a client query).
+func (s *Server) refreshAsync(key cacheKey, r *dns.Msg) {
+	s.refreshMu.Lock()
+	if s.refreshInFlight[key] {
+		s.refreshMu.Unlock()
+		return
+	}
+	s.refreshInFlight[key] = true
+	s.refreshMu.Unlock()
+
+	go func() {
+		defer func() {
+			s.refreshMu.Lock()
+			delete(s.refreshInFlight, key)
+			s.refreshMu.Unlock()
+		}()
+		if _, m := s.forward(r); m != nil {
+			s.storeInCache(key, m)
+		}
+	}()
+}
+
+// forward resolves r through the upstream pool. Per-domain DNS routes take
+// precedence when they match (route failure falls back to the pool). When no
+// pool is configured (legacy/tests), the plain strict-order path is used.
 func (s *Server) forward(r *dns.Msg) (string, *dns.Msg) {
-	for _, upstream := range s.upstreams {
-		m, _, err := s.client.Exchange(r, upstream)
+	if s.cfg.Pool != nil {
+		if s.cfg.Routes != nil && len(r.Question) > 0 {
+			domain := normalizeName(r.Question[0].Name)
+			if spec := s.cfg.Routes.GetUpstreamForDomain(domain); spec != "" {
+				if m, used, err := s.cfg.Pool.ExchangeRoute(spec, r); err == nil && m != nil {
+					m.Id = r.Id
+					return used, m
+				}
+				// Route upstream failed: fall through to the general pool.
+			}
+		}
+		m, used, err := s.cfg.Pool.Exchange(r)
 		if err != nil || m == nil {
-			log.Printf("[DEBUG] Upstream %s exchange failed: %v", upstream, err)
+			return "", nil
+		}
+		m.Id = r.Id
+		return used, m
+	}
+
+	for _, up := range s.upstreams {
+		m, _, err := s.client.Exchange(r, up)
+		if err != nil || m == nil {
+			log.Printf("[DEBUG] Upstream %s exchange failed: %v", up, err)
 			continue
 		}
 		if m.Truncated {
 			// Retry over TCP per DNS convention.
 			tcpClient := &dns.Client{Net: "tcp", Timeout: upstreamTimeout}
-			if tm, _, terr := tcpClient.Exchange(r, upstream); terr == nil && tm != nil {
+			if tm, _, terr := tcpClient.Exchange(r, up); terr == nil && tm != nil {
 				m = tm
 			}
 		}
 		m.Id = r.Id
-		return upstream, m
+		return up, m
 	}
 	return "", nil
 }
@@ -495,16 +566,16 @@ func (s *Server) storeInCache(key cacheKey, m *dns.Msg) {
 
 	switch {
 	case m.Rcode == dns.RcodeSuccess && len(m.Answer) > 0:
-		// Positive answer: min answer TTL clamped to [60, 600].
-		ent.ttl = clampTTL(minAnswerTTL(m.Answer))
+		// Positive answer: min answer TTL clamped to the configured bounds.
+		ent.ttl = s.cache.clamp(minAnswerTTL(m.Answer))
 	case m.Rcode == dns.RcodeNameError || (m.Rcode == dns.RcodeSuccess && len(m.Answer) == 0):
-		// Negative answer (NXDOMAIN/NODATA): SOA TTL clamped to max 600.
+		// Negative answer (NXDOMAIN/NODATA): SOA TTL clamped to the max.
 		ttl, ok := soaTTL(m.Ns)
 		if !ok {
 			return
 		}
-		if ttl > maxCacheTTL {
-			ttl = maxCacheTTL
+		if ttl > s.cache.maxTTL {
+			ttl = s.cache.maxTTL
 		}
 		if ttl == 0 {
 			return

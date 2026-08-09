@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 	"net"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -141,9 +140,6 @@ func (c *Checker) Start(ctx context.Context, onChange func([]string, map[string]
 
 			if changed {
 				log.Printf("Healthy upstreams changed: %v", currentHealthy)
-				if err := exec.Command("pkill", "-HUP", "dnsmasq").Run(); err != nil {
-					log.Printf("Error reloading dnsmasq: %v", err)
-				}
 			}
 			onChange(currentHealthy, currentLatencies)
 		}

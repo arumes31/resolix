@@ -161,6 +161,9 @@ type Server struct {
 	rewritesStore *rewrites.Store
 	dnsServer     *dnsserver.Server
 
+	// upstreamReloadFn reloads the upstream pool after upstreams.json saves
+	upstreamReloadFn func()
+
 	// DNS routes (Item 66)
 	dnsRoutes *dnsroutes.DNSRoutes
 
@@ -249,6 +252,14 @@ func (s *Server) SetDNSServer(srv *dnsserver.Server) {
 	s.fieldsMu.Lock()
 	defer s.fieldsMu.Unlock()
 	s.dnsServer = srv
+}
+
+// SetUpstreamReloadFunc configures the callback invoked after the upstreams
+// file is saved via the API, so the pool picks up changes immediately.
+func (s *Server) SetUpstreamReloadFunc(fn func()) {
+	s.fieldsMu.Lock()
+	defer s.fieldsMu.Unlock()
+	s.upstreamReloadFn = fn
 }
 
 // getFilter returns the configured filter engine (may be nil).
@@ -1596,6 +1607,14 @@ func (s *Server) handlePostUpstreams(w http.ResponseWriter, r *http.Request) {
 	if err := dnsroutes.SaveUpstreams(upstreamsPath, upstreams); err != nil {
 		http.Error(w, "Failed to save upstreams file", http.StatusInternalServerError)
 		return
+	}
+
+	// Reload the upstream pool so changes take effect immediately.
+	s.fieldsMu.RLock()
+	reload := s.upstreamReloadFn
+	s.fieldsMu.RUnlock()
+	if reload != nil {
+		reload()
 	}
 
 	w.Header().Set("Content-Type", "application/json")

@@ -10,12 +10,12 @@ import (
 	"strings"
 	"testing"
 
-	"tailscale-dnsrewrite/webgui/internal/clients"
-	"tailscale-dnsrewrite/webgui/internal/config"
-	"tailscale-dnsrewrite/webgui/internal/configsync"
-	"tailscale-dnsrewrite/webgui/internal/dnsroutes"
-	"tailscale-dnsrewrite/webgui/internal/filter"
-	"tailscale-dnsrewrite/webgui/internal/rewrites"
+	"github.com/arumes31/resolix/webgui/internal/clients"
+	"github.com/arumes31/resolix/webgui/internal/config"
+	"github.com/arumes31/resolix/webgui/internal/configsync"
+	"github.com/arumes31/resolix/webgui/internal/dnsroutes"
+	"github.com/arumes31/resolix/webgui/internal/filter"
+	"github.com/arumes31/resolix/webgui/internal/rewrites"
 )
 
 func TestConfigPageIsDedicatedAndRootRejectsUnknownPaths(t *testing.T) {

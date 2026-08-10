@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"tailscale-dnsrewrite/webgui/internal/models"
-	"tailscale-dnsrewrite/webgui/internal/storage"
+	"github.com/arumes31/resolix/webgui/internal/models"
+	"github.com/arumes31/resolix/webgui/internal/storage"
 )
 
 // bufPool is a sync.Pool for byte buffers used during log parsing.

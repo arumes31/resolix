@@ -1,4 +1,4 @@
-// Package main is the entry point for the tailscale-dnsrewrite web GUI
+// Package main is the entry point for Resolix.
 // application. It initializes configuration, storage, parsers, and the
 // HTTP server, then manages the application lifecycle including graceful
 // shutdown.
@@ -22,24 +22,24 @@ import (
 	"syscall"
 	"time"
 
-	"tailscale-dnsrewrite/webgui/internal/api"
-	"tailscale-dnsrewrite/webgui/internal/blocklist"
-	"tailscale-dnsrewrite/webgui/internal/clients"
-	"tailscale-dnsrewrite/webgui/internal/config"
-	"tailscale-dnsrewrite/webgui/internal/configsync"
-	"tailscale-dnsrewrite/webgui/internal/dnsroutes"
-	"tailscale-dnsrewrite/webgui/internal/dnsserver"
-	"tailscale-dnsrewrite/webgui/internal/filter"
-	"tailscale-dnsrewrite/webgui/internal/forwarder"
-	"tailscale-dnsrewrite/webgui/internal/health"
-	"tailscale-dnsrewrite/webgui/internal/logger"
-	"tailscale-dnsrewrite/webgui/internal/models"
-	"tailscale-dnsrewrite/webgui/internal/parser"
-	"tailscale-dnsrewrite/webgui/internal/policy"
-	"tailscale-dnsrewrite/webgui/internal/resolver"
-	"tailscale-dnsrewrite/webgui/internal/rewrites"
-	"tailscale-dnsrewrite/webgui/internal/storage"
-	"tailscale-dnsrewrite/webgui/internal/upstream"
+	"github.com/arumes31/resolix/webgui/internal/api"
+	"github.com/arumes31/resolix/webgui/internal/blocklist"
+	"github.com/arumes31/resolix/webgui/internal/clients"
+	"github.com/arumes31/resolix/webgui/internal/config"
+	"github.com/arumes31/resolix/webgui/internal/configsync"
+	"github.com/arumes31/resolix/webgui/internal/dnsroutes"
+	"github.com/arumes31/resolix/webgui/internal/dnsserver"
+	"github.com/arumes31/resolix/webgui/internal/filter"
+	"github.com/arumes31/resolix/webgui/internal/forwarder"
+	"github.com/arumes31/resolix/webgui/internal/health"
+	"github.com/arumes31/resolix/webgui/internal/logger"
+	"github.com/arumes31/resolix/webgui/internal/models"
+	"github.com/arumes31/resolix/webgui/internal/parser"
+	"github.com/arumes31/resolix/webgui/internal/policy"
+	"github.com/arumes31/resolix/webgui/internal/resolver"
+	"github.com/arumes31/resolix/webgui/internal/rewrites"
+	"github.com/arumes31/resolix/webgui/internal/storage"
+	"github.com/arumes31/resolix/webgui/internal/upstream"
 )
 
 // Version represents the current application version.
@@ -183,7 +183,7 @@ MODE=master
 # MASTER_URL=https://master-ip:35353
 
 # Unique identifier for this node
-NODE_NAME=dns-server-1
+NODE_NAME=resolix-1
 
 # Secret token to authenticate logs from slave nodes
 # INGEST_SECRET=your-secret-token
@@ -208,19 +208,19 @@ BASE_URL=/
 DB_PATH=dns.db
 
 # Path to a file with client IP=Alias mappings (one per line, # comments supported)
-# CLIENT_ALIASES_FILE=/etc/tailscale-dnsrewrite/aliases.txt
+# CLIENT_ALIASES_FILE=/etc/resolix/aliases.txt
 
 # Comma-separated client IP:Alias mappings (alternative to file-based aliases)
 # CLIENT_ALIASES=192.168.1.1:Gateway,100.64.0.1:Router
 
 # Path to a hosts-format blocklist file (Item 61)
-# BLOCKLIST_FILE=/etc/tailscale-dnsrewrite/blocklist.hosts
+# BLOCKLIST_FILE=/etc/resolix/blocklist.hosts
 
 # Path to a JSON file with upstream DNS server list (Item 62)
-# UPSTREAMS_FILE=/etc/tailscale-dnsrewrite/upstreams.json
+# UPSTREAMS_FILE=/etc/resolix/upstreams.json
 
 # Path to a JSON file with domain-specific DNS routing rules (Item 66)
-# DNS_ROUTES_FILE=/etc/tailscale-dnsrewrite/dns-routes.json
+# DNS_ROUTES_FILE=/etc/resolix/dns-routes.json
 
 # DNS server listen address and port for the embedded DNS server (replaces dnsmasq)
 # DNS_LISTEN_ADDR defaults to TAILSCALE_IP (set by entrypoint.sh), then 0.0.0.0
@@ -232,7 +232,7 @@ DB_PATH=dns.db
 # BLOCKLIST_URLS=https://example.com/blocklist.txt
 # ALLOWLIST_URLS=https://example.com/allowlist.txt
 # Local exceptions-only list (@@ semantics for every entry)
-# ALLOWLIST_FILE=/etc/tailscale-dnsrewrite/allowlist.txt
+# ALLOWLIST_FILE=/etc/resolix/allowlist.txt
 # FILTER_UPDATE_INTERVAL=24h
 
 # Blocking response mode: nxdomain (default), null_ip (0.0.0.0/::), refused,
@@ -281,8 +281,8 @@ DB_PATH=dns.db
 # DOH_AUTH_TOKEN=change-me (Bearer token; when unset, only private/tailnet clients)
 # DOT_ENABLED=false
 # DOT_PORT=853
-# TLS_CERT_FILE=/etc/tailscale-dnsrewrite/tls.crt
-# TLS_KEY_FILE=/etc/tailscale-dnsrewrite/tls.key
+# TLS_CERT_FILE=/etc/resolix/tls.crt
+# TLS_KEY_FILE=/etc/resolix/tls.key
 
 # Upstream latency alert threshold in milliseconds (Item 68, default: 200)
 # UPSTREAM_LATENCY_THRESHOLD=200
@@ -302,7 +302,7 @@ DB_PATH=dns.db
 # MAX_REQUEST_SIZE=1048576
 
 # Optional log file for file-based logging (default: empty = stderr only)
-# LOG_FILE=/var/log/tailscale-dnsrewrite.log
+# LOG_FILE=/var/log/resolix.log
 
 # ===== Distributed Architecture (Items 85-94) =====
 # Maximum retry attempts for forwarding with exponential backoff (default: 6)
@@ -334,7 +334,7 @@ func main() {
 
 	// Initialize the level-aware logger (Item 51)
 	logger.SetLevel(cfg.LogLevel)
-	logger.Info("Tailscale DNS Monitor v%s starting in %s mode", Version, cfg.Mode)
+	logger.Info("Resolix v%s starting in %s mode", Version, cfg.Mode)
 	logger.Info("Log level set to %s", cfg.LogLevel)
 
 	// Enable file logging if configured (Item 84)

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"tailscale-dnsrewrite/webgui/internal/logger"
+	"github.com/arumes31/resolix/webgui/internal/logger"
 )
 
 const (

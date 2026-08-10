@@ -13,13 +13,13 @@ import (
 	"testing"
 	"time"
 
-	"tailscale-dnsrewrite/webgui/internal/api"
-	"tailscale-dnsrewrite/webgui/internal/config"
-	"tailscale-dnsrewrite/webgui/internal/filter"
-	"tailscale-dnsrewrite/webgui/internal/forwarder"
-	"tailscale-dnsrewrite/webgui/internal/models"
-	"tailscale-dnsrewrite/webgui/internal/parser"
-	"tailscale-dnsrewrite/webgui/internal/storage"
+	"github.com/arumes31/resolix/webgui/internal/api"
+	"github.com/arumes31/resolix/webgui/internal/config"
+	"github.com/arumes31/resolix/webgui/internal/filter"
+	"github.com/arumes31/resolix/webgui/internal/forwarder"
+	"github.com/arumes31/resolix/webgui/internal/models"
+	"github.com/arumes31/resolix/webgui/internal/parser"
+	"github.com/arumes31/resolix/webgui/internal/storage"
 )
 
 func setupTest() (*config.Config, *storage.Store, *parser.Parser, *api.Server) {

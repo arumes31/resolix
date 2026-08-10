@@ -2,7 +2,7 @@
 set -euo pipefail
 
 smoke_dir="$(mktemp -d)"
-container_name="tailscale-dnsrewrite-smoke-${RANDOM}"
+container_name="resolix-smoke-${RANDOM}"
 socket_container="${container_name}-socket"
 socket_volume="${container_name}-socket"
 cleanup() {
@@ -34,10 +34,10 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "${openssl_subject}" \
 docker build \
   --build-arg VERSION=smoke \
   --build-arg BUILD_INFO="${GITHUB_SHA:-local}" \
-  -t tailscale-dnsrewrite:smoke .
+  -t resolix:smoke .
 
 # Provide a local Unix socket and deterministic CLI responses so the image's
-# default entrypoint exercises coordinated tailscaled/webgui startup without
+# default entrypoint exercises coordinated tailscaled/Resolix startup without
 # requiring access to a real tailnet or auth key.
 docker volume create "${socket_volume}" >/dev/null
 MSYS_NO_PATHCONV=1 docker run -d --name "${socket_container}" \
@@ -68,7 +68,7 @@ MSYS_NO_PATHCONV=1 docker run -d --name "${container_name}" \
   -e DOT_PORT=1853 \
   -e TLS_CERT_FILE=/smoke/tls.crt \
   -e TLS_KEY_FILE=/smoke/tls.key \
-  tailscale-dnsrewrite:smoke >/dev/null
+  resolix:smoke >/dev/null
 
 dns_udp_port="$(docker port "${container_name}" 1053/udp | awk -F: 'NR == 1 { print $NF }')"
 dns_tcp_port="$(docker port "${container_name}" 1053/tcp | awk -F: 'NR == 1 { print $NF }')"

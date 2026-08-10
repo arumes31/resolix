@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"tailscale-dnsrewrite/webgui/internal/config"
-	"tailscale-dnsrewrite/webgui/internal/models"
+	"github.com/arumes31/resolix/webgui/internal/config"
+	"github.com/arumes31/resolix/webgui/internal/models"
 )
 
 // newTestStore creates a Store with an on-disk SQLite database in a temporary

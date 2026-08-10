@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"tailscale-dnsrewrite/webgui/internal/logger"
+	"github.com/arumes31/resolix/webgui/internal/logger"
 )
 
 // Blocklist manages a set of blocked domains loaded from a hosts-format file.

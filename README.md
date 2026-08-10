@@ -1,14 +1,14 @@
-# 🛡️ Tailscale DNS Monitor & Rewriter
+# 🛡️ Resolix
 
-[![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/arumes31/tailscale-dnsrewrite/go-checks.yml?branch=main&style=flat-square)](https://github.com/arumes31/tailscale-dnsrewrite/actions)
-[![Go Version](https://img.shields.io/github/go-mod/go-version/arumes31/tailscale-dnsrewrite?filename=webgui%2Fgo.mod&style=flat-square)](https://go.dev/)
-[![License](https://img.shields.io/github/license/arumes31/tailscale-dnsrewrite?style=flat-square)](LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/arumes31/tailscale-dnsrewrite?style=flat-square)](https://github.com/arumes31/tailscale-dnsrewrite/stargazers)
-[![GitHub forks](https://img.shields.io/github/forks/arumes31/tailscale-dnsrewrite?style=flat-square)](https://github.com/arumes31/tailscale-dnsrewrite/network)
-[![GitHub issues](https://img.shields.io/github/issues/arumes31/tailscale-dnsrewrite?style=flat-square)](https://github.com/arumes31/tailscale-dnsrewrite/issues)
-[![Last Commit](https://img.shields.io/github/last-commit/arumes31/tailscale-dnsrewrite/main?style=flat-square)](https://github.com/arumes31/tailscale-dnsrewrite/commits/main)
+[![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/arumes31/resolix/go-checks.yml?branch=main&style=flat-square)](https://github.com/arumes31/resolix/actions)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/arumes31/resolix?filename=webgui%2Fgo.mod&style=flat-square)](https://go.dev/)
+[![License](https://img.shields.io/github/license/arumes31/resolix?style=flat-square)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/arumes31/resolix?style=flat-square)](https://github.com/arumes31/resolix/stargazers)
+[![GitHub forks](https://img.shields.io/github/forks/arumes31/resolix?style=flat-square)](https://github.com/arumes31/resolix/network)
+[![GitHub issues](https://img.shields.io/github/issues/arumes31/resolix?style=flat-square)](https://github.com/arumes31/resolix/issues)
+[![Last Commit](https://img.shields.io/github/last-commit/arumes31/resolix/main?style=flat-square)](https://github.com/arumes31/resolix/commits/main)
 
-A high-performance Tailscale DNS server that provides custom DNS overrides and intelligent upstream forwarding with a premium real-time monitoring dashboard.
+Resolix is a high-performance DNS control plane for Tailscale networks, combining rewrites, filtering, encrypted DNS, distributed configuration, and real-time observability in one Go service.
 
 ### 🔒 Security Features
 - **Master/Slave Encryption**: All log ingestion traffic can be secured via `INGEST_SECRET`.
@@ -21,7 +21,7 @@ A high-performance Tailscale DNS server that provides custom DNS overrides and i
 graph LR
     Client([💻 Client])
     MagicDNS[🪄 Tailscale MagicDNS]
-    Docker[🐳 Docker: Tailscale-Rewrite]
+    Docker[🐳 Docker: Resolix]
     Backend[🛡️ Backend DNS: Adguard/Pihole]
 
     Client --> MagicDNS
@@ -160,7 +160,7 @@ sudo sysctl -w net.ipv4.tcp_fastopen=3
 
 Persistent (survives reboot) — create a file in `/etc/sysctl.d/`:
 ```bash
-cat <<EOF | sudo tee /etc/sysctl.d/99-tailscale-dnsrewrite.conf
+cat <<EOF | sudo tee /etc/sysctl.d/99-resolix.conf
 net.core.somaxconn=1024
 net.ipv4.tcp_fastopen=3
 EOF
@@ -192,7 +192,7 @@ CLIENT_ALIASES=192.168.1.1:Gateway,100.64.0.1:Router
 
 **Via file (supports hot-reload every 30 seconds):**
 ```
-CLIENT_ALIASES_FILE=/etc/tailscale-dnsrewrite/aliases.txt
+CLIENT_ALIASES_FILE=/etc/resolix/aliases.txt
 ```
 File format (`IP=Alias`, one per line, `#` comments supported):
 ```
@@ -252,12 +252,20 @@ Use `/readyz` for readiness checks. It returns `200` only after the web listener
 The persistent state is the history directory (SQLite, rewrites, filters, clients, and upstream configuration) plus the Tailscale state directory. To get a consistent filesystem backup, stop the container and copy both mounted directories:
 
 ```bash
-docker compose stop dns-tailscale-1
-tar -czf tailscale-dnsrewrite-backup.tgz history tailscale
-docker compose start dns-tailscale-1
+docker compose stop resolix
+tar -czf resolix-backup.tgz history tailscale
+docker compose start resolix
 ```
 
 Restore into empty `history` and `tailscale` directories with the container stopped, retain file ownership/permissions, then start the same release tag and confirm `/readyz` before upgrading.
+
+#### Upgrading from the former project name
+
+- Pull new releases from `ghcr.io/arumes31/resolix`; images published under the former package name remain available but do not receive new releases.
+- The Compose files keep the host-side `./history` and `./tailscale` directories, so replacing the Compose definition preserves data.
+- The container uses `/var/lib/resolix`. During migration it automatically detects and uses a populated legacy `/var/lib/tailscale-dnsrewrite` mount when the new directory is empty.
+- Native systemd installs should replace the old unit with `contrib/resolix.service`. The new unit still reads the former environment-file and state-directory locations as fallbacks.
+- Update Git remotes to `https://github.com/arumes31/resolix.git`; GitHub redirects the former repository URL.
 
 Deploy immutable release tags through `IMAGE_VERSION` rather than `latest`:
 
@@ -306,11 +314,11 @@ We maintain high code quality and security standards using the following tools:
 
 ## 🔍 Troubleshooting
 
-- **Check Logs**: `docker logs dns-tailscale-1`
+- **Check Logs**: `docker logs resolix`
 - **Verify DNS**: `nslookup mydomain.internal <TAILSCALE_IP>`
-- **Tailscale Status**: `docker exec -it dns-tailscale-1 tailscale status`
-- **Upstream Health**: `docker exec -it dns-tailscale-1 dig @<UPSTREAM_IP> google.com`
-- **Config Validation**: `docker exec -it dns-tailscale-1 env | grep -E 'DNS_LISTEN|UPSTREAM_DNS|DOMAINS'`
+- **Tailscale Status**: `docker exec -it resolix tailscale status`
+- **Upstream Health**: `docker exec -it resolix dig @<UPSTREAM_IP> google.com`
+- **Config Validation**: `docker exec -it resolix env | grep -E 'DNS_LISTEN|UPSTREAM_DNS|DOMAINS'`
 - **CRLF Issues**: If the container exits immediately, ensure your `entrypoint.sh` is saved with LF endings.
 - **Health Check**: `curl http://localhost:35353/healthz` — should return `{"status":"ok"}`
 

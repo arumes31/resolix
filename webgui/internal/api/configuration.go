@@ -11,12 +11,12 @@ import (
 	"os"
 	"strings"
 
-	"tailscale-dnsrewrite/webgui/internal/clients"
-	"tailscale-dnsrewrite/webgui/internal/configsync"
-	"tailscale-dnsrewrite/webgui/internal/dnsroutes"
-	"tailscale-dnsrewrite/webgui/internal/filter"
-	"tailscale-dnsrewrite/webgui/internal/rewrites"
-	"tailscale-dnsrewrite/webgui/internal/upstream"
+	"github.com/arumes31/resolix/webgui/internal/clients"
+	"github.com/arumes31/resolix/webgui/internal/configsync"
+	"github.com/arumes31/resolix/webgui/internal/dnsroutes"
+	"github.com/arumes31/resolix/webgui/internal/filter"
+	"github.com/arumes31/resolix/webgui/internal/rewrites"
+	"github.com/arumes31/resolix/webgui/internal/upstream"
 )
 
 const maxUserRulesBytes = 1 << 20

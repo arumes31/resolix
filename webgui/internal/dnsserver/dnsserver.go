@@ -23,14 +23,14 @@ import (
 
 	"github.com/miekg/dns"
 
-	"tailscale-dnsrewrite/webgui/internal/clients"
-	"tailscale-dnsrewrite/webgui/internal/dnsroutes"
-	"tailscale-dnsrewrite/webgui/internal/filter"
-	"tailscale-dnsrewrite/webgui/internal/models"
-	"tailscale-dnsrewrite/webgui/internal/policy"
-	"tailscale-dnsrewrite/webgui/internal/resolver"
-	"tailscale-dnsrewrite/webgui/internal/rewrites"
-	"tailscale-dnsrewrite/webgui/internal/upstream"
+	"github.com/arumes31/resolix/webgui/internal/clients"
+	"github.com/arumes31/resolix/webgui/internal/dnsroutes"
+	"github.com/arumes31/resolix/webgui/internal/filter"
+	"github.com/arumes31/resolix/webgui/internal/models"
+	"github.com/arumes31/resolix/webgui/internal/policy"
+	"github.com/arumes31/resolix/webgui/internal/resolver"
+	"github.com/arumes31/resolix/webgui/internal/rewrites"
+	"github.com/arumes31/resolix/webgui/internal/upstream"
 )
 
 const (

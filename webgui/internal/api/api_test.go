@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -74,6 +77,35 @@ func TestForwardedHeadersRequireTrustedProxy(t *testing.T) {
 	if !s.isHTTPS(r) {
 		t.Fatal("trusted X-Forwarded-Proto was ignored")
 	}
+
+	r.Header.Set("X-Forwarded-Proto", "https, http")
+	if s.isHTTPS(r) {
+		t.Fatal("client-supplied HTTPS proto before the trusted proxy hop was accepted")
+	}
+	r.Header.Set("X-Forwarded-Proto", "http, https")
+	if !s.isHTTPS(r) {
+		t.Fatal("HTTPS proto from the trusted proxy hop was ignored")
+	}
+
+	r.Header.Del("X-Forwarded-Proto")
+	r.Header.Add("X-Forwarded-Proto", "https")
+	r.Header.Add("X-Forwarded-Proto", "http")
+	if s.isHTTPS(r) {
+		t.Fatal("client-supplied repeated HTTPS header was accepted before the proxy HTTP header")
+	}
+
+	r.Header.Del("X-Forwarded-Proto")
+	r.Header.Add("Forwarded", "for=203.0.113.9;proto=https")
+	r.Header.Add("Forwarded", "for=10.1.2.3;proto=http")
+	if s.isHTTPS(r) {
+		t.Fatal("client-supplied repeated Forwarded proto was accepted before the proxy HTTP entry")
+	}
+	r.Header.Del("Forwarded")
+	r.Header.Add("Forwarded", "for=203.0.113.9;proto=https")
+	r.Header.Add("Forwarded", "for=10.1.2.3")
+	if s.isHTTPS(r) {
+		t.Fatal("proto from an earlier Forwarded entry was accepted when the proxy entry omitted proto")
+	}
 }
 
 func TestStandardForwardedHeaderRequiresTrustedProxy(t *testing.T) {
@@ -111,11 +143,75 @@ func TestInternalRoutesUseWebAuthWithoutIngestSecret(t *testing.T) {
 		BaseURL:     "/",
 	})
 	req := httptest.NewRequest(http.MethodPost, "/api/ingest", nil)
+	req.TLS = &tls.ConnectionState{}
 	rec := httptest.NewRecorder()
 	s.SetupMux().ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d; want %d", rec.Code, http.StatusUnauthorized)
 	}
+}
+
+func TestWebAuthBehindTLSReverseProxy(t *testing.T) {
+	tmpl := template.Must(template.New("login.html").Parse(`{{define "login.html"}}login{{end}}`))
+	s := testServer(&config.Config{
+		BaseURL:        "/",
+		WebUsername:    "admin",
+		WebPassword:    "configured",
+		TrustedProxies: []string{"127.0.0.1"},
+	})
+	s.tmpl = tmpl
+
+	backend := httptest.NewServer(s.SetupMux())
+	t.Cleanup(backend.Close)
+
+	directResponse, err := backend.Client().Get(backend.URL + "/login")
+	if err != nil {
+		t.Fatal(err)
+	}
+	directStatus := directResponse.StatusCode
+	if err := directResponse.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if directStatus != http.StatusUpgradeRequired {
+		t.Fatalf("direct HTTP status = %d; want %d", directStatus, http.StatusUpgradeRequired)
+	}
+
+	target, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetURL(target)
+			r.SetXForwarded()
+			r.Out.Header.Set("X-Forwarded-Proto", "https")
+		},
+	}
+	frontend := httptest.NewTLSServer(proxy)
+	t.Cleanup(frontend.Close)
+
+	response, err := frontend.Client().Get(frontend.URL + "/login")
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseStatus := response.StatusCode
+	cookies := response.Cookies()
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if responseStatus != http.StatusOK {
+		t.Fatalf("proxied HTTPS status = %d; want %d", responseStatus, http.StatusOK)
+	}
+	for _, cookie := range cookies {
+		if cookie.Name != csrfCookieName {
+			continue
+		}
+		if !cookie.Secure || !cookie.HttpOnly || cookie.SameSite != http.SameSiteStrictMode {
+			t.Fatalf("CSRF cookie flags = Secure:%t HttpOnly:%t SameSite:%v", cookie.Secure, cookie.HttpOnly, cookie.SameSite)
+		}
+		return
+	}
+	t.Fatal("proxied HTTPS response did not set the CSRF cookie")
 }
 
 func TestInternalRoutesFailClosedWithoutAnyAuthentication(t *testing.T) {
@@ -453,14 +549,17 @@ func TestSubpathRouting(t *testing.T) {
 
 	// The SSE stream under the prefix enforces authentication
 	rec = httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dns/api/stream", nil))
+	req := httptest.NewRequest(http.MethodGet, "/dns/api/stream", nil)
+	req.TLS = &tls.ConnectionState{}
+	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated /dns/api/stream: code=%d, want %d", rec.Code, http.StatusUnauthorized)
 	}
 
 	// Unauthenticated HTML requests redirect to the prefixed login route
 	rec = httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/dns/", nil)
+	req = httptest.NewRequest(http.MethodGet, "/dns/", nil)
+	req.TLS = &tls.ConnectionState{}
 	req.Header.Set("Accept", "text/html")
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/dns/login" {

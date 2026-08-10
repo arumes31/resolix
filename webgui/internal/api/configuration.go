@@ -21,8 +21,31 @@ import (
 
 const maxUserRulesBytes = 1 << 20
 
+func (s *Server) isMaster() bool {
+	return s.cfg.Mode == "" || s.cfg.Mode == "master"
+}
+
+func validateSnapshotRevision(snapshot configsync.Snapshot) error {
+	valid, err := snapshot.ValidRevision()
+	if err != nil {
+		return fmt.Errorf("validate configuration snapshot revision: %w", err)
+	}
+	if !valid {
+		return errors.New("configuration snapshot revision is invalid")
+	}
+	return nil
+}
+
+func logConfigApplyFailure(failed string, applied []string) {
+	completed := "none"
+	if len(applied) > 0 {
+		completed = strings.Join(applied, ", ")
+	}
+	log.Printf("[WARN] DNS configuration apply failed at %s; stores already applied: %s", failed, completed)
+}
+
 func (s *Server) requireMaster(w http.ResponseWriter) bool {
-	if s.cfg.Mode == "" || s.cfg.Mode == "master" {
+	if s.isMaster() {
 		return true
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -84,6 +107,7 @@ func (s *Server) currentConfigSnapshot() (configsync.Snapshot, error) {
 	subscriptions := s.subscriptionStore
 	rewriteStore := s.rewritesStore
 	clientRegistry := s.clientsRegistry
+	dnsRoutes := s.dnsRoutes
 	s.fieldsMu.RUnlock()
 	var subscriptionItems []filter.Subscription
 	if subscriptions != nil {
@@ -98,15 +122,12 @@ func (s *Server) currentConfigSnapshot() (configsync.Snapshot, error) {
 		clientsList = clientRegistry.List()
 	}
 	routes := make(map[string]string)
-	s.fieldsMu.RLock()
-	dnsRoutes := s.dnsRoutes
-	s.fieldsMu.RUnlock()
 	if dnsRoutes != nil {
 		routes = dnsRoutes.GetRoutesMap()
 	}
 	return configsync.NewSnapshot(
 		s.configuredUpstreams(), routes, subscriptionItems, string(rules), rewritesList, clientsList,
-	), nil
+	)
 }
 
 func (s *Server) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
@@ -123,7 +144,7 @@ func (s *Server) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"mode":     s.cfg.Mode,
-		"editable": s.cfg.Mode == "master",
+		"editable": s.isMaster(),
 		"revision": snapshot.Revision,
 		"runtime": map[string]interface{}{
 			"upstream_mode":          s.cfg.UpstreamMode,
@@ -268,7 +289,7 @@ func (s *Server) handleSyncDNSConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if s.cfg.Mode != "master" {
+	if !s.isMaster() {
 		http.Error(w, "Configuration snapshots are only served by the master", http.StatusConflict)
 		return
 	}
@@ -284,8 +305,8 @@ func (s *Server) handleSyncDNSConfig(w http.ResponseWriter, r *http.Request) {
 // ApplyConfigSnapshot persists and activates a validated master snapshot on a
 // resolver node. The revision is accepted only when it matches the payload.
 func (s *Server) ApplyConfigSnapshot(snapshot configsync.Snapshot) error {
-	if !snapshot.ValidRevision() {
-		return errors.New("configuration snapshot revision is invalid")
+	if err := validateSnapshotRevision(snapshot); err != nil {
+		return err
 	}
 	if len(snapshot.Upstreams) == 0 {
 		return errors.New("configuration snapshot has no upstreams")
@@ -332,22 +353,34 @@ func (s *Server) ApplyConfigSnapshot(snapshot configsync.Snapshot) error {
 	if subscriptions == nil || rewriteStore == nil || clientRegistry == nil || engine == nil || dnsRoutes == nil {
 		return errors.New("DNS configuration stores are not initialized")
 	}
+	applied := make([]string, 0, 6)
 	if err := subscriptions.Replace(snapshot.Subscriptions); err != nil {
+		logConfigApplyFailure("subscriptions", applied)
 		return fmt.Errorf("replace subscriptions: %w", err)
 	}
+	applied = append(applied, "subscriptions")
 	if err := rewriteStore.Replace(snapshot.Rewrites); err != nil {
+		logConfigApplyFailure("rewrites", applied)
 		return fmt.Errorf("replace rewrites: %w", err)
 	}
+	applied = append(applied, "rewrites")
 	if err := clientRegistry.Replace(snapshot.Clients); err != nil {
+		logConfigApplyFailure("clients", applied)
 		return fmt.Errorf("replace clients: %w", err)
 	}
+	applied = append(applied, "clients")
 	if err := s.replaceUserRules(snapshot.UserRules); err != nil {
+		logConfigApplyFailure("user rules", applied)
 		return fmt.Errorf("replace user rules: %w", err)
 	}
+	applied = append(applied, "user rules")
 	if err := dnsroutes.SaveUpstreams(s.cfg.FullUpstreamsPath(), snapshot.Upstreams); err != nil {
+		logConfigApplyFailure("upstreams", applied)
 		return fmt.Errorf("replace upstreams: %w", err)
 	}
+	applied = append(applied, "upstreams")
 	if err := dnsRoutes.SetRoutes(snapshot.Routes); err != nil {
+		logConfigApplyFailure("DNS routes", applied)
 		return fmt.Errorf("replace DNS routes: %w", err)
 	}
 	engine.ReplaceURLSources(subscriptions.List())

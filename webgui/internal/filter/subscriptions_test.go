@@ -49,9 +49,17 @@ func TestReplaceURLSourcesPreservesFiles(t *testing.T) {
 	engine := New()
 	engine.AddFileSource(filepath.Join(t.TempDir(), "missing.txt"), false)
 	engine.AddURLSource("https://old.example/list", false)
-	engine.ReplaceURLSources([]Subscription{{ID: "new", Name: "New", URL: "https://new.example/list", Enabled: true}})
+	engine.ReplaceURLSources([]Subscription{
+		{ID: "new", Name: "New", URL: "https://new.example/list", Enabled: true},
+		{ID: "disabled", Name: "Disabled", URL: "https://disabled.example/list", Enabled: false},
+	})
 	sources := engine.Sources()
 	if len(sources) != 2 || sources[0].Kind != "file" || sources[1].ID != "new" {
 		t.Fatalf("sources = %+v", sources)
+	}
+	for _, source := range sources {
+		if source.ID == "disabled" {
+			t.Fatalf("disabled source remained registered: %+v", sources)
+		}
 	}
 }

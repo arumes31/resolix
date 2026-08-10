@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -36,30 +37,119 @@ func testEvents(domains ...string) []models.QueryEvent {
 }
 
 func TestSyncDNSConfigAppliesOnlyValidNewRevision(t *testing.T) {
-	snapshot := configsync.NewSnapshot([]string{"1.1.1.1"}, nil, nil, "||example.test^\n", nil, nil)
-	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/sync/dns-config" {
-			http.NotFound(w, r)
-			return
-		}
-		_ = json.NewEncoder(w).Encode(snapshot)
-	}))
-	defer master.Close()
-
-	forwarder := NewForwarder(&config.Config{Mode: "slave", MasterURL: master.URL, MaxRequestSize: 1 << 20})
-	var calls atomic.Int32
-	forwarder.SetDNSConfigFn(func(got configsync.Snapshot) error {
-		if got.Revision != snapshot.Revision {
-			t.Fatalf("revision = %q, want %q", got.Revision, snapshot.Revision)
-		}
-		calls.Add(1)
-		return nil
-	})
-	forwarder.syncDNSConfig(master.Client())
-	forwarder.syncDNSConfig(master.Client())
-	if calls.Load() != 1 || forwarder.ConfigRevision() != snapshot.Revision {
-		t.Fatalf("calls/revision = %d/%q", calls.Load(), forwarder.ConfigRevision())
+	snapshot, err := configsync.NewSnapshot([]string{"1.1.1.1"}, nil, nil, "||example.test^\n", nil, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
+
+	t.Run("valid and duplicate", func(t *testing.T) {
+		master := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/api/sync/dns-config" {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(snapshot)
+		}))
+		defer master.Close()
+
+		forwarder := NewForwarder(&config.Config{Mode: "slave", MasterURL: master.URL, MaxRequestSize: 1 << 20})
+		var calls atomic.Int32
+		forwarder.SetDNSConfigFn(func(got configsync.Snapshot) error {
+			if got.Revision != snapshot.Revision {
+				t.Fatalf("revision = %q, want %q", got.Revision, snapshot.Revision)
+			}
+			calls.Add(1)
+			return nil
+		})
+		forwarder.syncDNSConfig(master.Client())
+		forwarder.syncDNSConfig(master.Client())
+		if calls.Load() != 1 || forwarder.ConfigRevision() != snapshot.Revision {
+			t.Fatalf("calls/revision = %d/%q", calls.Load(), forwarder.ConfigRevision())
+		}
+	})
+
+	t.Run("invalid revision", func(t *testing.T) {
+		invalid := snapshot
+		invalid.Revision = "invalid"
+		master := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(invalid)
+		}))
+		defer master.Close()
+
+		forwarder := NewForwarder(&config.Config{Mode: "slave", MasterURL: master.URL, MaxRequestSize: 1 << 20})
+		var calls atomic.Int32
+		forwarder.SetDNSConfigFn(func(configsync.Snapshot) error {
+			calls.Add(1)
+			return nil
+		})
+		forwarder.syncDNSConfig(master.Client())
+		if calls.Load() != 0 || forwarder.ConfigRevision() != "" {
+			t.Fatalf("calls/revision = %d/%q", calls.Load(), forwarder.ConfigRevision())
+		}
+	})
+
+	t.Run("apply error", func(t *testing.T) {
+		master := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(snapshot)
+		}))
+		defer master.Close()
+
+		forwarder := NewForwarder(&config.Config{Mode: "slave", MasterURL: master.URL, MaxRequestSize: 1 << 20})
+		var calls atomic.Int32
+		forwarder.SetDNSConfigFn(func(configsync.Snapshot) error {
+			calls.Add(1)
+			return errors.New("apply failed")
+		})
+		forwarder.syncDNSConfig(master.Client())
+		if calls.Load() != 1 || forwarder.ConfigRevision() != "" {
+			t.Fatalf("calls/revision = %d/%q", calls.Load(), forwarder.ConfigRevision())
+		}
+	})
+
+	t.Run("unprotected transport", func(t *testing.T) {
+		master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(snapshot)
+		}))
+		defer master.Close()
+
+		forwarder := NewForwarder(&config.Config{Mode: "slave", MasterURL: master.URL, MaxRequestSize: 1 << 20})
+		var calls atomic.Int32
+		forwarder.SetDNSConfigFn(func(configsync.Snapshot) error {
+			calls.Add(1)
+			return nil
+		})
+		forwarder.syncDNSConfig(master.Client())
+		if calls.Load() != 0 || forwarder.ConfigRevision() != "" {
+			t.Fatalf("calls/revision = %d/%q", calls.Load(), forwarder.ConfigRevision())
+		}
+		if err := forwarder.Start(); err == nil {
+			t.Fatal("Start() accepted an unprotected master URL")
+		}
+	})
+
+	t.Run("redirect downgrade", func(t *testing.T) {
+		var downgradeRequests atomic.Int32
+		unprotected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			downgradeRequests.Add(1)
+			_ = json.NewEncoder(w).Encode(snapshot)
+		}))
+		defer unprotected.Close()
+		master := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, unprotected.URL, http.StatusTemporaryRedirect)
+		}))
+		defer master.Close()
+
+		forwarder := NewForwarder(&config.Config{Mode: "slave", MasterURL: master.URL, MaxRequestSize: 1 << 20})
+		var calls atomic.Int32
+		forwarder.SetDNSConfigFn(func(configsync.Snapshot) error {
+			calls.Add(1)
+			return nil
+		})
+		forwarder.syncDNSConfig(master.Client())
+		if calls.Load() != 0 || downgradeRequests.Load() != 0 || forwarder.ConfigRevision() != "" {
+			t.Fatalf("calls/downgrades/revision = %d/%d/%q", calls.Load(), downgradeRequests.Load(), forwarder.ConfigRevision())
+		}
+	})
 }
 
 // decodeJSONBody handles both gzip-compressed and uncompressed request bodies.
@@ -77,7 +167,7 @@ func decodeJSONBody(r *http.Request, v interface{}) error {
 }
 
 func TestNewForwarder(t *testing.T) {
-	cfg := &config.Config{Mode: "slave", MasterURL: "http://localhost:12345", NodeName: "test-node"}
+	cfg := &config.Config{Mode: "slave", MasterURL: "https://localhost:12345", NodeName: "test-node"}
 	fwd := NewForwarder(cfg)
 	if fwd == nil {
 		t.Fatal("NewForwarder returned nil")
@@ -340,7 +430,7 @@ func TestStart_StopDrain(t *testing.T) {
 	var receivedCount atomic.Int32
 	delivered := make(chan struct{}, 1)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		receivedCount.Add(1)
 		w.WriteHeader(http.StatusNoContent)
 		select {
@@ -361,6 +451,7 @@ func TestStart_StopDrain(t *testing.T) {
 		SyncUpstreamHealthInterval: 1 * time.Hour,
 	}
 	fwd := NewForwarder(cfg)
+	fwd.httpClient = server.Client()
 
 	// Enqueue some lines
 	fwd.EnqueueEvent(models.QueryEvent{Domain: "drain1.example.com", Node: "test-node"})
@@ -400,7 +491,7 @@ func TestRetryMechanism(t *testing.T) {
 	// Server that fails first 2 ingest attempts, then succeeds.
 	// Only POST /api/ingest requests are counted so concurrent startup
 	// heartbeat/sync requests cannot skew the retry count.
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/api/ingest" {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -426,6 +517,7 @@ func TestRetryMechanism(t *testing.T) {
 		SyncUpstreamHealthInterval: 1 * time.Hour,
 	}
 	fwd := NewForwarder(cfg)
+	fwd.httpClient = server.Client()
 
 	// Enqueue a line
 	fwd.EnqueueEvent(models.QueryEvent{Domain: "retry.example.com", Node: "test-node"})
@@ -461,7 +553,7 @@ func TestBatchSizeLimit(t *testing.T) {
 	fullBatch := make(chan struct{}, 1)
 
 	// Record only POST /api/ingest batches so heartbeat/sync requests are ignored.
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/api/ingest" {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -492,6 +584,7 @@ func TestBatchSizeLimit(t *testing.T) {
 		SyncUpstreamHealthInterval: 1 * time.Hour,
 	}
 	fwd := NewForwarder(cfg)
+	fwd.httpClient = server.Client()
 
 	// Enqueue more than 100 lines
 	for i := 0; i < 150; i++ {
@@ -538,7 +631,7 @@ func TestReportHealth_SlaveMode(t *testing.T) {
 	var mu sync.Mutex
 	received := make(chan struct{}, 1)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var payload map[string]interface{}
 		_ = decodeJSONBody(r, &payload)
 		if h, ok := payload["health"]; ok {
@@ -563,6 +656,7 @@ func TestReportHealth_SlaveMode(t *testing.T) {
 		BaseURL:   "",
 	}
 	fwd := NewForwarder(cfg)
+	fwd.httpClient = server.Client()
 
 	health := map[string]float64{"8.8.8.8": 12.3}
 	fwd.ReportHealth(health)
@@ -619,7 +713,7 @@ func TestCalculateBackoff(t *testing.T) {
 }
 
 func TestSyncFromMasterRejectsOversizedGzipResponse(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Encoding", "gzip")
 		writer := gzip.NewWriter(w)
 		_, _ = writer.Write([]byte("response-too-large"))

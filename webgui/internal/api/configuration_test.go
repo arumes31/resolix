@@ -29,7 +29,7 @@ func TestConfigPageIsDedicatedAndRootRejectsUnknownPaths(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config", nil))
-	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "Upstream resolvers") {
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `id="configAuthority"`) {
 		t.Fatalf("config response = %d %q", recorder.Code, recorder.Body.String())
 	}
 
@@ -45,6 +45,20 @@ func TestSlaveRejectsConfigurationMutation(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	server.handlePostUpstreams(recorder, httptest.NewRequest(http.MethodPost, "/api/upstreams", strings.NewReader("[]")))
 	if recorder.Code != http.StatusForbidden || !strings.Contains(recorder.Body.String(), "read-only") {
+		t.Fatalf("response = %d %q", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestMasterRejectsEmptyUpstreamList(t *testing.T) {
+	server := testServer(&config.Config{Mode: "master", WebUsername: "admin", WebPassword: "password"})
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/upstreams", strings.NewReader("[]"))
+	request.AddCookie(&http.Cookie{
+		Name: csrfCookieName, Value: "token", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
+	})
+	request.Header.Set("X-CSRF-Token", "token")
+	server.handlePostUpstreams(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("response = %d %q", recorder.Code, recorder.Body.String())
 	}
 }
@@ -74,7 +88,11 @@ func TestSyncDNSConfigRequiresBearerAndReturnsValidRevision(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &snapshot); err != nil {
 		t.Fatal(err)
 	}
-	if !snapshot.ValidRevision() || len(snapshot.Upstreams) != 1 {
+	validRevision, err := snapshot.ValidRevision()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !validRevision || len(snapshot.Upstreams) != 1 {
 		t.Fatalf("snapshot = %+v", snapshot)
 	}
 }
@@ -105,13 +123,17 @@ func TestApplyConfigSnapshotPersistsAllManagedSettings(t *testing.T) {
 	server.SetSubscriptionStore(subscriptions)
 	server.SetRewritesStore(rewriteStore)
 	server.SetClients(clientRegistry)
-	server.SetDNSRoutes(dnsroutes.New(filepath.Join(dir, "dns-routes.json")))
+	dnsRoutes := dnsroutes.New(filepath.Join(dir, "dns-routes.json"))
+	server.SetDNSRoutes(dnsRoutes)
 
-	snapshot := configsync.NewSnapshot(
+	snapshot, err := configsync.NewSnapshot(
 		[]string{"1.1.1.1"}, map[string]string{"internal": "9.9.9.9"}, nil, "||blocked.example^\n",
 		[]rewrites.Rewrite{{ID: "rewrite-1", Domain: "printer.internal", Type: "A", Value: "192.0.2.10"}},
 		[]clients.Client{{Name: "office", IDs: []string{"192.0.2.0/24"}, UseGlobalSettings: true}},
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := server.ApplyConfigSnapshot(snapshot); err != nil {
 		t.Fatal(err)
 	}
@@ -120,6 +142,9 @@ func TestApplyConfigSnapshotPersistsAllManagedSettings(t *testing.T) {
 	}
 	if len(rewriteStore.List()) != 1 || len(clientRegistry.List()) != 1 {
 		t.Fatalf("rewrites/clients = %d/%d", len(rewriteStore.List()), len(clientRegistry.List()))
+	}
+	if got := dnsRoutes.GetRoutesMap(); got["internal"] != "9.9.9.9" {
+		t.Fatalf("DNS routes = %v", got)
 	}
 	if result := engine.Match("blocked.example"); !result.Blocked {
 		t.Fatalf("synced user rule did not block: %+v", result)

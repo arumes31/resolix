@@ -319,16 +319,12 @@ func (s *Store) Replace(items []Rewrite) error {
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	s.mu.Lock()
-	previous := s.items
-	s.items = validated
-	s.mu.Unlock()
-	if err := s.save(); err != nil {
-		s.mu.Lock()
-		s.items = previous
-		s.mu.Unlock()
+	if err := s.saveItems(validated); err != nil {
 		return err
 	}
+	s.mu.Lock()
+	s.items = validated
+	s.mu.Unlock()
 	return nil
 }
 
@@ -395,12 +391,17 @@ func (s *Store) Delete(id string) (found bool, err error) {
 // save persists the store atomically (temp file + rename). No-op for
 // in-memory stores (empty path).
 func (s *Store) save() error {
+	s.mu.RLock()
+	items := append([]Rewrite(nil), s.items...)
+	s.mu.RUnlock()
+	return s.saveItems(items)
+}
+
+func (s *Store) saveItems(items []Rewrite) error {
 	if s.path == "" {
 		return nil
 	}
-	s.mu.RLock()
-	data, err := json.MarshalIndent(s.items, "", "  ")
-	s.mu.RUnlock()
+	data, err := json.MarshalIndent(items, "", "  ")
 	if err != nil {
 		return err
 	}

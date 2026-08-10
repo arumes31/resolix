@@ -380,13 +380,15 @@ const loaders = {
 };
 
 async function activatePanel(name, updateHash = true) {
-    if (!loaders[name]) name = 'upstreams';
+    let loader = loaders.upstreams;
+    if (Object.hasOwn(loaders, name) && typeof loaders[name] === 'function') loader = loaders[name];
+    else name = 'upstreams';
     document.querySelectorAll('.settings-tab').forEach(tab => tab.classList.toggle('active', tab.dataset.settingsTab === name));
     document.querySelectorAll('.settings-panel').forEach(panel => {
         const active = panel.dataset.panel === name; panel.classList.toggle('active', active); panel.hidden = !active;
     });
     if (updateHash) history.replaceState(null, '', `#${name}`);
-    try { await loaders[name](); } catch (error) { notice(error.message, true); }
+    try { await loader(); } catch (error) { notice(error.message, true); }
 }
 
 document.querySelectorAll('.settings-tab').forEach(tab => tab.addEventListener('click', () => activatePanel(tab.dataset.settingsTab)));
@@ -421,7 +423,7 @@ document.getElementById('clientList').addEventListener('click', event => {
 document.getElementById('clearCacheBtn').addEventListener('click', () => apiJSON('/api/cache/clear', { method: 'POST' }).then(() => notice('DNS cache cleared')).catch(error => notice(error.message, true)));
 document.getElementById('pause5Btn').addEventListener('click', () => apiJSON('/api/filtering/pause', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"minutes":5}' }).then(() => notice('Filtering paused for 5 minutes')).catch(error => notice(error.message, true)));
 document.getElementById('resumeBtn').addEventListener('click', () => apiJSON('/api/filtering/pause', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"minutes":0}' }).then(() => notice('Filtering resumed')).catch(error => notice(error.message, true)));
-document.getElementById('refreshSettingsBtn').addEventListener('click', () => Promise.all([loadStatus(), loaders[(location.hash || '#upstreams').slice(1)]?.()]).then(() => notice('Configuration refreshed')).catch(error => notice(error.message, true)));
+document.getElementById('refreshSettingsBtn').addEventListener('click', () => Promise.all([loadStatus(), activatePanel((location.hash || '#upstreams').slice(1), false)]).then(() => notice('Configuration refreshed')).catch(error => notice(error.message, true)));
 
 rewriteValueState(); resetSubscriptionForm(); resetClientForm();
 loadStatus().then(() => activatePanel((location.hash || '#upstreams').slice(1), false)).catch(error => notice(error.message, true));

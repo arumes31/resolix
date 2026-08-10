@@ -79,6 +79,21 @@ func TestDeleteReturnsPersistenceErrorAndRollsBack(t *testing.T) {
 	}
 }
 
+func TestReplaceDoesNotPublishBeforePersistence(t *testing.T) {
+	store, err := Load("", "example.test:192.0.2.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.path = filepath.Join(t.TempDir(), "missing", "rewrites.json")
+	if err := store.Replace([]Rewrite{{Domain: "new.example", Type: TypeA, Value: "192.0.2.2"}}); err == nil {
+		t.Fatal("Replace() succeeded with an unwritable persistence path")
+	}
+	items := store.List()
+	if len(items) != 1 || items[0].Domain != "example.test" {
+		t.Fatalf("failed replacement was published: %+v", items)
+	}
+}
+
 func TestLoadSeedsFromDomainsOnce(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "rewrites.json")

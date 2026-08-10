@@ -94,11 +94,26 @@ func TestDoHAccessControl(t *testing.T) {
 		}
 	})
 
-	t.Run("trusted loopback proxy forwards private client", func(t *testing.T) {
+	t.Run("forwarded headers do not authenticate loopback proxy", func(t *testing.T) {
 		s, wire := newDoHTestServer(t, "")
 		s.cfg.TrustedProxies = []string{"127.0.0.1"}
 		req := httptest.NewRequest(http.MethodPost, "/dns-query", bytes.NewReader(wire))
 		req.RemoteAddr = "127.0.0.1:53000"
+		req.Header.Set("X-Forwarded-For", "100.64.0.10")
+		req.Header.Set("Content-Type", "application/dns-message")
+		rec := httptest.NewRecorder()
+		s.SetupMux().ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+		}
+	})
+
+	t.Run("bearer authenticated loopback proxy", func(t *testing.T) {
+		s, wire := newDoHTestServer(t, "test-token")
+		s.cfg.TrustedProxies = []string{"127.0.0.1"}
+		req := httptest.NewRequest(http.MethodPost, "/dns-query", bytes.NewReader(wire))
+		req.RemoteAddr = "127.0.0.1:53000"
+		req.Header.Set("Authorization", "Bearer test-token")
 		req.Header.Set("X-Forwarded-For", "100.64.0.10")
 		req.Header.Set("Content-Type", "application/dns-message")
 		rec := httptest.NewRecorder()

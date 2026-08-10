@@ -112,7 +112,7 @@ docker-compose -f docker-compose.example.yaml up -d
 | `DNSSEC` | Send the DNSSEC DO bit upstream and pass responses through (no local validation) | `false` |
 | `DOH_ENABLED` | Enable DNS-over-HTTPS on the existing web HTTP mux | `false` |
 | `DOH_PATH` | DNS-over-HTTPS endpoint path | `/dns-query` |
-| `DOH_AUTH_TOKEN` | DoH Bearer token; when unset, access is limited to loopback/private/tailnet clients | - |
+| `DOH_AUTH_TOKEN` | DoH Bearer token; when unset, access is limited to direct private/tailnet clients | - |
 | `DOT_ENABLED` | Enable DNS-over-TLS (requires certificate and key files) | `false` |
 | `DOT_PORT` | DNS-over-TLS listen port | `853` |
 | `TLS_CERT_FILE` | PEM certificate chain used by the DoT listener | - |
@@ -125,7 +125,7 @@ docker-compose -f docker-compose.example.yaml up -d
 
 ### Encrypted DNS serving
 
-DoH uses the dashboard HTTP listener and is available at `DOH_PATH` when enabled. Terminate HTTPS at a trusted reverse proxy and forward that path to port `35353`. Set `DOH_AUTH_TOKEN` for public clients; without a token, only loopback, RFC1918, Tailscale CGNAT, and IPv6 ULA clients are accepted.
+DoH uses the dashboard HTTP listener and is available at `DOH_PATH` when enabled. Terminate HTTPS at a trusted reverse proxy and forward that path to port `35353`. Set `DOH_AUTH_TOKEN` for public clients and loopback reverse proxies; without a token, only direct RFC1918, Tailscale CGNAT, and IPv6 ULA clients are accepted.
 
 DoT listens directly on `DOT_PORT`. Enabling it requires readable PEM files in `TLS_CERT_FILE` and `TLS_KEY_FILE`; startup fails before binding DNS if the keypair cannot be loaded.
 

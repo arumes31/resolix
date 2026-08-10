@@ -1039,8 +1039,10 @@ func (s *Server) dohClientAllowed(r *http.Request) bool {
 		return subtle.ConstantTimeCompare([]byte(auth), []byte("Bearer "+token)) == 1
 	}
 	peerIP := net.ParseIP(remoteIP(r))
-	forwarded := (r.Header.Get("X-Forwarded-For") != "" || r.Header.Get("Forwarded") != "") && s.isTrustedProxy(r)
-	if peerIP != nil && peerIP.IsLoopback() && !forwarded {
+	// Forwarded headers are not proof that a loopback peer is a proxy: any
+	// local process can forge them. Loopback proxies must authenticate with
+	// DOH_AUTH_TOKEN, which is handled above.
+	if peerIP != nil && peerIP.IsLoopback() {
 		return false
 	}
 	ip := net.ParseIP(s.clientIP(r))

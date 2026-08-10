@@ -2081,15 +2081,16 @@ func (s *Server) handleRewrites(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var req struct {
-			Domain string `json:"domain"`
-			Type   string `json:"type"`
-			Value  string `json:"value"`
+			Domain      string   `json:"domain"`
+			Type        string   `json:"type"`
+			Value       string   `json:"value"`
+			SourceCIDRs []string `json:"source_cidrs"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
 			return
 		}
-		rw, err := store.Add(req.Domain, req.Type, req.Value)
+		rw, err := store.Add(req.Domain, req.Type, req.Value, req.SourceCIDRs...)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Invalid rewrite: %v", err), http.StatusBadRequest)
 			return

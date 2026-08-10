@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +25,7 @@ import (
 	"github.com/arumes31/resolix/webgui/internal/blocklist"
 	"github.com/arumes31/resolix/webgui/internal/config"
 	"github.com/arumes31/resolix/webgui/internal/models"
+	"github.com/arumes31/resolix/webgui/internal/rewrites"
 	"github.com/arumes31/resolix/webgui/internal/storage"
 )
 
@@ -212,6 +214,39 @@ func TestWebAuthBehindTLSReverseProxy(t *testing.T) {
 		return
 	}
 	t.Fatal("proxied HTTPS response did not set the CSRF cookie")
+}
+
+func TestRewriteAPIStoresSourceCIDRs(t *testing.T) {
+	store, err := rewrites.Load("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := testServer(&config.Config{
+		Mode:           config.ModeController,
+		BaseURL:        "/",
+		MaxRequestSize: config.DefaultMaxRequestSize,
+	})
+	s.SetRewritesStore(store)
+	body := strings.NewReader(`{
+		"domain":"internal.example",
+		"type":"A",
+		"value":"192.0.2.10",
+		"source_cidrs":["100.100.1.1/10","fd7a:115c:a1e0::/48"]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/rewrites", body)
+	rec := httptest.NewRecorder()
+	s.SetupMux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	items := store.List()
+	if len(items) != 1 {
+		t.Fatalf("rewrites = %+v", items)
+	}
+	want := []string{"100.64.0.0/10", "fd7a:115c:a1e0::/48"}
+	if !slices.Equal(items[0].SourceCIDRs, want) {
+		t.Fatalf("source CIDRs = %v, want %v", items[0].SourceCIDRs, want)
+	}
 }
 
 func TestInternalRoutesFailClosedWithoutAnyAuthentication(t *testing.T) {

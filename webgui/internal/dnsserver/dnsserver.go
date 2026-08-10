@@ -342,7 +342,7 @@ func (s *Server) Resolve(r *dns.Msg, clientIP string) (resp *dns.Msg, drop bool)
 		cl = s.cfg.Clients.Find(clientIP)
 	}
 
-	res := s.resolve(r, resp, 0, cl)
+	res := s.resolve(r, resp, 0, cl, clientIP)
 	if s.cfg.Policy != nil && s.cfg.Policy.AAAADisabled && len(r.Question) > 0 &&
 		(r.Question[0].Qtype == dns.TypeHTTPS || r.Question[0].Qtype == dns.TypeSVCB) {
 		stripIPv6Hints(resp.Answer)
@@ -397,7 +397,7 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 // filtering) → blocked services (per-client, schedule-aware) → cache →
 // forward (client upstreams → per-domain route → global pool) →
 // bogus-NXDOMAIN conversion → cache store. depth bounds chase chains.
-func (s *Server) resolve(r *dns.Msg, resp *dns.Msg, depth int, cl *clients.Client) resolution {
+func (s *Server) resolve(r *dns.Msg, resp *dns.Msg, depth int, cl *clients.Client, clientIP string) resolution {
 	if len(r.Question) == 0 {
 		resp.Rcode = dns.RcodeFormatError
 		return resolution{}
@@ -418,7 +418,7 @@ func (s *Server) resolve(r *dns.Msg, resp *dns.Msg, depth int, cl *clients.Clien
 	}
 
 	// Stage 1: typed rewrites (short-circuit, pre-cache).
-	if res, handled := s.stageRewrites(r, q, resp, depth, cl); handled {
+	if res, handled := s.stageRewrites(r, q, resp, depth, cl, clientIP); handled {
 		return res
 	}
 
@@ -428,7 +428,7 @@ func (s *Server) resolve(r *dns.Msg, resp *dns.Msg, depth int, cl *clients.Clien
 	}
 
 	// Stage 2: safe search (global engines or per-client override).
-	if res, handled := s.stageSafeSearch(r, q, resp, depth, cl); handled {
+	if res, handled := s.stageSafeSearch(r, q, resp, depth, cl, clientIP); handled {
 		return res
 	}
 
@@ -520,7 +520,14 @@ func (s *Server) ServiceStats() map[string]int64 {
 
 // stageRewrites applies typed rewrites from the store (or the legacy
 // StaticHosts fallback). handled is true when a rewrite answered the query.
-func (s *Server) stageRewrites(_ *dns.Msg, q dns.Question, resp *dns.Msg, depth int, cl *clients.Client) (resolution, bool) {
+func (s *Server) stageRewrites(
+	_ *dns.Msg,
+	q dns.Question,
+	resp *dns.Msg,
+	depth int,
+	cl *clients.Client,
+	clientIP string,
+) (resolution, bool) {
 	domain := normalizeName(q.Name)
 
 	if s.cfg.Rewrites == nil {
@@ -537,7 +544,7 @@ func (s *Server) stageRewrites(_ *dns.Msg, q dns.Question, resp *dns.Msg, depth 
 		return resolution{}, false
 	}
 
-	entries := s.cfg.Rewrites.Lookup(domain)
+	entries := s.cfg.Rewrites.LookupForClient(domain, clientIP)
 	if len(entries) == 0 {
 		return resolution{}, false
 	}
@@ -581,7 +588,7 @@ func (s *Server) stageRewrites(_ *dns.Msg, q dns.Question, resp *dns.Msg, depth 
 			if e.Type != rewrites.TypeCNAME {
 				continue
 			}
-			return s.chaseCNAME(q, resp, e.Value, e.String(), "Rewrite", "Rewrite", depth, cl), true
+			return s.chaseCNAME(q, resp, e.Value, e.String(), "Rewrite", "Rewrite", depth, cl, clientIP), true
 		}
 	}
 
@@ -592,7 +599,14 @@ func (s *Server) stageRewrites(_ *dns.Msg, q dns.Question, resp *dns.Msg, depth 
 // stageSafeSearch rewrites configured safe-search domains to their
 // restricted variants (pre-cache, like rewrites). Clients with global
 // settings disabled use their own engine list (or inherit the global set).
-func (s *Server) stageSafeSearch(_ *dns.Msg, q dns.Question, resp *dns.Msg, depth int, cl *clients.Client) (resolution, bool) {
+func (s *Server) stageSafeSearch(
+	_ *dns.Msg,
+	q dns.Question,
+	resp *dns.Msg,
+	depth int,
+	cl *clients.Client,
+	clientIP string,
+) (resolution, bool) {
 	target := ""
 	switch {
 	case cl != nil && !cl.UseGlobalSettings:
@@ -614,7 +628,17 @@ func (s *Server) stageSafeSearch(_ *dns.Msg, q dns.Question, resp *dns.Msg, dept
 	// Address-type queries chase the restricted target through the rest of
 	// the pipeline and return both the CNAME and the target's records.
 	if q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA || q.Qtype == dns.TypeCNAME {
-		return s.chaseCNAME(q, resp, target, "SafeSearch", "SafeSearch", policy.ReasonSafeSearch, depth, cl), true
+		return s.chaseCNAME(
+			q,
+			resp,
+			target,
+			"SafeSearch",
+			"SafeSearch",
+			policy.ReasonSafeSearch,
+			depth,
+			cl,
+			clientIP,
+		), true
 	}
 	// Other types get just the CNAME record.
 	resp.Answer = []dns.RR{&dns.CNAME{
@@ -626,7 +650,17 @@ func (s *Server) stageSafeSearch(_ *dns.Msg, q dns.Question, resp *dns.Msg, dept
 
 // chaseCNAME appends the CNAME record and resolves the target through the
 // rest of the pipeline (filter/cache/forward), merging the answers.
-func (s *Server) chaseCNAME(q dns.Question, resp *dns.Msg, target, rule, label, reason string, depth int, cl *clients.Client) resolution {
+func (s *Server) chaseCNAME(
+	q dns.Question,
+	resp *dns.Msg,
+	target string,
+	rule string,
+	label string,
+	reason string,
+	depth int,
+	cl *clients.Client,
+	clientIP string,
+) resolution {
 	if depth >= maxChainDepth {
 		resp.Rcode = dns.RcodeServerFailure
 		return resolution{upstream: label, matchedRule: rule + " (chain depth exceeded)", blockReason: reason}
@@ -641,7 +675,7 @@ func (s *Server) chaseCNAME(q dns.Question, resp *dns.Msg, target, rule, label, 
 	subResp := new(dns.Msg)
 	subResp.SetReply(sub)
 	subResp.RecursionAvailable = true
-	subResolution := s.resolve(sub, subResp, depth+1, cl)
+	subResolution := s.resolve(sub, subResp, depth+1, cl, clientIP)
 
 	resp.Rcode = subResp.Rcode
 	resp.Answer = append([]dns.RR{cname}, subResp.Answer...)

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -43,10 +44,12 @@ const AnswerTTL = 60
 
 // Rewrite is a single typed DNS rewrite rule.
 type Rewrite struct {
-	ID     string `json:"id"`
-	Domain string `json:"domain"` // normalized: lowercase, no leading/trailing dot
-	Type   string `json:"type"`
-	Value  string `json:"value,omitempty"`
+	ID             string   `json:"id"`
+	Domain         string   `json:"domain"` // normalized: lowercase, no leading/trailing dot
+	Type           string   `json:"type"`
+	Value          string   `json:"value,omitempty"`
+	SourceCIDRs    []string `json:"source_cidrs,omitempty"`
+	sourcePrefixes []netip.Prefix
 }
 
 // String returns a compact human-readable form used as MatchedRule on events.
@@ -61,6 +64,21 @@ func (rw Rewrite) String() string {
 // subdomains, label-boundary safe).
 func (rw Rewrite) matches(domain string) bool {
 	return domain == rw.Domain || strings.HasSuffix(domain, "."+rw.Domain)
+}
+
+func (rw Rewrite) allowsSource(addr netip.Addr) bool {
+	if len(rw.sourcePrefixes) == 0 {
+		return len(rw.SourceCIDRs) == 0
+	}
+	if !addr.IsValid() {
+		return false
+	}
+	for _, prefix := range rw.sourcePrefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // BuildRR constructs the DNS record for this rewrite. name is the original
@@ -223,6 +241,48 @@ func NormalizeDomain(d string) string {
 	return strings.TrimSuffix(d, ".")
 }
 
+func prepareRewrite(item Rewrite) (Rewrite, error) {
+	item.Domain = NormalizeDomain(item.Domain)
+	item.Type = strings.ToUpper(strings.TrimSpace(item.Type))
+	item.Value = strings.TrimSpace(item.Value)
+	if err := Validate(item.Domain, item.Type, item.Value); err != nil {
+		return Rewrite{}, err
+	}
+
+	const maxSourceCIDRs = 64
+	if len(item.SourceCIDRs) > maxSourceCIDRs {
+		return Rewrite{}, fmt.Errorf("source CIDRs must not exceed %d entries", maxSourceCIDRs)
+	}
+	normalized := make([]string, 0, len(item.SourceCIDRs))
+	prefixes := make([]netip.Prefix, 0, len(item.SourceCIDRs))
+	seen := make(map[netip.Prefix]struct{}, len(item.SourceCIDRs))
+	for _, raw := range item.SourceCIDRs {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(raw))
+		if err != nil {
+			return Rewrite{}, fmt.Errorf("invalid source CIDR %q", raw)
+		}
+		prefix = prefix.Masked()
+		if _, duplicate := seen[prefix]; duplicate {
+			continue
+		}
+		seen[prefix] = struct{}{}
+		normalized = append(normalized, prefix.String())
+		prefixes = append(prefixes, prefix)
+	}
+	item.SourceCIDRs = normalized
+	item.sourcePrefixes = prefixes
+	if item.ID == "" {
+		item.ID = newID()
+	}
+	return item, nil
+}
+
+func cloneRewrite(item Rewrite) Rewrite {
+	item.SourceCIDRs = append([]string(nil), item.SourceCIDRs...)
+	item.sourcePrefixes = append([]netip.Prefix(nil), item.sourcePrefixes...)
+	return item
+}
+
 // Store is a thread-safe rewrite set with JSON persistence.
 type Store struct {
 	mu      sync.RWMutex
@@ -243,6 +303,13 @@ func Load(path, seedDomains string) (*Store, error) {
 		if err == nil {
 			if err := json.Unmarshal(data, &s.items); err != nil {
 				return nil, fmt.Errorf("parse rewrites file %s: %w", path, err)
+			}
+			for i, item := range s.items {
+				prepared, err := prepareRewrite(item)
+				if err != nil {
+					return nil, fmt.Errorf("validate rewrite %d in %s: %w", i+1, path, err)
+				}
+				s.items[i] = prepared
 			}
 			return s, nil
 		}
@@ -274,15 +341,29 @@ func Load(path, seedDomains string) (*Store, error) {
 	return s, nil
 }
 
-// Lookup returns all rewrites matching the domain (apex + subdomains).
+// Lookup returns all rewrites matching the domain.
 func (s *Store) Lookup(domain string) []Rewrite {
+	return s.lookup(domain, netip.Addr{}, false)
+}
+
+// LookupForClient returns rewrites matching both the domain and source IP.
+func (s *Store) LookupForClient(domain, clientIP string) []Rewrite {
+	addr, _ := netip.ParseAddr(strings.TrimSpace(clientIP))
+	return s.lookup(domain, addr.Unmap(), true)
+}
+
+func (s *Store) lookup(domain string, sourceAddr netip.Addr, filterSource bool) []Rewrite {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	var out []Rewrite
+	out := make([]Rewrite, 0)
 	for _, rw := range s.items {
-		if rw.matches(domain) {
-			out = append(out, rw)
+		if !rw.matches(domain) {
+			continue
 		}
+		if filterSource && !rw.allowsSource(sourceAddr) {
+			continue
+		}
+		out = append(out, cloneRewrite(rw))
 	}
 	return out
 }
@@ -291,7 +372,10 @@ func (s *Store) Lookup(domain string) []Rewrite {
 func (s *Store) List() []Rewrite {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := append([]Rewrite(nil), s.items...)
+	out := make([]Rewrite, len(s.items))
+	for i, item := range s.items {
+		out[i] = cloneRewrite(item)
+	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Domain != out[j].Domain {
 			return out[i].Domain < out[j].Domain
@@ -305,16 +389,11 @@ func (s *Store) List() []Rewrite {
 func (s *Store) Replace(items []Rewrite) error {
 	validated := make([]Rewrite, len(items))
 	for i, item := range items {
-		item.Domain = NormalizeDomain(item.Domain)
-		item.Type = strings.ToUpper(strings.TrimSpace(item.Type))
-		item.Value = strings.TrimSpace(item.Value)
-		if err := Validate(item.Domain, item.Type, item.Value); err != nil {
+		prepared, err := prepareRewrite(item)
+		if err != nil {
 			return fmt.Errorf("rewrite %d: %w", i+1, err)
 		}
-		if item.ID == "" {
-			item.ID = newID()
-		}
-		validated[i] = item
+		validated[i] = prepared
 	}
 
 	s.writeMu.Lock()
@@ -329,17 +408,14 @@ func (s *Store) Replace(items []Rewrite) error {
 }
 
 // Add validates and stores a new rewrite, persisting the store.
-func (s *Store) Add(domain, typ, value string) (Rewrite, error) {
-	domain = NormalizeDomain(domain)
-	typ = strings.ToUpper(strings.TrimSpace(typ))
-	value = strings.TrimSpace(value)
-	if err := Validate(domain, typ, value); err != nil {
+func (s *Store) Add(domain, typ, value string, sourceCIDRs ...string) (Rewrite, error) {
+	rw, err := prepareRewrite(Rewrite{Domain: domain, Type: typ, Value: value, SourceCIDRs: sourceCIDRs})
+	if err != nil {
 		return Rewrite{}, err
 	}
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	rw := Rewrite{ID: newID(), Domain: domain, Type: typ, Value: value}
 	s.mu.Lock()
 	s.items = append(s.items, rw)
 	s.mu.Unlock()

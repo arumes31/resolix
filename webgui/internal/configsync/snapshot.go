@@ -16,7 +16,7 @@ import (
 )
 
 // CurrentVersion is the supported configuration snapshot schema version.
-const CurrentVersion = 1
+const CurrentVersion = 2
 
 // snapshotPayload is the revisioned content of a configuration snapshot.
 type snapshotPayload struct {
@@ -51,7 +51,7 @@ func NewSnapshot(
 			Routes:        maps.Clone(routes),
 			Subscriptions: slices.Clone(subscriptions),
 			UserRules:     userRules,
-			Rewrites:      slices.Clone(rewriteItems),
+			Rewrites:      cloneRewrites(rewriteItems),
 			Clients:       slices.Clone(clientItems),
 		},
 	}
@@ -61,6 +61,14 @@ func NewSnapshot(
 	}
 	snapshot.Revision = revision
 	return snapshot, nil
+}
+
+func cloneRewrites(items []rewrites.Rewrite) []rewrites.Rewrite {
+	cloned := slices.Clone(items)
+	for i := range cloned {
+		cloned[i].SourceCIDRs = slices.Clone(cloned[i].SourceCIDRs)
+	}
+	return cloned
 }
 
 // ValidRevision reports whether the snapshot revision matches its content.

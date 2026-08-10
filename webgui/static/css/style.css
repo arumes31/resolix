@@ -2701,6 +2701,29 @@ tr:hover .test-domain-btn {
   gap: 0.5rem;
 }
 
+.rewrite-scope {
+  padding: 0.8rem;
+  border: 1px dashed var(--border-color);
+  border-radius: 0.7rem;
+}
+
+.rewrite-scope-controls {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.7fr) minmax(240px, 2fr);
+  align-items: end;
+  gap: 0.8rem;
+}
+
+.rewrite-cidrs.is-muted {
+  opacity: 0.45;
+}
+
+.field-help {
+  margin: 0.55rem 0 0;
+  color: var(--text-secondary);
+  font-size: 0.68rem;
+}
+
 .client-policy-fields {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2919,7 +2942,8 @@ tr:hover .test-domain-btn {
 
   .settings-form,
   .compact-form,
-  .client-policy-fields {
+  .client-policy-fields,
+  .rewrite-scope-controls {
     grid-template-columns: 1fr;
   }
 

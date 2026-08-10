@@ -13,7 +13,7 @@ Resolix is a self-hosted DNS control plane for Tailscale networks. One Go servic
 - Embedded UDP/TCP DNS server built with [`miekg/dns`](https://github.com/miekg/dns); no dnsmasq sidecar.
 - UDP, TCP, DNS-over-TLS, and DNS-over-HTTPS upstreams with strict, parallel, and load-balanced selection.
 - Adblock, hosts, plain-domain, and RE2 filter rules; URL subscriptions support ETag/Last-Modified and keep the last good copy.
-- A/AAAA/CNAME/PTR/MX/TXT/SRV and RCODE rewrites, safe search, blocked services, private PTR, DNS64, DNSSEC passthrough, ACLs, and rate limiting.
+- Source-aware A/AAAA/CNAME/PTR/MX/TXT/SRV and RCODE rewrites, safe search, blocked services, private PTR, DNS64, DNSSEC passthrough, ACLs, and rate limiting.
 - Per-client filtering, safe search, service blocking, schedules, upstreams, and query-log/statistics exclusions.
 - In-memory TTL-aware cache with negative caching, optimistic refresh, and in-process clearing.
 - SQLite history with bounded asynchronous batching, live SSE updates, metrics, health checks, and node status.
@@ -207,6 +207,8 @@ Environment variables are the bootstrap layer. Settings that can be changed safe
 | `BLOCKED_SERVICES` | Globally blocked service IDs | unset |
 | `CLIENT_ALIASES` | Inline `IP:Alias` mappings | unset |
 | `CLIENT_ALIASES_FILE` | Hot-reloaded `IP=Alias` file | unset |
+
+Rewrites created in `/config` can apply to every client, only Tailscale address space (`100.64.0.0/10` and `fd7a:115c:a1e0::/48`), or custom IPv4/IPv6 CIDRs. Queries from other sources skip the rewrite and continue through normal filtering, cache, and upstream resolution. These restrictions are included in controller snapshots and synchronized to agents.
 
 ### Storage, logging, and synchronization
 

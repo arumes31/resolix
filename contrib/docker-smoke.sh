@@ -93,8 +93,19 @@ if [[ "${api_version}" != "smoke" || "${image_version}" != "smoke" ]]; then
   exit 1
 fi
 
+curl --fail --silent --request POST "http://127.0.0.1:${web_port}/api/rewrites" \
+  --header 'Content-Type: application/json' \
+  --data '{"domain":"scoped.test","type":"A","value":"192.0.2.77","source_cidrs":["127.0.0.0/8"]}' \
+  >/dev/null
+scoped_answer="$(docker exec "${container_name}" dig @127.0.0.1 -p 1053 scoped.test A +short)"
+if [[ "${scoped_answer}" != "192.0.2.77" ]]; then
+  echo "Source-scoped rewrite returned '${scoped_answer}' inside the container" >&2
+  exit 1
+fi
+
 python3 contrib/smoke_dns.py udp 127.0.0.1 "${dns_udp_port}" smoke.test 0
 python3 contrib/smoke_dns.py udp 127.0.0.1 "${dns_udp_port}" blocked.test 3
+python3 contrib/smoke_dns.py udp 127.0.0.1 "${dns_udp_port}" scoped.test 2
 python3 contrib/smoke_dns.py tcp 127.0.0.1 "${dns_tcp_port}" smoke.test 0
 python3 contrib/smoke_dns.py tcp 127.0.0.1 "${dns_tcp_port}" blocked.test 3
 python3 contrib/smoke_dns.py doh 127.0.0.1 "${web_port}" smoke.test 0

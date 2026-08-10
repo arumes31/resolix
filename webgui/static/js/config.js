@@ -1,5 +1,6 @@
 const apiBase = (document.body.dataset.baseUrl || '/').replace(/\/$/, '');
 const state = { editable: false, mode: '', revision: '', routes: {}, subscriptions: [], clients: [], services: [], editingClient: null };
+const tailscaleRewriteCIDRs = ['100.64.0.0/10', 'fd7a:115c:a1e0::/48'];
 
 function apiPath(path) { return apiBase + path; }
 function escapeHtml(value) {
@@ -38,6 +39,7 @@ function setEditable(editable) {
     document.querySelectorAll('.controller-edit input, .controller-edit select, .controller-edit textarea, .controller-edit button, button.controller-edit')
         .forEach(control => { control.disabled = !editable; });
     document.body.classList.toggle('read-only-config', !editable);
+    rewriteScopeState();
 }
 
 function formatRuntimeKey(key) {
@@ -252,6 +254,21 @@ function rewriteValueState() {
     document.getElementById('rewriteValue').required = !noValue;
 }
 
+function rewriteScopeState() {
+    const tailscaleOnly = document.getElementById('rewriteTailscaleOnly').checked;
+    const customCIDRs = document.getElementById('rewriteSourceCIDRs');
+    customCIDRs.disabled = !state.editable || tailscaleOnly;
+    customCIDRs.closest('label').classList.toggle('is-muted', tailscaleOnly);
+}
+
+function rewriteScopeLabel(sourceCIDRs = []) {
+    if (sourceCIDRs.length === 0) return 'All clients';
+    const sorted = [...sourceCIDRs].sort();
+    const tailscaleOnly = sorted.length === tailscaleRewriteCIDRs.length &&
+        tailscaleRewriteCIDRs.every((cidr, index) => sorted[index] === cidr);
+    return tailscaleOnly ? 'Tailscale only' : sourceCIDRs.join(', ');
+}
+
 async function loadRewrites() {
     const data = await apiJSON('/api/rewrites');
     const items = data.rewrites || [];
@@ -260,6 +277,7 @@ async function loadRewrites() {
         <div class="settings-list-row"><div class="settings-list-main">
             <div class="settings-list-title">${escapeHtml(item.domain)}</div>
             <div class="settings-list-meta">${escapeHtml(item.type)}${item.value ? ` → ${escapeHtml(item.value)}` : ''}</div>
+            <div class="settings-list-meta">Sources: ${escapeHtml(rewriteScopeLabel(item.source_cidrs || []))}</div>
         </div><div class="row-actions controller-edit"><button type="button" class="mini-action danger rewrite-delete" data-id="${escapeHtml(item.id)}">Delete</button></div></div>`
     ).join('') || emptyState('No DNS rewrites configured');
     setEditable(state.editable);
@@ -268,13 +286,16 @@ async function loadRewrites() {
 async function saveRewrite(event) {
     event.preventDefault();
     const domain = document.getElementById('rewriteDomain').value.trim();
+    const sourceCIDRs = document.getElementById('rewriteTailscaleOnly').checked
+        ? tailscaleRewriteCIDRs
+        : splitList(document.getElementById('rewriteSourceCIDRs').value);
     await apiJSON('/api/rewrites', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
             domain, type: document.getElementById('rewriteType').value,
-            value: document.getElementById('rewriteValue').value.trim()
+            value: document.getElementById('rewriteValue').value.trim(), source_cidrs: sourceCIDRs
         })
     });
-    event.target.reset(); rewriteValueState(); notice(`Rewrite added for ${domain}`);
+    event.target.reset(); rewriteValueState(); rewriteScopeState(); notice(`Rewrite added for ${domain}`);
     await Promise.all([loadRewrites(), loadStatus()]);
 }
 
@@ -398,6 +419,7 @@ document.getElementById('subscriptionForm').addEventListener('submit', event => 
 document.getElementById('subscriptionCancelBtn').addEventListener('click', resetSubscriptionForm);
 document.getElementById('userRulesForm').addEventListener('submit', event => saveRules(event).catch(error => notice(error.message, true)));
 document.getElementById('rewriteType').addEventListener('change', rewriteValueState);
+document.getElementById('rewriteTailscaleOnly').addEventListener('change', rewriteScopeState);
 document.getElementById('rewriteForm').addEventListener('submit', event => saveRewrite(event).catch(error => notice(error.message, true)));
 document.getElementById('clientForm').addEventListener('submit', event => saveClient(event).catch(error => notice(error.message, true)));
 document.getElementById('clientCancelBtn').addEventListener('click', resetClientForm);
@@ -425,5 +447,5 @@ document.getElementById('pause5Btn').addEventListener('click', () => apiJSON('/a
 document.getElementById('resumeBtn').addEventListener('click', () => apiJSON('/api/filtering/pause', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"minutes":0}' }).then(() => notice('Filtering resumed')).catch(error => notice(error.message, true)));
 document.getElementById('refreshSettingsBtn').addEventListener('click', () => Promise.all([loadStatus(), activatePanel((location.hash || '#upstreams').slice(1), false)]).then(() => notice('Configuration refreshed')).catch(error => notice(error.message, true)));
 
-rewriteValueState(); resetSubscriptionForm(); resetClientForm();
+rewriteValueState(); rewriteScopeState(); resetSubscriptionForm(); resetClientForm();
 loadStatus().then(() => activatePanel((location.hash || '#upstreams').slice(1), false)).catch(error => notice(error.message, true));

@@ -114,6 +114,7 @@
                     <div><span class="panel-index">04</span><h2>DNS rewrites</h2></div>
                     <span id="rewriteCount" class="state-pill">0 rules</span>
                 </div>
+                <p class="panel-copy">Return local DNS answers for every client, Tailscale clients only, or explicitly allowed source subnets.</p>
                 <form id="rewriteForm" class="settings-form compact-form controller-edit">
                     <label>Domain<input id="rewriteDomain" type="text" placeholder="printer.internal" required></label>
                     <label>Type<select id="rewriteType">
@@ -122,7 +123,15 @@
                         <option>NXDOMAIN</option><option>REFUSED</option><option>NOERROR</option>
                     </select></label>
                     <label id="rewriteValueLabel">Value<input id="rewriteValue" type="text" placeholder="192.0.2.10"></label>
-                    <button type="submit" class="btn btn-primary">Add rewrite</button>
+                    <fieldset class="rewrite-scope field-wide">
+                        <legend>Source clients</legend>
+                        <div class="rewrite-scope-controls">
+                            <label class="check-field"><input id="rewriteTailscaleOnly" type="checkbox"> Tailscale only</label>
+                            <label class="rewrite-cidrs">Custom subnets<input id="rewriteSourceCIDRs" type="text" placeholder="192.168.0.0/16, 10.20.0.0/16" aria-describedby="rewriteScopeHelp"></label>
+                        </div>
+                        <p id="rewriteScopeHelp" class="field-help">Leave custom subnets empty to apply this rewrite to every client.</p>
+                    </fieldset>
+                    <div class="inline-actions field-wide"><button type="submit" class="btn btn-primary">Add rewrite</button></div>
                 </form>
                 <div id="rewriteList" class="settings-list"></div>
             </section>

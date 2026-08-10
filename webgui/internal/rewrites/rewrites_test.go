@@ -20,12 +20,15 @@ func TestStoreCRUDAndPersistence(t *testing.T) {
 		t.Fatal("new store must be empty")
 	}
 
-	rw, err := s.Add("Example.COM.", "a", "192.0.2.1")
+	rw, err := s.Add("Example.COM.", "a", "192.0.2.1", "192.0.2.44/24", "192.0.2.0/24")
 	if err != nil {
 		t.Fatalf("Add: %v", err)
 	}
 	if rw.Domain != "example.com" || rw.Type != TypeA || rw.ID == "" {
 		t.Errorf("unexpected rewrite normalization: %+v", rw)
+	}
+	if len(rw.SourceCIDRs) != 1 || rw.SourceCIDRs[0] != "192.0.2.0/24" {
+		t.Errorf("source CIDR normalization = %v", rw.SourceCIDRs)
 	}
 	if _, err := s.Add("bad", "A", "not-an-ip"); err == nil {
 		t.Error("expected validation error for bad IPv4")
@@ -40,7 +43,7 @@ func TestStoreCRUDAndPersistence(t *testing.T) {
 		t.Fatalf("reload: %v", err)
 	}
 	items := s2.List()
-	if len(items) != 1 || items[0].Domain != "example.com" {
+	if len(items) != 1 || items[0].Domain != "example.com" || len(items[0].SourceCIDRs) != 1 {
 		t.Fatalf("reloaded items: %+v", items)
 	}
 
@@ -158,6 +161,58 @@ func TestLookupMatching(t *testing.T) {
 		if got := len(s.Lookup(tt.domain)); got != tt.want {
 			t.Errorf("Lookup(%q) = %d rewrites, want %d", tt.domain, got, tt.want)
 		}
+	}
+}
+
+func TestLookupFiltersBySourceCIDR(t *testing.T) {
+	s, err := Load("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Add(
+		"tailnet.example",
+		TypeA,
+		"192.0.2.10",
+		"100.64.0.0/10",
+		"fd7a:115c:a1e0::/48",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Add("all.example", TypeA, "192.0.2.11"); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(s.Lookup("tailnet.example")); got != 1 {
+		t.Fatalf("unfiltered Lookup returned %d rewrites, want 1", got)
+	}
+
+	tests := []struct {
+		name     string
+		domain   string
+		clientIP string
+		want     int
+	}{
+		{name: "tailscale IPv4", domain: "tailnet.example", clientIP: "100.100.10.20", want: 1},
+		{name: "mapped tailscale IPv4", domain: "tailnet.example", clientIP: "::ffff:100.100.10.20", want: 1},
+		{name: "tailscale IPv6", domain: "tailnet.example", clientIP: "fd7a:115c:a1e0::1234", want: 1},
+		{name: "outside subnet", domain: "tailnet.example", clientIP: "192.168.1.20", want: 0},
+		{name: "invalid client", domain: "tailnet.example", clientIP: "not-an-ip", want: 0},
+		{name: "unrestricted", domain: "all.example", clientIP: "192.168.1.20", want: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := len(s.LookupForClient(test.domain, test.clientIP)); got != test.want {
+				t.Fatalf("LookupForClient(%q, %q) = %d, want %d", test.domain, test.clientIP, got, test.want)
+			}
+		})
+	}
+
+	items := s.List()
+	items[1].SourceCIDRs[0] = "0.0.0.0/0"
+	if got := len(s.LookupForClient("tailnet.example", "192.168.1.20")); got != 0 {
+		t.Fatal("List returned mutable source CIDR state")
+	}
+	if _, err := s.Add("invalid.example", TypeA, "192.0.2.12", "not-a-cidr"); err == nil {
+		t.Fatal("Add accepted an invalid source CIDR")
 	}
 }
 

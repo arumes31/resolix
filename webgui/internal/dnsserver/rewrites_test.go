@@ -150,6 +150,43 @@ func TestRewriteLiveUpdate(t *testing.T) {
 	_ = h.nextEvent(t)
 }
 
+func TestRewriteSourceCIDRs(t *testing.T) {
+	var hits atomic.Int32
+	upstreamAddr := startFakeUpstream(t, &hits)
+	store, err := rewrites.Load("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Add(
+		"scoped.test",
+		"A",
+		"192.0.2.77",
+		"100.64.0.0/10",
+		"fd7a:115c:a1e0::/48",
+	); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(Config{
+		Upstreams: []string{upstreamAddr},
+		NodeName:  "test-node",
+		Rewrites:  store,
+	}, nil)
+	query := new(dns.Msg)
+	query.SetQuestion("scoped.test.", dns.TypeA)
+
+	allowed, drop := srv.Resolve(query, "100.100.10.20")
+	if drop || len(allowed.Answer) != 1 || allowed.Answer[0].(*dns.A).A.String() != "192.0.2.77" {
+		t.Fatalf("allowed client answer = %v, drop=%t", allowed.Answer, drop)
+	}
+	denied, drop := srv.Resolve(query, "192.168.1.20")
+	if drop || len(denied.Answer) != 1 || denied.Answer[0].(*dns.A).A.String() != "93.184.216.34" {
+		t.Fatalf("outside client answer = %v, drop=%t", denied.Answer, drop)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("upstream hits = %d, want 1", hits.Load())
+	}
+}
+
 func TestCNAMEChainLoopCap(t *testing.T) {
 	var hits atomic.Int32
 	upstreamAddr := startFakeUpstream(t, &hits)

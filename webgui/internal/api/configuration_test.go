@@ -128,7 +128,13 @@ func TestApplyConfigSnapshotPersistsAllManagedSettings(t *testing.T) {
 
 	snapshot, err := configsync.NewSnapshot(
 		[]string{"1.1.1.1"}, map[string]string{"internal": "9.9.9.9"}, nil, "||blocked.example^\n",
-		[]rewrites.Rewrite{{ID: "rewrite-1", Domain: "printer.internal", Type: "A", Value: "192.0.2.10"}},
+		[]rewrites.Rewrite{{
+			ID:          "rewrite-1",
+			Domain:      "printer.internal",
+			Type:        "A",
+			Value:       "192.0.2.10",
+			SourceCIDRs: []string{"100.64.0.0/10"},
+		}},
 		[]clients.Client{{Name: "office", IDs: []string{"192.0.2.0/24"}, UseGlobalSettings: true}},
 	)
 	if err != nil {
@@ -140,8 +146,12 @@ func TestApplyConfigSnapshotPersistsAllManagedSettings(t *testing.T) {
 	if got := server.configuredUpstreams(); len(got) != 1 || got[0] != "1.1.1.1" {
 		t.Fatalf("upstreams = %v", got)
 	}
-	if len(rewriteStore.List()) != 1 || len(clientRegistry.List()) != 1 {
+	rewriteItems := rewriteStore.List()
+	if len(rewriteItems) != 1 || len(clientRegistry.List()) != 1 {
 		t.Fatalf("rewrites/clients = %d/%d", len(rewriteStore.List()), len(clientRegistry.List()))
+	}
+	if len(rewriteItems[0].SourceCIDRs) != 1 || rewriteItems[0].SourceCIDRs[0] != "100.64.0.0/10" {
+		t.Fatalf("rewrite source CIDRs = %v", rewriteItems[0].SourceCIDRs)
 	}
 	if got := dnsRoutes.GetRoutesMap(); got["internal"] != "9.9.9.9" {
 		t.Fatalf("DNS routes = %v", got)

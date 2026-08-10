@@ -43,16 +43,16 @@ func TestSyncDNSConfigAppliesOnlyValidNewRevision(t *testing.T) {
 	}
 
 	t.Run("valid and duplicate", func(t *testing.T) {
-		master := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		controller := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path != "/api/sync/dns-config" {
 				http.NotFound(w, r)
 				return
 			}
 			_ = json.NewEncoder(w).Encode(snapshot)
 		}))
-		defer master.Close()
+		defer controller.Close()
 
-		forwarder := NewForwarder(&config.Config{Mode: "slave", MasterURL: master.URL, MaxRequestSize: 1 << 20})
+		forwarder := NewForwarder(&config.Config{Mode: config.ModeAgent, ControllerURL: controller.URL, MaxRequestSize: 1 << 20})
 		var calls atomic.Int32
 		forwarder.SetDNSConfigFn(func(got configsync.Snapshot) error {
 			if got.Revision != snapshot.Revision {
@@ -61,8 +61,8 @@ func TestSyncDNSConfigAppliesOnlyValidNewRevision(t *testing.T) {
 			calls.Add(1)
 			return nil
 		})
-		forwarder.syncDNSConfig(master.Client())
-		forwarder.syncDNSConfig(master.Client())
+		forwarder.syncDNSConfig(controller.Client())
+		forwarder.syncDNSConfig(controller.Client())
 		if calls.Load() != 1 || forwarder.ConfigRevision() != snapshot.Revision {
 			t.Fatalf("calls/revision = %d/%q", calls.Load(), forwarder.ConfigRevision())
 		}
@@ -71,59 +71,59 @@ func TestSyncDNSConfigAppliesOnlyValidNewRevision(t *testing.T) {
 	t.Run("invalid revision", func(t *testing.T) {
 		invalid := snapshot
 		invalid.Revision = "invalid"
-		master := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		controller := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode(invalid)
 		}))
-		defer master.Close()
+		defer controller.Close()
 
-		forwarder := NewForwarder(&config.Config{Mode: "slave", MasterURL: master.URL, MaxRequestSize: 1 << 20})
+		forwarder := NewForwarder(&config.Config{Mode: config.ModeAgent, ControllerURL: controller.URL, MaxRequestSize: 1 << 20})
 		var calls atomic.Int32
 		forwarder.SetDNSConfigFn(func(configsync.Snapshot) error {
 			calls.Add(1)
 			return nil
 		})
-		forwarder.syncDNSConfig(master.Client())
+		forwarder.syncDNSConfig(controller.Client())
 		if calls.Load() != 0 || forwarder.ConfigRevision() != "" {
 			t.Fatalf("calls/revision = %d/%q", calls.Load(), forwarder.ConfigRevision())
 		}
 	})
 
 	t.Run("apply error", func(t *testing.T) {
-		master := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		controller := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode(snapshot)
 		}))
-		defer master.Close()
+		defer controller.Close()
 
-		forwarder := NewForwarder(&config.Config{Mode: "slave", MasterURL: master.URL, MaxRequestSize: 1 << 20})
+		forwarder := NewForwarder(&config.Config{Mode: config.ModeAgent, ControllerURL: controller.URL, MaxRequestSize: 1 << 20})
 		var calls atomic.Int32
 		forwarder.SetDNSConfigFn(func(configsync.Snapshot) error {
 			calls.Add(1)
 			return errors.New("apply failed")
 		})
-		forwarder.syncDNSConfig(master.Client())
+		forwarder.syncDNSConfig(controller.Client())
 		if calls.Load() != 1 || forwarder.ConfigRevision() != "" {
 			t.Fatalf("calls/revision = %d/%q", calls.Load(), forwarder.ConfigRevision())
 		}
 	})
 
 	t.Run("unprotected transport", func(t *testing.T) {
-		master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		controller := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode(snapshot)
 		}))
-		defer master.Close()
+		defer controller.Close()
 
-		forwarder := NewForwarder(&config.Config{Mode: "slave", MasterURL: master.URL, MaxRequestSize: 1 << 20})
+		forwarder := NewForwarder(&config.Config{Mode: config.ModeAgent, ControllerURL: controller.URL, MaxRequestSize: 1 << 20})
 		var calls atomic.Int32
 		forwarder.SetDNSConfigFn(func(configsync.Snapshot) error {
 			calls.Add(1)
 			return nil
 		})
-		forwarder.syncDNSConfig(master.Client())
+		forwarder.syncDNSConfig(controller.Client())
 		if calls.Load() != 0 || forwarder.ConfigRevision() != "" {
 			t.Fatalf("calls/revision = %d/%q", calls.Load(), forwarder.ConfigRevision())
 		}
 		if err := forwarder.Start(); err == nil {
-			t.Fatal("Start() accepted an unprotected master URL")
+			t.Fatal("Start() accepted an unprotected controller URL")
 		}
 	})
 
@@ -134,18 +134,18 @@ func TestSyncDNSConfigAppliesOnlyValidNewRevision(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(snapshot)
 		}))
 		defer unprotected.Close()
-		master := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		controller := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, unprotected.URL, http.StatusTemporaryRedirect)
 		}))
-		defer master.Close()
+		defer controller.Close()
 
-		forwarder := NewForwarder(&config.Config{Mode: "slave", MasterURL: master.URL, MaxRequestSize: 1 << 20})
+		forwarder := NewForwarder(&config.Config{Mode: config.ModeAgent, ControllerURL: controller.URL, MaxRequestSize: 1 << 20})
 		var calls atomic.Int32
 		forwarder.SetDNSConfigFn(func(configsync.Snapshot) error {
 			calls.Add(1)
 			return nil
 		})
-		forwarder.syncDNSConfig(master.Client())
+		forwarder.syncDNSConfig(controller.Client())
 		if calls.Load() != 0 || downgradeRequests.Load() != 0 || forwarder.ConfigRevision() != "" {
 			t.Fatalf("calls/downgrades/revision = %d/%d/%q", calls.Load(), downgradeRequests.Load(), forwarder.ConfigRevision())
 		}
@@ -167,15 +167,15 @@ func decodeJSONBody(r *http.Request, v interface{}) error {
 }
 
 func TestNewForwarder(t *testing.T) {
-	cfg := &config.Config{Mode: "slave", MasterURL: "https://localhost:12345", NodeName: "test-node"}
+	cfg := &config.Config{Mode: config.ModeAgent, ControllerURL: "https://localhost:12345", NodeName: "test-node"}
 	fwd := NewForwarder(cfg)
 	if fwd == nil {
 		t.Fatal("NewForwarder returned nil")
 	}
 }
 
-func TestEnqueue_SlaveMode(t *testing.T) {
-	cfg := &config.Config{Mode: "slave", MasterURL: "http://localhost:12345", NodeName: "test-node"}
+func TestEnqueue_AgentMode(t *testing.T) {
+	cfg := &config.Config{Mode: config.ModeAgent, ControllerURL: "http://localhost:12345", NodeName: "test-node"}
 	fwd := NewForwarder(cfg)
 
 	fwd.EnqueueEvent(models.QueryEvent{Domain: "line1.example.com", Node: "test-node"})
@@ -190,8 +190,8 @@ func TestEnqueue_SlaveMode(t *testing.T) {
 	}
 }
 
-func TestEnqueue_MasterMode(t *testing.T) {
-	cfg := &config.Config{Mode: "master", NodeName: "test-node"}
+func TestEnqueue_ControllerMode(t *testing.T) {
+	cfg := &config.Config{Mode: config.ModeController, NodeName: "test-node"}
 	fwd := NewForwarder(cfg)
 
 	fwd.EnqueueEvent(models.QueryEvent{Domain: "line1.example.com", Node: "test-node"})
@@ -201,12 +201,12 @@ func TestEnqueue_MasterMode(t *testing.T) {
 	fwd.backlogMu.Unlock()
 
 	if count != 0 {
-		t.Errorf("expected 0 items in backlog for master mode, got %d", count)
+		t.Errorf("expected 0 items in backlog for controller mode, got %d", count)
 	}
 }
 
-func TestEnqueue_NoMasterURL(t *testing.T) {
-	cfg := &config.Config{Mode: "slave", MasterURL: "", NodeName: "test-node"}
+func TestEnqueue_NoControllerURL(t *testing.T) {
+	cfg := &config.Config{Mode: config.ModeAgent, ControllerURL: "", NodeName: "test-node"}
 	fwd := NewForwarder(cfg)
 
 	fwd.EnqueueEvent(models.QueryEvent{Domain: "line1.example.com", Node: "test-node"})
@@ -216,14 +216,14 @@ func TestEnqueue_NoMasterURL(t *testing.T) {
 	fwd.backlogMu.Unlock()
 
 	if count != 0 {
-		t.Errorf("expected 0 items in backlog when no MasterURL, got %d", count)
+		t.Errorf("expected 0 items in backlog when no ControllerURL, got %d", count)
 	}
 }
 
 func TestEnqueue_MaxBacklogSize(t *testing.T) {
 	cfg := &config.Config{
-		Mode:           "slave",
-		MasterURL:      "http://localhost:12345",
+		Mode:           config.ModeAgent,
+		ControllerURL:  "http://localhost:12345",
 		NodeName:       "test-node",
 		MaxBacklogSize: 2048, // Small limit (a few events)
 	}
@@ -269,10 +269,10 @@ func TestSendBatch_Success(t *testing.T) {
 	defer server.Close()
 
 	cfg := &config.Config{
-		Mode:      "slave",
-		MasterURL: server.URL,
-		NodeName:  "test-node",
-		BaseURL:   "",
+		Mode:          config.ModeAgent,
+		ControllerURL: server.URL,
+		NodeName:      "test-node",
+		BaseURL:       "",
 	}
 	fwd := NewForwarder(cfg)
 
@@ -306,11 +306,11 @@ func TestSendBatch_WithIngestSecret(t *testing.T) {
 	defer server.Close()
 
 	cfg := &config.Config{
-		Mode:         "slave",
-		MasterURL:    server.URL,
-		NodeName:     "test-node",
-		IngestSecret: "my-secret-token",
-		BaseURL:      "",
+		Mode:          config.ModeAgent,
+		ControllerURL: server.URL,
+		NodeName:      "test-node",
+		IngestSecret:  "my-secret-token",
+		BaseURL:       "",
 	}
 	fwd := NewForwarder(cfg)
 
@@ -333,10 +333,10 @@ func TestSendBatch_ServerError(t *testing.T) {
 	defer server.Close()
 
 	cfg := &config.Config{
-		Mode:      "slave",
-		MasterURL: server.URL,
-		NodeName:  "test-node",
-		BaseURL:   "",
+		Mode:          config.ModeAgent,
+		ControllerURL: server.URL,
+		NodeName:      "test-node",
+		BaseURL:       "",
 	}
 	fwd := NewForwarder(cfg)
 
@@ -349,10 +349,10 @@ func TestSendBatch_ServerError(t *testing.T) {
 
 func TestSendBatch_ConnectionRefused(t *testing.T) {
 	cfg := &config.Config{
-		Mode:      "slave",
-		MasterURL: "http://localhost:0", // Port 0 is invalid/unreachable
-		NodeName:  "test-node",
-		BaseURL:   "",
+		Mode:          config.ModeAgent,
+		ControllerURL: "http://localhost:0", // Port 0 is invalid/unreachable
+		NodeName:      "test-node",
+		BaseURL:       "",
 	}
 	fwd := NewForwarder(cfg)
 
@@ -382,10 +382,10 @@ func TestSendBatch_WithHealth(t *testing.T) {
 	defer server.Close()
 
 	cfg := &config.Config{
-		Mode:      "slave",
-		MasterURL: server.URL,
-		NodeName:  "test-node",
-		BaseURL:   "",
+		Mode:          config.ModeAgent,
+		ControllerURL: server.URL,
+		NodeName:      "test-node",
+		BaseURL:       "",
 	}
 	fwd := NewForwarder(cfg)
 
@@ -405,7 +405,7 @@ func TestSendBatch_WithHealth(t *testing.T) {
 }
 
 func TestStop(_ *testing.T) {
-	cfg := &config.Config{Mode: "slave", MasterURL: "http://localhost:12345", NodeName: "test-node"}
+	cfg := &config.Config{Mode: config.ModeAgent, ControllerURL: "http://localhost:12345", NodeName: "test-node"}
 	fwd := NewForwarder(cfg)
 
 	// Stop should not panic
@@ -415,14 +415,14 @@ func TestStop(_ *testing.T) {
 	fwd.Stop()
 }
 
-func TestStart_MasterMode(t *testing.T) {
-	cfg := &config.Config{Mode: "master", NodeName: "test-node"}
+func TestStart_ControllerMode(t *testing.T) {
+	cfg := &config.Config{Mode: config.ModeController, NodeName: "test-node"}
 	fwd := NewForwarder(cfg)
 
-	// Start should return nil immediately in master mode
+	// Start should return nil immediately in controller mode
 	err := fwd.Start()
 	if err != nil {
-		t.Errorf("expected nil for master mode Start, got %v", err)
+		t.Errorf("expected nil for controller mode Start, got %v", err)
 	}
 }
 
@@ -441,8 +441,8 @@ func TestStart_StopDrain(t *testing.T) {
 	defer server.Close()
 
 	cfg := &config.Config{
-		Mode:                       "slave",
-		MasterURL:                  server.URL,
+		Mode:                       config.ModeAgent,
+		ControllerURL:              server.URL,
 		NodeName:                   "test-node",
 		BaseURL:                    "",
 		HeartbeatInterval:          1 * time.Hour,
@@ -507,8 +507,8 @@ func TestRetryMechanism(t *testing.T) {
 	defer server.Close()
 
 	cfg := &config.Config{
-		Mode:                       "slave",
-		MasterURL:                  server.URL,
+		Mode:                       config.ModeAgent,
+		ControllerURL:              server.URL,
 		NodeName:                   "test-node",
 		BaseURL:                    "",
 		HeartbeatInterval:          1 * time.Hour,
@@ -574,8 +574,8 @@ func TestBatchSizeLimit(t *testing.T) {
 	defer server.Close()
 
 	cfg := &config.Config{
-		Mode:                       "slave",
-		MasterURL:                  server.URL,
+		Mode:                       config.ModeAgent,
+		ControllerURL:              server.URL,
 		NodeName:                   "test-node",
 		BaseURL:                    "",
 		HeartbeatInterval:          1 * time.Hour,
@@ -626,7 +626,7 @@ func TestBatchSizeLimit(t *testing.T) {
 	}
 }
 
-func TestReportHealth_SlaveMode(t *testing.T) {
+func TestReportHealth_AgentMode(t *testing.T) {
 	var receivedHealth map[string]interface{}
 	var mu sync.Mutex
 	received := make(chan struct{}, 1)
@@ -650,10 +650,10 @@ func TestReportHealth_SlaveMode(t *testing.T) {
 	defer server.Close()
 
 	cfg := &config.Config{
-		Mode:      "slave",
-		MasterURL: server.URL,
-		NodeName:  "test-node",
-		BaseURL:   "",
+		Mode:          config.ModeAgent,
+		ControllerURL: server.URL,
+		NodeName:      "test-node",
+		BaseURL:       "",
 	}
 	fwd := NewForwarder(cfg)
 	fwd.httpClient = server.Client()
@@ -674,11 +674,11 @@ func TestReportHealth_SlaveMode(t *testing.T) {
 	}
 }
 
-func TestReportHealth_MasterMode(_ *testing.T) {
-	cfg := &config.Config{Mode: "master", NodeName: "test-node"}
+func TestReportHealth_ControllerMode(_ *testing.T) {
+	cfg := &config.Config{Mode: config.ModeController, NodeName: "test-node"}
 	fwd := NewForwarder(cfg)
 
-	// Should not panic in master mode
+	// Should not panic in controller mode
 	fwd.ReportHealth(map[string]float64{"8.8.8.8": 12.3})
 }
 
@@ -712,7 +712,7 @@ func TestCalculateBackoff(t *testing.T) {
 	}
 }
 
-func TestSyncFromMasterRejectsOversizedGzipResponse(t *testing.T) {
+func TestSyncFromControllerRejectsOversizedGzipResponse(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Encoding", "gzip")
 		writer := gzip.NewWriter(w)
@@ -720,8 +720,8 @@ func TestSyncFromMasterRejectsOversizedGzipResponse(t *testing.T) {
 		_ = writer.Close()
 	}))
 	defer server.Close()
-	fwd := NewForwarder(&config.Config{MasterURL: server.URL, MaxRequestSize: 4})
-	if _, err := fwd.syncFromMaster(server.Client(), "/sync"); err == nil {
+	fwd := NewForwarder(&config.Config{ControllerURL: server.URL, MaxRequestSize: 4})
+	if _, err := fwd.syncFromController(server.Client(), "/sync"); err == nil {
 		t.Fatal("expected oversized response error")
 	}
 }
@@ -774,10 +774,10 @@ func TestVersionHeaders(t *testing.T) {
 	defer server.Close()
 
 	cfg := &config.Config{
-		Mode:      "slave",
-		MasterURL: server.URL,
-		NodeName:  "test-node",
-		BaseURL:   "",
+		Mode:          config.ModeAgent,
+		ControllerURL: server.URL,
+		NodeName:      "test-node",
+		BaseURL:       "",
 	}
 	fwd := NewForwarder(cfg)
 

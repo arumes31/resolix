@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/arumes31/resolix/webgui/internal/clients"
+	"github.com/arumes31/resolix/webgui/internal/config"
 	"github.com/arumes31/resolix/webgui/internal/configsync"
 	"github.com/arumes31/resolix/webgui/internal/dnsroutes"
 	"github.com/arumes31/resolix/webgui/internal/filter"
@@ -21,8 +22,8 @@ import (
 
 const maxUserRulesBytes = 1 << 20
 
-func (s *Server) isMaster() bool {
-	return s.cfg.Mode == "" || s.cfg.Mode == "master"
+func (s *Server) isController() bool {
+	return s.cfg.Mode == "" || s.cfg.Mode == config.ModeController
 }
 
 func validateSnapshotRevision(snapshot configsync.Snapshot) error {
@@ -44,15 +45,15 @@ func logConfigApplyFailure(failed string, applied []string) {
 	log.Printf("[WARN] DNS configuration apply failed at %s; stores already applied: %s", failed, completed)
 }
 
-func (s *Server) requireMaster(w http.ResponseWriter) bool {
-	if s.isMaster() {
+func (s *Server) requireController(w http.ResponseWriter) bool {
+	if s.isController() {
 		return true
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusForbidden)
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"status":  "error",
-		"message": "configuration is read-only on resolver nodes; edit the master node",
+		"message": "configuration is read-only on resolver nodes; edit the controller node",
 	})
 	return false
 }
@@ -144,7 +145,7 @@ func (s *Server) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"mode":     s.cfg.Mode,
-		"editable": s.isMaster(),
+		"editable": s.isController(),
 		"revision": snapshot.Revision,
 		"runtime": map[string]interface{}{
 			"upstream_mode":          s.cfg.UpstreamMode,
@@ -196,7 +197,7 @@ func (s *Server) handleFilterSubscriptions(w http.ResponseWriter, r *http.Reques
 	case http.MethodGet:
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"subscriptions": store.List()})
 	case http.MethodPut:
-		if !s.requireMaster(w) || !s.checkCSRF(w, r) {
+		if !s.requireController(w) || !s.checkCSRF(w, r) {
 			return
 		}
 		var request struct {
@@ -230,7 +231,7 @@ func (s *Server) handleUserRules(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]string{"rules": string(data)})
 	case http.MethodPut:
-		if !s.requireMaster(w) || !s.checkCSRF(w, r) {
+		if !s.requireController(w) || !s.checkCSRF(w, r) {
 			return
 		}
 		var request struct {
@@ -289,8 +290,8 @@ func (s *Server) handleSyncDNSConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if !s.isMaster() {
-		http.Error(w, "Configuration snapshots are only served by the master", http.StatusConflict)
+	if !s.isController() {
+		http.Error(w, "Configuration snapshots are only served by the controller", http.StatusConflict)
 		return
 	}
 	snapshot, err := s.currentConfigSnapshot()
@@ -302,7 +303,7 @@ func (s *Server) handleSyncDNSConfig(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(snapshot)
 }
 
-// ApplyConfigSnapshot persists and activates a validated master snapshot on a
+// ApplyConfigSnapshot persists and activates a validated controller snapshot on a
 // resolver node. The revision is accepted only when it matches the payload.
 func (s *Server) ApplyConfigSnapshot(snapshot configsync.Snapshot) error {
 	if err := validateSnapshotRevision(snapshot); err != nil {

@@ -18,6 +18,10 @@ import (
 )
 
 const (
+	// ModeController is the authoritative cluster role.
+	ModeController = "controller"
+	// ModeAgent is the managed resolver role.
+	ModeAgent = "agent"
 	// DefaultPort is the default listening port for the web GUI.
 	DefaultPort = "35353"
 	// DefaultWebListenAddr is the default web/API bind address.
@@ -36,7 +40,7 @@ const (
 	DefaultArchiveInterval = 30 * time.Minute
 	// DefaultScanLimit is the limit for scanning the ring buffer for updates.
 	DefaultScanLimit = 1000
-	// DefaultMaxBacklogSize is the maximum size of the slave backlog before dropping.
+	// DefaultMaxBacklogSize is the maximum size of the agent backlog before dropping.
 	DefaultMaxBacklogSize = 10 * 1024 * 1024 // 10MB
 	// DefaultHistoryRetention is the time to keep history files on disk.
 	DefaultHistoryRetention = 72 * time.Hour
@@ -115,13 +119,13 @@ const (
 
 	// DefaultMaxRetryAttempts is the maximum number of retry attempts for forwarding.
 	DefaultMaxRetryAttempts = 6
-	// DefaultHeartbeatInterval is the default interval for slave heartbeats to master.
+	// DefaultHeartbeatInterval is the default interval for agent heartbeats to controller.
 	DefaultHeartbeatInterval = 30 * time.Second
-	// DefaultSyncAliasesInterval is the default interval for syncing client aliases from master.
+	// DefaultSyncAliasesInterval is the default interval for syncing client aliases from controller.
 	DefaultSyncAliasesInterval = 5 * time.Minute
-	// DefaultSyncDNSRoutesInterval is the default interval for syncing DNS routes from master.
+	// DefaultSyncDNSRoutesInterval is the default interval for syncing DNS routes from controller.
 	DefaultSyncDNSRoutesInterval = 5 * time.Minute
-	// DefaultSyncUpstreamHealthInterval is the default interval for syncing upstream health from master.
+	// DefaultSyncUpstreamHealthInterval is the default interval for syncing upstream health from controller.
 	DefaultSyncUpstreamHealthInterval = 1 * time.Minute
 	// DefaultNodeOfflineThreshold is the time after which a node is considered offline without heartbeat.
 	DefaultNodeOfflineThreshold = 90 * time.Second
@@ -130,7 +134,7 @@ const (
 // Config holds the application configuration.
 type Config struct {
 	Mode             string
-	MasterURL        string
+	ControllerURL    string
 	NodeName         string
 	Port             string
 	WebListenAddr    string
@@ -275,13 +279,13 @@ type Config struct {
 	// Item 85-94: Distributed architecture configuration
 	// MaxRetryAttempts is the maximum number of retry attempts for forwarding with exponential backoff.
 	MaxRetryAttempts int
-	// HeartbeatInterval is the interval for slave heartbeats to master.
+	// HeartbeatInterval is the interval for agent heartbeats to controller.
 	HeartbeatInterval time.Duration
-	// SyncAliasesInterval is the interval for syncing client aliases from master.
+	// SyncAliasesInterval is the interval for syncing client aliases from controller.
 	SyncAliasesInterval time.Duration
-	// SyncDNSRoutesInterval is the interval for syncing DNS routes from master.
+	// SyncDNSRoutesInterval is the interval for syncing DNS routes from controller.
 	SyncDNSRoutesInterval time.Duration
-	// SyncUpstreamHealthInterval is the interval for syncing upstream health from master.
+	// SyncUpstreamHealthInterval is the interval for syncing upstream health from controller.
 	SyncUpstreamHealthInterval time.Duration
 	// NodeOfflineThreshold is the time after which a node is considered offline.
 	NodeOfflineThreshold time.Duration
@@ -416,7 +420,7 @@ func (c *Config) StartClientAliasesReload(ctx context.Context) {
 }
 
 // SetClientAliases updates the client aliases map (Item 90).
-// This is used by the forwarder sync callback to apply aliases synced from the master.
+// This is used by the forwarder sync callback to apply aliases synced from the controller.
 func (c *Config) SetClientAliases(aliases map[string]string) {
 	if aliases == nil {
 		return
@@ -536,17 +540,24 @@ func parseUint32Env(key string, defaultVal uint32) uint32 {
 	return uint32(n)
 }
 
-// resolveMode reads and validates the MODE environment variable.
+// resolveMode reads MODE and normalizes legacy role names.
 func resolveMode() string {
-	mode := strings.ToLower(os.Getenv("MODE"))
-	if mode == "" {
-		return "master"
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("MODE")))
+	switch mode {
+	case "", ModeController:
+		return ModeController
+	case ModeAgent:
+		return ModeAgent
+	case "master":
+		log.Printf("[WARN] MODE=master is deprecated; use MODE=%s", ModeController)
+		return ModeController
+	case "slave":
+		log.Printf("[WARN] MODE=slave is deprecated; use MODE=%s", ModeAgent)
+		return ModeAgent
+	default:
+		log.Printf("[WARN] Invalid MODE '%s', falling back to %s", sanitizeForLog(mode), ModeController) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		return ModeController
 	}
-	if mode != "master" && mode != "slave" {
-		log.Printf("[WARN] Invalid MODE '%s', falling back to master", sanitizeForLog(mode)) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-		return "master"
-	}
-	return mode
 }
 
 // resolveNodeName reads NODE_NAME, falling back to the OS hostname.
@@ -576,17 +587,28 @@ func resolvePort() string {
 	return port
 }
 
-// validateMasterURL exits fatally when masterURL is set but invalid.
-func validateMasterURL(masterURL string) {
-	if masterURL == "" {
+// validateControllerURL exits fatally when controllerURL is set but invalid.
+func validateControllerURL(controllerURL string) {
+	if controllerURL == "" {
 		return
 	}
-	if !isValidMasterURL(masterURL) {
-		log.Fatalf("[FATAL] Invalid MASTER_URL: must start with https:// (got: %s)", sanitizeForLog(masterURL)) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+	if !isValidControllerURL(controllerURL) {
+		log.Fatalf("[FATAL] Invalid CONTROLLER_URL: must start with https:// (got: %s)", sanitizeForLog(controllerURL)) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
 	}
-	if _, err := url.ParseRequestURI(masterURL); err != nil {
-		log.Fatalf("[FATAL] Invalid MASTER_URL: %v", err)
+	if _, err := url.ParseRequestURI(controllerURL); err != nil {
+		log.Fatalf("[FATAL] Invalid CONTROLLER_URL: %v", err)
 	}
+}
+
+func resolveControllerURL() string {
+	controllerURL := os.Getenv("CONTROLLER_URL")
+	if controllerURL == "" {
+		controllerURL = os.Getenv("MASTER_URL")
+		if controllerURL != "" {
+			log.Printf("[WARN] MASTER_URL is deprecated; use CONTROLLER_URL")
+		}
+	}
+	return strings.TrimSuffix(controllerURL, "/")
 }
 
 // loadEnvAliases parses the CLIENT_ALIASES environment variable
@@ -752,8 +774,8 @@ func LoadConfig() *Config {
 		healthDomain = DefaultHealthDomain
 	}
 
-	masterURL := strings.TrimSuffix(os.Getenv("MASTER_URL"), "/")
-	validateMasterURL(masterURL)
+	controllerURL := resolveControllerURL()
+	validateControllerURL(controllerURL)
 
 	// Load client aliases from env var
 	aliases := loadEnvAliases()
@@ -877,7 +899,7 @@ func LoadConfig() *Config {
 
 	cfg := &Config{
 		Mode:                       mode,
-		MasterURL:                  masterURL,
+		ControllerURL:              controllerURL,
 		NodeName:                   nodeName,
 		Port:                       port,
 		WebListenAddr:              webListenAddr,
@@ -965,15 +987,15 @@ func LoadConfig() *Config {
 		NodeOfflineThreshold:       nodeOfflineThreshold,
 	}
 
-	if cfg.Mode == "slave" && cfg.MasterURL == "" {
-		log.Fatal("[FATAL] MASTER_URL is required when MODE is slave")
+	if cfg.Mode == ModeAgent && cfg.ControllerURL == "" {
+		log.Fatal("[FATAL] CONTROLLER_URL is required when MODE is agent")
 	}
 
 	return cfg
 }
 
-// isValidMasterURL checks that the URL uses protected HTTPS transport.
-func isValidMasterURL(rawURL string) bool {
+// isValidControllerURL checks that the URL uses protected HTTPS transport.
+func isValidControllerURL(rawURL string) bool {
 	return strings.HasPrefix(rawURL, "https://")
 }
 
@@ -1065,9 +1087,9 @@ func (c *Config) VerifyConfig() ([]string, []string) {
 		}
 	}
 
-	// 2. MASTER_URL schema validation (if set)
-	if c.MasterURL != "" && !isValidMasterURL(c.MasterURL) {
-		errs = append(errs, fmt.Sprintf("MASTER_URL must start with https:// (got: %s)", c.MasterURL))
+	// 2. CONTROLLER_URL schema validation (if set)
+	if c.ControllerURL != "" && !isValidControllerURL(c.ControllerURL) {
+		errs = append(errs, fmt.Sprintf("CONTROLLER_URL must start with https:// (got: %s)", c.ControllerURL))
 	}
 
 	// 3. Authentication must be either fully configured or explicitly backed

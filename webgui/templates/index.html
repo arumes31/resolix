@@ -117,11 +117,11 @@
         </div>
 
         <!-- Node Status Panel (Items 92, 93) -->
-        {{if eq .Mode "master"}}
+        {{if eq .Mode "controller"}}
         <div class="node-status-panel" id="nodeStatusPanel">
             <h3>Cluster Nodes</h3>
             <div id="nodeCards" class="node-status-grid">
-                <p class="empty-state">No slave
+                <p class="empty-state">No agent
                     nodes connected</p>
             </div>
         </div>

@@ -2879,11 +2879,11 @@ tr:hover .test-domain-btn {
   font-size: 0.8rem;
 }
 
-.read-only-config .master-edit {
+.read-only-config .controller-edit {
   opacity: 0.58;
 }
 
-.read-only-config .master-edit::after {
+.read-only-config .controller-edit::after {
   color: var(--text-secondary);
 }
 

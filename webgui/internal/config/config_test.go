@@ -6,6 +6,42 @@ import (
 	"time"
 )
 
+func TestResolveModeCanonicalizesLegacyNames(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "default", want: ModeController},
+		{name: "controller", value: ModeController, want: ModeController},
+		{name: "agent", value: ModeAgent, want: ModeAgent},
+		{name: "legacy master", value: "master", want: ModeController},
+		{name: "legacy slave", value: "slave", want: ModeAgent},
+		{name: "invalid", value: "invalid", want: ModeController},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("MODE", tt.value)
+			if got := resolveMode(); got != tt.want {
+				t.Fatalf("resolveMode() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveControllerURLPrefersCanonicalEnvironment(t *testing.T) {
+	t.Setenv("CONTROLLER_URL", "https://controller.example.test/")
+	t.Setenv("MASTER_URL", "https://legacy.example.test")
+	if got := resolveControllerURL(); got != "https://controller.example.test" {
+		t.Fatalf("resolveControllerURL() = %q", got)
+	}
+
+	t.Setenv("CONTROLLER_URL", "")
+	if got := resolveControllerURL(); got != "https://legacy.example.test" {
+		t.Fatalf("legacy resolveControllerURL() = %q", got)
+	}
+}
+
 func TestParseDurationEnvRequiresPositiveDuration(t *testing.T) {
 	const key = "TEST_DURATION"
 	fallback := 5 * time.Second

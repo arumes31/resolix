@@ -24,7 +24,7 @@ type Subscription struct {
 	Enabled   bool   `json:"enabled"`
 }
 
-// SubscriptionStore persists the master-authoritative subscription list.
+// SubscriptionStore persists the controller-authoritative subscription list.
 type SubscriptionStore struct {
 	mu    sync.RWMutex
 	path  string

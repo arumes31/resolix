@@ -172,20 +172,19 @@ PORT=35353
 # Web/API bind address
 WEB_LISTEN_ADDR=0.0.0.0
 
-# Run mode (master or slave)
-MODE=master
+# Run mode (controller or agent)
+MODE=controller
 
-# URL of the Master node (Required for slave mode)
-# NOTE: HTTPS is strongly preferred (use https:// with valid TLS certificates) to encrypt
-# master/slave communication. Plain HTTP transmits data unencrypted and should only be
-# used on trusted/private networks (e.g., Tailscale).
-# Example: MASTER_URL=https://master-node:35353
-# MASTER_URL=https://master-ip:35353
+# HTTPS URL of the Controller node (required for agent mode).
+# Resolix rejects plain HTTP for controller/agent synchronization.
+# Example: CONTROLLER_URL=https://controller-node:35353
+# CONTROLLER_URL=https://controller-ip:35353
+# Legacy upgrades may still use MASTER_URL; CONTROLLER_URL takes precedence.
 
 # Unique identifier for this node
 NODE_NAME=resolix-1
 
-# Secret token to authenticate logs from slave nodes
+# Secret token to authenticate logs from agent nodes
 # INGEST_SECRET=your-secret-token
 
 # Web GUI authentication. Set both values together. INGEST_SECRET is required
@@ -308,16 +307,16 @@ DB_PATH=dns.db
 # Maximum retry attempts for forwarding with exponential backoff (default: 6)
 # MAX_RETRY_ATTEMPTS=6
 
-# Interval for slave heartbeats to master (default: 30s)
+# Interval for agent heartbeats to controller (default: 30s)
 # HEARTBEAT_INTERVAL=30s
 
-# Interval for syncing client aliases from master (default: 5m)
+# Interval for syncing client aliases from controller (default: 5m)
 # SYNC_ALIASES_INTERVAL=5m
 
-# Interval for syncing DNS routes from master (default: 5m)
+# Interval for syncing DNS routes from controller (default: 5m)
 # SYNC_DNSROUTES_INTERVAL=5m
 
-# Interval for syncing upstream health from master (default: 1m)
+# Interval for syncing upstream health from controller (default: 1m)
 # SYNC_UPSTREAM_HEALTH_INTERVAL=1m
 
 # Time after which a node is considered offline without heartbeat (default: 90s)
@@ -393,10 +392,10 @@ func main() {
 	// Item 88: Set forwarder version to match main version (settable via -ldflags)
 	forwarder.Version = Version
 
-	// Items 90, 91, 94: Wire forwarder sync callbacks for slave mode
+	// Items 90, 91, 94: Wire forwarder sync callbacks for agent mode
 	fwd.SetDNSRoutesFn(func(routes map[string]string) {
 		if err := dr.SetRoutes(routes); err != nil {
-			logger.Warning("Failed to sync DNS routes from master: %v", err)
+			logger.Warning("Failed to sync DNS routes from controller: %v", err)
 		}
 	})
 	fwd.SetAliasesFn(func(aliases map[string]string) {
@@ -425,7 +424,7 @@ func main() {
 	checker := health.NewChecker(cfg, strings.Join(upstreamSpecs, " "))
 	go checker.Start(ctx, func(_ []string, latencies map[string]float64) {
 		store.SetUpstreamHealth(cfg.NodeName, latencies)
-		if cfg.Mode == "slave" {
+		if cfg.Mode == config.ModeAgent {
 			fwd.ReportHealth(latencies)
 		}
 		logger.Debug("Health status updated for node %s. Latencies: %v", cfg.NodeName, latencies)
@@ -458,7 +457,7 @@ func main() {
 	// → cache → client upstreams → route → global pool → bogus-NXDOMAIN →
 	// cache store → respond.
 	// Each answered query becomes a QueryEvent fed into Store + SSE (and the
-	// forwarder in slave mode). dnsDone closes when both listeners have
+	// forwarder in agent mode). dnsDone closes when both listeners have
 	// stopped, so shutdown can archive after events have ceased.
 
 	// Filter engine (Step 2): local files (BLOCKLIST_FILE entries now
@@ -489,7 +488,7 @@ func main() {
 	})
 
 	// Start forwarding only after every config-sync target is initialized, so
-	// the initial slave sync cannot race application startup.
+	// the initial agent sync cannot race application startup.
 	go func() {
 		if err := fwd.Start(); err != nil {
 			errChan <- err
@@ -530,7 +529,7 @@ func main() {
 		// exclude_from_stats clients emit to SSE only (no store/forwarder).
 		if !excludeFromStats {
 			store.AddEvent(ev)
-			if cfg.Mode == "slave" {
+			if cfg.Mode == config.ModeAgent {
 				fwd.EnqueueEvent(ev)
 			}
 		}

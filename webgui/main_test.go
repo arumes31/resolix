@@ -113,7 +113,7 @@ func TestApiIngest(t *testing.T) {
 	defer func() { _ = os.RemoveAll(store.GetConfig().HistoryDir) }()
 
 	payload := map[string]interface{}{
-		"node": "slave-1",
+		"node": "agent-1",
 		"batch": []string{
 			"Jan 02 15:04:05 dnsmasq[1]: query[A] d1.com from 1.1.1.1",
 			"Jan 02 15:04:05 dnsmasq[1]: query[A] d2.com from 2.2.2.2",
@@ -140,15 +140,15 @@ func TestApiIngest(t *testing.T) {
 }
 
 // TestApiIngestEvents verifies the new ingest format: a top-level JSON array
-// of structured QueryEvent produced by dnsserver-based slaves.
+// of structured QueryEvent produced by dnsserver-based agents.
 func TestApiIngestEvents(t *testing.T) {
 	cfg, store, _, srv := setupTest()
 	defer func() { _ = os.RemoveAll(store.GetConfig().HistoryDir) }()
 
 	now := time.Now().Unix()
 	events := []models.QueryEvent{
-		{UnixTime: now, Type: "A", Domain: "e1.example.com", ClientIP: "100.64.0.1", Node: "slave-1", Upstream: "8.8.8.8:53", ResponseCode: "NOERROR"},
-		{UnixTime: now, Type: "AAAA", Domain: "e2.example.com", ClientIP: "100.64.0.2", Node: "slave-1", Upstream: "System Cache", ResponseCode: "NXDOMAIN"},
+		{UnixTime: now, Type: "A", Domain: "e1.example.com", ClientIP: "100.64.0.1", Node: "agent-1", Upstream: "8.8.8.8:53", ResponseCode: "NOERROR"},
+		{UnixTime: now, Type: "AAAA", Domain: "e2.example.com", ClientIP: "100.64.0.2", Node: "agent-1", Upstream: "System Cache", ResponseCode: "NXDOMAIN"},
 	}
 	data, _ := json.Marshal(events)
 
@@ -169,13 +169,13 @@ func TestApiIngestEvents(t *testing.T) {
 		t.Fatalf("Expected 2 events, got %d", len(stored))
 	}
 	// GetRecentEvents returns oldest first.
-	if stored[0].Domain != "e1.example.com" || stored[0].Node != "slave-1" {
+	if stored[0].Domain != "e1.example.com" || stored[0].Node != "agent-1" {
 		t.Errorf("Unexpected stored event: %+v", stored[0])
 	}
 
 	// Node status should have been created from the event node name.
-	if ns := store.GetNodeStatus("slave-1"); ns == nil {
-		t.Error("Expected node status for slave-1 after events ingest")
+	if ns := store.GetNodeStatus("agent-1"); ns == nil {
+		t.Error("Expected node status for agent-1 after events ingest")
 	}
 }
 
@@ -347,7 +347,7 @@ func TestConcurrency(t *testing.T) {
 				prs.ParseLogBytes(line, "node-1")
 
 				payload := map[string]interface{}{
-					"node": "slave-1",
+					"node": "agent-1",
 					"batch": []string{
 						fmt.Sprintf("Jan 02 15:04:05 dnsmasq[1]: query[A] batch-%d-%d.com from 2.2.2.2", id, j),
 					},
@@ -381,7 +381,7 @@ func TestApiIngestAuth(t *testing.T) {
 	handler := srv.SetupMux()
 
 	payload := map[string]interface{}{
-		"node":  "slave-1",
+		"node":  "agent-1",
 		"batch": []string{"Jan 02 15:04:05 dnsmasq[1]: query[A] d1.com from 1.1.1.1"},
 	}
 	data, _ := json.Marshal(payload)
@@ -448,12 +448,12 @@ func TestArchiveStep(t *testing.T) {
 
 func TestForwarder_NoPanic(t *testing.T) {
 	_ = t // Ignore unused param warning
-	cfg := &config.Config{Mode: "slave", MasterURL: "http://localhost:12345", NodeName: "slave-1"}
+	cfg := &config.Config{Mode: config.ModeAgent, ControllerURL: "http://localhost:12345", NodeName: "agent-1"}
 	fwd := forwarder.NewForwarder(cfg)
 
 	// Test EnqueueEvent adds to backlog
-	fwd.EnqueueEvent(models.QueryEvent{Domain: "line1.example.com", Node: "slave-1"})
-	fwd.EnqueueEvent(models.QueryEvent{Domain: "line2.example.com", Node: "slave-1"})
+	fwd.EnqueueEvent(models.QueryEvent{Domain: "line1.example.com", Node: "agent-1"})
+	fwd.EnqueueEvent(models.QueryEvent{Domain: "line2.example.com", Node: "agent-1"})
 
 	// Verify backlog indirectly or via reflection if needed,
 	// but let's just ensure no panic and basic functionality.

@@ -108,7 +108,7 @@ func (n *NodeStatus) IsOnline(threshold time.Duration) bool {
 	return time.Since(n.LastSeen) < threshold
 }
 
-// HeartbeatPayload represents the heartbeat data sent from slave to master (Item 92).
+// HeartbeatPayload represents the heartbeat data sent from agent to controller (Item 92).
 type HeartbeatPayload struct {
 	Node           string             `json:"node"`
 	Version        string             `json:"version,omitempty"`

@@ -2343,6 +2343,14 @@ tr:hover .test-domain-btn {
   background: var(--status-error);
 }
 
+.latency-neutral {
+  color: var(--text-muted);
+}
+
+.logout-form {
+  margin: 0;
+}
+
 #simulatorResult.visible {
   display: block;
 }

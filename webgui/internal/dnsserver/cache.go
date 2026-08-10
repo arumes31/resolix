@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -45,6 +46,12 @@ type cache struct {
 	optimistic bool
 	ll         *list.List // front = most recently used
 	items      map[cacheKey]*list.Element
+	hits       atomic.Int64
+	misses     atomic.Int64
+	staleHits  atomic.Int64
+	evictions  atomic.Int64
+	cleared    atomic.Int64
+	refreshes  atomic.Int64
 }
 
 func newCache(capacity int, minTTL, maxTTL uint32) *cache {
@@ -89,6 +96,7 @@ func (c *cache) get(key cacheKey) (*cacheEntry, uint32, bool) {
 
 	el, ok := c.items[key]
 	if !ok {
+		c.misses.Add(1)
 		return nil, 0, false
 	}
 	en := el.Value.(entry)
@@ -100,8 +108,10 @@ func (c *cache) get(key cacheKey) (*cacheEntry, uint32, bool) {
 		if !c.optimistic {
 			c.removeElement(el)
 		}
+		c.misses.Add(1)
 		return nil, 0, false
 	}
+	c.hits.Add(1)
 	c.ll.MoveToFront(el)
 
 	out := &cacheEntry{
@@ -129,6 +139,7 @@ func (c *cache) getStale(key cacheKey) (*cacheEntry, bool) {
 	if !ok {
 		return nil, false
 	}
+	c.staleHits.Add(1)
 	ent := el.Value.(entry).value
 	return &cacheEntry{
 		answers:           copyRRs(ent.answers),
@@ -151,6 +162,7 @@ func (c *cache) set(key cacheKey, ent *cacheEntry) {
 		return
 	}
 	if len(c.items) >= c.cap {
+		c.evictions.Add(1)
 		c.removeElement(c.ll.Back())
 	}
 	c.items[key] = c.ll.PushFront(entry{key: key, value: ent})
@@ -178,7 +190,31 @@ func (c *cache) clear() int {
 	n := len(c.items)
 	c.ll.Init()
 	c.items = make(map[cacheKey]*list.Element)
+	c.cleared.Add(int64(n))
 	return n
+}
+
+// CacheStats is a point-in-time snapshot of cache usage and counters.
+type CacheStats struct {
+	Entries   int
+	Capacity  int
+	Hits      int64
+	Misses    int64
+	StaleHits int64
+	Evictions int64
+	Cleared   int64
+	Refreshes int64
+}
+
+func (c *cache) stats() CacheStats {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return CacheStats{
+		Entries: len(c.items), Capacity: c.cap, Hits: c.hits.Load(),
+		Misses: c.misses.Load(), StaleHits: c.staleHits.Load(),
+		Evictions: c.evictions.Load(), Cleared: c.cleared.Load(),
+		Refreshes: c.refreshes.Load(),
+	}
 }
 
 // entry bundles the list key with the entry value for LRU bookkeeping.

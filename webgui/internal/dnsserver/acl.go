@@ -59,7 +59,7 @@ func (s *Server) aclDrop(clientIP string) bool {
 
 // aclRefuse reports whether the client is outside a non-empty allowed list.
 func (s *Server) aclRefuse(clientIP string) bool {
-	return len(s.allowed) > 0 && !cidrListContains(s.allowed, clientIP)
+	return s.allowedConfigured && !cidrListContains(s.allowed, clientIP)
 }
 
 // rateBucket is a per-subnet token bucket.

@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"math/rand/v2"
@@ -39,9 +40,10 @@ type PoolConfig struct {
 
 // stat tracks per-upstream performance.
 type stat struct {
-	ewmaMS    float64 // exponentially weighted moving average latency
-	failures  atomic.Int64
-	successes atomic.Int64
+	ewmaMS         float64 // exponentially weighted moving average latency
+	failures       atomic.Int64
+	failurePenalty atomic.Int64
+	successes      atomic.Int64
 }
 
 // StatSnapshot reports per-upstream stats for metrics.
@@ -104,8 +106,12 @@ func NewPool(cfg PoolConfig) *Pool {
 		prefixes = []string{"64:ff9b::/96"}
 	}
 	for _, raw := range prefixes {
-		_, n, err := net.ParseCIDR(strings.TrimSpace(raw))
-		if err != nil {
+		ip, n, err := net.ParseCIDR(strings.TrimSpace(raw))
+		ones, bits := 0, 0
+		if err == nil {
+			ones, bits = n.Mask.Size()
+		}
+		if err != nil || ip.To4() != nil || ones != 96 || bits != 128 {
 			log.Printf("[WARN] Invalid DNS64 prefix %q (ignoring)", raw)
 			continue
 		}
@@ -169,6 +175,13 @@ func (p *Pool) SetPrimarySpecs(specs []string) {
 	p.warnHostnameUpstreams()
 }
 
+// ClearRouteCache drops resolvers created for domain-specific routes.
+func (p *Pool) ClearRouteCache() {
+	p.mu.Lock()
+	p.routes = make(map[string]Resolver)
+	p.mu.Unlock()
+}
+
 // SetHealthProvider installs the health data source (spec → latency ms,
 // negative = unhealthy). Called by main after the store is available.
 func (p *Pool) SetHealthProvider(fn func() map[string]float64) {
@@ -194,11 +207,8 @@ func (p *Pool) healthy(rs []Resolver) []Resolver {
 	health := fn()
 	out := make([]Resolver, 0, len(rs))
 	for _, r := range rs {
-		// Health probing (internal/health) is UDP-only, so it only covers
-		// plain schemeless specs; encrypted upstreams are always considered
-		// healthy here.
 		lat, known := health[r.String()]
-		if known && lat < 0 && !strings.Contains(r.String(), "://") {
+		if known && lat < 0 {
 			continue
 		}
 		out = append(out, r)
@@ -321,26 +331,33 @@ func (p *Pool) exchangeParallel(candidates []Resolver, m *dns.Msg) (*dns.Msg, st
 	type result struct {
 		resp *dns.Msg
 		spec string
+		err  error
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), exchangeTimeout+time.Second)
+	defer cancel()
 	results := make(chan result, len(candidates))
 	for _, r := range candidates {
 		go func(r Resolver) {
-			resp, err := p.exchange(r, m.Copy())
-			if err == nil && resp != nil {
-				results <- result{resp, r.String()}
-			}
+			resp, err := p.exchangeContext(ctx, r, m.Copy())
+			results <- result{resp: resp, spec: r.String(), err: err}
 		}(r)
 	}
-	timeout := time.After(exchangeTimeout + time.Second)
+	var failures []error
 	for range candidates {
 		select {
 		case res := <-results:
-			return res.resp, res.spec, nil
-		case <-timeout:
-			return nil, "", fmt.Errorf("parallel exchange: all %d upstreams timed out", len(candidates))
+			if res.err == nil && res.resp != nil {
+				cancel()
+				return res.resp, res.spec, nil
+			}
+			if res.err != nil {
+				failures = append(failures, res.err)
+			}
+		case <-ctx.Done():
+			return nil, "", fmt.Errorf("parallel exchange: %w", ctx.Err())
 		}
 	}
-	return nil, "", fmt.Errorf("parallel exchange: all %d upstreams failed", len(candidates))
+	return nil, "", fmt.Errorf("parallel exchange: all %d upstreams failed: %v", len(candidates), failures)
 }
 
 // exchangeLoadBalanced picks candidates in weighted-random order, preferring
@@ -362,7 +379,7 @@ func (p *Pool) weightedOrder(candidates []Resolver) []Resolver {
 		if ewma <= 0 {
 			ewma = 1
 		}
-		weights[i] = 1 / (ewma * float64(1+st.failures.Load()))
+		weights[i] = 1 / (ewma * float64(1+st.failurePenalty.Load()))
 	}
 
 	out := make([]Resolver, 0, len(candidates))
@@ -391,18 +408,34 @@ func (p *Pool) weightedOrder(candidates []Resolver) []Resolver {
 
 // exchange runs one upstream exchange with ECS, stats, and DNS64 handling.
 func (p *Pool) exchange(r Resolver, m *dns.Msg) (*dns.Msg, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), exchangeTimeout)
+	defer cancel()
+	return p.exchangeContext(ctx, r, m)
+}
+
+func (p *Pool) exchangeContext(ctx context.Context, r Resolver, m *dns.Msg) (*dns.Msg, error) {
 	out := p.withECS(m)
 
 	start := time.Now()
-	resp, err := r.Exchange(out)
+	var resp *dns.Msg
+	var err error
+	if contextual, ok := r.(interface {
+		ExchangeContext(context.Context, *dns.Msg) (*dns.Msg, error)
+	}); ok {
+		resp, err = contextual.ExchangeContext(ctx, out)
+	} else {
+		resp, err = r.Exchange(out)
+	}
 	elapsed := float64(time.Since(start).Microseconds()) / 1000.0
 
 	st := p.statFor(r.String())
 	if err != nil || resp == nil {
 		st.failures.Add(1)
+		st.failurePenalty.Add(1)
 		return nil, err
 	}
 	st.successes.Add(1)
+	st.failurePenalty.Store(0)
 	p.recordLatency(st, elapsed)
 
 	// DNS64: synthesize AAAA from A on empty AAAA answers.

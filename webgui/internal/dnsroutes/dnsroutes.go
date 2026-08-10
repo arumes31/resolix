@@ -26,9 +26,10 @@ type DNSRoutes struct {
 	routes []Route
 	// mu guards routes; writeMu serializes concurrent SetRoutes calls
 	// (file persistence + swap) without blocking readers.
-	mu      sync.RWMutex
-	writeMu sync.Mutex
-	cancel  context.CancelFunc
+	mu       sync.RWMutex
+	writeMu  sync.Mutex
+	cancel   context.CancelFunc
+	onChange func()
 }
 
 // New creates a new DNSRoutes from the given JSON config file path and loads it immediately.
@@ -60,18 +61,12 @@ func (dr *DNSRoutes) load() {
 		} else {
 			logger.Error("Failed to read DNS routes file: %v", err)
 		}
-		dr.mu.Lock()
-		dr.routes = newRoutes
-		dr.mu.Unlock()
 		return
 	}
 
 	var raw map[string]string
 	if err := json.Unmarshal(data, &raw); err != nil {
 		logger.Error("Failed to parse DNS routes file: %v", err)
-		dr.mu.Lock()
-		dr.routes = newRoutes
-		dr.mu.Unlock()
 		return
 	}
 
@@ -85,7 +80,11 @@ func (dr *DNSRoutes) load() {
 
 	dr.mu.Lock()
 	dr.routes = newRoutes
+	onChange := dr.onChange
 	dr.mu.Unlock()
+	if onChange != nil {
+		onChange()
+	}
 
 	logger.Info("Loaded %d DNS routes from %s", len(newRoutes), dr.path)
 }
@@ -116,6 +115,13 @@ func (dr *DNSRoutes) Stop() {
 	if dr.cancel != nil {
 		dr.cancel()
 	}
+}
+
+// SetOnChange configures a callback invoked after a successful route swap.
+func (dr *DNSRoutes) SetOnChange(fn func()) {
+	dr.mu.Lock()
+	dr.onChange = fn
+	dr.mu.Unlock()
 }
 
 // GetUpstreamForDomain returns the upstream server for a domain if a matching route exists.
@@ -206,7 +212,11 @@ func (dr *DNSRoutes) SetRoutes(routesMap map[string]string) error {
 
 	dr.mu.Lock()
 	dr.routes = newRoutes
+	onChange := dr.onChange
 	dr.mu.Unlock()
+	if onChange != nil {
+		onChange()
+	}
 
 	return nil
 }
@@ -272,7 +282,7 @@ func SaveUpstreams(path string, upstreams []string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0600)
+	return writeFileAtomic(path, data, 0o600)
 }
 
 // LoadUpstreams reads the upstream server list from a JSON file.

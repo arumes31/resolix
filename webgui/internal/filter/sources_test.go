@@ -166,10 +166,12 @@ func TestStartUpdateLoopInitialLoad(t *testing.T) {
 	e.StartUpdateLoop(ctx, time.Hour) // initial load happens immediately
 
 	deadline := time.Now().Add(2 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
 	for !e.Match("loop.example.com").Blocked {
 		if time.Now().After(deadline) {
 			t.Fatal("initial subscription load did not happen")
 		}
-		time.Sleep(10 * time.Millisecond)
+		<-ticker.C
 	}
 }

@@ -310,10 +310,15 @@ func TestStart_MasterMode(t *testing.T) {
 
 func TestStart_StopDrain(t *testing.T) {
 	var receivedCount atomic.Int32
+	delivered := make(chan struct{}, 1)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		receivedCount.Add(1)
 		w.WriteHeader(http.StatusNoContent)
+		select {
+		case delivered <- struct{}{}:
+		default:
+		}
 	}))
 	defer server.Close()
 
@@ -339,8 +344,11 @@ func TestStart_StopDrain(t *testing.T) {
 		done <- fwd.Start()
 	}()
 
-	// Give it a moment to start processing
-	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-delivered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("forwarder did not deliver backlog")
+	}
 
 	// Stop the forwarder
 	fwd.Stop()
@@ -358,6 +366,8 @@ func TestStart_StopDrain(t *testing.T) {
 
 func TestRetryMechanism(t *testing.T) {
 	var attemptCount atomic.Int32
+	delivered := make(chan struct{})
+	var deliveredOnce sync.Once
 
 	// Server that fails first 2 ingest attempts, then succeeds.
 	// Only POST /api/ingest requests are counted so concurrent startup
@@ -373,6 +383,7 @@ func TestRetryMechanism(t *testing.T) {
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
+		deliveredOnce.Do(func() { close(delivered) })
 	}))
 	defer server.Close()
 
@@ -396,8 +407,11 @@ func TestRetryMechanism(t *testing.T) {
 		done <- fwd.Start()
 	}()
 
-	// Wait for retries to complete
-	time.Sleep(5 * time.Second)
+	select {
+	case <-delivered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("forwarder retries did not reach a success")
+	}
 	fwd.Stop()
 
 	select {
@@ -416,6 +430,7 @@ func TestRetryMechanism(t *testing.T) {
 func TestBatchSizeLimit(t *testing.T) {
 	var batchSizes []int
 	var mu sync.Mutex
+	fullBatch := make(chan struct{}, 1)
 
 	// Record only POST /api/ingest batches so heartbeat/sync requests are ignored.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -428,6 +443,12 @@ func TestBatchSizeLimit(t *testing.T) {
 		mu.Lock()
 		batchSizes = append(batchSizes, len(events))
 		mu.Unlock()
+		if len(events) == 100 {
+			select {
+			case fullBatch <- struct{}{}:
+			default:
+			}
+		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
@@ -454,8 +475,11 @@ func TestBatchSizeLimit(t *testing.T) {
 		done <- fwd.Start()
 	}()
 
-	// Wait for first batch to be sent
-	time.Sleep(500 * time.Millisecond)
+	select {
+	case <-fullBatch:
+	case <-time.After(5 * time.Second):
+		t.Fatal("forwarder did not send a full batch")
+	}
 	fwd.Stop()
 
 	select {

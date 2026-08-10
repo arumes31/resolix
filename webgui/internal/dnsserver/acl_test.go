@@ -76,6 +76,17 @@ func TestACLDefaultAllowsAll(t *testing.T) {
 	}
 }
 
+func TestInvalidConfiguredAllowACLRefusesAll(t *testing.T) {
+	h := startClientHarness(t, Config{AllowedClients: "not-a-cidr"})
+	w := &fakeResponseWriter{remote: &net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 53000}}
+	request := new(dns.Msg)
+	request.SetQuestion("example.org.", dns.TypeA)
+	h.srv.ServeDNS(w, request)
+	if w.last == nil || w.last.Rcode != dns.RcodeRefused {
+		t.Fatalf("invalid configured allow ACL returned %v, want REFUSED", w.last)
+	}
+}
+
 func TestRateLimiter(t *testing.T) {
 	rl := newRateLimiter(3)
 

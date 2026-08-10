@@ -42,6 +42,7 @@ function apiPath(path) {
 let allEvents = [];
 let rpmHistory = Array(20).fill(0);
 let lastEventTimestamp = 0;
+let lastEventID = '';
 let isTabVisible = true;
 let isFrozen = false;
 let isViewCleared = false;
@@ -50,15 +51,48 @@ let nodeStatusInterval = null;
 let knownServices = [];
 let configuredClients = [];
 let editingClient = null;
+let frozenEvents = [];
+let lastModalFocus = null;
+
+function setStreamStatus(connected) {
+    const status = document.getElementById('systemStatus');
+    status.classList.toggle('offline', !connected);
+    status.textContent = connected ? '● Live stream connected' : '● Live stream reconnecting';
+}
+
+function mergeEvent(newEvent, updateDOM = true) {
+    const index = allEvents.findIndex(e => e.id === newEvent.id);
+    const searchTerm = document.getElementById('searchInput').value.toLowerCase();
+    const isFiltered = searchTerm.length > 0;
+    if (index !== -1) {
+        allEvents[index] = newEvent;
+        if (updateDOM && !isFiltered && isTabVisible) updateRowInDom(newEvent);
+    } else {
+        allEvents.unshift(newEvent);
+        if (allEvents.length > 1000) allEvents.pop();
+        if (updateDOM && !isFiltered && isTabVisible) prependRowToDom(newEvent);
+    }
+    if (isFiltered && updateDOM && isTabVisible) {
+        if (window.renderTimeout) clearTimeout(window.renderTimeout);
+        window.renderTimeout = setTimeout(renderEvents, 100);
+    }
+}
 
 // Stream handler
 function startStream() {
     const eventSource = new EventSource(apiPath('/api/stream'));
+    eventSource.onopen = () => setStreamStatus(true);
     eventSource.onmessage = (event) => {
         try {
             const newEvent = JSON.parse(event.data);
 
-            if (isFrozen) return;
+            if (event.lastEventId) lastEventID = event.lastEventId;
+            if (isFrozen) {
+                const index = frozenEvents.findIndex(item => item.id === newEvent.id);
+                if (index === -1) frozenEvents.push(newEvent); else frozenEvents[index] = newEvent;
+                if (frozenEvents.length > 1000) frozenEvents.shift();
+                return;
+            }
 
             // Dismiss view-cleared banner when new events arrive
             if (isViewCleared) {
@@ -69,39 +103,24 @@ function startStream() {
                 if (clearBtn) clearBtn.classList.remove('active');
             }
 
-            const index = allEvents.findIndex(e => e.id === newEvent.id);
-            const searchTerm = document.getElementById('searchInput').value.toLowerCase();
-            const isFiltered = searchTerm.length > 0;
-
-            if (index !== -1) {
-                allEvents[index] = newEvent;
-                if (!isFiltered && isTabVisible) updateRowInDom(newEvent);
-            } else {
-                allEvents.unshift(newEvent);
-                if (allEvents.length > 1000) allEvents.pop();
-                if (!isFiltered && isTabVisible) prependRowToDom(newEvent);
-            }
-
-            if (isFiltered && isTabVisible) {
-                // Throttle filter re-render
-                if (window.renderTimeout) clearTimeout(window.renderTimeout);
-                window.renderTimeout = setTimeout(renderEvents, 100);
-            }
+            mergeEvent(newEvent);
         } catch (e) {
             console.error("Failed to parse SSE event:", e, event.data);
         }
     };
     eventSource.onerror = () => {
+        setStreamStatus(false);
         console.error("SSE connection lost. Reconnecting...");
     };
 }
 
 function createRowHtml(e) {
-    let latencyClass = 'latency-low';
-    if (e.latency_ms > 50) latencyClass = 'latency-mid';
-    if (e.latency_ms > 150) latencyClass = 'latency-high';
+    const hasLatency = e.latency_ms !== null && e.latency_ms !== undefined;
+    let latencyClass = hasLatency ? 'latency-low' : 'latency-neutral';
+    if (hasLatency && e.latency_ms > 50) latencyClass = 'latency-mid';
+    if (hasLatency && e.latency_ms > 150) latencyClass = 'latency-high';
 
-    const latencyText = e.latencyFormatted || (e.latency_ms !== null && e.latency_ms !== undefined ? e.latency_ms.toFixed(1) + 'ms' : '-');
+    const latencyText = e.latencyFormatted || (hasLatency ? e.latency_ms.toFixed(1) + 'ms' : '-');
     const timeStr = new Date(e.unix_time * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
     const relTime = getRelativeTime(e.unix_time);
     const action = e.user_rule_action || (e.blocked ? 'unblock' : 'block');
@@ -111,14 +130,14 @@ function createRowHtml(e) {
         <td class="timestamp"><div class="timestamp-primary">${escapeHtml(timeStr)}</div><div class="timestamp-relative">${escapeHtml(relTime)}</div></td>
         <td><span class="badge node-badge">${escapeHtml(e.node || 'local')}</span></td>
         <td><span class="badge badge-type">${escapeHtml(e.type)}</span></td>
-        <td class="domain cell-with-copy">${escapeHtml(e.domain)}<button class="test-domain-btn" title="Test in simulator" data-domain="${escapeHtml(e.domain)}"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></button></td>
+        <td class="domain cell-with-copy">${escapeHtml(e.domain)}<button type="button" class="test-domain-btn" title="Test in simulator" aria-label="Test ${escapeHtml(e.domain)} in simulator" data-domain="${escapeHtml(e.domain)}"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></button></td>
         <td class="client-cell" data-client-ip="${escapeHtml(e.client_ip)}" title="Click for details">
             <span class="badge badge-ip">${escapeHtml(e.client_ip)}</span>
             ${e.alias ? `<span class="alias-tag">${escapeHtml(e.alias)}</span>` : ''}
         </td>
         <td>${e.upstream ? `<span class="upstream-badge">${escapeHtml(e.upstream)}</span>` : '-'}</td>
         <td class="latency-cell ${latencyClass}">${escapeHtml(latencyText)}</td>
-        <td><button type="button" class="query-action-btn ${action === 'unblock' ? 'is-unblock' : ''}" data-domain="${escapeHtml(e.domain)}" data-action="${action}">${actionLabel}</button></td>
+        <td><button type="button" class="query-action-btn ${action === 'unblock' ? 'is-unblock' : ''}" aria-label="${actionLabel} ${escapeHtml(e.domain)}" data-domain="${escapeHtml(e.domain)}" data-action="${action}">${actionLabel}</button></td>
     `;
 }
 
@@ -148,12 +167,19 @@ async function fetchAll() {
 
 async function fetchEvents() {
     try {
-        const response = await fetch(apiPath('/api/events'));
-        if (!response.ok) throw new Error('API down');
+        const cursorQuery = lastEventID ? `?cursor=${encodeURIComponent(lastEventID)}&limit=1000` : '?limit=1000';
+        const response = await fetch(apiPath('/api/events' + cursorQuery));
+        if (!response.ok) throw new Error(`Events API failed (${response.status})`);
         const newEvents = await response.json();
+        const nextCursor = response.headers.get('X-Next-Cursor');
+        if (nextCursor) lastEventID = nextCursor;
 
         if (newEvents.length > 0) {
-            allEvents = newEvents.slice(0, 1000);
+            if (allEvents.length === 0) {
+                allEvents = newEvents.slice(0, 1000);
+            } else {
+                newEvents.forEach(event => mergeEvent(event, false));
+            }
             renderEvents();
         }
 
@@ -169,6 +195,7 @@ async function fetchEvents() {
 async function fetchStats() {
     try {
         const response = await fetch(apiPath('/api/stats'));
+        if (!response.ok) throw new Error(`Stats API failed (${response.status})`);
         const stats = await response.json();
         renderTopList('topDomains', stats.top_domains);
         renderTopList('topClients', stats.top_clients);
@@ -273,7 +300,8 @@ async function fetchNodeStatus() {
     try {
         const response = await fetch(apiPath('/api/nodes'));
         if (!response.ok) return;
-        const nodes = await response.json();
+        const data = await response.json();
+        const nodes = data.nodes || [];
         const container = document.getElementById('nodeCards');
         if (!container) return;
         if (!nodes || nodes.length === 0) {
@@ -281,27 +309,29 @@ async function fetchNodeStatus() {
             return;
         }
         container.innerHTML = nodes.map(node => {
-            const statusClass = node.Online ? 'online' : 'offline';
-            const statusText = node.Online ? 'Online' : 'Offline';
-            const lastSeen = node.LastSeen ? new Date(node.LastSeen).toLocaleTimeString() : 'Never';
-            const memInfo = node.MemoryMB ? node.MemoryMB.toFixed(1) + ' MB' : '-';
-            const dbInfo = node.DBSizeMB ? node.DBSizeMB.toFixed(1) + ' MB' : '-';
+            const statusClass = node.online ? 'online' : 'offline';
+            const statusText = node.online ? 'Online' : 'Offline';
+            const lastSeen = node.last_seen ? getRelativeTime(new Date(node.last_seen).getTime() / 1000) : 'Never';
+            const memInfo = node.memory_mb != null ? node.memory_mb.toFixed(1) + ' MB' : '-';
+            const dbInfo = node.db_size_mb != null ? node.db_size_mb.toFixed(1) + ' MB' : '-';
             return '<div class="node-card">' +
                 '<div class="node-card-header">' +
-                '<span class="node-name">' + escapeHtml(node.Name) + '</span>' +
+                '<span class="node-name">' + escapeHtml(node.name) + '</span>' +
                 '<span class="node-online-indicator ' + statusClass + '">' +
                 '<span class="node-online-dot ' + statusClass + '"></span>' +
                 statusText +
                 '</span>' +
                 '</div>' +
                 '<div class="node-details">' +
-                '<div class="node-detail-row"><span class="node-detail-label">Version</span><span class="node-detail-value">' + escapeHtml(node.Version || '-') + '</span></div>' +
+                '<div class="node-detail-row"><span class="node-detail-label">Version</span><span class="node-detail-value">' + escapeHtml(node.version || '-') + '</span></div>' +
+                '<div class="node-detail-row"><span class="node-detail-label">Go</span><span class="node-detail-value">' + escapeHtml(node.go_version || '-') + '</span></div>' +
+                '<div class="node-detail-row"><span class="node-detail-label">Build</span><span class="node-detail-value">' + escapeHtml(node.build_info || '-') + '</span></div>' +
                 '<div class="node-detail-row"><span class="node-detail-label">Last Seen</span><span class="node-detail-value">' + lastSeen + '</span></div>' +
                 '<div class="node-detail-row"><span class="node-detail-label">Memory</span><span class="node-detail-value">' + memInfo + '</span></div>' +
-                '<div class="node-detail-row"><span class="node-detail-label">Goroutines</span><span class="node-detail-value">' + (node.Goroutines || '-') + '</span></div>' +
+                '<div class="node-detail-row"><span class="node-detail-label">Goroutines</span><span class="node-detail-value">' + (node.goroutines ?? '-') + '</span></div>' +
                 '<div class="node-detail-row"><span class="node-detail-label">DB Size</span><span class="node-detail-value">' + dbInfo + '</span></div>' +
                 '</div>' +
-                (node.Version ? '<div class="node-version">v' + escapeHtml(node.Version) + '</div>' : '') +
+                (node.version ? '<div class="node-version">' + escapeHtml(node.version) + '</div>' : '') +
                 '</div>';
         }).join('');
     } catch (e) {
@@ -336,8 +366,11 @@ async function simulateQuery() {
     const resBox = document.getElementById('simulatorResult');
     resBox.classList.add('visible');
     resBox.textContent = 'Querying...';
+    const button = document.getElementById('simulateBtn');
+    button.disabled = true;
     try {
         const response = await fetch(apiPath(`/api/simulate?domain=${encodeURIComponent(domain)}`));
+        if (!response.ok) throw new Error(`Simulation failed (${response.status})`);
         const data = await response.json();
         if (data.status === 'success') {
             resBox.innerHTML = `<strong>Results:</strong> ${data.ips.map(escapeHtml).join(', ')}`;
@@ -345,6 +378,7 @@ async function simulateQuery() {
             resBox.innerHTML = `<span class="sim-error">Error: ${escapeHtml(data.error)}</span>`;
         }
     } catch (e) { resBox.textContent = 'Error: ' + e.message; }
+    finally { button.disabled = false; }
 }
 
 function renderEvents() {
@@ -414,10 +448,14 @@ function renderMiniChart() {
 async function showClientStats(ip) {
     const modal = document.getElementById('clientModal');
     document.getElementById('modalTitle').textContent = `Stats for ${ip}`;
+    lastModalFocus = document.activeElement;
     modal.classList.add('open');
+    modal.setAttribute('aria-hidden', 'false');
+    document.getElementById('modalCloseBtn').focus();
 
     try {
         const response = await fetch(apiPath(`/api/client_stats?ip=${encodeURIComponent(ip)}`));
+        if (!response.ok) throw new Error(`Client stats failed (${response.status})`);
         const data = await response.json();
 
         document.getElementById('modalRPM').textContent = data.rpm;
@@ -431,6 +469,26 @@ async function showClientStats(ip) {
         }).join('');
         applyDynamicStyles(charts);
     } catch (e) { console.error(e); }
+}
+
+function closeClientModal() {
+    const modal = document.getElementById('clientModal');
+    modal.classList.remove('open');
+    modal.setAttribute('aria-hidden', 'true');
+    if (lastModalFocus && typeof lastModalFocus.focus === 'function') lastModalFocus.focus();
+}
+
+async function withFormBusy(form, action) {
+    const controls = Array.from(form.querySelectorAll('button, input, select, textarea'));
+    controls.forEach(control => { control.disabled = true; });
+    form.setAttribute('aria-busy', 'true');
+    try {
+        return await action();
+    } finally {
+        controls.forEach(control => { control.disabled = false; });
+        form.removeAttribute('aria-busy');
+        if (form.id === 'clientForm') setClientPolicyState();
+    }
 }
 
 async function apiJSON(path, options = {}) {
@@ -528,18 +586,20 @@ async function loadRewrites() {
 
 async function addRewrite(event) {
     event.preventDefault();
-    const domain = document.getElementById('rewriteDomain').value.trim();
-    const type = document.getElementById('rewriteType').value;
-    const value = document.getElementById('rewriteValue').value.trim();
-    await apiJSON('/api/rewrites', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ domain, type, value })
+    await withFormBusy(event.target, async () => {
+        const domain = document.getElementById('rewriteDomain').value.trim();
+        const type = document.getElementById('rewriteType').value;
+        const value = document.getElementById('rewriteValue').value.trim();
+        await apiJSON('/api/rewrites', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ domain, type, value })
+        });
+        event.target.reset();
+        rewriteValueState();
+        showSettingsNotice(`Rewrite added for ${domain}`);
+        await loadRewrites();
     });
-    event.target.reset();
-    rewriteValueState();
-    showSettingsNotice(`Rewrite added for ${domain}`);
-    await loadRewrites();
 }
 
 async function deleteRewrite(id) {
@@ -618,29 +678,31 @@ async function loadClients() {
 
 async function saveClient(event) {
     event.preventDefault();
-    const inherit = document.getElementById('clientUseGlobal').checked;
-    const selectedServices = Array.from(document.querySelectorAll('#clientServicePicker input:checked')).map(input => input.value);
-    const client = {
-        ...(editingClient || {}),
-        name: document.getElementById('clientName').value.trim(),
-        ids: splitSettingList(document.getElementById('clientIDs').value),
-        use_global_settings: inherit,
-        filtering_enabled: inherit || document.getElementById('clientFiltering').checked,
-        safe_search_enabled: !inherit && document.getElementById('clientSafeSearch').checked,
-        safe_search_engines: inherit ? [] : splitSettingList(document.getElementById('clientSafeEngines').value),
-        blocked_services: inherit ? [] : selectedServices,
-        upstreams: splitSettingList(document.getElementById('clientUpstreams').value),
-        exclude_from_log: document.getElementById('clientExcludeLog').checked,
-        exclude_from_stats: document.getElementById('clientExcludeStats').checked
-    };
-    await apiJSON('/api/clients', {
-        method: editingClient ? 'PUT' : 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(client)
+    await withFormBusy(event.target, async () => {
+        const inherit = document.getElementById('clientUseGlobal').checked;
+        const selectedServices = Array.from(document.querySelectorAll('#clientServicePicker input:checked')).map(input => input.value);
+        const client = {
+            ...(editingClient || {}),
+            name: document.getElementById('clientName').value.trim(),
+            ids: splitSettingList(document.getElementById('clientIDs').value),
+            use_global_settings: inherit,
+            filtering_enabled: inherit || document.getElementById('clientFiltering').checked,
+            safe_search_enabled: !inherit && document.getElementById('clientSafeSearch').checked,
+            safe_search_engines: inherit ? [] : splitSettingList(document.getElementById('clientSafeEngines').value),
+            blocked_services: inherit ? [] : selectedServices,
+            upstreams: splitSettingList(document.getElementById('clientUpstreams').value),
+            exclude_from_log: document.getElementById('clientExcludeLog').checked,
+            exclude_from_stats: document.getElementById('clientExcludeStats').checked
+        };
+        await apiJSON('/api/clients', {
+            method: editingClient ? 'PUT' : 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(client)
+        });
+        showSettingsNotice(editingClient ? `Client ${client.name} updated` : `Client ${client.name} added`);
+        resetClientForm();
+        await loadClients();
     });
-    showSettingsNotice(editingClient ? `Client ${client.name} updated` : `Client ${client.name} added`);
-    resetClientForm();
-    await loadClients();
 }
 
 async function deleteClient(name) {
@@ -705,10 +767,18 @@ document.getElementById('freezeBtn').addEventListener('click', function () {
     isFrozen = !isFrozen;
     this.classList.toggle('freeze-active', isFrozen);
     this.textContent = isFrozen ? '▶️' : '⏸️';
+    this.setAttribute('aria-pressed', String(isFrozen));
+    this.setAttribute('aria-label', isFrozen ? 'Resume live query log' : 'Freeze live query log');
+    if (!isFrozen && frozenEvents.length > 0) {
+        frozenEvents.forEach(event => mergeEvent(event, false));
+        frozenEvents = [];
+        renderEvents();
+    }
 });
 
 document.getElementById('compactToggle').addEventListener('click', function () {
-    document.body.classList.toggle('compact');
+    const active = document.body.classList.toggle('compact');
+    this.setAttribute('aria-pressed', String(active));
 });
 
 document.getElementById('clearViewBtn').addEventListener('click', function () {
@@ -717,10 +787,14 @@ document.getElementById('clearViewBtn').addEventListener('click', function () {
 
 document.getElementById('simulateBtn').addEventListener('click', simulateQuery);
 document.getElementById('modalCloseBtn').addEventListener('click', function () {
-    document.getElementById('clientModal').classList.remove('open');
+    closeClientModal();
 });
 document.getElementById('clientModal').addEventListener('click', function (event) {
-    if (event.target === this) this.classList.remove('open');
+    if (event.target === this) closeClientModal();
+});
+document.addEventListener('keydown', event => {
+    const modal = document.getElementById('clientModal');
+    if (event.key === 'Escape' && modal.classList.contains('open')) closeClientModal();
 });
 
 document.getElementById('searchInput').addEventListener('input', renderEvents);
@@ -816,3 +890,6 @@ resetClientForm();
 loadSettings().catch(error => showSettingsNotice(error.message, true));
 updateVisibility(); // Initial set
 startStream();
+setInterval(() => {
+    if (isTabVisible && !isFrozen) renderEvents();
+}, 30000);

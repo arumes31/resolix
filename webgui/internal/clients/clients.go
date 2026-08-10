@@ -4,6 +4,7 @@
 package clients
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"sort"
@@ -39,13 +40,9 @@ func (s *Schedule) Active(now time.Time) bool {
 		}
 	}
 	now = now.In(loc)
-	day := strings.ToLower(now.Weekday().String()[:3])
-	ranges, ok := s.Days[day]
-	if !ok {
-		return false
-	}
 	mins := now.Hour()*60 + now.Minute()
-	for _, r := range ranges {
+	day := strings.ToLower(now.Weekday().String()[:3])
+	for _, r := range s.Days[day] {
 		start, err1 := parseHHMM(r.Start)
 		end, err2 := parseHHMM(r.End)
 		if err1 != nil || err2 != nil {
@@ -54,7 +51,7 @@ func (s *Schedule) Active(now time.Time) bool {
 		if end == start {
 			continue
 		}
-		if end < start { // overnight window
+		if end < start {
 			if mins >= start || mins < end {
 				return true
 			}
@@ -62,18 +59,23 @@ func (s *Schedule) Active(now time.Time) bool {
 			return true
 		}
 	}
+	previous := strings.ToLower(now.AddDate(0, 0, -1).Weekday().String()[:3])
+	for _, r := range s.Days[previous] {
+		start, err1 := parseHHMM(r.Start)
+		end, err2 := parseHHMM(r.End)
+		if err1 == nil && err2 == nil && end < start && mins < end {
+			return true
+		}
+	}
 	return false
 }
 
 func parseHHMM(s string) (int, error) {
-	var h, m int
-	if _, err := fmt.Sscanf(s, "%d:%d", &h, &m); err != nil {
+	parsed, err := time.Parse("15:04", s)
+	if err != nil {
 		return 0, err
 	}
-	if h < 0 || h > 23 || m < 0 || m > 59 {
-		return 0, fmt.Errorf("invalid time %q", s)
-	}
-	return h*60 + m, nil
+	return parsed.Hour()*60 + parsed.Minute(), nil
 }
 
 // Client is a per-client policy profile.
@@ -106,6 +108,14 @@ type Client struct {
 	nets []cidrEntry // parsed IDs, longest-prefix first
 }
 
+// UnmarshalJSON preserves the documented true default when older client
+// files omit use_global_settings.
+func (c *Client) UnmarshalJSON(data []byte) error {
+	type plain Client
+	*c = Client{UseGlobalSettings: true}
+	return json.Unmarshal(data, (*plain)(c))
+}
+
 // cidrEntry is one parsed client ID.
 type cidrEntry struct {
 	net  *net.IPNet
@@ -114,11 +124,17 @@ type cidrEntry struct {
 
 // compile parses IDs into CIDR entries sorted longest-prefix first.
 func (c *Client) compile() error {
+	if strings.TrimSpace(c.Name) == "" {
+		return fmt.Errorf("client name is required")
+	}
+	if len(c.IDs) == 0 {
+		return fmt.Errorf("client %q requires at least one ID", c.Name)
+	}
 	c.nets = nil
 	for _, raw := range c.IDs {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
-			continue
+			return fmt.Errorf("client %q contains an empty ID", c.Name)
 		}
 		if !strings.Contains(raw, "/") {
 			ip := net.ParseIP(raw)
@@ -139,6 +155,37 @@ func (c *Client) compile() error {
 		c.nets = append(c.nets, cidrEntry{net: n, bits: bits})
 	}
 	sort.Slice(c.nets, func(i, j int) bool { return c.nets[i].bits > c.nets[j].bits })
+	if err := validateSchedule(c.Schedule); err != nil {
+		return fmt.Errorf("client %q schedule: %w", c.Name, err)
+	}
+	return nil
+}
+
+func validateSchedule(schedule *Schedule) error {
+	if schedule == nil {
+		return nil
+	}
+	if schedule.Timezone != "" {
+		if _, err := time.LoadLocation(schedule.Timezone); err != nil {
+			return fmt.Errorf("invalid timezone")
+		}
+	}
+	validDays := map[string]bool{"mon": true, "tue": true, "wed": true, "thu": true, "fri": true, "sat": true, "sun": true}
+	for day, ranges := range schedule.Days {
+		if !validDays[strings.ToLower(day)] {
+			return fmt.Errorf("invalid weekday %q", day)
+		}
+		for _, timeRange := range ranges {
+			start, err := parseHHMM(timeRange.Start)
+			if err != nil {
+				return fmt.Errorf("invalid start time")
+			}
+			end, err := parseHHMM(timeRange.End)
+			if err != nil || start == end {
+				return fmt.Errorf("invalid end time")
+			}
+		}
+	}
 	return nil
 }
 
@@ -170,7 +217,11 @@ func (r *Registry) Find(ipStr string) *Client {
 			}
 		}
 	}
-	return best
+	if best == nil {
+		return nil
+	}
+	copy := cloneClient(*best)
+	return &copy
 }
 
 // List returns all clients (sorted by name).
@@ -179,7 +230,7 @@ func (r *Registry) List() []Client {
 	defer r.mu.RUnlock()
 	out := make([]Client, len(r.clients))
 	for i, c := range r.clients {
-		out[i] = *c
+		out[i] = cloneClient(*c)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
@@ -202,10 +253,20 @@ func (r *Registry) Add(c Client) error {
 	if err := c.compile(); err != nil {
 		return err
 	}
+	r.mu.RLock()
+	proposed := cloneClientPointers(r.clients)
+	r.mu.RUnlock()
+	if err := validateConflicts(proposed, &c); err != nil {
+		return err
+	}
+	proposed = append(proposed, &c)
+	if err := r.saveClients(proposed); err != nil {
+		return err
+	}
 	r.mu.Lock()
-	r.clients = append(r.clients, &c)
+	r.clients = proposed
 	r.mu.Unlock()
-	return r.save()
+	return nil
 }
 
 // Update replaces the client with the same name, persisting the registry.
@@ -216,15 +277,25 @@ func (r *Registry) Update(c Client) error {
 	if err := c.compile(); err != nil {
 		return err
 	}
-	r.mu.Lock()
-	for i, existing := range r.clients {
+	r.mu.RLock()
+	proposed := cloneClientPointers(r.clients)
+	r.mu.RUnlock()
+	for i, existing := range proposed {
 		if existing.Name == c.Name {
-			r.clients[i] = &c
+			withoutCurrent := append(cloneClientPointers(proposed[:i]), cloneClientPointers(proposed[i+1:])...)
+			if err := validateConflicts(withoutCurrent, &c); err != nil {
+				return err
+			}
+			proposed[i] = &c
+			if err := r.saveClients(proposed); err != nil {
+				return err
+			}
+			r.mu.Lock()
+			r.clients = proposed
 			r.mu.Unlock()
-			return r.save()
+			return nil
 		}
 	}
-	r.mu.Unlock()
 	return fmt.Errorf("client %q not found", c.Name)
 }
 
@@ -233,14 +304,60 @@ func (r *Registry) Delete(name string) bool {
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()
 
-	r.mu.Lock()
-	for i, existing := range r.clients {
+	r.mu.RLock()
+	proposed := cloneClientPointers(r.clients)
+	r.mu.RUnlock()
+	for i, existing := range proposed {
 		if existing.Name == name {
-			r.clients = append(r.clients[:i], r.clients[i+1:]...)
+			proposed = append(proposed[:i], proposed[i+1:]...)
+			if r.saveClients(proposed) != nil {
+				return false
+			}
+			r.mu.Lock()
+			r.clients = proposed
 			r.mu.Unlock()
-			return r.save() == nil
+			return true
 		}
 	}
-	r.mu.Unlock()
 	return false
+}
+
+func cloneClient(client Client) Client {
+	client.IDs = append([]string(nil), client.IDs...)
+	client.Tags = append([]string(nil), client.Tags...)
+	client.SafeSearchEngines = append([]string(nil), client.SafeSearchEngines...)
+	client.BlockedServices = append([]string(nil), client.BlockedServices...)
+	client.Upstreams = append([]string(nil), client.Upstreams...)
+	client.nets = append([]cidrEntry(nil), client.nets...)
+	if client.Schedule != nil {
+		schedule := *client.Schedule
+		schedule.Days = make(map[string][]TimeRange, len(client.Schedule.Days))
+		for day, ranges := range client.Schedule.Days {
+			schedule.Days[day] = append([]TimeRange(nil), ranges...)
+		}
+		client.Schedule = &schedule
+	}
+	return client
+}
+
+func cloneClientPointers(clients []*Client) []*Client {
+	out := make([]*Client, len(clients))
+	for i, client := range clients {
+		copy := cloneClient(*client)
+		out[i] = &copy
+	}
+	return out
+}
+
+func validateConflicts(existing []*Client, candidate *Client) error {
+	for _, client := range existing {
+		for _, current := range client.nets {
+			for _, next := range candidate.nets {
+				if current.bits == next.bits && current.net.String() == next.net.String() {
+					return fmt.Errorf("client ID conflicts with client %q", client.Name)
+				}
+			}
+		}
+	}
+	return nil
 }

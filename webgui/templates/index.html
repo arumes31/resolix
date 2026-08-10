@@ -19,20 +19,24 @@
                 <p id="systemStatus" class="system-status">● System Online</p>
             </div>
             <div class="header-controls">
-                <button id="freezeBtn" class="btn-icon" title="Freeze/Pause Log">⏸️</button>
-                <button id="compactToggle" class="btn-icon" title="Toggle Compact Mode">↕️</button>
-                <button id="clearViewBtn" class="btn-icon" title="Clear View">🗑️</button>
+				<form method="post" action="{{.BaseURL}}/logout" class="logout-form">
+					<input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+					<button type="submit" class="btn-icon" title="Sign out" aria-label="Sign out">↪</button>
+				</form>
+                <button id="freezeBtn" type="button" class="btn-icon" title="Freeze/Pause Log" aria-label="Freeze live query log" aria-pressed="false">⏸️</button>
+                <button id="compactToggle" type="button" class="btn-icon" title="Toggle Compact Mode" aria-label="Toggle compact mode" aria-pressed="false">↕️</button>
+                <button id="clearViewBtn" type="button" class="btn-icon" title="Clear View" aria-label="Clear query view">🗑️</button>
                 <div class="search-container">
                     <svg class="search-icon" width="20" height="20" viewBox="0 0 24 24" fill="none"
                         stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <circle cx="11" cy="11" r="8"></circle>
                         <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
                     </svg>
-                    <input type="text" id="searchInput" class="search-input" placeholder="Quick Filter...">
+                    <input type="text" id="searchInput" class="search-input" placeholder="Quick Filter..." aria-label="Filter DNS queries">
                 </div>
             </div>
             <div class="simulator-box card simulator-compact">
-                <input type="text" id="simDomain" class="simulator-input" placeholder="Test domain...">
+                <input type="text" id="simDomain" class="simulator-input" placeholder="Test domain..." aria-label="Domain to test">
                 <button id="simulateBtn" class="btn btn-primary">Test</button>
             </div>
         </header>
@@ -248,8 +252,8 @@
         {{end}}
     </div>
 
-    <div id="clientModal" class="modal">
-        <div class="modal-content">
+    <div id="clientModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-hidden="true">
+        <div class="modal-content" tabindex="-1">
             <h2 id="modalTitle" class="modal-title">Client Stats</h2>
             <div id="modalCharts" class="modal-charts"></div>
             <div class="modal-stats-grid">

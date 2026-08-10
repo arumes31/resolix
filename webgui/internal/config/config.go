@@ -20,6 +20,8 @@ import (
 const (
 	// DefaultPort is the default listening port for the web GUI.
 	DefaultPort = "35353"
+	// DefaultWebListenAddr is the default web/API bind address.
+	DefaultWebListenAddr = "0.0.0.0"
 	// DefaultHistoryDir is the default directory for JSONL history files.
 	DefaultHistoryDir = "/var/lib/tailscale-dnsrewrite"
 	// DefaultDBPath is the default database file name.
@@ -125,6 +127,7 @@ type Config struct {
 	MasterURL        string
 	NodeName         string
 	Port             string
+	WebListenAddr    string
 	HistoryDir       string
 	DBPath           string
 	MaxEvents        int
@@ -668,12 +671,18 @@ func resolveBlocking() (mode, ip4, ip6 string) {
 }
 
 // LoadConfig reads configuration from environment variables.
+//
+//nolint:gocyclo // Environment mapping is intentionally centralized so defaults remain auditable in one place.
 func LoadConfig() *Config {
 	mode := resolveMode()
 
 	nodeName := resolveNodeName()
 
 	port := resolvePort()
+	webListenAddr := strings.TrimSpace(os.Getenv("WEB_LISTEN_ADDR"))
+	if webListenAddr == "" {
+		webListenAddr = DefaultWebListenAddr
+	}
 
 	historyDir := os.Getenv("HISTORY_DIR")
 	if historyDir == "" {
@@ -817,12 +826,13 @@ func LoadConfig() *Config {
 		MasterURL:                  masterURL,
 		NodeName:                   nodeName,
 		Port:                       port,
+		WebListenAddr:              webListenAddr,
 		HistoryDir:                 historyDir,
 		DBPath:                     dbPath,
 		MaxEvents:                  DefaultMaxEvents,
 		HealthDomain:               healthDomain,
 		CleanupInterval:            DefaultCleanupInterval,
-		ArchiveInterval:            DefaultArchiveInterval,
+		ArchiveInterval:            batchArchive,
 		HistoryRetention:           DefaultHistoryRetention,
 		IngestSecret:               os.Getenv("INGEST_SECRET"),
 		WebUsername:                os.Getenv("WEB_USERNAME"),
@@ -976,6 +986,8 @@ func (c *Config) FullBlocklistPath() string {
 
 // VerifyConfig checks critical configuration values before the server starts.
 // Returns a slice of error messages for critical failures and a slice of warning messages.
+//
+//nolint:gocyclo // Each independent validation is retained so all startup errors can be reported together.
 func (c *Config) VerifyConfig() ([]string, []string) {
 	var errs []string
 	var warnings []string
@@ -1001,14 +1013,21 @@ func (c *Config) VerifyConfig() ([]string, []string) {
 		errs = append(errs, fmt.Sprintf("MASTER_URL must start with http:// or https:// (got: %s)", c.MasterURL))
 	}
 
-	// 3. WEB_PASSWORD check (non-critical warning)
-	if c.WebPassword == "" {
-		warnings = append(warnings, "WEB_PASSWORD is not set — the dashboard will be publicly accessible")
+	// 3. Authentication must be either fully configured or explicitly backed
+	// by an ingest secret. Internal endpoints must never silently fail open.
+	if (c.WebUsername == "") != (c.WebPassword == "") {
+		errs = append(errs, "WEB_USERNAME and WEB_PASSWORD must be configured together")
+	}
+	if c.WebUsername == "" && c.WebPassword == "" && c.IngestSecret == "" {
+		errs = append(errs, "configure WEB_USERNAME/WEB_PASSWORD or INGEST_SECRET; internal endpoints may not run without authentication")
 	}
 
 	// 4. Port number validation
 	if p, err := strconv.Atoi(c.Port); err != nil || p < 1 || p > 65535 {
 		errs = append(errs, fmt.Sprintf("Invalid PORT '%s' — must be a number between 1 and 65535", c.Port))
+	}
+	if strings.ContainsAny(c.WebListenAddr, "\r\n\x00") {
+		errs = append(errs, "WEB_LISTEN_ADDR contains invalid characters")
 	}
 
 	// 4b. DNSMASQ_PID_FILE deprecation notice (non-critical warning)
@@ -1025,6 +1044,51 @@ func (c *Config) VerifyConfig() ([]string, []string) {
 	}
 	if c.DoHEnabled && !validDoHPath(c.DoHPath) {
 		errs = append(errs, "DOH_PATH must be a non-conflicting literal HTTP path")
+	}
+
+	for _, setting := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "DNS_ALLOWED_CLIENTS", raw: c.DNSAllowedClients},
+		{name: "DNS_DISALLOWED_CLIENTS", raw: c.DNSDisallowedClients},
+	} {
+		for _, value := range splitConfigList(setting.raw) {
+			if !validIPOrCIDR(value) {
+				errs = append(errs, fmt.Sprintf("%s contains an invalid IP or CIDR", setting.name))
+				break
+			}
+		}
+	}
+
+	if c.DNS64 {
+		for _, value := range splitConfigList(c.DNS64Prefixes) {
+			ip, network, err := net.ParseCIDR(value)
+			ones, bits := 0, 0
+			if err == nil {
+				ones, bits = network.Mask.Size()
+			}
+			if err != nil || ip.To4() != nil || bits != 128 || ones != 96 {
+				errs = append(errs, "DNS64_PREFIXES must contain only IPv6 /96 prefixes")
+				break
+			}
+		}
+	}
+
+	for _, setting := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "BLOCKLIST_URLS", raw: c.BlocklistURLs},
+		{name: "ALLOWLIST_URLS", raw: c.AllowlistURLs},
+	} {
+		for _, value := range splitConfigList(setting.raw) {
+			u, err := url.Parse(value)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+				errs = append(errs, fmt.Sprintf("%s contains an invalid URL (only http/https without embedded credentials is allowed)", setting.name))
+				break
+			}
+		}
 	}
 
 	// 5. Client aliases file check (non-critical warning)
@@ -1049,4 +1113,18 @@ func (c *Config) VerifyConfig() ([]string, []string) {
 	}
 
 	return errs, warnings
+}
+
+func splitConfigList(raw string) []string {
+	return strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	})
+}
+
+func validIPOrCIDR(value string) bool {
+	if net.ParseIP(value) != nil {
+		return true
+	}
+	_, _, err := net.ParseCIDR(value)
+	return err == nil
 }

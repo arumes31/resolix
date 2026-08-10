@@ -1,0 +1,54 @@
+name: Automatic Patch Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "webgui/**"
+      - "Dockerfile"
+      - "entrypoint.sh"
+      - "docker-compose*.yaml"
+      - ".github/workflows/**"
+
+concurrency:
+  group: automatic-patch-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Compute next patch version
+        id: version
+        shell: bash
+        run: |
+          latest="$(git tag --list | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)"
+          if [[ -z "${latest}" ]]; then
+            latest="v0.0.0"
+          fi
+          IFS=. read -r major minor patch <<< "${latest#v}"
+          next="v${major}.${minor}.$((patch + 1))"
+          echo "version=${next}" >> "${GITHUB_OUTPUT}"
+
+      - name: Tag code-changing push
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${VERSION}" -m "Automated release ${VERSION}"
+          git push origin "${VERSION}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: gh release create "${VERSION}" --generate-notes --verify-tag

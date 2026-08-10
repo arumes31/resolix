@@ -107,3 +107,50 @@ func TestVerifyStep6Config(t *testing.T) {
 		t.Fatal("conflicting DoH path passed verification")
 	}
 }
+
+func TestVerifyConfigRejectsAuthenticationAndNetworkMisconfiguration(t *testing.T) {
+	base := func() *Config {
+		return &Config{
+			Port: DefaultPort, WebListenAddr: DefaultWebListenAddr,
+			HistoryDir: t.TempDir(), DBPath: DefaultDBPath,
+			IngestSecret: "test-secret",
+		}
+	}
+
+	cfg := base()
+	cfg.WebUsername = "admin"
+	errList, _ := cfg.VerifyConfig()
+	if len(errList) == 0 {
+		t.Fatal("partial web authentication passed verification")
+	}
+
+	cfg = base()
+	cfg.DNSAllowedClients = "not-a-cidr"
+	errList, _ = cfg.VerifyConfig()
+	if len(errList) == 0 {
+		t.Fatal("invalid DNS allow ACL passed verification")
+	}
+
+	cfg = base()
+	cfg.DNS64 = true
+	cfg.DNS64Prefixes = "2001:db8::/64"
+	errList, _ = cfg.VerifyConfig()
+	if len(errList) == 0 {
+		t.Fatal("non-/96 DNS64 prefix passed verification")
+	}
+
+	cfg = base()
+	cfg.BlocklistURLs = "https://user:password@example.test/list.txt"
+	errList, _ = cfg.VerifyConfig()
+	if len(errList) == 0 {
+		t.Fatal("filter URL with embedded credentials passed verification")
+	}
+}
+
+func TestBatchArchiveIntervalFeedsLegacyAndCurrentFields(t *testing.T) {
+	t.Setenv("BATCH_ARCHIVE_INTERVAL", "17s")
+	cfg := LoadConfig()
+	if cfg.BatchArchiveInterval != 17*time.Second || cfg.ArchiveInterval != 17*time.Second {
+		t.Fatalf("archive intervals = %s/%s", cfg.BatchArchiveInterval, cfg.ArchiveInterval)
+	}
+}

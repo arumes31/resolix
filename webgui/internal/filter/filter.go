@@ -1,6 +1,7 @@
 package filter
 
 import (
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,11 +36,16 @@ type Source struct {
 	RuleCount      int       `json:"rule_count"`
 	AllowRuleCount int       `json:"allow_rule_count"`
 	LastUpdate     time.Time `json:"last_update"`
+	LastChecked    time.Time `json:"last_checked"`
+	LastChanged    time.Time `json:"last_changed"`
 	LastError      string    `json:"last_error,omitempty"`
+	IgnoredCount   int       `json:"ignored_count"`
+	Truncated      bool      `json:"truncated"`
 
 	// Conditional-GET state (not serialized).
 	etag         string
 	lastModified string
+	validURL     bool
 }
 
 // Engine is the filter rule engine. It is safe for concurrent use.
@@ -56,6 +62,7 @@ type Engine struct {
 	pausedUntil  atomic.Int64 // unix seconds; 0 = protection enabled
 	blockedTotal atomic.Int64
 	allowedTotal atomic.Int64
+	httpClient   *http.Client
 }
 
 type indexedRule struct {
@@ -71,6 +78,7 @@ func New() *Engine {
 		allowRules:       make(map[*Source][]Rule),
 		blockDomainIndex: make(map[string][]indexedRule),
 		allowDomainIndex: make(map[string][]indexedRule),
+		httpClient:       &http.Client{Timeout: fetchTimeout},
 	}
 }
 
@@ -163,15 +171,23 @@ func (e *Engine) Sources() []Source {
 // setRules atomically swaps the parsed rules of a source and refreshes its
 // status (keep-last-good: callers only invoke this on successful loads).
 func (e *Engine) setRules(src *Source, block, allow []Rule, loadErr string) {
+	e.setRulesStatus(src, block, allow, loadErr, 0, false)
+}
+
+func (e *Engine) setRulesStatus(src *Source, block, allow []Rule, loadErr string, ignored int, truncated bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	src.LastChecked = time.Now()
 	if loadErr == "" {
 		e.blockRules[src] = block
 		e.allowRules[src] = allow
 		e.rebuildIndexesLocked()
 		src.RuleCount = len(block)
 		src.AllowRuleCount = len(allow)
-		src.LastUpdate = time.Now()
+		src.LastUpdate = src.LastChecked
+		src.LastChanged = src.LastChecked
+		src.IgnoredCount = ignored
+		src.Truncated = truncated
 	}
 	src.LastError = loadErr
 }
@@ -206,6 +222,7 @@ func (e *Engine) rebuildIndexesLocked() {
 
 func (e *Engine) setSourceError(src *Source, loadErr string) {
 	e.mu.Lock()
+	src.LastChecked = time.Now()
 	src.LastError = loadErr
 	e.mu.Unlock()
 }

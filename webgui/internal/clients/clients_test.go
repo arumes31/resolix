@@ -1,6 +1,7 @@
 package clients
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -58,6 +59,44 @@ func TestRegistryCRUDAndPersistence(t *testing.T) {
 	}
 	if r2.Find("192.168.1.50") != nil {
 		t.Error("deleted client still found")
+	}
+}
+
+func TestRegistryPersistenceFailureDoesNotMutateMemory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing", "clients.json")
+	registry, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Add(Client{Name: "client", IDs: []string{"192.0.2.1"}}); err == nil {
+		t.Fatal("add unexpectedly succeeded with missing persistence directory")
+	}
+	if clients := registry.List(); len(clients) != 0 {
+		t.Fatalf("memory mutated after failed save: %+v", clients)
+	}
+}
+
+func TestRegistryReturnsDeepCopiesAndRejectsConflicts(t *testing.T) {
+	registry, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := Client{Name: "one", IDs: []string{"192.0.2.0/24"}, Tags: []string{"original"}}
+	if err := registry.Add(original); err != nil {
+		t.Fatal(err)
+	}
+	listed := registry.List()
+	listed[0].IDs[0] = "198.51.100.0/24"
+	found := registry.Find("192.0.2.1")
+	if found == nil || found.IDs[0] != "192.0.2.0/24" {
+		t.Fatalf("registry leaked mutable state: %+v", found)
+	}
+	found.Tags[0] = "mutated"
+	if registry.Find("192.0.2.1").Tags[0] != "original" {
+		t.Fatal("Find returned internal slice storage")
+	}
+	if err := registry.Add(Client{Name: "two", IDs: []string{"192.0.2.0/24"}}); err == nil {
+		t.Fatal("equal-prefix conflict was accepted")
 	}
 }
 
@@ -148,6 +187,34 @@ func TestScheduleActive(t *testing.T) {
 	}}
 	if equal.Active(mon("09:00")) || equal.Active(mon("12:00")) {
 		t.Error("equal schedule endpoints must be inactive")
+	}
+}
+
+func TestSchedulePreviousDayOvernightAndValidation(t *testing.T) {
+	location, err := time.LoadLocation("Europe/Vienna")
+	if err != nil {
+		t.Fatal(err)
+	}
+	schedule := &Schedule{Timezone: "Europe/Vienna", Days: map[string][]TimeRange{
+		"mon": {{Start: "22:00", End: "02:00"}},
+	}}
+	tuesday := time.Date(2024, time.January, 2, 1, 0, 0, 0, location)
+	if !schedule.Active(tuesday) {
+		t.Fatal("Monday overnight schedule should remain active early Tuesday")
+	}
+	bad := Client{Name: "bad", IDs: []string{"192.0.2.1"}, Schedule: &Schedule{Timezone: "Not/AZone"}}
+	if err := bad.compile(); err == nil {
+		t.Fatal("invalid timezone passed validation")
+	}
+}
+
+func TestClientJSONDefaultsGlobalSettings(t *testing.T) {
+	var client Client
+	if err := json.Unmarshal([]byte(`{"name":"legacy","ids":["192.0.2.1"]}`), &client); err != nil {
+		t.Fatal(err)
+	}
+	if !client.UseGlobalSettings {
+		t.Fatal("omitted use_global_settings should default true")
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -41,7 +42,10 @@ import (
 )
 
 // Version represents the current application version.
-var Version = "2.0.0" // Changed from const to var for -ldflags build-time setting (Item 88)
+var (
+	Version   = "dev"
+	BuildInfo = "local"
+)
 
 //go:embed templates static
 var embedFS embed.FS
@@ -150,6 +154,8 @@ func generateEnvFile() {
 func defaultEnvContent() string {
 	return `# Tailscale Authentication Key
 TS_AUTHKEY=tskey-auth-xxxxx
+# Prefer a mounted secret file in containers; TS_AUTHKEY takes precedence.
+# TS_AUTHKEY_FILE=/run/secrets/tailscale_authkey
 
 # Space-separated upstream DNS servers
 UPSTREAM_DNS=8.8.8.8 8.8.4.4
@@ -162,6 +168,8 @@ HEALTHCHECK_DOMAIN=google.com
 
 # Web GUI listening port
 PORT=35353
+# Web/API bind address
+WEB_LISTEN_ADDR=0.0.0.0
 
 # Run mode (master or slave)
 MODE=master
@@ -179,7 +187,8 @@ NODE_NAME=dns-server-1
 # Secret token to authenticate logs from slave nodes
 # INGEST_SECRET=your-secret-token
 
-# Web GUI authentication (leave empty to disable auth)
+# Web GUI authentication. Set both values together. INGEST_SECRET is required
+# when web authentication is disabled.
 # WEB_USERNAME=admin
 # WEB_PASSWORD=
 
@@ -189,6 +198,9 @@ LOG_LEVEL=INFO
 # Base URL for hosting behind a reverse proxy subpath (default: /)
 # Example: BASE_URL=/dashboard
 BASE_URL=/
+# Comma-separated proxy IPs/CIDRs allowed to supply Forwarded/X-Forwarded-*.
+# TRUSTED_PROXIES=127.0.0.1,10.0.0.0/8
+# COOKIE_SECURE=true
 
 # Database file name or absolute path (default: dns.db)
 # If relative, it is placed inside HISTORY_DIR
@@ -346,6 +358,7 @@ func main() {
 	tmpl := parseTemplates()
 	prs := parser.NewParser(store, cfg.Debug)
 	srv := api.NewServer(cfg, store, prs, tmpl)
+	srv.SetBuildInfo(Version, BuildInfo)
 
 	// Item 59: Initialize and start reverse DNS resolver
 	res := resolver.New()
@@ -370,6 +383,7 @@ func main() {
 	logger.Info("DNS loop detection started")
 
 	fwd := forwarder.NewForwarder(cfg)
+	srv.SetForwarder(fwd)
 
 	// Item 88: Set forwarder version to match main version (settable via -ldflags)
 	forwarder.Version = Version
@@ -417,7 +431,7 @@ func main() {
 
 	// History Archiver (uses configurable BatchArchiveInterval)
 	go func() {
-		ticker := time.NewTicker(cfg.ArchiveInterval)
+		ticker := time.NewTicker(cfg.BatchArchiveInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -481,7 +495,8 @@ func main() {
 	})
 
 	// Upstream pool (Step 4): modes, fallback, bootstrap, ECS, DNS64.
-	pool := setupUpstreamPool(ctx, cfg, store, srv, loadSpecs, upstreamSpecs)
+	pool := setupUpstreamPool(ctx, cfg, store, srv, checker, loadSpecs, upstreamSpecs)
+	dr.SetOnChange(pool.ClearRouteCache)
 
 	dnsSrv := dnsserver.New(dnsserver.Config{
 		Addr:            cfg.DNSListenAddr,
@@ -690,7 +705,7 @@ func loadRewritesStore(cfg *config.Config) *rewrites.Store {
 
 // setupUpstreamPool builds the upstream pool, wires health data and the API
 // reload callback, and starts the upstreams.json hot-reload poller.
-func setupUpstreamPool(ctx context.Context, cfg *config.Config, store *storage.Store, srv *api.Server, loadSpecs func() []string, current []string) *upstream.Pool {
+func setupUpstreamPool(ctx context.Context, cfg *config.Config, store *storage.Store, srv *api.Server, checker *health.Checker, loadSpecs func() []string, current []string) *upstream.Pool {
 	pool := upstream.NewPool(upstream.PoolConfig{
 		Mode:             cfg.UpstreamMode,
 		PrimarySpecs:     current,
@@ -703,8 +718,18 @@ func setupUpstreamPool(ctx context.Context, cfg *config.Config, store *storage.S
 	pool.SetHealthProvider(func() map[string]float64 {
 		return store.GetUpstreamHealth()[cfg.NodeName]
 	})
+	srv.SetUpstreamPool(pool)
+	var currentMu sync.Mutex
+	reload := func() {
+		specs := loadSpecs()
+		pool.SetPrimarySpecs(specs)
+		checker.UpdateUpstreams(specs)
+		currentMu.Lock()
+		current = append([]string(nil), specs...)
+		currentMu.Unlock()
+	}
 	srv.SetUpstreamReloadFunc(func() {
-		pool.SetPrimarySpecs(loadSpecs())
+		reload()
 	})
 
 	// Hot-reload upstreams.json: poll for changes (covers external edits).
@@ -716,10 +741,13 @@ func setupUpstreamPool(ctx context.Context, cfg *config.Config, store *storage.S
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if specs := loadSpecs(); !equalStringSlices(specs, current) {
+				specs := loadSpecs()
+				currentMu.Lock()
+				changed := !equalStringSlices(specs, current)
+				currentMu.Unlock()
+				if changed {
 					logger.Info("Upstream list changed, reloading pool (%d upstreams)", len(specs))
-					pool.SetPrimarySpecs(specs)
-					current = specs
+					reload()
 				}
 			}
 		}

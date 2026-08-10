@@ -83,6 +83,43 @@ func TestAddEvent_EmptyBuffer(t *testing.T) {
 	}
 }
 
+func TestArchiveStepRetainsBatchOnDatabaseFailure(t *testing.T) {
+	s, cleanup := newTestStore(t)
+	defer cleanup()
+	s.AddEvent(models.QueryEvent{UnixTime: time.Now().Unix(), Domain: "retry.test", Type: "A"})
+	if _, err := s.db.Exec("DROP TABLE queries"); err != nil {
+		t.Fatal(err)
+	}
+	if archived := s.ArchiveStep(time.Now()); archived != 0 {
+		t.Fatalf("archived = %d, want 0", archived)
+	}
+	s.batchMu.Lock()
+	pending := len(s.batch)
+	s.batchMu.Unlock()
+	if pending != 1 {
+		t.Fatalf("pending batch = %d, want 1", pending)
+	}
+}
+
+func TestArchiveStepPrunesWithoutPendingBatch(t *testing.T) {
+	s, cleanup := newTestStore(t)
+	defer cleanup()
+	old := time.Now().Add(-7 * 24 * time.Hour).Unix()
+	if _, err := s.db.Exec("INSERT INTO queries (unix_time, node, client_ip, domain, type, upstream, latency, dnssec, response_code, client_hostname, blocked, latency_alert, matched_rule, block_reason) VALUES (?, '', '', 'old.test', 'A', '', NULL, '', '', '', 0, 0, '', '')", old); err != nil {
+		t.Fatal(err)
+	}
+	if archived := s.ArchiveStep(time.Now()); archived != 0 {
+		t.Fatalf("archived = %d, want 0", archived)
+	}
+	var count int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM queries WHERE domain = 'old.test'").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("old rows remaining = %d", count)
+	}
+}
+
 func TestAddEvent_SingleEvent(t *testing.T) {
 	s, cleanup := newTestStore(t)
 	defer cleanup()

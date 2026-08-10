@@ -8,7 +8,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -36,7 +38,12 @@ func (e *Engine) AddFileSource(path string, allowOnly bool) *Source {
 // happens on the first UpdateAll/StartUpdateLoop pass.
 // allowOnly sources contribute exceptions only (ALLOWLIST_URLS).
 func (e *Engine) AddURLSource(rawurl string, allowOnly bool) *Source {
-	src := &Source{Name: rawurl, Kind: "url", AllowOnly: allowOnly}
+	src := &Source{Name: rawurl, Kind: "url", AllowOnly: allowOnly, validURL: true}
+	u, err := url.Parse(rawurl)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+		src.validURL = false
+		src.LastError = "invalid URL: only http/https without embedded credentials is allowed"
+	}
 	e.mu.Lock()
 	e.sources = append(e.sources, src)
 	e.mu.Unlock()
@@ -98,16 +105,28 @@ func (e *Engine) UpdateAll() {
 	}
 	e.mu.RUnlock()
 
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, 4)
 	for _, src := range urls {
-		e.fetchSource(src)
+		if !src.validURL {
+			continue
+		}
+		wg.Add(1)
+		go func(source *Source) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+			e.fetchSource(source)
+		}(src)
 	}
+	wg.Wait()
 }
 
 // fetchSource downloads a subscription with ETag/Last-Modified conditional
 // GET. On 304 the existing rules are kept; on 200 the rules are parsed and
 // atomically swapped; on any error the last good rules are kept.
 func (e *Engine) fetchSource(src *Source) {
-	client := &http.Client{Timeout: fetchTimeout}
+	logName := sourceLogName(src)
 	req, err := http.NewRequest(http.MethodGet, src.Name, nil)
 	if err != nil {
 		e.setRules(src, nil, nil, err.Error())
@@ -122,25 +141,26 @@ func (e *Engine) fetchSource(src *Source) {
 	}
 	e.mu.RUnlock()
 
-	resp, err := client.Do(req)
+	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		e.setRules(src, nil, nil, err.Error())
-		log.Printf("[WARN] filter: update failed for %s (keeping last good): %v", src.Name, err)
+		e.setRules(src, nil, nil, "request failed")
+		log.Printf("[WARN] filter: update request failed for %s (keeping last good)", logName)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusNotModified {
 		e.mu.Lock()
-		src.LastUpdate = time.Now()
+		src.LastChecked = time.Now()
+		src.LastError = ""
 		e.mu.Unlock()
-		log.Printf("[DEBUG] filter: %s not modified (304)", src.Name)
+		log.Printf("[DEBUG] filter: %s not modified (304)", logName)
 		return
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		err = fmt.Errorf("unexpected status %d", resp.StatusCode)
 		e.setRules(src, nil, nil, err.Error())
-		log.Printf("[WARN] filter: update failed for %s (keeping last good): %v", src.Name, err)
+		log.Printf("[WARN] filter: update failed for %s (keeping last good): %v", logName, err)
 		return
 	}
 
@@ -148,19 +168,19 @@ func (e *Engine) fetchSource(src *Source) {
 	body, readErr := io.ReadAll(counter)
 	if readErr != nil {
 		e.setSourceError(src, readErr.Error())
-		log.Printf("[WARN] filter: parse failed for %s (keeping last good): %v", src.Name, readErr)
+		log.Printf("[WARN] filter: parse failed for %s (keeping last good): %v", logName, readErr)
 		return
 	}
 	if counter.n > maxFetchBytes {
 		readErr = fmt.Errorf("subscription exceeds %d-byte limit", maxFetchBytes)
 		e.setSourceError(src, readErr.Error())
-		log.Printf("[WARN] filter: update failed for %s (keeping last good): %v", src.Name, readErr)
+		log.Printf("[WARN] filter: update failed for %s (keeping last good): %v", logName, readErr)
 		return
 	}
-	block, allow, readErr := parseRulesCapped(bytes.NewReader(body), src.AllowOnly)
+	block, allow, ignored, truncated, readErr := parseRulesCapped(bytes.NewReader(body), src.AllowOnly)
 	if readErr != nil {
 		e.setSourceError(src, readErr.Error())
-		log.Printf("[WARN] filter: parse failed for %s (keeping last good): %v", src.Name, readErr)
+		log.Printf("[WARN] filter: parse failed for %s (keeping last good): %v", logName, readErr)
 		return
 	}
 
@@ -168,8 +188,21 @@ func (e *Engine) fetchSource(src *Source) {
 	src.etag = resp.Header.Get("ETag")
 	src.lastModified = resp.Header.Get("Last-Modified")
 	e.mu.Unlock()
-	e.setRules(src, block, allow, "")
-	log.Printf("[INFO] filter: updated %s — %d rules (%d exceptions)", src.Name, len(block), len(allow))
+	e.setRulesStatus(src, block, allow, "", ignored, truncated)
+	log.Printf("[INFO] filter: updated %s — %d rules (%d exceptions)", logName, len(block), len(allow))
+}
+
+func sourceLogName(src *Source) string {
+	if src.Kind != "url" {
+		return src.Name
+	}
+	u, err := url.Parse(src.Name)
+	if err != nil {
+		return "subscription"
+	}
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.Redacted()
 }
 
 type countingReader struct {
@@ -190,7 +223,6 @@ func (e *Engine) StartUpdateLoop(ctx context.Context, interval time.Duration) {
 		interval = 24 * time.Hour
 	}
 	go func() {
-		e.LoadLocal()
 		e.UpdateAll()
 
 		ticker := time.NewTicker(interval)
@@ -209,23 +241,25 @@ func (e *Engine) StartUpdateLoop(ctx context.Context, interval time.Duration) {
 
 // parseRules parses all rule lines from r.
 func parseRules(r io.Reader, allowOnly bool) (block, allow []Rule) {
-	block, allow, _ = parseRulesCapped(r, allowOnly)
+	block, allow, _, _, _ = parseRulesCapped(r, allowOnly)
 	return block, allow
 }
 
 // parseRulesCapped parses rule lines with a per-source rule cap.
-func parseRulesCapped(r io.Reader, allowOnly bool) (block, allow []Rule, err error) {
+func parseRulesCapped(r io.Reader, allowOnly bool) (block, allow []Rule, ignored int, truncated bool, err error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // tolerate long lines up to 1MB
 	count := 0
 	for scanner.Scan() {
 		rule, exception, ok := parseLine(scanner.Text())
 		if !ok {
+			ignored++
 			continue
 		}
 		count++
 		if count > maxRulesPerSource {
 			log.Printf("[WARN] filter: rule cap (%d) reached, ignoring remaining rules", maxRulesPerSource)
+			truncated = true
 			break
 		}
 		if exception || allowOnly {
@@ -235,7 +269,7 @@ func parseRulesCapped(r io.Reader, allowOnly bool) (block, allow []Rule, err err
 		}
 	}
 	if scanErr := scanner.Err(); scanErr != nil {
-		return block, allow, fmt.Errorf("read rules: %w", scanErr)
+		return block, allow, ignored, truncated, fmt.Errorf("read rules: %w", scanErr)
 	}
-	return block, allow, nil
+	return block, allow, ignored, truncated, nil
 }

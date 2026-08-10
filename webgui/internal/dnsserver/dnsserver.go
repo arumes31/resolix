@@ -122,10 +122,14 @@ type Server struct {
 	client    *dns.Client
 
 	// ACL and rate limiting (Step 6)
-	allowed          []*net.IPNet
-	disallowed       []*net.IPNet
-	rateLimiter      *rateLimiter
-	rateLimitDropped atomic.Int64
+	allowed           []*net.IPNet
+	allowedConfigured bool
+	disallowed        []*net.IPNet
+	rateLimiter       *rateLimiter
+	rateLimitDropped  atomic.Int64
+	aclDropped        atomic.Int64
+	aclRefused        atomic.Int64
+	ready             atomic.Bool
 
 	rewriteHits    atomic.Int64
 	safeSearchHits atomic.Int64
@@ -164,6 +168,7 @@ func New(cfg Config, emit func(models.QueryEvent, bool)) *Server {
 		log.Printf("[WARN] No valid upstream DNS servers configured; all non-static queries will fail")
 	}
 	s.allowed = parseCIDRList(cfg.AllowedClients)
+	s.allowedConfigured = strings.TrimSpace(cfg.AllowedClients) != ""
 	s.disallowed = parseCIDRList(cfg.DisallowedClients)
 	if cfg.RateLimitQPS > 0 {
 		s.rateLimiter = newRateLimiter(cfg.RateLimitQPS)
@@ -270,6 +275,8 @@ func (s *Server) startOn(ctx context.Context, udpConn net.PacketConn, tcpLn, dot
 	for _, srv := range servers {
 		go func(srv *dns.Server) { errCh <- srv.ActivateAndServe() }(srv)
 	}
+	s.ready.Store(true)
+	defer s.ready.Store(false)
 
 	shutdown := func() {
 		for _, srv := range servers {
@@ -309,10 +316,12 @@ func (s *Server) Resolve(r *dns.Msg, clientIP string) (resp *dns.Msg, drop bool)
 
 	// Stage 0a: ACL — disallowed clients are dropped silently.
 	if s.aclDrop(clientIP) {
+		s.aclDropped.Add(1)
 		return nil, true
 	}
 	// Stage 0b: ACL — outside a non-empty allowed list → REFUSED (no event).
 	if s.aclRefuse(clientIP) {
+		s.aclRefused.Add(1)
 		resp.Rcode = dns.RcodeRefused
 		return resp, false
 	}
@@ -330,6 +339,10 @@ func (s *Server) Resolve(r *dns.Msg, clientIP string) (resp *dns.Msg, drop bool)
 	}
 
 	res := s.resolve(r, resp, 0, cl)
+	if s.cfg.Policy != nil && s.cfg.Policy.AAAADisabled && len(r.Question) > 0 &&
+		(r.Question[0].Qtype == dns.TypeHTTPS || r.Question[0].Qtype == dns.TypeSVCB) {
+		stripIPv6Hints(resp.Answer)
+	}
 
 	if s.emit == nil {
 		return resp, false
@@ -340,6 +353,28 @@ func (s *Server) Resolve(r *dns.Msg, clientIP string) (resp *dns.Msg, drop bool)
 	excludeFromStats := cl != nil && cl.ExcludeFromStats
 	s.emit(s.buildEvent(r, resp, clientIP, cl, res, start), excludeFromStats)
 	return resp, false
+}
+
+func stripIPv6Hints(records []dns.RR) {
+	for _, record := range records {
+		var values *[]dns.SVCBKeyValue
+		switch typed := record.(type) {
+		case *dns.SVCB:
+			values = &typed.Value
+		case *dns.HTTPS:
+			values = &typed.Value
+		}
+		if values == nil {
+			continue
+		}
+		filtered := (*values)[:0]
+		for _, value := range *values {
+			if _, ipv6Hint := value.(*dns.SVCBIPv6Hint); !ipv6Hint {
+				filtered = append(filtered, value)
+			}
+		}
+		*values = filtered
+	}
 }
 
 // ServeDNS implements the dns.Handler interface (UDP/TCP/DoT listeners).
@@ -761,6 +796,7 @@ func (s *Server) refreshAsync(key cacheKey, r *dns.Msg, specs []string) {
 		}()
 		if _, m := s.forward(r, specs); m != nil {
 			s.storeInCache(key, m)
+			s.cache.refreshes.Add(1)
 		}
 	}()
 }
@@ -927,6 +963,24 @@ func (s *Server) Stats() (rewriteHits, safeSearchHits, bogusNXHits int64) {
 // RateLimitDropped returns the number of queries refused by the rate limiter.
 func (s *Server) RateLimitDropped() int64 {
 	return s.rateLimitDropped.Load()
+}
+
+// Ready reports whether all configured DNS listeners have been started.
+func (s *Server) Ready() bool {
+	return s.ready.Load()
+}
+
+// ACLStats reports ACL decisions and active rate-limit buckets.
+func (s *Server) ACLStats() (dropped, refused int64, buckets int) {
+	if s.rateLimiter != nil {
+		buckets = s.rateLimiter.bucketCount()
+	}
+	return s.aclDropped.Load(), s.aclRefused.Load(), buckets
+}
+
+// CacheStats returns a snapshot of the in-process response cache.
+func (s *Server) CacheStats() CacheStats {
+	return s.cache.stats()
 }
 
 // ClearCache removes all in-process DNS response cache entries and returns

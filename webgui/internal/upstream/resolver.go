@@ -56,13 +56,19 @@ type dnsResolver struct {
 func (r *dnsResolver) String() string { return r.spec.Raw }
 
 func (r *dnsResolver) Exchange(m *dns.Msg) (*dns.Msg, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), exchangeTimeout)
+	defer cancel()
+	return r.ExchangeContext(ctx, m)
+}
+
+func (r *dnsResolver) ExchangeContext(ctx context.Context, m *dns.Msg) (*dns.Msg, error) {
 	addrs, err := r.spec.dialAddrs(r.boot)
 	if err != nil {
 		return nil, err
 	}
 	var lastErr error
 	for _, addr := range addrs {
-		resp, err := r.exchange(addr, m)
+		resp, err := r.exchange(ctx, addr, m)
 		if err == nil && resp != nil {
 			return resp, nil
 		}
@@ -75,7 +81,7 @@ func (r *dnsResolver) Exchange(m *dns.Msg) (*dns.Msg, error) {
 }
 
 // exchange performs one exchange against a concrete dial address.
-func (r *dnsResolver) exchange(addr string, m *dns.Msg) (*dns.Msg, error) {
+func (r *dnsResolver) exchange(ctx context.Context, addr string, m *dns.Msg) (*dns.Msg, error) {
 	client := &dns.Client{Timeout: exchangeTimeout}
 	switch r.spec.Scheme {
 	case SchemeTCP:
@@ -86,13 +92,13 @@ func (r *dnsResolver) exchange(addr string, m *dns.Msg) (*dns.Msg, error) {
 	default: // udp with TCP fallback on truncation
 		client.Net = "udp"
 	}
-	resp, _, err := client.Exchange(m, addr)
+	resp, _, err := client.ExchangeContext(ctx, m, addr)
 	if err != nil {
 		return nil, err
 	}
 	if resp != nil && resp.Truncated && client.Net == "udp" {
 		tcpClient := &dns.Client{Net: "tcp", Timeout: exchangeTimeout}
-		if tm, _, terr := tcpClient.Exchange(m, addr); terr == nil && tm != nil {
+		if tm, _, terr := tcpClient.ExchangeContext(ctx, m, addr); terr == nil && tm != nil {
 			return tm, nil
 		}
 	}
@@ -112,13 +118,19 @@ type dohResolver struct {
 func (r *dohResolver) String() string { return r.spec.Raw }
 
 func (r *dohResolver) Exchange(m *dns.Msg) (*dns.Msg, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), dohTimeout)
+	defer cancel()
+	return r.ExchangeContext(ctx, m)
+}
+
+func (r *dohResolver) ExchangeContext(ctx context.Context, m *dns.Msg) (*dns.Msg, error) {
 	wire, err := m.Pack()
 	if err != nil {
 		return nil, err
 	}
 
 	u := url.URL{Scheme: "https", Host: net.JoinHostPort(r.spec.Host, r.spec.Port), Path: r.spec.Path}
-	req, err := http.NewRequest(http.MethodPost, u.String(), bytes.NewReader(wire))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(wire))
 	if err != nil {
 		return nil, err
 	}
@@ -161,10 +173,50 @@ func (r *dohResolver) httpClient() *http.Client {
 					return nil, err
 				}
 				d := net.Dialer{}
-				return d.DialContext(ctx, network, addrs[0])
+				var lastErr error
+				for _, addr := range addrs {
+					conn, dialErr := d.DialContext(ctx, network, addr)
+					if dialErr == nil {
+						return conn, nil
+					}
+					lastErr = dialErr
+				}
+				return nil, lastErr
 			},
 		}
 		r.client = &http.Client{Timeout: dohTimeout, Transport: transport}
 	})
 	return r.client
+}
+
+// Probe performs a protocol-aware DNS health exchange for one upstream.
+func Probe(ctx context.Context, raw, domain string, bootstrapServers []string) error {
+	spec, err := Parse(raw)
+	if err != nil {
+		return err
+	}
+	boot := newBootstrapper(bootstrapServers)
+	var resolver Resolver
+	if spec.Scheme == SchemeHTTPS {
+		resolver = &dohResolver{spec: spec, boot: boot}
+	} else {
+		resolver = &dnsResolver{spec: spec, boot: boot}
+	}
+	query := new(dns.Msg)
+	query.SetQuestion(dns.Fqdn(domain), dns.TypeA)
+	var response *dns.Msg
+	if contextual, ok := resolver.(interface {
+		ExchangeContext(context.Context, *dns.Msg) (*dns.Msg, error)
+	}); ok {
+		response, err = contextual.ExchangeContext(ctx, query)
+	} else {
+		response, err = resolver.Exchange(query)
+	}
+	if err != nil {
+		return err
+	}
+	if response == nil {
+		return fmt.Errorf("empty DNS response")
+	}
+	return nil
 }

@@ -108,7 +108,7 @@ func TestParseLogBytes(t *testing.T) {
 }
 
 func TestApiIngest(t *testing.T) {
-	_, store, _, srv := setupTest()
+	cfg, store, _, srv := setupTest()
 	defer func() { _ = os.RemoveAll(store.GetConfig().HistoryDir) }()
 
 	payload := map[string]interface{}{
@@ -121,6 +121,8 @@ func TestApiIngest(t *testing.T) {
 	data, _ := json.Marshal(payload)
 
 	req := httptest.NewRequest("POST", "/api/ingest", bytes.NewBuffer(data))
+	cfg.IngestSecret = "test-secret"
+	req.Header.Set("Authorization", "Bearer test-secret")
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 
@@ -139,7 +141,7 @@ func TestApiIngest(t *testing.T) {
 // TestApiIngestEvents verifies the new ingest format: a top-level JSON array
 // of structured QueryEvent produced by dnsserver-based slaves.
 func TestApiIngestEvents(t *testing.T) {
-	_, store, _, srv := setupTest()
+	cfg, store, _, srv := setupTest()
 	defer func() { _ = os.RemoveAll(store.GetConfig().HistoryDir) }()
 
 	now := time.Now().Unix()
@@ -150,6 +152,8 @@ func TestApiIngestEvents(t *testing.T) {
 	data, _ := json.Marshal(events)
 
 	req := httptest.NewRequest("POST", "/api/ingest", bytes.NewBuffer(data))
+	cfg.IngestSecret = "test-secret"
+	req.Header.Set("Authorization", "Bearer test-secret")
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
 
@@ -317,8 +321,9 @@ func TestRootHandler(t *testing.T) {
 }
 
 func TestConcurrency(t *testing.T) {
-	_, store, prs, srv := setupTest()
+	cfg, store, prs, srv := setupTest()
 	defer func() { _ = os.RemoveAll(store.GetConfig().HistoryDir) }()
+	cfg.IngestSecret = "test-secret"
 	handler := srv.SetupMux()
 
 	const workers = 10
@@ -341,6 +346,7 @@ func TestConcurrency(t *testing.T) {
 				}
 				data, _ := json.Marshal(payload)
 				req := httptest.NewRequest("POST", "/api/ingest", bytes.NewBuffer(data))
+				req.Header.Set("Authorization", "Bearer test-secret")
 				rr := httptest.NewRecorder()
 				handler.ServeHTTP(rr, req)
 			}

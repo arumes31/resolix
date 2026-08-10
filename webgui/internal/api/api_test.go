@@ -2,7 +2,9 @@ package api
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -52,6 +54,19 @@ func TestForwardedHeadersRequireTrustedProxy(t *testing.T) {
 	}
 }
 
+func TestStandardForwardedHeaderRequiresTrustedProxy(t *testing.T) {
+	s := testServer(&config.Config{TrustedProxies: []string{"127.0.0.1"}})
+	r := httptest.NewRequest(http.MethodGet, "http://example.test", nil)
+	r.RemoteAddr = "127.0.0.1:1234"
+	r.Header.Set("Forwarded", `for="[2001:db8::10]";proto=https`)
+	if got := s.clientIP(r); got != "2001:db8::10" {
+		t.Fatalf("forwarded client IP = %q", got)
+	}
+	if !s.isHTTPS(r) {
+		t.Fatal("trusted Forwarded proto was ignored")
+	}
+}
+
 func TestSessionLifecycle(t *testing.T) {
 	s := testServer(&config.Config{})
 	token, err := s.newSession()
@@ -78,6 +93,53 @@ func TestInternalRoutesUseWebAuthWithoutIngestSecret(t *testing.T) {
 	s.SetupMux().ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d; want %d", rec.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestInternalRoutesFailClosedWithoutAnyAuthentication(t *testing.T) {
+	s := testServer(&config.Config{BaseURL: "/"})
+	req := httptest.NewRequest(http.MethodPost, "/api/ingest", nil)
+	rec := httptest.NewRecorder()
+	s.SetupMux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d; want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestReadRequestBodyLimitsDecompressedSize(t *testing.T) {
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write(bytes.Repeat([]byte("a"), 2048)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(compressed.Bytes()))
+	req.Header.Set("Content-Encoding", "gzip")
+	_, err := readRequestBody(httptest.NewRecorder(), req, 1024)
+	var tooLarge *http.MaxBytesError
+	if !errors.As(err, &tooLarge) {
+		t.Fatalf("error = %v, want MaxBytesError", err)
+	}
+}
+
+func TestEventsRejectInvalidSinceAndReturnCursor(t *testing.T) {
+	cfg := &config.Config{MaxEvents: 10}
+	s := testServer(cfg)
+	s.store = storage.NewStore(cfg)
+	s.store.AddEvent(models.QueryEvent{UnixTime: time.Now().Unix(), Domain: "cursor.test"})
+
+	recorder := httptest.NewRecorder()
+	s.handleEvents(recorder, httptest.NewRequest(http.MethodGet, "/api/events?since=bad", nil))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid since status = %d", recorder.Code)
+	}
+
+	recorder = httptest.NewRecorder()
+	s.handleEvents(recorder, httptest.NewRequest(http.MethodGet, "/api/events?limit=1", nil))
+	if recorder.Code != http.StatusOK || recorder.Header().Get("X-Next-Cursor") == "" {
+		t.Fatalf("events status/cursor = %d/%q", recorder.Code, recorder.Header().Get("X-Next-Cursor"))
 	}
 }
 

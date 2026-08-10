@@ -3,12 +3,12 @@ package health
 import (
 	"context"
 	"log"
-	"net"
 	"strings"
 	"sync"
 	"time"
 
 	"tailscale-dnsrewrite/webgui/internal/config"
+	"tailscale-dnsrewrite/webgui/internal/upstream"
 )
 
 // Checker monitors the health of upstream DNS servers.
@@ -54,18 +54,18 @@ func NewChecker(cfg *config.Config, upstreamDNS string) *Checker {
 // CheckUpstream verifies if a specific DNS server is responsive and measures latency.
 func (c *Checker) CheckUpstream(ctx context.Context, server string) (bool, float64) {
 	start := time.Now()
-	resolver := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 2 * time.Second}
-			return d.DialContext(ctx, "udp", server+":53")
-		},
-	}
-	_, err := resolver.LookupHost(ctx, c.cfg.HealthDomain)
-	if err != nil {
+	if err := upstream.Probe(ctx, server, c.cfg.HealthDomain, strings.Fields(c.cfg.BootstrapDNS)); err != nil {
 		return false, -1
 	}
 	return true, float64(time.Since(start).Microseconds()) / 1000.0
+}
+
+// UpdateUpstreams replaces the probe target set after a hot reload.
+func (c *Checker) UpdateUpstreams(servers []string) {
+	servers = append([]string(nil), servers...)
+	c.mu.Lock()
+	c.upstreams = servers
+	c.mu.Unlock()
 }
 
 // Start begins the health check loop.
@@ -78,6 +78,9 @@ func (c *Checker) Start(ctx context.Context, onChange func([]string, map[string]
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			c.mu.RLock()
+			servers := append([]string(nil), c.upstreams...)
+			c.mu.RUnlock()
 			var wg sync.WaitGroup
 			type res struct {
 				ok  bool
@@ -86,10 +89,17 @@ func (c *Checker) Start(ctx context.Context, onChange func([]string, map[string]
 			results := make(map[string]res)
 			var resMu sync.Mutex
 
-			for _, ups := range c.upstreams {
+			semaphore := make(chan struct{}, 8)
+			for _, ups := range servers {
 				wg.Add(1)
 				go func(u string) {
 					defer wg.Done()
+					select {
+					case semaphore <- struct{}{}:
+						defer func() { <-semaphore }()
+					case <-ctx.Done():
+						return
+					}
 					ok, lat := c.CheckUpstream(ctx, u)
 					resMu.Lock()
 					results[u] = res{ok: ok, lat: lat}
@@ -100,7 +110,7 @@ func (c *Checker) Start(ctx context.Context, onChange func([]string, map[string]
 
 			var newHealthy []string
 			newLatencies := make(map[string]float64)
-			for _, ups := range c.upstreams {
+			for _, ups := range servers {
 				r := results[ups]
 				if r.ok {
 					newHealthy = append(newHealthy, ups)
@@ -123,7 +133,7 @@ func (c *Checker) Start(ctx context.Context, onChange func([]string, map[string]
 				log.Printf("CRITICAL: All upstreams failed health check. Preserving previous healthy set.")
 				newHealthy = c.healthy
 				if len(newHealthy) == 0 {
-					newHealthy = c.upstreams
+					newHealthy = servers
 				}
 			}
 

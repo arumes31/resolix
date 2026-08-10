@@ -76,14 +76,11 @@ func (r *Registry) reload() {
 	r.mu.Unlock()
 }
 
-// save persists the registry atomically (temp file + rename).
-func (r *Registry) save() (err error) {
+func (r *Registry) saveClients(clients []*Client) (err error) {
 	if r.path == "" {
 		return nil
 	}
-	r.mu.RLock()
-	data, err := json.MarshalIndent(r.clients, "", "  ")
-	r.mu.RUnlock()
+	data, err := json.MarshalIndent(clients, "", "  ")
 	if err != nil {
 		return err
 	}

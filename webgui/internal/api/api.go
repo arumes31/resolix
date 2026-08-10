@@ -790,6 +790,23 @@ func (w *statusResponseWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
 
+func metricMethod(method string) string {
+	switch method {
+	case http.MethodConnect,
+		http.MethodDelete,
+		http.MethodGet,
+		http.MethodHead,
+		http.MethodOptions,
+		http.MethodPatch,
+		http.MethodPost,
+		http.MethodPut,
+		http.MethodTrace:
+		return method
+	default:
+		return "OTHER"
+	}
+}
+
 func (s *Server) requestMetricsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
@@ -799,7 +816,7 @@ func (s *Server) requestMetricsMiddleware(next http.Handler) http.Handler {
 		}
 		rw := &statusResponseWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rw, r)
-		key := r.Method + " " + strconv.Itoa(rw.status)
+		key := metricMethod(r.Method) + " " + strconv.Itoa(rw.status)
 		counter := &atomic.Int64{}
 		actual, _ := s.metrics.httpRequests.LoadOrStore(key, counter)
 		actual.(*atomic.Int64).Add(1)

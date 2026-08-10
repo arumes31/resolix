@@ -100,6 +100,44 @@ func TestRegistryReturnsDeepCopiesAndRejectsConflicts(t *testing.T) {
 	}
 }
 
+func TestRegistryClonesAddAndUpdateCandidates(t *testing.T) {
+	registry, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := Client{
+		Name: "owned",
+		IDs:  []string{"192.0.2.1"},
+		Tags: []string{"original"},
+		Schedule: &Schedule{Days: map[string][]TimeRange{
+			"mon": {{Start: "09:00", End: "17:00"}},
+		}},
+	}
+	if err := registry.Add(candidate); err != nil {
+		t.Fatal(err)
+	}
+	candidate.IDs[0] = "198.51.100.1"
+	candidate.Tags[0] = "caller-mutated"
+	candidate.Schedule.Days["mon"][0].Start = "10:00"
+	stored := registry.List()[0]
+	if stored.IDs[0] != "192.0.2.1" || stored.Tags[0] != "original" || stored.Schedule.Days["mon"][0].Start != "09:00" {
+		t.Fatalf("Add retained caller-owned state: %+v", stored)
+	}
+
+	updated := stored
+	updated.Tags = []string{"updated"}
+	updated.Schedule.Days["mon"][0].Start = "08:00"
+	if err := registry.Update(updated); err != nil {
+		t.Fatal(err)
+	}
+	updated.Tags[0] = "caller-mutated-again"
+	updated.Schedule.Days["mon"][0].Start = "07:00"
+	stored = registry.List()[0]
+	if stored.Tags[0] != "updated" || stored.Schedule.Days["mon"][0].Start != "08:00" {
+		t.Fatalf("Update retained caller-owned state: %+v", stored)
+	}
+}
+
 func TestLongestPrefixMatch(t *testing.T) {
 	r, err := Load("")
 	if err != nil {

@@ -32,6 +32,26 @@ func testServer(cfg *config.Config) *Server {
 	}
 }
 
+func TestMetricMethodUsesFixedAllowlist(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		want   string
+	}{
+		{name: "get", method: http.MethodGet, want: http.MethodGet},
+		{name: "patch", method: http.MethodPatch, want: http.MethodPatch},
+		{name: "unknown", method: "CUSTOM-METHOD", want: "OTHER"},
+		{name: "empty", method: "", want: "OTHER"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := metricMethod(test.method); got != test.want {
+				t.Fatalf("metricMethod(%q) = %q, want %q", test.method, got, test.want)
+			}
+		})
+	}
+}
+
 func TestForwardedHeadersRequireTrustedProxy(t *testing.T) {
 	s := testServer(&config.Config{TrustedProxies: []string{"10.0.0.0/8"}})
 	r := httptest.NewRequest(http.MethodGet, "http://example.test", nil)

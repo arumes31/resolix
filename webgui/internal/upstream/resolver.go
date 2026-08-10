@@ -189,6 +189,10 @@ func (r *dohResolver) httpClient() *http.Client {
 	return r.client
 }
 
+func (r *dohResolver) closeIdleConnections() {
+	r.httpClient().CloseIdleConnections()
+}
+
 // Probe performs a protocol-aware DNS health exchange for one upstream.
 func Probe(ctx context.Context, raw, domain string, bootstrapServers []string) error {
 	spec, err := Parse(raw)
@@ -198,7 +202,9 @@ func Probe(ctx context.Context, raw, domain string, bootstrapServers []string) e
 	boot := newBootstrapper(bootstrapServers)
 	var resolver Resolver
 	if spec.Scheme == SchemeHTTPS {
-		resolver = &dohResolver{spec: spec, boot: boot}
+		doh := &dohResolver{spec: spec, boot: boot}
+		defer doh.closeIdleConnections()
+		resolver = doh
 	} else {
 		resolver = &dnsResolver{spec: spec, boot: boot}
 	}
@@ -217,6 +223,9 @@ func Probe(ctx context.Context, raw, domain string, bootstrapServers []string) e
 	}
 	if response == nil {
 		return fmt.Errorf("empty DNS response")
+	}
+	if response.Rcode != dns.RcodeSuccess {
+		return fmt.Errorf("DNS health probe for %q returned RCODE %d", raw, response.Rcode)
 	}
 	return nil
 }

@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -23,6 +24,22 @@ import (
 // testAnswerIP is the A record every test upstream answers with (unless a
 // custom handler says otherwise).
 const testAnswerIP = "93.184.216.34"
+
+type closeTrackingTransport struct {
+	base   http.RoundTripper
+	closed atomic.Bool
+}
+
+func (t *closeTrackingTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return t.base.RoundTrip(request)
+}
+
+func (t *closeTrackingTransport) CloseIdleConnections() {
+	t.closed.Store(true)
+	if closer, ok := t.base.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
+}
 
 // startUDPUpstream starts a fake UDP DNS server on an ephemeral loopback
 // port answering A queries with testAnswerIP.
@@ -235,5 +252,54 @@ func TestDoHHTTPClientConcurrentInitialization(t *testing.T) {
 		if client != r.client {
 			t.Fatal("concurrent initialization returned different clients")
 		}
+	}
+}
+
+func TestProbeRejectsUnsuccessfulRcode(t *testing.T) {
+	addr := startUDPUpstreamHandler(t, func(w dns.ResponseWriter, request *dns.Msg) {
+		response := new(dns.Msg)
+		response.SetRcode(request, dns.RcodeServerFailure)
+		_ = w.WriteMsg(response)
+	})
+	if err := Probe(context.Background(), addr, "health.test", nil); err == nil {
+		t.Fatal("Probe accepted SERVFAIL response")
+	}
+}
+
+func TestProbeClosesDoHIdleConnections(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		wire, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Errorf("read request: %v", err)
+			return
+		}
+		query := new(dns.Msg)
+		if err := query.Unpack(wire); err != nil {
+			t.Errorf("unpack request: %v", err)
+			return
+		}
+		response := new(dns.Msg)
+		response.SetReply(query)
+		packed, err := response.Pack()
+		if err != nil {
+			t.Errorf("pack response: %v", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(packed)
+	}))
+	defer server.Close()
+
+	client := server.Client()
+	transport := &closeTrackingTransport{base: client.Transport}
+	client.Transport = transport
+	testHTTPClient = client
+	t.Cleanup(func() { testHTTPClient = nil })
+
+	if err := Probe(context.Background(), server.URL+"/dns-query", "health.test", nil); err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	if !transport.closed.Load() {
+		t.Fatal("Probe left DoH transport idle connections open")
 	}
 }

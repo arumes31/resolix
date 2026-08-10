@@ -3,13 +3,25 @@ set -euo pipefail
 
 smoke_dir="$(mktemp -d)"
 container_name="tailscale-dnsrewrite-smoke-${RANDOM}"
+socket_container="${container_name}-socket"
+socket_volume="${container_name}-socket"
 cleanup() {
   docker rm -f "${container_name}" >/dev/null 2>&1 || true
+  docker rm -f "${socket_container}" >/dev/null 2>&1 || true
+  docker volume rm "${socket_volume}" >/dev/null 2>&1 || true
   rm -rf -- "${smoke_dir}"
 }
 trap cleanup EXIT
 
 printf '%s\n' '||blocked.test^' > "${smoke_dir}/blocklist.txt"
+printf '%s\n' '#!/bin/sh' 'exec sleep 86400' > "${smoke_dir}/tailscaled"
+printf '%s\n' '#!/bin/sh' 'case "${1:-}" in' \
+  '  ip) echo "100.64.0.1" ;;' \
+  '  status) echo "100.64.0.1 smoke-node linux active" ;;' \
+  '  up) exit 0 ;;' \
+  '  *) exit 1 ;;' \
+  'esac' > "${smoke_dir}/tailscale"
+chmod +x "${smoke_dir}/tailscale" "${smoke_dir}/tailscaled"
 openssl_subject='/CN=localhost'
 smoke_mount="${smoke_dir}"
 if [[ "${OSTYPE:-}" == msys* || "${OSTYPE:-}" == cygwin* ]]; then
@@ -24,13 +36,25 @@ docker build \
   --build-arg BUILD_INFO="${GITHUB_SHA:-local}" \
   -t tailscale-dnsrewrite:smoke .
 
+# Provide a local Unix socket and deterministic CLI responses so the image's
+# default entrypoint exercises coordinated tailscaled/webgui startup without
+# requiring access to a real tailnet or auth key.
+docker volume create "${socket_volume}" >/dev/null
+MSYS_NO_PATHCONV=1 docker run -d --name "${socket_container}" \
+  -v "${socket_volume}:/var/run/tailscale" \
+  alpine:3.24 sh -c \
+  'apk add --no-cache socat >/dev/null && exec socat UNIX-LISTEN:/var/run/tailscale/tailscaled.sock,fork EXEC:/bin/true' \
+  >/dev/null
+
 MSYS_NO_PATHCONV=1 docker run -d --name "${container_name}" \
-  --entrypoint webgui \
   -p 127.0.0.1:0:1053/udp \
   -p 127.0.0.1:0:1053/tcp \
   -p 127.0.0.1:0:35353/tcp \
   -p 127.0.0.1:0:1853/tcp \
   -v "${smoke_mount}:/smoke:ro" \
+  -v "${smoke_mount}/tailscale:/usr/bin/tailscale:ro" \
+  -v "${smoke_mount}/tailscaled:/usr/sbin/tailscaled:ro" \
+  -v "${socket_volume}:/var/run/tailscale" \
   -e PORT=35353 \
   -e WEB_LISTEN_ADDR=0.0.0.0 \
   -e DNS_LISTEN_ADDR=0.0.0.0 \

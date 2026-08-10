@@ -15,6 +15,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  actions: write
   contents: write
 
 jobs:
@@ -40,12 +41,14 @@ jobs:
 
       - name: Tag code-changing push
         env:
+          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "${VERSION}" -m "Automated release ${VERSION}"
           git push origin "${VERSION}"
+          gh workflow run docker-publish.yml --ref "${VERSION}"
 
       - name: Create GitHub release
         env:

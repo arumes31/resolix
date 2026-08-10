@@ -65,6 +65,7 @@ func (c *Checker) UpdateUpstreams(servers []string) {
 	servers = append([]string(nil), servers...)
 	c.mu.Lock()
 	c.upstreams = servers
+	c.healthy = retainServers(c.healthy, serverSet(servers))
 	c.mu.Unlock()
 }
 
@@ -129,11 +130,20 @@ func (c *Checker) Start(ctx context.Context, onChange func([]string, map[string]
 			default:
 			}
 
+			currentServers := append([]string(nil), c.upstreams...)
+			currentSet := serverSet(currentServers)
+			newHealthy = retainServers(newHealthy, currentSet)
+			for server := range newLatencies {
+				if _, ok := currentSet[server]; !ok {
+					delete(newLatencies, server)
+				}
+			}
+
 			if len(newHealthy) == 0 {
 				log.Printf("CRITICAL: All upstreams failed health check. Preserving previous healthy set.")
-				newHealthy = c.healthy
+				newHealthy = retainServers(c.healthy, currentSet)
 				if len(newHealthy) == 0 {
-					newHealthy = servers
+					newHealthy = currentServers
 				}
 			}
 
@@ -181,4 +191,22 @@ func equalSlices(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func serverSet(servers []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(servers))
+	for _, server := range servers {
+		set[server] = struct{}{}
+	}
+	return set
+}
+
+func retainServers(servers []string, allowed map[string]struct{}) []string {
+	retained := make([]string, 0, len(servers))
+	for _, server := range servers {
+		if _, ok := allowed[server]; ok {
+			retained = append(retained, server)
+		}
+	}
+	return retained
 }

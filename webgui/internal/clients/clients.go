@@ -253,13 +253,14 @@ func (r *Registry) Add(c Client) error {
 	if err := c.compile(); err != nil {
 		return err
 	}
+	candidate := cloneClient(c)
 	r.mu.RLock()
 	proposed := cloneClientPointers(r.clients)
 	r.mu.RUnlock()
-	if err := validateConflicts(proposed, &c); err != nil {
+	if err := validateConflicts(proposed, &candidate); err != nil {
 		return err
 	}
-	proposed = append(proposed, &c)
+	proposed = append(proposed, &candidate)
 	if err := r.saveClients(proposed); err != nil {
 		return err
 	}
@@ -277,16 +278,17 @@ func (r *Registry) Update(c Client) error {
 	if err := c.compile(); err != nil {
 		return err
 	}
+	candidate := cloneClient(c)
 	r.mu.RLock()
 	proposed := cloneClientPointers(r.clients)
 	r.mu.RUnlock()
 	for i, existing := range proposed {
 		if existing.Name == c.Name {
 			withoutCurrent := append(cloneClientPointers(proposed[:i]), cloneClientPointers(proposed[i+1:])...)
-			if err := validateConflicts(withoutCurrent, &c); err != nil {
+			if err := validateConflicts(withoutCurrent, &candidate); err != nil {
 				return err
 			}
-			proposed[i] = &c
+			proposed[i] = &candidate
 			if err := r.saveClients(proposed); err != nil {
 				return err
 			}

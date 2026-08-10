@@ -54,3 +54,21 @@ func TestCheckerUsesConfiguredProtocolAndPort(t *testing.T) {
 		t.Fatalf("updated upstreams = %v", got)
 	}
 }
+
+func TestUpdateUpstreamsRemovesStaleHealthyServers(t *testing.T) {
+	checker := &Checker{
+		upstreams: []string{"removed", "retained"},
+		healthy:   []string{"removed", "retained"},
+		latencies: map[string]float64{"removed": 1, "retained": 2},
+	}
+	replacement := []string{"retained", "new"}
+	checker.UpdateUpstreams(replacement)
+	replacement[0] = "caller-mutated"
+
+	if got := checker.GetHealthy(); len(got) != 1 || got[0] != "retained" {
+		t.Fatalf("healthy upstreams = %v, want [retained]", got)
+	}
+	if got := checker.upstreams; len(got) != 2 || got[0] != "retained" || got[1] != "new" {
+		t.Fatalf("replacement upstreams = %v", got)
+	}
+}

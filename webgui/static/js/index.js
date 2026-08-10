@@ -53,11 +53,29 @@ let configuredClients = [];
 let editingClient = null;
 let frozenEvents = [];
 let lastModalFocus = null;
+let streamConnected = false;
+let pollingHealthy = true;
+
+function renderSystemStatus() {
+    const status = document.getElementById('systemStatus');
+    status.classList.toggle('offline', !streamConnected || !pollingHealthy);
+    if (!pollingHealthy) {
+        status.textContent = '● System Offline';
+    } else if (!streamConnected) {
+        status.textContent = '● Live stream reconnecting';
+    } else {
+        status.textContent = '● Live stream connected';
+    }
+}
 
 function setStreamStatus(connected) {
-    const status = document.getElementById('systemStatus');
-    status.classList.toggle('offline', !connected);
-    status.textContent = connected ? '● Live stream connected' : '● Live stream reconnecting';
+    streamConnected = connected;
+    renderSystemStatus();
+}
+
+function setPollingStatus(healthy) {
+    pollingHealthy = healthy;
+    renderSystemStatus();
 }
 
 function mergeEvent(newEvent, updateDOM = true) {
@@ -183,12 +201,10 @@ async function fetchEvents() {
             renderEvents();
         }
 
-        document.getElementById('systemStatus').classList.remove('offline');
-        document.getElementById('systemStatus').textContent = '● System Online';
+        setPollingStatus(true);
     } catch (e) {
         console.error(e);
-        document.getElementById('systemStatus').classList.add('offline');
-        document.getElementById('systemStatus').textContent = '● System Offline';
+        setPollingStatus(false);
     }
 }
 
@@ -328,7 +344,7 @@ async function fetchNodeStatus() {
                 '<div class="node-detail-row"><span class="node-detail-label">Build</span><span class="node-detail-value">' + escapeHtml(node.build_info || '-') + '</span></div>' +
                 '<div class="node-detail-row"><span class="node-detail-label">Last Seen</span><span class="node-detail-value">' + lastSeen + '</span></div>' +
                 '<div class="node-detail-row"><span class="node-detail-label">Memory</span><span class="node-detail-value">' + memInfo + '</span></div>' +
-                '<div class="node-detail-row"><span class="node-detail-label">Goroutines</span><span class="node-detail-value">' + (node.goroutines ?? '-') + '</span></div>' +
+                '<div class="node-detail-row"><span class="node-detail-label">Goroutines</span><span class="node-detail-value">' + escapeHtml(String(node.goroutines ?? '-')) + '</span></div>' +
                 '<div class="node-detail-row"><span class="node-detail-label">DB Size</span><span class="node-detail-value">' + dbInfo + '</span></div>' +
                 '</div>' +
                 (node.version ? '<div class="node-version">' + escapeHtml(node.version) + '</div>' : '') +
@@ -480,12 +496,13 @@ function closeClientModal() {
 
 async function withFormBusy(form, action) {
     const controls = Array.from(form.querySelectorAll('button, input, select, textarea'));
+    const disabledStates = controls.map(control => control.disabled);
     controls.forEach(control => { control.disabled = true; });
     form.setAttribute('aria-busy', 'true');
     try {
         return await action();
     } finally {
-        controls.forEach(control => { control.disabled = false; });
+        controls.forEach((control, index) => { control.disabled = disabledStates[index]; });
         form.removeAttribute('aria-busy');
         if (form.id === 'clientForm') setClientPolicyState();
     }

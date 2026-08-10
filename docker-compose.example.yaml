@@ -1,6 +1,6 @@
 services:
   resolix:
-    image: ghcr.io/arumes31/resolix:${IMAGE_VERSION:-v2.3.0}
+    image: ghcr.io/arumes31/resolix:${IMAGE_VERSION:-latest}
     container_name: resolix
     environment:
       - TS_AUTHKEY=${TS_AUTHKEY}

@@ -941,10 +941,10 @@ func (s *Server) SetupMux() http.Handler {
 	// back to normal web authentication otherwise.
 	mux.Handle("/api/ingest", s.internalAuth(http.HandlerFunc(s.handleIngest)))
 
-	// Item 92: Heartbeat endpoint for slave nodes
+	// Item 92: Heartbeat endpoint for agent nodes
 	mux.Handle("/api/heartbeat", s.internalAuth(http.HandlerFunc(s.handleHeartbeat)))
 
-	// Items 90, 91, 94: Sync endpoints for slave configuration
+	// Items 90, 91, 94: Sync endpoints for agent configuration
 	mux.Handle("/api/sync/aliases", s.internalAuth(http.HandlerFunc(s.handleSyncAliases)))
 	mux.Handle("/api/sync/dns-routes", s.internalAuth(http.HandlerFunc(s.handleSyncDNSRoutes)))
 	mux.Handle("/api/sync/upstream-health", s.internalAuth(http.HandlerFunc(s.handleSyncUpstreamHealth)))
@@ -1357,11 +1357,11 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	}
 	if fwd != nil {
 		backlog, backlogBytes, retries, dropped, sent := fwd.Stats()
-		fmt.Fprintf(&buf, "# HELP forwarder_backlog_events Events waiting for master delivery\n# TYPE forwarder_backlog_events gauge\nforwarder_backlog_events %d\n", backlog)
-		fmt.Fprintf(&buf, "# HELP forwarder_backlog_bytes Bytes waiting for master delivery\n# TYPE forwarder_backlog_bytes gauge\nforwarder_backlog_bytes %d\n", backlogBytes)
-		fmt.Fprintf(&buf, "# HELP forwarder_retries_total Master delivery retries\n# TYPE forwarder_retries_total counter\nforwarder_retries_total %d\n", retries)
+		fmt.Fprintf(&buf, "# HELP forwarder_backlog_events Events waiting for controller delivery\n# TYPE forwarder_backlog_events gauge\nforwarder_backlog_events %d\n", backlog)
+		fmt.Fprintf(&buf, "# HELP forwarder_backlog_bytes Bytes waiting for controller delivery\n# TYPE forwarder_backlog_bytes gauge\nforwarder_backlog_bytes %d\n", backlogBytes)
+		fmt.Fprintf(&buf, "# HELP forwarder_retries_total Controller delivery retries\n# TYPE forwarder_retries_total counter\nforwarder_retries_total %d\n", retries)
 		fmt.Fprintf(&buf, "# HELP forwarder_dropped_events_total Events dropped by forwarding limits or permanent errors\n# TYPE forwarder_dropped_events_total counter\nforwarder_dropped_events_total %d\n", dropped)
-		fmt.Fprintf(&buf, "# HELP forwarder_sent_events_total Events delivered to the master\n# TYPE forwarder_sent_events_total counter\nforwarder_sent_events_total %d\n", sent)
+		fmt.Fprintf(&buf, "# HELP forwarder_sent_events_total Events delivered to the controller\n# TYPE forwarder_sent_events_total counter\nforwarder_sent_events_total %d\n", sent)
 	}
 
 	_, _ = buf.WriteTo(w)
@@ -1595,7 +1595,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// New format: a top-level JSON array of QueryEvent (structured events
-	// from dnsserver-based slaves). Legacy format: an object with raw dnsmasq
+	// from dnsserver-based agents). Legacy format: an object with raw dnsmasq
 	// log lines parsed via internal/parser.
 	if bytes.HasPrefix(bytes.TrimSpace(body), []byte("[")) {
 		s.handleIngestEvents(w, r, body)
@@ -1689,7 +1689,7 @@ func readRequestBody(w http.ResponseWriter, r *http.Request, maxBytes int64) ([]
 }
 
 // handleIngestEvents processes the new ingest format: a top-level JSON array
-// of models.QueryEvent produced by dnsserver-based slaves. Node status is
+// of models.QueryEvent produced by dnsserver-based agents. Node status is
 // updated from the X-Node-* headers as with legacy payloads.
 func (s *Server) handleIngestEvents(w http.ResponseWriter, r *http.Request, body []byte) {
 	var events []models.QueryEvent
@@ -2641,7 +2641,7 @@ func (s *Server) handleUpstreamLatency(w http.ResponseWriter, _ *http.Request) {
 }
 
 // ===== Item 92: Heartbeat Endpoint =====
-// handleHeartbeat processes heartbeat messages from slave nodes.
+// handleHeartbeat processes heartbeat messages from agent nodes.
 // It updates the node status in storage and is protected by IngestSecret.
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -2723,7 +2723,7 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 
 // ===== Item 90: Sync Client Aliases Endpoint =====
 // handleSyncAliases returns the current client aliases configuration.
-// Slaves call this to sync their aliases with the master.
+// Agents call this to sync their aliases with the controller.
 func (s *Server) handleSyncAliases(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -2748,7 +2748,7 @@ func (s *Server) handleSyncAliases(w http.ResponseWriter, r *http.Request) {
 
 // ===== Item 91: Sync DNS Routes Endpoint =====
 // handleSyncDNSRoutes returns the current DNS routes configuration.
-// Slaves call this to sync their DNS routes with the master.
+// Agents call this to sync their DNS routes with the controller.
 func (s *Server) handleSyncDNSRoutes(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -2781,7 +2781,7 @@ func (s *Server) handleSyncDNSRoutes(w http.ResponseWriter, r *http.Request) {
 
 // ===== Item 94: Sync Upstream Health Endpoint =====
 // handleSyncUpstreamHealth returns the upstream health data for all nodes.
-// Slaves call this to sync their upstream health view with the master.
+// Agents call this to sync their upstream health view with the controller.
 func (s *Server) handleSyncUpstreamHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)

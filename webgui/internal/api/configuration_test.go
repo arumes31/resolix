@@ -23,7 +23,7 @@ func TestConfigPageIsDedicatedAndRootRejectsUnknownPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := testServer(&config.Config{BaseURL: "/", Mode: "master", MaxRequestSize: 1 << 20})
+	server := testServer(&config.Config{BaseURL: "/", Mode: config.ModeController, MaxRequestSize: 1 << 20})
 	server.tmpl = tmpl
 	mux := server.SetupMux()
 
@@ -40,8 +40,8 @@ func TestConfigPageIsDedicatedAndRootRejectsUnknownPaths(t *testing.T) {
 	}
 }
 
-func TestSlaveRejectsConfigurationMutation(t *testing.T) {
-	server := testServer(&config.Config{Mode: "slave"})
+func TestAgentRejectsConfigurationMutation(t *testing.T) {
+	server := testServer(&config.Config{Mode: config.ModeAgent})
 	recorder := httptest.NewRecorder()
 	server.handlePostUpstreams(recorder, httptest.NewRequest(http.MethodPost, "/api/upstreams", strings.NewReader("[]")))
 	if recorder.Code != http.StatusForbidden || !strings.Contains(recorder.Body.String(), "read-only") {
@@ -49,8 +49,8 @@ func TestSlaveRejectsConfigurationMutation(t *testing.T) {
 	}
 }
 
-func TestMasterRejectsEmptyUpstreamList(t *testing.T) {
-	server := testServer(&config.Config{Mode: "master", WebUsername: "admin", WebPassword: "password"})
+func TestControllerRejectsEmptyUpstreamList(t *testing.T) {
+	server := testServer(&config.Config{Mode: config.ModeController, WebUsername: "admin", WebPassword: "password"})
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/api/upstreams", strings.NewReader("[]"))
 	request.AddCookie(&http.Cookie{
@@ -66,7 +66,7 @@ func TestMasterRejectsEmptyUpstreamList(t *testing.T) {
 func TestSyncDNSConfigRequiresBearerAndReturnsValidRevision(t *testing.T) {
 	dir := t.TempDir()
 	server := testServer(&config.Config{
-		Mode:         "master",
+		Mode:         config.ModeController,
 		IngestSecret: "cluster-secret",
 		HistoryDir:   dir,
 		UpstreamDNS:  "1.1.1.1",
@@ -99,7 +99,7 @@ func TestSyncDNSConfigRequiresBearerAndReturnsValidRevision(t *testing.T) {
 
 func TestApplyConfigSnapshotPersistsAllManagedSettings(t *testing.T) {
 	dir := t.TempDir()
-	cfg := &config.Config{Mode: "slave", HistoryDir: dir, UpstreamsFile: "upstreams.json"}
+	cfg := &config.Config{Mode: config.ModeAgent, HistoryDir: dir, UpstreamsFile: "upstreams.json"}
 	server := testServer(cfg)
 	engine := filter.New()
 	userRulesPath := filepath.Join(dir, "user_rules.txt")

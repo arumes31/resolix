@@ -56,7 +56,7 @@ RUN sed -i 's/\r$//' /usr/bin/entrypoint.sh && chmod +x /usr/bin/entrypoint.sh
 # Environment variables
 RUN mkdir -p /var/run/tailscale && chmod 750 /var/run/tailscale
 
-ENV MODE=master
+ENV MODE=controller
 ENV PORT=35353
 ENV WEB_LISTEN_ADDR=0.0.0.0
 

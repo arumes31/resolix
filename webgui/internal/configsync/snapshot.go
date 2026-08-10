@@ -1,5 +1,5 @@
 // Package configsync defines the versioned DNS configuration replicated from
-// a master node to resolver nodes.
+// a controller node to resolver nodes.
 package configsync
 
 import (
@@ -29,7 +29,7 @@ type snapshotPayload struct {
 	Clients       []clients.Client      `json:"clients"`
 }
 
-// Snapshot is a complete master-authoritative configuration revision.
+// Snapshot is a complete controller-authoritative configuration revision.
 type Snapshot struct {
 	snapshotPayload
 	Revision string `json:"revision"`

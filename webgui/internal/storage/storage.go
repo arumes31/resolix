@@ -1209,7 +1209,7 @@ func (s *Store) GetUpstreamHealth() map[string]map[string]float64 {
 }
 
 // SetNodeStatus updates the status of a node (Items 89, 92, 93).
-// This is called when a heartbeat is received from a slave node.
+// This is called when a heartbeat is received from a agent node.
 func (s *Store) SetNodeStatus(name string, status models.NodeStatus) {
 	if name == "" {
 		name = "unknown"

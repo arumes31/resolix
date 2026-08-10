@@ -37,7 +37,7 @@ function applyDynamicStyles(root) {
 
 // Base URL prefix for API requests (empty for root deployments)
 const apiBase = (document.body.dataset.baseUrl || '/').replace(/\/$/, '');
-const configReadOnly = document.body.dataset.mode === 'slave';
+const configReadOnly = document.body.dataset.mode === 'agent';
 
 function apiPath(path) {
     return apiBase + path;
@@ -181,7 +181,7 @@ function createRowHtml(e) {
         </td>
         <td>${e.upstream ? `<span class="upstream-badge">${escapeHtml(e.upstream)}</span>` : '-'}</td>
         <td class="latency-cell ${latencyClass}">${escapeHtml(latencyText)}</td>
-        <td>${configReadOnly ? '<span class="settings-list-meta">Master managed</span>' : `<button type="button" class="query-action-btn ${action === 'unblock' ? 'is-unblock' : ''}" aria-label="${actionLabel} ${escapeHtml(e.domain)}" data-domain="${escapeHtml(e.domain)}" data-action="${action}">${actionLabel}</button>`}</td>
+        <td>${configReadOnly ? '<span class="settings-list-meta">Controller managed</span>' : `<button type="button" class="query-action-btn ${action === 'unblock' ? 'is-unblock' : ''}" aria-label="${actionLabel} ${escapeHtml(e.domain)}" data-domain="${escapeHtml(e.domain)}" data-action="${action}">${actionLabel}</button>`}</td>
     `;
 }
 
@@ -354,7 +354,7 @@ function fetchNodeStatus() {
         const container = document.getElementById('nodeCards');
         if (!container) return;
         if (!nodes || nodes.length === 0) {
-            replaceHTMLIfChanged(container, '<p class="empty-state">No slave nodes connected</p>');
+            replaceHTMLIfChanged(container, '<p class="empty-state">No agent nodes connected</p>');
             return;
         }
         const nodeCardsHTML = nodes.map(node => {

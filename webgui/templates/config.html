@@ -55,7 +55,7 @@
                     <span id="upstreamCount" class="state-pill">0 servers</span>
                 </div>
                 <p class="panel-copy">One resolver specification per line. Plain DNS, TCP, DNS-over-TLS, and DNS-over-HTTPS are supported.</p>
-                <form id="upstreamForm" class="settings-form single-column-form master-edit">
+                <form id="upstreamForm" class="settings-form single-column-form controller-edit">
                     <label>Resolver list<textarea id="upstreamList" rows="8" spellcheck="false"
                         placeholder="1.1.1.1&#10;tls://dns.quad9.net:853&#10;https://dns.google/dns-query"></textarea></label>
                     <div class="inline-actions"><button type="submit" class="btn btn-primary">Save upstreams</button></div>
@@ -68,7 +68,7 @@
                     <span id="routeCount" class="state-pill">0 routes</span>
                 </div>
                 <p class="panel-copy">Send matching domains to a dedicated resolver. Exact and suffix patterns use the existing DNS route matcher.</p>
-                <form id="routeForm" class="settings-form master-edit">
+                <form id="routeForm" class="settings-form controller-edit">
                     <label>Domain pattern<input id="routePattern" type="text" placeholder="corp.internal" required></label>
                     <label>Resolver<input id="routeUpstream" type="text" placeholder="10.0.0.53" required></label>
                     <div class="inline-actions field-wide">
@@ -83,7 +83,7 @@
                     <div><span class="panel-index">02</span><h2>Filter subscriptions</h2></div>
                     <span id="subscriptionCount" class="state-pill">0 lists</span>
                 </div>
-                <form id="subscriptionForm" class="settings-form subscription-form master-edit">
+                <form id="subscriptionForm" class="settings-form subscription-form controller-edit">
                     <input id="subscriptionID" type="hidden">
                     <label>Name<input id="subscriptionName" type="text" maxlength="120" placeholder="StevenBlack hosts"></label>
                     <label class="field-wide">URL<input id="subscriptionURL" type="url" placeholder="https://example.com/blocklist.txt" required></label>
@@ -103,7 +103,7 @@
                     <span id="ruleCount" class="state-pill">0 rules</span>
                 </div>
                 <p class="panel-copy">Adblock rules, exceptions (<code>@@</code>), hosts entries, plain domains, and <code>/RE2/</code> expressions.</p>
-                <form id="userRulesForm" class="settings-form single-column-form master-edit">
+                <form id="userRulesForm" class="settings-form single-column-form controller-edit">
                     <label>Rules<textarea id="userRules" rows="16" spellcheck="false" placeholder="||ads.example^&#10;@@||allowed.example^"></textarea></label>
                     <div class="inline-actions"><button type="submit" class="btn btn-primary">Save custom rules</button></div>
                 </form>
@@ -114,7 +114,7 @@
                     <div><span class="panel-index">04</span><h2>DNS rewrites</h2></div>
                     <span id="rewriteCount" class="state-pill">0 rules</span>
                 </div>
-                <form id="rewriteForm" class="settings-form compact-form master-edit">
+                <form id="rewriteForm" class="settings-form compact-form controller-edit">
                     <label>Domain<input id="rewriteDomain" type="text" placeholder="printer.internal" required></label>
                     <label>Type<select id="rewriteType">
                         <option>A</option><option>AAAA</option><option>CNAME</option><option>PTR</option>
@@ -132,7 +132,7 @@
                     <div><span class="panel-index">05</span><h2>Client policies</h2></div>
                     <span id="clientCount" class="state-pill">0 clients</span>
                 </div>
-                <form id="clientForm" class="settings-form client-form master-edit">
+                <form id="clientForm" class="settings-form client-form controller-edit">
                     <label>Name<input id="clientName" type="text" placeholder="Kids devices" required></label>
                     <label class="field-wide">IPs or CIDRs<input id="clientIDs" type="text" placeholder="100.64.0.12, 192.168.20.0/24" required></label>
                     <label class="check-field field-wide"><input id="clientUseGlobal" type="checkbox" checked> Inherit global filtering and service settings</label>
@@ -163,12 +163,12 @@
                 <div class="panel-heading"><div><span class="panel-index">07</span><h2>DNS, cache & protocols</h2></div><span class="state-pill paused">Restart required</span></div>
                 <p class="panel-copy">These runtime values are visible here but remain environment-owned because changing listeners, ACLs, or protocol behavior safely requires a process restart.</p>
                 <div id="runtimeSettings" class="runtime-grid"></div>
-                <div class="inline-actions"><button type="button" id="pause5Btn" class="btn btn-secondary master-edit">Pause filtering 5m</button><button type="button" id="resumeBtn" class="btn btn-primary master-edit">Resume filtering</button></div>
+                <div class="inline-actions"><button type="button" id="pause5Btn" class="btn btn-secondary controller-edit">Pause filtering 5m</button><button type="button" id="resumeBtn" class="btn btn-primary controller-edit">Resume filtering</button></div>
             </section>
 
             <section id="settings-cluster" class="settings-panel" data-panel="cluster" hidden>
                 <div class="panel-heading"><div><span class="panel-index">08</span><h2>Cluster synchronization</h2></div><span id="clusterMode" class="state-pill">Loading</span></div>
-                <p class="panel-copy">The master is authoritative. Resolver nodes verify and apply content-addressed snapshots containing upstreams, routes, subscriptions, custom rules, rewrites, and clients.</p>
+                <p class="panel-copy">The controller is authoritative. Agent nodes verify and apply content-addressed snapshots containing upstreams, routes, subscriptions, custom rules, rewrites, and clients.</p>
                 <div id="clusterSummary" class="runtime-grid"></div>
             </section>
         </main>

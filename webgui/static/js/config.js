@@ -35,7 +35,7 @@ function notice(message, error = false) {
 
 function setEditable(editable) {
     state.editable = editable;
-    document.querySelectorAll('.master-edit input, .master-edit select, .master-edit textarea, .master-edit button, button.master-edit')
+    document.querySelectorAll('.controller-edit input, .controller-edit select, .controller-edit textarea, .controller-edit button, button.controller-edit')
         .forEach(control => { control.disabled = !editable; });
     document.body.classList.toggle('read-only-config', !editable);
 }
@@ -56,17 +56,17 @@ async function loadStatus() {
     state.revision = data.revision || '';
     setEditable(Boolean(data.editable));
     const statePill = document.getElementById('authorityState');
-    statePill.textContent = data.editable ? 'Master' : 'Read only';
+    statePill.textContent = data.editable ? 'Controller' : 'Read only';
     statePill.classList.toggle('online', Boolean(data.editable));
     statePill.classList.toggle('paused', !data.editable);
     document.getElementById('authorityTitle').textContent = data.editable
-        ? 'Changes apply here and replicate to resolver nodes'
-        : 'This resolver mirrors configuration from the master node';
+        ? 'Changes apply here and replicate to agent nodes'
+        : 'This agent mirrors configuration from the controller node';
     document.getElementById('configRevision').textContent = `revision ${String(data.revision || '—').slice(0, 12)}`;
     document.getElementById('clusterMode').textContent = data.mode;
     document.getElementById('clusterSummary').innerHTML = [
         ['Role', data.mode],
-        ['Authority', data.editable ? 'Master-owned' : 'Mirrored / read only'],
+        ['Authority', data.editable ? 'Controller-owned' : 'Mirrored / read only'],
         ['Revision', data.revision || 'Not available'],
         ['Snapshot contents', 'Upstreams, routes, blocklists, rules, rewrites, clients']
     ].map(([key, value]) => `<div class="runtime-item"><span>${escapeHtml(key)}</span><strong>${escapeHtml(value)}</strong></div>`).join('');
@@ -78,13 +78,13 @@ async function loadStatus() {
 async function loadCluster() {
     await loadStatus();
     let nodes = [];
-    if (state.mode === 'master') {
+    if (state.mode === 'controller') {
         const data = await apiJSON('/api/nodes');
         nodes = data.nodes || [];
     }
     const summary = [
         ['Role', state.mode],
-        ['Authority', state.editable ? 'Master-owned' : 'Mirrored / read only'],
+        ['Authority', state.editable ? 'Controller-owned' : 'Mirrored / read only'],
         ['Local revision', state.revision || 'Not available'],
         ['Snapshot contents', 'Upstreams, routes, blocklists, rules, rewrites, clients']
     ];
@@ -126,7 +126,7 @@ async function loadRoutes() {
         <div class="settings-list-row"><div class="settings-list-main">
             <div class="settings-list-title">${escapeHtml(pattern)}</div>
             <div class="settings-list-meta">${escapeHtml(resolver)}</div>
-        </div><div class="row-actions master-edit"><button type="button" class="mini-action danger route-delete" data-pattern="${escapeHtml(pattern)}">Delete</button></div></div>`
+        </div><div class="row-actions controller-edit"><button type="button" class="mini-action danger route-delete" data-pattern="${escapeHtml(pattern)}">Delete</button></div></div>`
     ).join('') || emptyState('No domain-specific routes configured');
     setEditable(state.editable);
 }
@@ -170,7 +170,7 @@ async function loadSubscriptions() {
                 <div class="settings-list-title">${escapeHtml(item.name || item.url)}</div>
                 <div class="settings-list-meta">${item.allow_only ? 'Allowlist' : 'Blocklist'} · ${item.enabled ? 'enabled' : 'disabled'} · ${escapeHtml(sourceState)} · ${escapeHtml(item.url)}</div>
             </div>
-            <div class="row-actions master-edit">
+            <div class="row-actions controller-edit">
                 <button type="button" class="mini-action subscription-edit" data-id="${escapeHtml(item.id)}">Edit</button>
                 <button type="button" class="mini-action danger subscription-delete" data-id="${escapeHtml(item.id)}">Delete</button>
             </div>
@@ -260,7 +260,7 @@ async function loadRewrites() {
         <div class="settings-list-row"><div class="settings-list-main">
             <div class="settings-list-title">${escapeHtml(item.domain)}</div>
             <div class="settings-list-meta">${escapeHtml(item.type)}${item.value ? ` → ${escapeHtml(item.value)}` : ''}</div>
-        </div><div class="row-actions master-edit"><button type="button" class="mini-action danger rewrite-delete" data-id="${escapeHtml(item.id)}">Delete</button></div></div>`
+        </div><div class="row-actions controller-edit"><button type="button" class="mini-action danger rewrite-delete" data-id="${escapeHtml(item.id)}">Delete</button></div></div>`
     ).join('') || emptyState('No DNS rewrites configured');
     setEditable(state.editable);
 }
@@ -334,7 +334,7 @@ async function loadClients() {
         <div class="settings-list-row"><div class="settings-list-main">
             <div class="settings-list-title">${escapeHtml(client.name)}</div>
             <div class="settings-list-meta">${escapeHtml((client.ids || []).join(', '))} · ${client.use_global_settings ? 'Global policy' : 'Custom policy'}</div>
-        </div><div class="row-actions master-edit">
+        </div><div class="row-actions controller-edit">
             <button type="button" class="mini-action client-edit" data-name="${escapeHtml(client.name)}">Edit</button>
             <button type="button" class="mini-action danger client-delete" data-name="${escapeHtml(client.name)}">Delete</button>
         </div></div>`).join('') || emptyState('No client policies configured');

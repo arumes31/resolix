@@ -92,6 +92,10 @@ func Parse(raw string) (Spec, error) {
 		if spec.Host == "" {
 			return Spec{}, fmt.Errorf("missing host in upstream %q", raw)
 		}
+		portNumber, err := strconv.Atoi(spec.Port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return Spec{}, fmt.Errorf("upstream %q has an invalid port", raw)
+		}
 		return spec, nil
 	}
 
@@ -118,6 +122,25 @@ func Parse(raw string) (Spec, error) {
 		return Spec{}, fmt.Errorf("plain upstream %q has an invalid port", raw)
 	}
 	return Spec{Scheme: SchemeUDP, Host: host, Port: port, Raw: raw}, nil
+}
+
+// ValidateBootstrapServers requires plain UDP IP-literal resolvers. Allowing a
+// hostname here would fall back to the operating-system resolver and defeat
+// the bootstrap boundary for hostname-based DoT and DoH upstreams.
+func ValidateBootstrapServers(servers []string) error {
+	for index, raw := range servers {
+		spec, err := Parse(raw)
+		if err != nil {
+			return fmt.Errorf("bootstrap resolver %d: %w", index+1, err)
+		}
+		if spec.Scheme != SchemeUDP {
+			return fmt.Errorf("bootstrap resolver %d must use plain UDP", index+1)
+		}
+		if spec.Hostname() {
+			return fmt.Errorf("bootstrap resolver %d must use an IP literal", index+1)
+		}
+	}
+	return nil
 }
 
 // dialAddrs returns the host:port addresses to dial. For IP literals it is a

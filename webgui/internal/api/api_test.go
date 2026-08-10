@@ -3,12 +3,14 @@ package api
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -16,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -36,6 +39,91 @@ func testServer(cfg *config.Config) *Server {
 		subscribers: make(map[chan models.QueryEvent]int),
 		rateLimits:  make(map[string]*rateLimitEntry),
 		metrics:     &Metrics{StartTime: time.Now()},
+	}
+}
+
+func TestServerStartGeneratedHTTPS(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve web port: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatalf("release reserved web port: %v", err)
+	}
+
+	cfg := &config.Config{
+		BaseURL:             "/",
+		HistoryDir:          t.TempDir(),
+		HTTPReadTimeout:     5 * time.Second,
+		HTTPWriteTimeout:    5 * time.Second,
+		HTTPShutdownTimeout: 5 * time.Second,
+		Port:                strconv.Itoa(port),
+		WebListenAddr:       "127.0.0.1",
+		WebTLSMode:          "auto",
+		WebTLSIP:            "100.64.30.40",
+	}
+	server := testServer(cfg)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- server.Start(
+			ctx,
+			http.NotFoundHandler(),
+			func(next http.Handler) http.Handler { return next },
+			func(context.Context) string { return "" },
+		)
+	}()
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS13,
+			// #nosec G402 -- test-only client inspects the generated self-signed chain below.
+			InsecureSkipVerify: true,
+		}},
+	}
+	defer client.CloseIdleConnections()
+	var response *http.Response
+	healthURL := "https://127.0.0.1:" + strconv.Itoa(port) + "/healthz"
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		response, err = client.Get(healthURL)
+		if err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		cancel()
+		t.Fatalf("generated HTTPS request failed: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		cancel()
+		t.Fatalf("health status = %d, want 200", response.StatusCode)
+	}
+	if response.TLS == nil || response.TLS.Version != tls.VersionTLS13 {
+		cancel()
+		t.Fatalf("TLS state = %#v, want TLS 1.3", response.TLS)
+	}
+	if len(response.TLS.PeerCertificates) != 2 {
+		cancel()
+		t.Fatalf("presented certificate chain length = %d, want 2", len(response.TLS.PeerCertificates))
+	}
+	if err := response.TLS.PeerCertificates[0].VerifyHostname("100.64.30.40"); err != nil {
+		cancel()
+		t.Fatalf("generated leaf IP SAN verification failed: %v", err)
+	}
+
+	cancel()
+	select {
+	case startErr := <-done:
+		if startErr != nil && !errors.Is(startErr, http.ErrServerClosed) {
+			t.Fatalf("Server.Start() error = %v", startErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("generated HTTPS server did not stop")
 	}
 }
 

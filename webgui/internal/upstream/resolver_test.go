@@ -74,6 +74,22 @@ func startUDPUpstreamHandler(t *testing.T, handler dns.HandlerFunc) string {
 	return pc.LocalAddr().String()
 }
 
+func startBootstrapServer(t *testing.T, host string, hits *atomic.Int32) string {
+	t.Helper()
+	return startUDPUpstreamHandler(t, func(w dns.ResponseWriter, request *dns.Msg) {
+		hits.Add(1)
+		response := new(dns.Msg)
+		response.SetReply(request)
+		if len(request.Question) > 0 && request.Question[0].Name == dns.Fqdn(host) && request.Question[0].Qtype == dns.TypeA {
+			response.Answer = []dns.RR{&dns.A{
+				Hdr: dns.RR_Header{Name: request.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 120},
+				A:   net.ParseIP("127.0.0.1").To4(),
+			}}
+		}
+		_ = w.WriteMsg(response)
+	})
+}
+
 // deadAddr returns an address with a closed UDP port (a server that was
 // started and immediately shut down).
 func deadAddr(t *testing.T) string {
@@ -185,6 +201,48 @@ func TestDoTResolver(t *testing.T) {
 	}
 }
 
+func TestDoTResolverUsesBootstrapServer(t *testing.T) {
+	const hostname = "dot.bootstrap.test"
+	var bootstrapHits atomic.Int32
+	bootstrapAddress := startBootstrapServer(t, hostname, &bootstrapHits)
+
+	cert := selfSignedCert(t)
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &dns.Server{Listener: listener, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, request *dns.Msg) {
+		response := new(dns.Msg)
+		response.SetReply(request)
+		response.Answer = []dns.RR{&dns.A{
+			Hdr: dns.RR_Header{Name: request.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 120},
+			A:   net.ParseIP(testAnswerIP).To4(),
+		}}
+		_ = w.WriteMsg(response)
+	})}
+	go func() { _ = server.ActivateAndServe() }()
+	t.Cleanup(func() { _ = server.Shutdown() })
+
+	testTLSConfig = &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- test-only self-signed fixture
+	t.Cleanup(func() { testTLSConfig = nil })
+	_, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := Parse("tls://" + net.JoinHostPort(hostname, port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := &dnsResolver{spec: spec, boot: newBootstrapper([]string{bootstrapAddress})}
+	response, err := resolver.Exchange(queryA())
+	if err != nil {
+		t.Fatalf("DoT exchange through bootstrap: %v", err)
+	}
+	if len(response.Answer) != 1 || bootstrapHits.Load() != 1 {
+		t.Fatalf("DoT answer/bootstrap hits = %v/%d", response.Answer, bootstrapHits.Load())
+	}
+}
+
 func TestDoHResolver(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if ct := r.Header.Get("Content-Type"); ct != "application/dns-message" {
@@ -228,6 +286,59 @@ func TestDoHResolver(t *testing.T) {
 	}
 	if len(resp.Answer) != 1 || resp.Answer[0].(*dns.A).A.String() != testAnswerIP {
 		t.Fatalf("DoH answer = %v", resp.Answer)
+	}
+}
+
+func TestDoHResolverUsesBootstrapServer(t *testing.T) {
+	const hostname = "doh.bootstrap.test"
+	var bootstrapHits atomic.Int32
+	bootstrapAddress := startBootstrapServer(t, hostname, &bootstrapHits)
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		wire, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+			return
+		}
+		query := new(dns.Msg)
+		if err := query.Unpack(wire); err != nil {
+			t.Errorf("unpack query: %v", err)
+			return
+		}
+		response := new(dns.Msg)
+		response.SetReply(query)
+		response.Answer = []dns.RR{&dns.A{
+			Hdr: dns.RR_Header{Name: query.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 120},
+			A:   net.ParseIP(testAnswerIP).To4(),
+		}}
+		packed, err := response.Pack()
+		if err != nil {
+			t.Errorf("pack response: %v", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(packed)
+	}))
+	defer server.Close()
+
+	testTLSConfig = &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- test-only self-signed fixture
+	t.Cleanup(func() { testTLSConfig = nil })
+	_, port, err := net.SplitHostPort(server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := Parse("https://" + net.JoinHostPort(hostname, port) + "/dns-query")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := &dohResolver{spec: spec, boot: newBootstrapper([]string{bootstrapAddress})}
+	t.Cleanup(resolver.closeIdleConnections)
+	response, err := resolver.Exchange(queryA())
+	if err != nil {
+		t.Fatalf("DoH exchange through bootstrap: %v", err)
+	}
+	if len(response.Answer) != 1 || bootstrapHits.Load() != 1 {
+		t.Fatalf("DoH answer/bootstrap hits = %v/%d", response.Answer, bootstrapHits.Load())
 	}
 }
 

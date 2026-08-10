@@ -11,24 +11,66 @@
     <link rel="stylesheet" href="static/css/style.css">
 </head>
 
-<body class="config-page" data-base-url="{{.BaseURL}}" data-csrf-token="{{.CSRFToken}}" data-mode="{{.Mode}}">
-    <div class="container config-container">
-        <header class="config-header">
-            <div>
-                <p class="console-kicker">DNS CONTROL PLANE</p>
-                <h1>Configuration</h1>
-                <p class="console-subtitle">Resolver policy, upstreams, filters, clients, and cluster state.</p>
+<body class="app-page config-page" data-base-url="{{.BaseURL}}" data-csrf-token="{{.CSRFToken}}" data-mode="{{.Mode}}">
+    <div id="sidebarScrim" class="sidebar-scrim" aria-hidden="true"></div>
+    <aside id="appSidebar" class="app-sidebar" aria-label="Primary navigation">
+        <div class="sidebar-brand">
+            <span class="brand-mark" aria-hidden="true">R</span>
+            <div><strong>Resolix</strong><span>{{if eq .Mode "controller"}}Controller{{else}}Agent{{end}} node</span></div>
+        </div>
+        <div class="sidebar-status">
+            <span class="status-beacon" aria-hidden="true"></span>
+            <div><strong>DNS control plane</strong><span>Protected and operational</span></div>
+        </div>
+        <nav class="app-nav" aria-label="Application">
+            <span class="nav-section-label">Observe</span>
+            <a class="app-nav-link" href="./">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13h6V4H4v9Zm0 7h6v-4H4v4Zm10 0h6v-9h-6v9Zm0-16v4h6V4h-6Z"/></svg><span>Dashboard</span>
+            </a>
+            <a class="app-nav-link" href="./#query-log">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v3H5V4Zm0 6h14v3H5v-3Zm0 6h9v3H5v-3Z"/></svg><span>Query log</span><span class="nav-live">Live</span>
+            </a>
+            {{if eq .Mode "controller"}}
+            <a class="app-nav-link" href="./#cluster-nodes">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a4 4 0 0 1 4 4c0 .7-.18 1.36-.5 1.93L19.57 13A4 4 0 1 1 18 14.5l-4.07-4.07A4 4 0 0 1 12 11a4 4 0 0 1-1.93-.5L6 14.57A4 4 0 1 1 4.43 13l4.07-4.07A4 4 0 1 1 12 3Z"/></svg><span>Cluster nodes</span>
+            </a>
+            {{end}}
+            <span class="nav-section-label">Manage</span>
+            <a class="app-nav-link is-active" href="config" aria-current="page">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19.14 12.94c.04-.3.06-.62.06-.94s-.02-.64-.07-.94l2.03-1.58-1.92-3.32-2.39.96a7.3 7.3 0 0 0-1.63-.94L14.86 3h-3.84l-.36 3.18c-.59.24-1.13.56-1.63.94l-2.39-.96-1.92 3.32 2.03 1.58c-.05.3-.08.63-.08.94s.03.64.08.94l-2.03 1.58 1.92 3.32 2.39-.96c.5.39 1.04.7 1.63.94l.36 3.18h3.84l.36-3.18a7.3 7.3 0 0 0 1.63-.94l2.39.96 1.92-3.32-2.02-1.58ZM12.94 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z"/></svg><span>Configuration</span>
+            </a>
+        </nav>
+        <div class="sidebar-footer">
+            <div class="sidebar-footnote"><span>Mode</span><strong>{{.Mode}}</strong></div>
+            <form method="post" action="./logout" class="logout-form sidebar-logout">
+                <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+                <button type="submit" class="app-nav-link sidebar-button" aria-label="Sign out">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 17v3H4V4h6v3H7v10h3Zm4.59-9.59L16 6l6 6-6 6-1.41-1.41L18.17 13H9v-2h9.17l-3.58-3.59Z"/></svg><span>Sign out</span>
+                </button>
+            </form>
+        </div>
+    </aside>
+
+    <div class="app-main">
+        <header class="app-topbar">
+            <div class="topbar-title">
+                <button id="sidebarToggle" type="button" class="sidebar-toggle" aria-controls="appSidebar" aria-expanded="false" aria-label="Open navigation">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16v2H4V6Zm0 5h16v2H4v-2Zm0 5h16v2H4v-2Z"/></svg>
+                </button>
+                <div><span class="page-kicker">DNS control plane</span><h1>Configuration</h1></div>
             </div>
-            <div class="header-controls">
-                <a class="btn btn-secondary header-link" href="./">Dashboard</a>
+            <div class="topbar-actions">
+                <span class="config-role"><i class="metric-dot green"></i>{{if eq .Mode "controller"}}Controller authority{{else}}Agent mirror{{end}}</span>
                 <button type="button" id="refreshSettingsBtn" class="btn btn-secondary">Refresh</button>
                 <button type="button" id="clearCacheBtn" class="btn btn-danger">Clear cache</button>
-                <form method="post" action="./logout" class="logout-form">
-                    <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-                    <button type="submit" class="btn-icon" title="Sign out" aria-label="Sign out">↪</button>
-                </form>
             </div>
         </header>
+
+        <main class="app-content container config-container">
+            <div class="config-intro">
+                <div><span class="page-kicker">Configuration workspace</span><h2>Resolver policy and cluster state</h2></div>
+                <p>Manage upstreams, filtering, client policy, rewrites, and synchronized controller settings.</p>
+            </div>
 
         <div id="configAuthority" class="authority-banner" role="status">
             <div><span id="authorityState" class="state-pill">Loading</span><strong id="authorityTitle">Checking configuration authority</strong></div>
@@ -48,16 +90,19 @@
             <button type="button" class="settings-tab" data-settings-tab="cluster">Cluster</button>
         </nav>
 
-        <main class="settings-panels config-panels">
+        <div class="settings-panels config-panels">
             <section id="settings-upstreams" class="settings-panel active" data-panel="upstreams">
                 <div class="panel-heading">
                     <div><span class="panel-index">01</span><h2>Upstream resolvers</h2></div>
                     <span id="upstreamCount" class="state-pill">0 servers</span>
                 </div>
-                <p class="panel-copy">One resolver specification per line. Plain DNS, TCP, DNS-over-TLS, and DNS-over-HTTPS are supported.</p>
+                <p class="panel-copy">One resolver specification per line. Plain DNS, TCP, DNS-over-TLS, and DNS-over-HTTPS are supported. Hostname-based encrypted resolvers use the bootstrap list below.</p>
                 <form id="upstreamForm" class="settings-form single-column-form controller-edit">
                     <label>Resolver list<textarea id="upstreamList" rows="8" spellcheck="false"
                         placeholder="1.1.1.1&#10;tls://dns.quad9.net:853&#10;https://dns.google/dns-query"></textarea></label>
+                    <label>Bootstrap resolver list<textarea id="bootstrapList" rows="4" spellcheck="false"
+                        placeholder="9.9.9.9&#10;1.1.1.1"></textarea></label>
+                    <p class="panel-copy">Bootstrap resolvers must be plain UDP IP addresses, optionally with a port. They resolve DoT and DoH hostnames without depending on the system DNS resolver.</p>
                     <div class="inline-actions"><button type="submit" class="btn btn-primary">Save upstreams</button></div>
                 </form>
             </section>
@@ -180,8 +225,10 @@
                 <p class="panel-copy">The controller is authoritative. Agent nodes verify and apply content-addressed snapshots containing upstreams, routes, subscriptions, custom rules, rewrites, and clients.</p>
                 <div id="clusterSummary" class="runtime-grid"></div>
             </section>
+        </div>
         </main>
     </div>
+    <script nonce="{{.Nonce}}" src="static/js/shell.js"></script>
     <script nonce="{{.Nonce}}" src="static/js/config.js"></script>
 </body>
 

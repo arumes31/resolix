@@ -1,4 +1,4 @@
-ARG VERSION=2.4.2
+ARG VERSION=2.4.7
 
 # Stage 1: Build
 FROM golang:1.26.5-alpine AS builder
@@ -65,6 +65,10 @@ ENV WEB_LISTEN_ADDR=0.0.0.0
 EXPOSE 53/udp 53/tcp 853/tcp 35353/tcp
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
-  CMD wget -qO- http://127.0.0.1:${PORT}/healthz >/dev/null || exit 1
+  CMD if [ "${WEB_TLS_MODE}" = "auto" ]; then \
+        wget --no-check-certificate -qO- https://127.0.0.1:${PORT}/healthz >/dev/null; \
+      else \
+        wget -qO- http://127.0.0.1:${PORT}/healthz >/dev/null; \
+      fi || exit 1
 
 ENTRYPOINT ["/usr/bin/entrypoint.sh"]

@@ -19,7 +19,7 @@ Resolix is a self-hosted DNS control plane for Tailscale networks. One Go servic
 - SQLite history with bounded asynchronous batching, live SSE updates, metrics, health checks, and node status.
 - A dedicated `/config` control plane for upstreams, routes, filter subscriptions, custom rules, rewrites, clients, services, and cache management.
 - Controller/Agent clusters with content-addressed configuration snapshots and visible revision drift.
-- Reverse-proxy TLS termination and subpath support through `WEB_LISTEN_ADDR`, `BASE_URL`, and `TRUSTED_PROXIES`.
+- Generated controller HTTPS with tailnet-restricted CA pinning, plus external reverse-proxy TLS and subpath support.
 
 ## Quick start
 
@@ -81,27 +81,110 @@ flowchart LR
     AgentB -- events and heartbeat --> Controller
 ```
 
-### Cluster roles
+### Configure a controller and agents
 
-| Role | Purpose | Configuration |
+| Role | Purpose | Required cluster settings |
 | --- | --- | --- |
 | `controller` | Authoritative dashboard, query history, configuration editor, and cluster status | `MODE=controller` (default) |
-| `agent` | Managed resolver that forwards events and pulls verified configuration snapshots | `MODE=agent`, `CONTROLLER_URL=https://...`, matching `INGEST_SECRET` |
+| `agent` | Managed resolver that forwards events and applies verified configuration snapshots | `MODE=agent`, an HTTPS `CONTROLLER_URL`, and the controller's `INGEST_SECRET` |
 
-`CONTROLLER_URL` must use HTTPS. A TLS-terminating reverse proxy is supported. Agents expose `/config` as read-only and report their last applied revision in heartbeats.
+Run each node as a separate Compose deployment with its own `history` and `tailscale` directories. Use the same immutable `IMAGE_VERSION` and `INGEST_SECRET` on every node, but give every node a unique `NODE_NAME` and Tailscale identity. Never share persistent directories between nodes.
+
+Generate the cluster secret once and keep it out of source control:
+
+```bash
+openssl rand -hex 32
+```
+
+#### 1. Configure the controller
+
+Copy `.env.example` to `.env` on the controller host and set:
+
+```dotenv
+IMAGE_VERSION=vX.Y.Z
+MODE=controller
+NODE_NAME=resolix-controller
+TS_AUTHKEY=tskey-auth-REPLACE_ME
+INGEST_SECRET=<paste-generated-secret>
+
+# Serve HTTPS directly on the container's Tailscale address.
+WEB_TLS_MODE=auto
+# Leave empty to use the address exported by the bundled Tailscale client.
+WEB_TLS_IP=
+```
+
+Start the controller and record its Tailscale IPv4 address:
+
+```bash
+docker compose -f docker-compose.example.yaml up -d
+docker exec resolix tailscale ip -4
+docker exec resolix wget --no-check-certificate -qO- https://127.0.0.1:35353/readyz
+```
+
+`WEB_TLS_MODE=auto` accepts only a `100.64.0.0/10` address. It creates the private controller CA under `history/tls`, serves TLS 1.3, and rotates the IP-SAN server certificate automatically. Back up `history`; agents remain pinned to this CA across leaf rotations.
+
+#### 2. Configure each agent
+
+Create a fresh deployment directory on the agent host, then configure its `.env` with the controller address returned above:
+
+```dotenv
+IMAGE_VERSION=vX.Y.Z
+MODE=agent
+NODE_NAME=resolix-agent-1
+TS_AUTHKEY=tskey-auth-REPLACE_ME
+INGEST_SECRET=<paste-the-same-generated-secret>
+
+CONTROLLER_URL=https://100.64.10.20:35353
+CONTROLLER_TLS_TRUST=tofu-tailnet
+CONTROLLER_TLS_PIN_FILE=tls/controller-ca-pin.json
+WEB_TLS_MODE=off
+```
+
+Start the agent and inspect its enrollment:
+
+```bash
+docker compose -f docker-compose.example.yaml up -d
+docker compose -f docker-compose.example.yaml logs --tail=100 resolix
+docker exec resolix cat /var/lib/resolix/tls/controller-ca-pin.json
+```
+
+Tailnet TOFU is available only for direct HTTPS URLs using an exact `100.64.0.0/10` IPv4 address. On the first connection, the agent validates the server chain and IP SAN, saves the controller CA fingerprint before transmitting `INGEST_SECRET`, and rejects later CA changes. Compare the saved fingerprint with the controller's `CA sha256:...` startup log through an independent trusted channel.
+
+Repeat this step for additional agents, changing `NODE_NAME`, `TS_AUTHKEY`, and the local persistent directories for every node. A persisted `tailscale` directory removes the need to retain `TS_AUTHKEY` after successful enrollment.
+
+#### 3. Configure DNS once on the controller
+
+Open the controller's `/config` page and manage upstreams, bootstrap resolvers, DNS routes, filter subscriptions, custom rules, rewrites, and client policies there. Agents expose `/config` as read-only, periodically pull the controller's content-addressed snapshot, persist it locally, and report their applied revision. Query events and heartbeats flow back to the controller using the shared `INGEST_SECRET`.
+
+Point clients at the Tailscale IPv4 address of the desired controller or agent on UDP/TCP port 53. Ensure Tailscale ACLs permit clients to reach DNS on the resolver nodes and permit agents to reach the controller's HTTPS port.
+
+#### Reverse-proxy certificate instead of generated TLS
+
+When a reverse proxy terminates HTTPS for the controller, use a hostname with a publicly or privately trusted certificate:
 
 ```dotenv
 # Controller
-MODE=controller
-NODE_NAME=dns-controller
-INGEST_SECRET=shared-cluster-secret
+WEB_TLS_MODE=off
+TRUSTED_PROXIES=100.64.10.5/32
+WEB_USERNAME=resolix-admin
+WEB_PASSWORD=<generated-dashboard-password>
 
-# Agent
-MODE=agent
-NODE_NAME=dns-agent-1
-CONTROLLER_URL=https://dns-controller.example.com
-INGEST_SECRET=shared-cluster-secret
+# Agents
+CONTROLLER_URL=https://resolix.example.com
+CONTROLLER_TLS_TRUST=system
 ```
+
+The proxy must preserve the `/api` paths and provide HTTPS all the way to the agent-visible controller URL. Restrict the plain HTTP backend to the proxy, and list only the proxy's actual address or CIDR in `TRUSTED_PROXIES`.
+
+#### Cluster troubleshooting
+
+| Symptom | Check |
+| --- | --- |
+| Agent exits during startup | `MODE=agent` requires an HTTPS `CONTROLLER_URL`; confirm the controller address and port. |
+| Agent does not appear on the controller | Confirm network reachability, unique `NODE_NAME` values, and an identical `INGEST_SECRET` on both nodes. |
+| Agent rejects the controller certificate | Confirm the URL uses the controller's exact Tailscale IPv4 address. After an intentional CA replacement, stop the agent, independently verify the new controller fingerprint, remove its configured pin file, and restart. |
+| Agent configuration is read-only | Expected: edit `/config` on the controller and wait for the revision to synchronize. |
+| DNS is unreachable | Confirm the node is connected to Tailscale and that ACLs allow UDP and TCP port 53 to its Tailscale address. |
 
 Legacy `MODE=master`, `MODE=slave`, and `MASTER_URL` values are accepted for upgrades and normalized to the new names. `CONTROLLER_URL` takes precedence when both URL variables are present.
 
@@ -131,12 +214,16 @@ Cache hits are measured inside the DNS request lifecycle. Query events are emitt
 
 Environment variables are the bootstrap layer. Settings that can be changed safely at runtime are managed from `/config` and synchronized from the controller to agents. Listener addresses, credentials, certificates, and storage paths remain environment-owned and require a restart.
 
+The **Upstreams** panel manages both upstream resolver specifications and the shared bootstrap resolver list. Bootstrap entries must be plain UDP IP literals (with an optional port); Resolix uses them to resolve hostname-based DoT and DoH endpoints, hot-reloads them without restarting DNS, and includes them in controller-to-agent configuration revisions. `BOOTSTRAP_DNS` supplies the initial list until the controller saves an explicit list in `/config`.
+
 ### Node, web, and cluster
 
 | Variable | Description | Default |
 | --- | --- | --- |
 | `MODE` | `controller` or `agent`; legacy values are normalized | `controller` |
 | `CONTROLLER_URL` | HTTPS controller URL required by agents | unset |
+| `CONTROLLER_TLS_TRUST` | Agent trust mode: `system` or direct-IP `tofu-tailnet` | `system` |
+| `CONTROLLER_TLS_PIN_FILE` | Persisted CA SPKI pin, relative to `HISTORY_DIR` unless absolute | `tls/controller-ca-pin.json` |
 | `NODE_NAME` | Unique node label shown in the dashboard | OS hostname |
 | `TS_AUTHKEY` | Tailscale auth key used for first enrollment | unset |
 | `TS_AUTHKEY_FILE` | File containing the auth key; used when `TS_AUTHKEY` is empty | unset |
@@ -144,6 +231,8 @@ Environment variables are the bootstrap layer. Settings that can be changed safe
 | `WEB_USERNAME` / `WEB_PASSWORD` | Dashboard credentials; configure both or neither | unset |
 | `PORT` | Web/API listen port | `35353` |
 | `WEB_LISTEN_ADDR` | Web/API bind address | `0.0.0.0` |
+| `WEB_TLS_MODE` | `off` for HTTP/reverse-proxy termination or `auto` for generated controller HTTPS | `off` |
+| `WEB_TLS_IP` | Exact Tailscale IPv4 SAN for generated HTTPS; falls back to `TAILSCALE_IP` | automatic |
 | `BASE_URL` | Reverse-proxy subpath such as `/dns` | `/` |
 | `TRUSTED_PROXIES` | Proxy IPs/CIDRs allowed to provide forwarded headers | unset |
 | `MAX_REQUEST_SIZE` | Maximum HTTP request body size in bytes | `1048576` |
@@ -177,7 +266,7 @@ Environment variables are the bootstrap layer. Settings that can be changed safe
 | `UPSTREAM_DNS` | Space-separated `ip`, `ip#port`, `udp://`, `tcp://`, `tls://`, or `https://` endpoints | `8.8.8.8 8.8.4.4` |
 | `UPSTREAM_MODE` | `load_balance`, `parallel`, or `strict` | `load_balance` |
 | `FALLBACK_DNS` | Used only when every primary upstream fails | unset |
-| `BOOTSTRAP_DNS` | Plain UDP resolver for hostname-based DoT/DoH upstreams | unset |
+| `BOOTSTRAP_DNS` | Initial space-separated plain UDP IP resolvers for hostname-based DoT/DoH; `/config` overrides | unset |
 | `ECS_CLIENT_SUBNET` | EDNS Client Subnet sent upstream | unset |
 | `UPSTREAMS_FILE` | Persisted upstream list, relative to `HISTORY_DIR` unless absolute | `upstreams.json` |
 | `DNS_ROUTES_FILE` | Persisted domain-route map | unset |
@@ -246,7 +335,17 @@ DoT listens directly on `DOT_PORT`. When `DOT_ENABLED=true`, startup fails unles
 
 ## Reverse proxy and web TLS
 
-The web listener intentionally serves HTTP behind a TLS-terminating reverse proxy. When dashboard authentication is configured, Resolix accepts it only over HTTPS observed directly or through an explicitly trusted proxy. Session and CSRF cookies are always `Secure`, `HttpOnly`, and `SameSite=Strict`.
+### Direct Tailscale HTTPS
+
+Set `WEB_TLS_MODE=auto` on the controller to serve TLS 1.3 directly on `PORT`. `WEB_TLS_IP` must be the controller's exact `100.64.0.0/10` address; containers normally inherit it from `TAILSCALE_IP`. Resolix creates `HISTORY_DIR/tls/controller-ca.pem` with mode `0600`. This private CA is valid for 100 years. One-year IP-SAN server certificates and keys remain in memory and rotate automatically during the final 30 days.
+
+On each agent, set `CONTROLLER_URL=https://100.x.y.z:35353` and `CONTROLLER_TLS_TRUST=tofu-tailnet`. The first valid CA is pinned before any authenticated HTTP request is transmitted. Later CA changes fail closed and are never accepted automatically. TOFU is deliberately unavailable for hostnames, RFC1918 addresses, public addresses, and non-HTTPS URLs.
+
+To enroll a replacement controller CA, stop the agent, verify the new fingerprint from the controller logs through an independent trusted channel, remove the configured `CONTROLLER_TLS_PIN_FILE`, and restart the agent. Protect and back up the controller CA with the rest of `HISTORY_DIR`; losing it requires this explicit re-enrollment on every agent.
+
+### External reverse proxy
+
+Leave `WEB_TLS_MODE=off` when a reverse proxy terminates TLS. When dashboard authentication is configured, Resolix accepts it only over HTTPS observed directly or through an explicitly trusted proxy. Session and CSRF cookies are always `Secure`, `HttpOnly`, and `SameSite=Strict`.
 
 Bind Resolix to loopback when the proxy runs on the same host and trust only the proxy address:
 
@@ -295,7 +394,7 @@ tar -czf resolix-backup.tgz history tailscale
 docker compose start resolix
 ```
 
-Restore both directories while the container is stopped, retain ownership and permissions, start the same image tag, and confirm `/readyz` before upgrading.
+Restore both directories while the container is stopped, retain ownership and permissions, start the same image tag, and confirm `/readyz` before upgrading. `history/tls` contains the generated controller CA and is the default controller TLS pin location. If `CONTROLLER_TLS_PIN_FILE` is absolute, also back up that configured path. These files must remain private.
 
 ### Migration from the former project name
 
@@ -309,13 +408,13 @@ Restore both directories while the container is stopped, retain ownership and pe
 
 [`webgui/VERSION`](webgui/VERSION) is the canonical application version. The binary, API, node status, and container metadata report that version; CI rejects a mismatched Dockerfile default.
 
-Merging code into `main` does not create a tag or release. When a version is ready to ship:
+Every code push to `main` builds and publishes a multi-platform GHCR image tagged `main` and with the immutable commit SHA. Version and `latest` tags are applied only to validated release builds. A main push does not create a Git tag or GitHub release. When a version is ready to become a formal release:
 
 1. Update `webgui/VERSION` and the matching `ARG VERSION` default in `Dockerfile`.
 2. Merge the tested change into `main`.
 3. Run the **Create Release** workflow manually in GitHub Actions.
 
-The workflow tags the current `main` commit with `v<version>`, dispatches the multi-platform GHCR build for that tag, and creates the GitHub release. The image receives version, revision, build-date, semver, `latest`, and SHA metadata/tags. The release and image workflows reject tags that do not exactly match `webgui/VERSION`.
+The manual workflow tags the current `main` commit with `v<version>`, dispatches the release-tagged multi-platform GHCR build, and creates the GitHub release. Release images receive version, revision, build-date, semver, `latest`, and SHA metadata/tags. The release and image workflows reject tags that do not exactly match `webgui/VERSION`.
 
 ## Operations
 
@@ -353,6 +452,7 @@ sudo sysctl -w net.ipv4.tcp_fastopen=3
 - Prefer `TS_AUTHKEY_FILE` to an inline enrollment key. Revoke exposed or unused keys after enrollment.
 - Rotate `INGEST_SECRET` across the controller and all agents in one maintenance window.
 - Rotate web credentials and `DOH_AUTH_TOKEN` independently.
+- Generated server leaves rotate automatically. Back up the generated controller CA; never copy its private key to agents.
 - Replace DoT certificate/key files atomically, restart Resolix, and verify DoT before retiring the old certificate.
 
 ## Troubleshooting
@@ -360,7 +460,7 @@ sudo sysctl -w net.ipv4.tcp_fastopen=3
 | Check | Command |
 | --- | --- |
 | Container logs | `docker logs resolix` |
-| Readiness | `curl --fail http://127.0.0.1:35353/readyz` |
+| Readiness | `curl --fail http://127.0.0.1:35353/readyz`, or `curl --insecure --fail https://127.0.0.1:35353/readyz` with generated TLS |
 | Tailscale status | `docker exec resolix tailscale status` |
 | DNS rewrite | `dig @TAILSCALE_IP example.internal` |
 | Upstream reachability | `docker exec resolix dig @UPSTREAM_IP google.com` |
@@ -369,6 +469,8 @@ sudo sysctl -w net.ipv4.tcp_fastopen=3
 Common startup failures:
 
 - Agent mode without an HTTPS `CONTROLLER_URL`.
+- Generated controller TLS without a `100.64.0.0/10` `WEB_TLS_IP`/`TAILSCALE_IP`.
+- `tofu-tailnet` configured with a hostname, non-Tailscale address, corrupt pin, or changed controller CA.
 - Partial web authentication: `WEB_USERNAME` and `WEB_PASSWORD` must be configured together.
 - No web credentials and no `INGEST_SECRET`.
 - DoT enabled without a valid certificate/key pair.

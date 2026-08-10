@@ -25,6 +25,7 @@ func TestParse(t *testing.T) {
 		{"https://dns.google/dns-query", "https", "dns.google", "443", "/dns-query", false},
 		{"https://1.1.1.1", "https", "1.1.1.1", "443", "/dns-query", false},
 		{"https://1.1.1.1:4443/custom", "https", "1.1.1.1", "4443", "/custom", false},
+		{"udp://192.0.2.53:70000", "", "", "", "", true},
 		{"dns.google", "", "", "", "", true},        // hostname without scheme
 		{"quic://dns.google", "", "", "", "", true}, // unsupported scheme
 		{"https://", "", "", "", "", true},
@@ -73,5 +74,27 @@ func TestSpecHostname(t *testing.T) {
 	nameSpec, _ := Parse("tls://dns.google")
 	if !nameSpec.Hostname() {
 		t.Error("dns.google must need bootstrap")
+	}
+}
+
+func TestValidateBootstrapServers(t *testing.T) {
+	tests := []struct {
+		name    string
+		servers []string
+		wantErr bool
+	}{
+		{name: "IPv4 and IPv6 literals", servers: []string{"9.9.9.9", "[2001:4860:4860::8888]:53"}},
+		{name: "UDP scheme", servers: []string{"udp://1.1.1.1:5353"}},
+		{name: "encrypted transport", servers: []string{"tls://dns.example"}, wantErr: true},
+		{name: "hostname", servers: []string{"udp://dns.example"}, wantErr: true},
+		{name: "out-of-range port", servers: []string{"udp://192.0.2.53:70000"}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := ValidateBootstrapServers(test.servers)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("ValidateBootstrapServers() error = %v, wantErr %v", err, test.wantErr)
+			}
+		})
 	}
 }

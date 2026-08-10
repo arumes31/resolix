@@ -9,6 +9,7 @@ import (
 func TestSnapshotRevisionDetectsMutation(t *testing.T) {
 	snapshot, err := NewSnapshot(
 		[]string{"1.1.1.1"},
+		[]string{"9.9.9.9"},
 		nil,
 		nil,
 		"||example.test^\n",
@@ -41,6 +42,7 @@ func TestSnapshotRevisionDetectsMutation(t *testing.T) {
 	}
 	snapshot, err = NewSnapshot(
 		[]string{"1.1.1.1"},
+		[]string{"9.9.9.9"},
 		nil,
 		nil,
 		"||example.test^\n",
@@ -63,5 +65,17 @@ func TestSnapshotRevisionDetectsMutation(t *testing.T) {
 	}
 	if valid {
 		t.Fatal("source CIDR mutation did not invalidate revision")
+	}
+	snapshot, err = NewSnapshot([]string{"1.1.1.1"}, []string{"9.9.9.9"}, nil, nil, "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.BootstrapServers[0] = "8.8.8.8"
+	valid, err = snapshot.ValidRevision()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if valid {
+		t.Fatal("bootstrap resolver mutation did not invalidate revision")
 	}
 }

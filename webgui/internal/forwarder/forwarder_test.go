@@ -37,7 +37,7 @@ func testEvents(domains ...string) []models.QueryEvent {
 }
 
 func TestSyncDNSConfigAppliesOnlyValidNewRevision(t *testing.T) {
-	snapshot, err := configsync.NewSnapshot([]string{"1.1.1.1"}, nil, nil, "||example.test^\n", nil, nil)
+	snapshot, err := configsync.NewSnapshot([]string{"1.1.1.1"}, []string{"9.9.9.9"}, nil, nil, "||example.test^\n", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,6 +171,33 @@ func TestNewForwarder(t *testing.T) {
 	fwd := NewForwarder(cfg)
 	if fwd == nil {
 		t.Fatal("NewForwarder returned nil")
+	}
+}
+
+func TestNewForwarderConfiguresTailnetTOFU(t *testing.T) {
+	cfg := &config.Config{
+		Mode:                 config.ModeAgent,
+		ControllerURL:        "https://100.64.20.30:35353",
+		ControllerTLSTrust:   "tofu-tailnet",
+		ControllerTLSPinFile: "pin.json",
+		HistoryDir:           t.TempDir(),
+	}
+	fwd := NewForwarder(cfg)
+	if fwd.transportErr != nil {
+		t.Fatalf("NewForwarder() transport error = %v", fwd.transportErr)
+	}
+	transport, ok := fwd.httpClient.Transport.(*http.Transport)
+	if !ok || transport.TLSClientConfig == nil || transport.TLSClientConfig.VerifyConnection == nil {
+		t.Fatal("NewForwarder() did not install the TOFU TLS verifier")
+	}
+	if transport.Proxy != nil {
+		t.Fatal("NewForwarder() allowed a proxy to intercept tailnet TOFU enrollment")
+	}
+
+	cfg.ControllerURL = "https://controller.example.test"
+	fwd = NewForwarder(cfg)
+	if fwd.transportErr == nil || fwd.httpClient != nil {
+		t.Fatal("NewForwarder() did not fail closed for non-tailnet TOFU")
 	}
 }
 

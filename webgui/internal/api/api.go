@@ -37,6 +37,7 @@ import (
 	"github.com/arumes31/resolix/webgui/internal/blocklist"
 	"github.com/arumes31/resolix/webgui/internal/clients"
 	"github.com/arumes31/resolix/webgui/internal/config"
+	"github.com/arumes31/resolix/webgui/internal/controllertls"
 	"github.com/arumes31/resolix/webgui/internal/dnsroutes"
 	"github.com/arumes31/resolix/webgui/internal/dnsserver"
 	apperr "github.com/arumes31/resolix/webgui/internal/errors"
@@ -938,6 +939,7 @@ func (s *Server) SetupMux() http.Handler {
 
 	// Item 62: Upstream configuration editor
 	mux.Handle("/api/upstreams", s.authMiddleware(http.HandlerFunc(s.handleUpstreams)))
+	mux.Handle("/api/upstream-settings", s.authMiddleware(http.HandlerFunc(s.handleUpstreamSettings)))
 
 	// Item 63: Cache clear endpoint
 	mux.Handle("/api/cache/clear", s.authMiddleware(http.HandlerFunc(s.handleCacheClear)))
@@ -2414,6 +2416,79 @@ func (s *Server) handleGetUpstreams(w http.ResponseWriter, _ *http.Request) {
 	_ = json.NewEncoder(w).Encode(s.configuredUpstreams())
 }
 
+func (s *Server) handleUpstreamSettings(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"upstreams":         s.configuredUpstreams(),
+			"bootstrap_servers": s.configuredBootstrapServers(),
+		})
+	case http.MethodPost:
+		if !s.requireController(w) || !s.checkCSRF(w, r) {
+			return
+		}
+		var request struct {
+			Upstreams        []string `json:"upstreams"`
+			BootstrapServers []string `json:"bootstrap_servers"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&request); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+		upstreams := compactStrings(request.Upstreams)
+		bootstrapServers := compactStrings(request.BootstrapServers)
+		if err := validateResolverSettings(upstreams, bootstrapServers); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := s.saveUpstreamSettings(upstreams, bootstrapServers); err != nil {
+			http.Error(w, "Failed to save upstream settings", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":            "ok",
+			"upstreams":         upstreams,
+			"bootstrap_servers": bootstrapServers,
+		})
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func compactStrings(values []string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
+func (s *Server) saveUpstreamSettings(upstreams, bootstrapServers []string) error {
+	path := s.cfg.FullUpstreamsPath()
+	if path == "" {
+		return errors.New("upstreams file not configured")
+	}
+	if err := dnsroutes.SaveUpstreamSettings(path, dnsroutes.UpstreamSettings{
+		Upstreams:           upstreams,
+		BootstrapServers:    bootstrapServers,
+		BootstrapConfigured: true,
+	}); err != nil {
+		return err
+	}
+	s.fieldsMu.RLock()
+	reload := s.upstreamReloadFn
+	s.fieldsMu.RUnlock()
+	if reload != nil {
+		reload()
+	}
+	return nil
+}
+
 func (s *Server) handlePostUpstreams(w http.ResponseWriter, r *http.Request) {
 	if !s.requireController(w) {
 		return
@@ -2855,6 +2930,15 @@ func (s *Server) Start(ctx context.Context, staticHandler http.Handler, cspMiddl
 		WriteTimeout:      s.cfg.HTTPWriteTimeout,
 		IdleTimeout:       120 * time.Second,
 	}
+	var tlsManager *controllertls.Manager
+	if s.cfg.WebTLSMode == controllertls.WebTLSAuto {
+		manager, err := controllertls.NewManager(s.cfg.HistoryDir, s.cfg.WebTLSIP)
+		if err != nil {
+			return fmt.Errorf("configure generated web TLS: %w", err)
+		}
+		tlsManager = manager
+		server.TLSConfig = manager.TLSConfig()
+	}
 
 	ln, err := net.Listen("tcp", server.Addr)
 	if err != nil {
@@ -2874,8 +2958,16 @@ func (s *Server) Start(ctx context.Context, staticHandler http.Handler, cspMiddl
 		close(shutdownDone)
 	}()
 
-	log.Printf("Starting Advanced Web GUI on %s", server.Addr)
-	err = server.Serve(ln)
+	if tlsManager != nil {
+		go tlsManager.Run(ctx, func(rotationErr error) {
+			log.Printf("Controller TLS certificate rotation failed: %v", rotationErr)
+		})
+		log.Printf("Starting Advanced Web GUI with generated HTTPS on %s (CA %s)", server.Addr, tlsManager.CAFingerprint())
+		err = server.ServeTLS(ln, "", "")
+	} else {
+		log.Printf("Starting Advanced Web GUI on %s", server.Addr)
+		err = server.Serve(ln)
+	}
 	if ctx.Err() != nil {
 		<-shutdownDone
 	}

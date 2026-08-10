@@ -623,6 +623,10 @@ func resolveDoHPath() string {
 	if !strings.HasPrefix(p, "/") {
 		p = "/" + p
 	}
+	if len(p) > 1 && (p[1] == '/' || p[1] == '\\') {
+		log.Printf("[WARN] Invalid DOH_PATH '%s', falling back to %s", sanitizeForLog(p), DefaultDoHPath) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		return DefaultDoHPath
+	}
 	p = pathpkg.Clean(p)
 	if !validDoHPath(p) {
 		log.Printf("[WARN] Conflicting DOH_PATH '%s', falling back to %s", sanitizeForLog(p), DefaultDoHPath) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper

@@ -149,7 +149,7 @@ type Server struct {
 func New(cfg Config, emit func(models.QueryEvent, bool)) *Server {
 	s := &Server{
 		cfg:             cfg,
-		cache:           newCache(cfg.CacheSize, uint32(cfg.CacheMinTTL), uint32(cfg.CacheMaxTTL)), // #nosec G115 -- CacheMinTTL/MaxTTL are validated non-negative in config
+		cache:           newCache(cfg.CacheSize, cacheTTL(cfg.CacheMinTTL), cacheTTL(cfg.CacheMaxTTL)),
 		emit:            emit,
 		refreshInFlight: make(map[cacheKey]bool),
 		client: &dns.Client{
@@ -177,6 +177,17 @@ func New(cfg Config, emit func(models.QueryEvent, bool)) *Server {
 	s.udp = &dns.Server{Net: "udp", Handler: handler}
 	s.tcp = &dns.Server{Net: "tcp", Handler: handler}
 	return s
+}
+
+func cacheTTL(value int) uint32 {
+	if value <= 0 {
+		return 0
+	}
+	const maxUint32 = uint64(1<<32 - 1)
+	if uint64(value) > maxUint32 {
+		return ^uint32(0)
+	}
+	return uint32(value)
 }
 
 // ListenAddr returns the host:port the server binds to.

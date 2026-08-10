@@ -147,6 +147,25 @@ func TestVerifyConfigRejectsAuthenticationAndNetworkMisconfiguration(t *testing.
 	}
 }
 
+func TestResolveDoHPathRejectsProtocolRelativeForms(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{name: "double slash", value: "//example.test/dns-query"},
+		{name: "slash backslash", value: `/\\example.test/dns-query`},
+		{name: "backslash slash", value: `\\/example.test/dns-query`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("DOH_PATH", test.value)
+			if got := resolveDoHPath(); got != DefaultDoHPath {
+				t.Fatalf("resolveDoHPath() = %q, want %q", got, DefaultDoHPath)
+			}
+		})
+	}
+}
+
 func TestBatchArchiveIntervalFeedsLegacyAndCurrentFields(t *testing.T) {
 	t.Setenv("BATCH_ARCHIVE_INTERVAL", "17s")
 	cfg := LoadConfig()

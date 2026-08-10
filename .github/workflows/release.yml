@@ -18,6 +18,9 @@ permissions:
   actions: write
   contents: write
 
+env:
+  RELEASE_SERIES: v2.3
+
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -31,9 +34,9 @@ jobs:
         id: version
         shell: bash
         run: |
-          latest="$(git tag --list | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)"
+          latest="$(git tag --list | grep -E "^${RELEASE_SERIES//./\\.}\\.[0-9]+$" | sort -V | tail -n 1 || true)"
           if [[ -z "${latest}" ]]; then
-            latest="v0.0.0"
+            latest="${RELEASE_SERIES}.0"
           fi
           IFS=. read -r major minor patch <<< "${latest#v}"
           next="v${major}.${minor}.$((patch + 1))"

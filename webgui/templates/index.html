@@ -41,6 +41,17 @@
             </div>
         </header>
 
+        <div class="settings-tabs top-settings-menu" role="tablist" aria-label="DNS settings">
+            <button type="button" id="settings-tab-filters" class="settings-tab active" role="tab"
+                aria-selected="true" aria-controls="settings-filters" data-settings-tab="filters">Filters</button>
+            <button type="button" id="settings-tab-rewrites" class="settings-tab" role="tab"
+                aria-selected="false" aria-controls="settings-rewrites" data-settings-tab="rewrites">Rewrites</button>
+            <button type="button" id="settings-tab-clients" class="settings-tab" role="tab"
+                aria-selected="false" aria-controls="settings-clients" data-settings-tab="clients">Clients</button>
+            <button type="button" id="settings-tab-services" class="settings-tab" role="tab"
+                aria-selected="false" aria-controls="settings-services" data-settings-tab="services">Services</button>
+        </div>
+
         <div id="simulatorResult"></div>
 
         <div class="dashboard-grid">
@@ -110,26 +121,7 @@
                         <th>Action</th>
                     </tr>
                 </thead>
-                <tbody id="eventTable">
-                    {{range .Events}}
-                    <tr>
-                        <td class="timestamp">{{.TimestampFormatted}}</td>
-                        <td><span class="badge node-badge">{{if
-                                .Node}}{{.Node}}{{else}}local{{end}}</span></td>
-                        <td><span class="badge badge-type">{{.Type}}</span></td>
-                        <td class="domain">{{.Domain}}</td>
-                        <td>
-                            <span class="badge badge-ip">{{.ClientIP}}</span>
-                            {{if .Alias}}<span class="alias-tag">{{.Alias}}</span>{{end}}
-                        </td>
-                        <td>{{if .Upstream}}<span class="upstream-badge">{{.Upstream}}</span>{{else}}-{{end}}</td>
-                        <td class="latency-cell">{{if .LatencyFormatted}}{{.LatencyFormatted}}{{else}}-{{end}}</td>
-                        <td><button type="button" class="query-action-btn {{if .Blocked}}is-unblock{{end}}"
-                                data-domain="{{.Domain}}" data-action="{{if .Blocked}}unblock{{else}}block{{end}}">{{if
-                                .Blocked}}Unblock{{else}}Block{{end}}</button></td>
-                    </tr>
-                    {{end}}
-                </tbody>
+                <tbody id="eventTable"></tbody>
             </table>
         </div>
 
@@ -148,17 +140,6 @@
             <div id="settingsNotice" class="settings-notice is-hidden" role="status" aria-live="polite"></div>
 
             <div class="settings-shell">
-                <div class="settings-tabs" role="tablist" aria-label="DNS settings">
-                    <button type="button" id="settings-tab-filters" class="settings-tab active" role="tab"
-                        aria-selected="true" aria-controls="settings-filters" data-settings-tab="filters">Filters</button>
-                    <button type="button" id="settings-tab-rewrites" class="settings-tab" role="tab"
-                        aria-selected="false" aria-controls="settings-rewrites" data-settings-tab="rewrites">Rewrites</button>
-                    <button type="button" id="settings-tab-clients" class="settings-tab" role="tab"
-                        aria-selected="false" aria-controls="settings-clients" data-settings-tab="clients">Clients</button>
-                    <button type="button" id="settings-tab-services" class="settings-tab" role="tab"
-                        aria-selected="false" aria-controls="settings-services" data-settings-tab="services">Services</button>
-                </div>
-
                 <div class="settings-panels">
                     <div id="settings-filters" class="settings-panel active" role="tabpanel"
                         aria-labelledby="settings-tab-filters">

@@ -316,8 +316,15 @@ func TestRootHandler(t *testing.T) {
 	rr := httptest.NewRecorder()
 	handler.ServeHTTP(rr, req)
 
-	if !strings.Contains(rr.Body.String(), "root.com") {
-		t.Error("Dashboard did not contain injected event")
+	if strings.Contains(rr.Body.String(), "root.com") {
+		t.Error("Dashboard HTML duplicated query history from the events API")
+	}
+
+	eventsReq := httptest.NewRequest("GET", "/api/events?limit=10", nil)
+	eventsRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(eventsRecorder, eventsReq)
+	if !strings.Contains(eventsRecorder.Body.String(), "root.com") {
+		t.Error("Events API did not contain injected event")
 	}
 }
 

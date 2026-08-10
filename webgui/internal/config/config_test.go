@@ -198,3 +198,25 @@ func TestBatchArchiveIntervalFeedsLegacyAndCurrentFields(t *testing.T) {
 		t.Fatalf("archive intervals = %s/%s", cfg.BatchArchiveInterval, cfg.ArchiveInterval)
 	}
 }
+
+func TestArchiveQueueSettings(t *testing.T) {
+	t.Run("explicit values", func(t *testing.T) {
+		t.Setenv("ARCHIVE_QUEUE_CAPACITY", "200000")
+		t.Setenv("ARCHIVE_TRIGGER_SIZE", "10000")
+		t.Setenv("ARCHIVE_WRITE_BATCH_SIZE", "2500")
+		cfg := LoadConfig()
+		if cfg.ArchiveQueueCapacity != 200000 || cfg.ArchiveTriggerSize != 10000 || cfg.ArchiveWriteBatchSize != 2500 {
+			t.Fatalf("archive queue settings = %d/%d/%d", cfg.ArchiveQueueCapacity, cfg.ArchiveTriggerSize, cfg.ArchiveWriteBatchSize)
+		}
+	})
+
+	t.Run("limits follow capacity", func(t *testing.T) {
+		t.Setenv("ARCHIVE_QUEUE_CAPACITY", "100")
+		t.Setenv("ARCHIVE_TRIGGER_SIZE", "101")
+		t.Setenv("ARCHIVE_WRITE_BATCH_SIZE", "101")
+		cfg := LoadConfig()
+		if cfg.ArchiveTriggerSize != 50 || cfg.ArchiveWriteBatchSize != 100 {
+			t.Fatalf("normalized archive limits = %d/%d, want 50/100", cfg.ArchiveTriggerSize, cfg.ArchiveWriteBatchSize)
+		}
+	})
+}

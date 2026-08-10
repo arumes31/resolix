@@ -2358,6 +2358,7 @@ tr:hover .test-domain-btn {
 /* ===== DNS Control Plane ===== */
 .dns-console {
   margin: 2rem 0;
+  scroll-margin-top: 5.5rem;
   border: 1px solid var(--border-color);
   border-radius: 1.25rem;
   overflow: hidden;
@@ -2448,21 +2449,31 @@ tr:hover .test-domain-btn {
 }
 
 .settings-shell {
-  display: grid;
-  grid-template-columns: minmax(150px, 0.22fr) 1fr;
   min-height: 420px;
 }
 
 .settings-tabs {
   display: flex;
-  flex-direction: column;
+  align-items: center;
   gap: 0.35rem;
-  padding: 1rem;
-  border-right: 1px solid var(--border-color);
-  background: hsla(0, 0%, 0%, 0.08);
+  overflow-x: auto;
+}
+
+.top-settings-menu {
+  position: sticky;
+  top: 0.75rem;
+  z-index: 20;
+  margin-bottom: 1rem;
+  padding: 0.55rem;
+  border: 1px solid var(--border-color);
+  border-radius: 0.9rem;
+  background: var(--bg-card);
+  box-shadow: 0 16px 45px -30px var(--shadow-color);
+  backdrop-filter: blur(18px);
 }
 
 .settings-tab {
+  flex: 0 0 auto;
   padding: 0.75rem 0.9rem;
   border: 1px solid transparent;
   border-radius: 0.65rem;
@@ -2472,7 +2483,7 @@ tr:hover .test-domain-btn {
   font: inherit;
   font-size: 0.82rem;
   font-weight: 600;
-  text-align: left;
+  text-align: center;
   transition: 0.2s ease;
 }
 
@@ -2777,15 +2788,9 @@ tr:hover .test-domain-btn {
     flex-direction: column;
   }
 
-  .settings-shell {
-    grid-template-columns: 1fr;
-  }
-
-  .settings-tabs {
-    flex-direction: row;
-    overflow-x: auto;
-    border-right: 0;
-    border-bottom: 1px solid var(--border-color);
+  .top-settings-menu {
+    top: 0.5rem;
+    margin-inline: -0.1rem;
   }
 
   .settings-tab {

@@ -8,13 +8,13 @@ import (
 	_ "github.com/glebarez/go-sqlite"
 )
 
-// TestInitDBMigratesOldSchema creates a queries table with the pre-filter
-// (Step 1) column set and verifies InitDB adds matched_rule/block_reason
-// while keeping inserts and reads working.
+// TestInitDBMigratesOldSchema creates a queries table with the original
+// column set and verifies InitDB adds all later columns while keeping inserts
+// and reads working.
 func TestInitDBMigratesOldSchema(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "old.db")
 
-	// Create an old-schema DB (no matched_rule/block_reason columns).
+	// Create an original-schema DB with none of the later optional columns.
 	raw, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
@@ -27,12 +27,7 @@ func TestInitDBMigratesOldSchema(t *testing.T) {
 		domain TEXT NOT NULL,
 		type TEXT NOT NULL,
 		upstream TEXT,
-		latency REAL,
-		dnssec TEXT DEFAULT '',
-		client_hostname TEXT DEFAULT '',
-		blocked INTEGER DEFAULT 0,
-		response_code TEXT DEFAULT '',
-		latency_alert INTEGER DEFAULT 0
+		latency REAL
 	);`)
 	if err != nil {
 		t.Fatalf("create old schema: %v", err)
@@ -68,6 +63,12 @@ func TestInitDBMigratesOldSchema(t *testing.T) {
 	for _, want := range []string{"matched_rule", "block_reason", "dnssec", "blocked"} {
 		if !cols[want] {
 			t.Errorf("column %q missing after migration", want)
+		}
+	}
+	for _, want := range []string{"idx_queries_blocked", "idx_queries_response_code"} {
+		var name string
+		if err := db.QueryRow("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?", want).Scan(&name); err != nil {
+			t.Errorf("index %q missing after migration: %v", want, err)
 		}
 	}
 

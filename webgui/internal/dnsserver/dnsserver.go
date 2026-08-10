@@ -13,6 +13,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"strings"
 	"sync"
@@ -183,8 +184,7 @@ func cacheTTL(value int) uint32 {
 	if value <= 0 {
 		return 0
 	}
-	const maxUint32 = uint64(1<<32 - 1)
-	if uint64(value) > maxUint32 {
+	if int64(value) > int64(math.MaxUint32) {
 		return ^uint32(0)
 	}
 	return uint32(value)

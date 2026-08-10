@@ -18,10 +18,10 @@ import (
 	"testing/fstest"
 	"time"
 
-	"tailscale-dnsrewrite/webgui/internal/blocklist"
-	"tailscale-dnsrewrite/webgui/internal/config"
-	"tailscale-dnsrewrite/webgui/internal/models"
-	"tailscale-dnsrewrite/webgui/internal/storage"
+	"github.com/arumes31/resolix/webgui/internal/blocklist"
+	"github.com/arumes31/resolix/webgui/internal/config"
+	"github.com/arumes31/resolix/webgui/internal/models"
+	"github.com/arumes31/resolix/webgui/internal/storage"
 )
 
 func testServer(cfg *config.Config) *Server {

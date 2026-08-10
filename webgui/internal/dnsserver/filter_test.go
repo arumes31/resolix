@@ -9,9 +9,9 @@ import (
 
 	"github.com/miekg/dns"
 
-	"tailscale-dnsrewrite/webgui/internal/filter"
-	"tailscale-dnsrewrite/webgui/internal/models"
-	"tailscale-dnsrewrite/webgui/internal/rewrites"
+	"github.com/arumes31/resolix/webgui/internal/filter"
+	"github.com/arumes31/resolix/webgui/internal/models"
+	"github.com/arumes31/resolix/webgui/internal/rewrites"
 )
 
 // filterHarness bundles a server under test with a filter engine and a fake

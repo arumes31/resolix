@@ -1,5 +1,5 @@
 // Package api implements the HTTP API and web GUI server for the
-// tailscale-dnsrewrite application. It handles authentication, SSE
+// Resolix application. It handles authentication, SSE
 // broadcasting, Prometheus metrics, request size limiting, and all
 // API endpoints.
 package api
@@ -34,21 +34,21 @@ import (
 
 	"github.com/miekg/dns"
 
-	"tailscale-dnsrewrite/webgui/internal/blocklist"
-	"tailscale-dnsrewrite/webgui/internal/clients"
-	"tailscale-dnsrewrite/webgui/internal/config"
-	"tailscale-dnsrewrite/webgui/internal/dnsroutes"
-	"tailscale-dnsrewrite/webgui/internal/dnsserver"
-	apperr "tailscale-dnsrewrite/webgui/internal/errors"
-	"tailscale-dnsrewrite/webgui/internal/filter"
-	"tailscale-dnsrewrite/webgui/internal/forwarder"
-	"tailscale-dnsrewrite/webgui/internal/models"
-	"tailscale-dnsrewrite/webgui/internal/parser"
-	"tailscale-dnsrewrite/webgui/internal/policy"
-	"tailscale-dnsrewrite/webgui/internal/resolver"
-	"tailscale-dnsrewrite/webgui/internal/rewrites"
-	"tailscale-dnsrewrite/webgui/internal/storage"
-	"tailscale-dnsrewrite/webgui/internal/upstream"
+	"github.com/arumes31/resolix/webgui/internal/blocklist"
+	"github.com/arumes31/resolix/webgui/internal/clients"
+	"github.com/arumes31/resolix/webgui/internal/config"
+	"github.com/arumes31/resolix/webgui/internal/dnsroutes"
+	"github.com/arumes31/resolix/webgui/internal/dnsserver"
+	apperr "github.com/arumes31/resolix/webgui/internal/errors"
+	"github.com/arumes31/resolix/webgui/internal/filter"
+	"github.com/arumes31/resolix/webgui/internal/forwarder"
+	"github.com/arumes31/resolix/webgui/internal/models"
+	"github.com/arumes31/resolix/webgui/internal/parser"
+	"github.com/arumes31/resolix/webgui/internal/policy"
+	"github.com/arumes31/resolix/webgui/internal/resolver"
+	"github.com/arumes31/resolix/webgui/internal/rewrites"
+	"github.com/arumes31/resolix/webgui/internal/storage"
+	"github.com/arumes31/resolix/webgui/internal/upstream"
 )
 
 const (

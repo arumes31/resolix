@@ -9,7 +9,7 @@ import (
 
 	"github.com/miekg/dns"
 
-	"tailscale-dnsrewrite/webgui/internal/config"
+	"github.com/arumes31/resolix/webgui/internal/config"
 )
 
 func TestCheckerUsesConfiguredProtocolAndPort(t *testing.T) {

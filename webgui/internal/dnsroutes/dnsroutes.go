@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"tailscale-dnsrewrite/webgui/internal/logger"
+	"github.com/arumes31/resolix/webgui/internal/logger"
 )
 
 // Route represents a domain-to-upstream mapping.

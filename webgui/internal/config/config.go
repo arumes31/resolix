@@ -23,7 +23,7 @@ const (
 	// DefaultWebListenAddr is the default web/API bind address.
 	DefaultWebListenAddr = "0.0.0.0"
 	// DefaultHistoryDir is the default directory for JSONL history files.
-	DefaultHistoryDir = "/var/lib/tailscale-dnsrewrite"
+	DefaultHistoryDir = "/var/lib/resolix"
 	// DefaultDBPath is the default database file name.
 	DefaultDBPath = "dns.db"
 	// DefaultMaxEvents is the maximum number of events to keep in memory.

@@ -18,7 +18,7 @@ COPY webgui/ .
 
 # Build the application (Improvement 45: Binary size reduction; inject release version)
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
-    -ldflags="-s -w -X main.Version=${VERSION} -X main.BuildInfo=${BUILD_INFO}" -o webgui .
+    -ldflags="-s -w -X main.Version=${VERSION} -X main.BuildInfo=${BUILD_INFO}" -o resolix .
 
 # Stage 2: Final Image
 FROM alpine:3.24
@@ -26,12 +26,12 @@ FROM alpine:3.24
 ARG VERSION=dev
 ARG BUILD_INFO=local
 ARG BUILD_DATE
-LABEL org.opencontainers.image.title="tailscale-dnsrewrite" \
+LABEL org.opencontainers.image.title="Resolix" \
       org.opencontainers.image.description="Embedded Go DNS filtering and rewrite server for Tailscale" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${BUILD_INFO}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
-      org.opencontainers.image.source="https://github.com/arumes31/tailscale-dnsrewrite"
+      org.opencontainers.image.source="https://github.com/arumes31/resolix"
 
 # Install runtime dependencies (including those required by Tailscale)
 RUN apk add --no-cache bash bind-tools ca-certificates iptables iproute2 ip6tables
@@ -41,10 +41,12 @@ COPY --from=tailscale/tailscale:v1.102.2 /usr/local/bin/tailscale /usr/bin/tails
 COPY --from=tailscale/tailscale:v1.102.2 /usr/local/bin/tailscaled /usr/sbin/tailscaled
 
 # Copy binary from builder
-COPY --from=builder /app/webgui /usr/bin/webgui
+COPY --from=builder /app/resolix /usr/bin/resolix
 
-# Create history directory
-RUN mkdir -p /var/lib/tailscale-dnsrewrite && chmod 750 /var/lib/tailscale-dnsrewrite \
+# Create the current and legacy data directories. The entrypoint recognizes a
+# populated legacy mount during upgrades.
+RUN mkdir -p /var/lib/resolix /var/lib/tailscale-dnsrewrite \
+    && chmod 750 /var/lib/resolix /var/lib/tailscale-dnsrewrite \
     && mkdir -p /var/lib/tailscale && chmod 750 /var/lib/tailscale
 
 # Copy entrypoint (strip CRLF — Windows git can inject \r that breaks heredocs)
@@ -57,7 +59,6 @@ RUN mkdir -p /var/run/tailscale && chmod 750 /var/run/tailscale
 ENV MODE=master
 ENV PORT=35353
 ENV WEB_LISTEN_ADDR=0.0.0.0
-ENV HISTORY_DIR=/var/lib/tailscale-dnsrewrite
 
 EXPOSE 53/udp 53/tcp 853/tcp 35353/tcp
 

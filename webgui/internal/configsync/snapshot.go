@@ -10,9 +10,9 @@ import (
 	"maps"
 	"slices"
 
-	"tailscale-dnsrewrite/webgui/internal/clients"
-	"tailscale-dnsrewrite/webgui/internal/filter"
-	"tailscale-dnsrewrite/webgui/internal/rewrites"
+	"github.com/arumes31/resolix/webgui/internal/clients"
+	"github.com/arumes31/resolix/webgui/internal/filter"
+	"github.com/arumes31/resolix/webgui/internal/rewrites"
 )
 
 // CurrentVersion is the supported configuration snapshot schema version.

@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"tailscale-dnsrewrite/webgui/internal/config"
-	"tailscale-dnsrewrite/webgui/internal/storage"
+	"github.com/arumes31/resolix/webgui/internal/config"
+	"github.com/arumes31/resolix/webgui/internal/storage"
 )
 
 // newBenchStore creates a Store for benchmarking with an in-memory database.

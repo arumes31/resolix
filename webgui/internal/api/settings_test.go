@@ -9,10 +9,10 @@ import (
 	"strings"
 	"testing"
 
-	"tailscale-dnsrewrite/webgui/internal/config"
-	"tailscale-dnsrewrite/webgui/internal/dnsserver"
-	"tailscale-dnsrewrite/webgui/internal/filter"
-	"tailscale-dnsrewrite/webgui/internal/policy"
+	"github.com/arumes31/resolix/webgui/internal/config"
+	"github.com/arumes31/resolix/webgui/internal/dnsserver"
+	"github.com/arumes31/resolix/webgui/internal/filter"
+	"github.com/arumes31/resolix/webgui/internal/policy"
 )
 
 func TestCheckCSRFRequiresMatchingCookieAndHeader(t *testing.T) {

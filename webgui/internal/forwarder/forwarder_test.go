@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"tailscale-dnsrewrite/webgui/internal/config"
-	"tailscale-dnsrewrite/webgui/internal/configsync"
-	"tailscale-dnsrewrite/webgui/internal/models"
+	"github.com/arumes31/resolix/webgui/internal/config"
+	"github.com/arumes31/resolix/webgui/internal/configsync"
+	"github.com/arumes31/resolix/webgui/internal/models"
 )
 
 // testEvents builds query events with the given domains for "test-node".

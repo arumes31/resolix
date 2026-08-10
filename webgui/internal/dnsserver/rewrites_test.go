@@ -8,9 +8,9 @@ import (
 
 	"github.com/miekg/dns"
 
-	"tailscale-dnsrewrite/webgui/internal/models"
-	"tailscale-dnsrewrite/webgui/internal/policy"
-	"tailscale-dnsrewrite/webgui/internal/rewrites"
+	"github.com/arumes31/resolix/webgui/internal/models"
+	"github.com/arumes31/resolix/webgui/internal/policy"
+	"github.com/arumes31/resolix/webgui/internal/rewrites"
 )
 
 // policyHarness runs a server under test with a rewrites store and policy.

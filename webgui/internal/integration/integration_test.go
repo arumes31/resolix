@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"tailscale-dnsrewrite/webgui/internal/config"
-	"tailscale-dnsrewrite/webgui/internal/parser"
-	"tailscale-dnsrewrite/webgui/internal/storage"
+	"github.com/arumes31/resolix/webgui/internal/config"
+	"github.com/arumes31/resolix/webgui/internal/parser"
+	"github.com/arumes31/resolix/webgui/internal/storage"
 )
 
 // nowStamp returns the current time formatted as a dnsmasq log timestamp

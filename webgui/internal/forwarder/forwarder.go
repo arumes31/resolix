@@ -19,9 +19,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"tailscale-dnsrewrite/webgui/internal/config"
-	"tailscale-dnsrewrite/webgui/internal/configsync"
-	"tailscale-dnsrewrite/webgui/internal/models"
+	"github.com/arumes31/resolix/webgui/internal/config"
+	"github.com/arumes31/resolix/webgui/internal/configsync"
+	"github.com/arumes31/resolix/webgui/internal/models"
 )
 
 // Version is set at build time via -ldflags.

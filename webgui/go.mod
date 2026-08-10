@@ -1,4 +1,4 @@
-module tailscale-dnsrewrite/webgui
+module github.com/arumes31/resolix/webgui
 
 go 1.26.5
 

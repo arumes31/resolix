@@ -28,8 +28,8 @@ jobs:
       - name: Prepare minified build context
         shell: bash
         run: |
-          build_context="${RUNNER_TEMP}/tailscale-dnsrewrite-build"
-          minified_root="${RUNNER_TEMP}/tailscale-dnsrewrite-js"
+          build_context="${RUNNER_TEMP}/resolix-build"
+          minified_root="${RUNNER_TEMP}/resolix-js"
           js_root="${build_context}/webgui/static/js"
 
           mkdir -p "${build_context}" "${minified_root}"

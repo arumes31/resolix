@@ -1,5 +1,5 @@
 // Package errors defines custom structured error types used throughout the
-// tailscale-dnsrewrite application. Each error type carries a machine-readable
+// Resolix application. Each error type carries a machine-readable
 // code, a human-readable message, and an optional wrapped underlying error.
 package errors
 

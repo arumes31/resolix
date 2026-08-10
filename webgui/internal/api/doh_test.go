@@ -11,8 +11,8 @@ import (
 
 	"github.com/miekg/dns"
 
-	"tailscale-dnsrewrite/webgui/internal/config"
-	"tailscale-dnsrewrite/webgui/internal/dnsserver"
+	"github.com/arumes31/resolix/webgui/internal/config"
+	"github.com/arumes31/resolix/webgui/internal/dnsserver"
 )
 
 func newDoHTestServer(t *testing.T, token string) (*Server, []byte) {

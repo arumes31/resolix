@@ -11,7 +11,7 @@ import (
 
 	"github.com/miekg/dns"
 
-	"tailscale-dnsrewrite/webgui/internal/models"
+	"github.com/arumes31/resolix/webgui/internal/models"
 )
 
 type scriptedResetConn struct {

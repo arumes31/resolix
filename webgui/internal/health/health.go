@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"tailscale-dnsrewrite/webgui/internal/config"
-	"tailscale-dnsrewrite/webgui/internal/upstream"
+	"github.com/arumes31/resolix/webgui/internal/config"
+	"github.com/arumes31/resolix/webgui/internal/upstream"
 )
 
 // Checker monitors the health of upstream DNS servers.

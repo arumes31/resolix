@@ -14,8 +14,8 @@ TS_AUTHKEY_FILE=${TS_AUTHKEY_FILE:-}
 cleanup() {
     trap - SIGINT SIGTERM
     echo "Shutting down..."
-    kill "$TAILSCALED_PID" "$WEBGUI_PID" 2>/dev/null
-    wait "$TAILSCALED_PID" "$WEBGUI_PID" 2>/dev/null
+    kill "$TAILSCALED_PID" "$RESOLIX_PID" 2>/dev/null
+    wait "$TAILSCALED_PID" "$RESOLIX_PID" 2>/dev/null
 }
 
 trap 'cleanup; exit 143' SIGINT SIGTERM
@@ -25,8 +25,24 @@ UPSTREAM_DNS=$(echo "$UPSTREAM_DNS" | tr -d '\r' | xargs)
 HEALTHCHECK_DOMAIN=$(echo "$HEALTHCHECK_DOMAIN" | tr -d '\r' | xargs)
 DOMAINS=$(echo "$DOMAINS" | tr -d '\r' | xargs)
 TS_AUTHKEY=$(echo "$TS_AUTHKEY" | tr -d '\r' | xargs)
-NODE_NAME=$(echo "${NODE_NAME:-dns-server}" | tr -d '\r' | xargs)
+NODE_NAME=$(echo "${NODE_NAME:-resolix}" | tr -d '\r' | xargs)
 export NODE_NAME
+
+# Preserve upgrades from images that stored state at the former project path.
+# A configured HISTORY_DIR or a populated Resolix directory always wins.
+directory_has_entries() {
+    [ -d "$1" ] && [ -n "$(find "$1" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]
+}
+
+HISTORY_DIR_CONFIGURED=${HISTORY_DIR+x}
+HISTORY_DIR=${HISTORY_DIR:-/var/lib/resolix}
+if [ -z "$HISTORY_DIR_CONFIGURED" ] \
+    && ! directory_has_entries "$HISTORY_DIR" \
+    && directory_has_entries "/var/lib/tailscale-dnsrewrite"; then
+    HISTORY_DIR=/var/lib/tailscale-dnsrewrite
+    echo "Using data from the legacy history directory: $HISTORY_DIR"
+fi
+export HISTORY_DIR
 
 if [ -z "$TS_AUTHKEY" ] && [ -n "$TS_AUTHKEY_FILE" ]; then
     if [ ! -f "$TS_AUTHKEY_FILE" ] || [ ! -r "$TS_AUTHKEY_FILE" ]; then
@@ -97,21 +113,21 @@ elif command -v ss >/dev/null; then
     ss -tuln | grep ":${DNS_LISTEN_PORT:-53} " || echo "No conflicts found via ss"
 fi
 
-# Start Web GUI with the embedded DNS server (dnsmasq is no longer used)
+# Start Resolix with the embedded DNS server (dnsmasq is no longer used)
 DNS_EFFECTIVE_ADDR=${DNS_LISTEN_ADDR:-${TAILSCALE_IP:-0.0.0.0}}
-echo "Starting Web GUI (embedded DNS server on ${DNS_EFFECTIVE_ADDR}:${DNS_LISTEN_PORT:-53})..."
-/usr/bin/webgui &
-WEBGUI_PID=$!
+echo "Starting Resolix (embedded DNS server on ${DNS_EFFECTIVE_ADDR}:${DNS_LISTEN_PORT:-53})..."
+/usr/bin/resolix &
+RESOLIX_PID=$!
 
-echo "Processes started: GUI(PID:$WEBGUI_PID), tailscaled(PID:$TAILSCALED_PID)"
+echo "Processes started: Resolix(PID:$RESOLIX_PID), tailscaled(PID:$TAILSCALED_PID)"
 
 # Exit when either child exits and terminate the survivor cleanly.
 set +e
-wait -n "$TAILSCALED_PID" "$WEBGUI_PID"
+wait -n "$TAILSCALED_PID" "$RESOLIX_PID"
 STATUS=$?
 set -e
 if kill -0 "$TAILSCALED_PID" 2>/dev/null; then
-    echo "Error: Web GUI exited (status: $STATUS)."
+    echo "Error: Resolix exited (status: $STATUS)."
 else
     echo "Error: tailscaled exited (status: $STATUS)."
 fi

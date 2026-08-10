@@ -42,8 +42,8 @@ func newBootstrapper(servers []string) *bootstrapper {
 			log.Printf("[WARN] Ignoring invalid BOOTSTRAP_DNS entry %q: %v", raw, err)
 			continue
 		}
-		if spec.Scheme != SchemeUDP {
-			log.Printf("[WARN] BOOTSTRAP_DNS entries must be plain UDP resolvers, skipping %q", raw)
+		if spec.Scheme != SchemeUDP || spec.Hostname() {
+			log.Printf("[WARN] BOOTSTRAP_DNS entries must be plain UDP IP-literal resolvers, skipping %q", raw)
 			continue
 		}
 		normalized = append(normalized, net.JoinHostPort(spec.Host, spec.Port))

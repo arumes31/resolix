@@ -75,3 +75,24 @@ func TestSpecHostname(t *testing.T) {
 		t.Error("dns.google must need bootstrap")
 	}
 }
+
+func TestValidateBootstrapServers(t *testing.T) {
+	tests := []struct {
+		name    string
+		servers []string
+		wantErr bool
+	}{
+		{name: "IPv4 and IPv6 literals", servers: []string{"9.9.9.9", "[2001:4860:4860::8888]:53"}},
+		{name: "UDP scheme", servers: []string{"udp://1.1.1.1:5353"}},
+		{name: "encrypted transport", servers: []string{"tls://dns.example"}, wantErr: true},
+		{name: "hostname", servers: []string{"udp://dns.example"}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := ValidateBootstrapServers(test.servers)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("ValidateBootstrapServers() error = %v, wantErr %v", err, test.wantErr)
+			}
+		})
+	}
+}

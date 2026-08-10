@@ -11,121 +11,129 @@
     <link rel="stylesheet" href="static/css/style.css">
 </head>
 
-<body data-base-url="{{.BaseURL}}" data-csrf-token="{{.CSRFToken}}" data-mode="{{.Mode}}">
-    <div class="container">
-        <header>
+<body class="app-page dashboard-page" data-base-url="{{.BaseURL}}" data-csrf-token="{{.CSRFToken}}" data-mode="{{.Mode}}">
+    <div id="sidebarScrim" class="sidebar-scrim" aria-hidden="true"></div>
+    <aside id="appSidebar" class="app-sidebar" aria-label="Primary navigation">
+        <div class="sidebar-brand">
+            <span class="brand-mark" aria-hidden="true">R</span>
             <div>
-                <h1>Resolix</h1>
-                <p id="systemStatus" class="system-status">● System Online</p>
+                <strong>Resolix</strong>
+                <span>{{if eq .Mode "controller"}}Controller{{else}}Agent{{end}} node</span>
             </div>
-            <div class="header-controls">
-				<a class="btn btn-secondary header-link" href="config">Configuration</a>
-				<form method="post" action="{{.BaseURL}}/logout" class="logout-form">
-					<input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-					<button type="submit" class="btn-icon" title="Sign out" aria-label="Sign out">↪</button>
-				</form>
-                <button id="freezeBtn" type="button" class="btn-icon" title="Freeze/Pause Log" aria-label="Freeze live query log" aria-pressed="false">⏸️</button>
-                <button id="compactToggle" type="button" class="btn-icon" title="Toggle Compact Mode" aria-label="Toggle compact mode" aria-pressed="false">↕️</button>
-                <button id="clearViewBtn" type="button" class="btn-icon" title="Clear View" aria-label="Clear query view">🗑️</button>
+        </div>
+        <div class="sidebar-status">
+            <span class="status-beacon" aria-hidden="true"></span>
+            <div><strong>DNS control plane</strong><span>Protected and operational</span></div>
+        </div>
+        <nav class="app-nav" aria-label="Application">
+            <span class="nav-section-label">Observe</span>
+            <a class="app-nav-link is-active" href="./" data-sidebar-view="dashboard">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13h6V4H4v9Zm0 7h6v-4H4v4Zm10 0h6v-9h-6v9Zm0-16v4h6V4h-6Z"/></svg>
+                <span>Dashboard</span>
+            </a>
+            <a class="app-nav-link" href="#query-log" data-sidebar-view="query-log">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v3H5V4Zm0 6h14v3H5v-3Zm0 6h9v3H5v-3Z"/></svg>
+                <span>Query log</span>
+                <span class="nav-live">Live</span>
+            </a>
+            {{if eq .Mode "controller"}}
+            <a class="app-nav-link" href="#cluster-nodes" data-sidebar-view="cluster-nodes">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a4 4 0 0 1 4 4c0 .7-.18 1.36-.5 1.93L19.57 13A4 4 0 1 1 18 14.5l-4.07-4.07A4 4 0 0 1 12 11a4 4 0 0 1-1.93-.5L6 14.57A4 4 0 1 1 4.43 13l4.07-4.07A4 4 0 1 1 12 3Z"/></svg>
+                <span>Cluster nodes</span>
+            </a>
+            {{end}}
+            <span class="nav-section-label">Manage</span>
+            <a class="app-nav-link" href="config">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19.14 12.94c.04-.3.06-.62.06-.94s-.02-.64-.07-.94l2.03-1.58-1.92-3.32-2.39.96a7.3 7.3 0 0 0-1.63-.94L14.86 3h-3.84l-.36 3.18c-.59.24-1.13.56-1.63.94l-2.39-.96-1.92 3.32 2.03 1.58c-.05.3-.08.63-.08.94s.03.64.08.94l-2.03 1.58 1.92 3.32 2.39-.96c.5.39 1.04.7 1.63.94l.36 3.18h3.84l.36-3.18a7.3 7.3 0 0 0 1.63-.94l2.39.96 1.92-3.32-2.02-1.58ZM12.94 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z"/></svg>
+                <span>Configuration</span>
+            </a>
+        </nav>
+        <div class="sidebar-footer">
+            <div class="sidebar-footnote"><span>Mode</span><strong>{{.Mode}}</strong></div>
+            <form method="post" action="{{.BaseURL}}/logout" class="logout-form sidebar-logout">
+                <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+                <button type="submit" class="app-nav-link sidebar-button" aria-label="Sign out">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 17v3H4V4h6v3H7v10h3Zm4.59-9.59L16 6l6 6-6 6-1.41-1.41L18.17 13H9v-2h9.17l-3.58-3.59Z"/></svg>
+                    <span>Sign out</span>
+                </button>
+            </form>
+        </div>
+    </aside>
+
+    <div class="app-main">
+        <header class="app-topbar">
+            <div class="topbar-title">
+                <button id="sidebarToggle" type="button" class="sidebar-toggle" aria-controls="appSidebar" aria-expanded="false" aria-label="Open navigation">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16v2H4V6Zm0 5h16v2H4v-2Zm0 5h16v2H4v-2Z"/></svg>
+                </button>
+                <div><span class="page-kicker">Network operations</span><h1>Operations dashboard</h1></div>
+            </div>
+            <div class="topbar-actions">
+                <p id="systemStatus" class="system-status" role="status" aria-live="polite"><span class="status-dot status-online"></span> System online</p>
                 <div class="search-container">
-                    <svg class="search-icon" width="20" height="20" viewBox="0 0 24 24" fill="none"
-                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <circle cx="11" cy="11" r="8"></circle>
-                        <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                    <svg class="search-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line>
                     </svg>
-                    <input type="text" id="searchInput" class="search-input" placeholder="Quick Filter..." aria-label="Filter DNS queries">
+                    <input type="text" id="searchInput" class="search-input" placeholder="Filter live queries…" aria-label="Filter DNS queries">
                 </div>
-            </div>
-            <div class="simulator-box card simulator-compact">
-                <input type="text" id="simDomain" class="simulator-input" placeholder="Test domain..." aria-label="Domain to test">
-                <button id="simulateBtn" class="btn btn-primary">Test</button>
+                <button id="freezeBtn" type="button" class="btn-icon" title="Freeze live query log" aria-label="Freeze live query log" aria-pressed="false">Ⅱ</button>
+                <button id="compactToggle" type="button" class="btn-icon" title="Toggle compact mode" aria-label="Toggle compact mode" aria-pressed="false">↕</button>
+                <button id="clearViewBtn" type="button" class="btn-icon" title="Clear query view" aria-label="Clear query view">×</button>
             </div>
         </header>
-		<div id="settingsNotice" class="settings-notice is-hidden" role="status" aria-live="polite"></div>
 
-        <div id="simulatorResult"></div>
-
-        <div class="dashboard-grid">
-            <div class="card">
-                <div class="stat-header"><span>Traffic Stats</span> <span id="rpm_val" class="stat-accent">0 RPM</span></div>
-                <div class="mini-chart" id="miniChart">
-                    <!-- Simple bar chart will be here -->
+        <main class="app-content container">
+            <div id="settingsNotice" class="settings-notice is-hidden" role="status" aria-live="polite"></div>
+            <section class="command-bar" aria-label="DNS lookup test">
+                <div class="command-copy"><span class="command-prompt" aria-hidden="true">›_</span><div><strong>Resolution probe</strong><span>Test the active policy path from this node</span></div></div>
+                <div class="simulator-box simulator-compact">
+                    <input type="text" id="simDomain" class="simulator-input" placeholder="domain.example" aria-label="Domain to test">
+                    <button id="simulateBtn" class="btn btn-primary">Run probe</button>
                 </div>
-                <div class="traffic-summary">
-                    <div><span class="stat-label">Hour:</span> <span id="rph_val" class="stat-strong">0</span>
-                    </div>
-                    <div><span class="stat-label">Day:</span> <span id="rpd_val" class="stat-strong">0</span></div>
-                    <div><span class="stat-label">Cache Hit:</span> <span id="cache_ratio"
-                            class="stat-cache">0%</span></div>
-                    <div><span class="stat-label">Total:</span> <span id="total_val" class="stat-strong">0</span>
-                    </div>
+            </section>
+            <div id="simulatorResult"></div>
+
+            <section class="metric-grid" aria-label="Traffic summary">
+                <article class="metric-card"><span>Queries / minute</span><strong id="rpm_val">0 RPM</strong><small><i class="metric-dot blue"></i>Live request rate</small></article>
+                <article class="metric-card"><span>Queries / hour</span><strong id="rph_val">0</strong><small>Total observed: <b id="total_val">0</b></small></article>
+                <article class="metric-card"><span>Queries / 24 hours</span><strong id="rpd_val">0</strong><small><i class="metric-dot green"></i>Rolling traffic window</small></article>
+                <article class="metric-card"><span>Cache hit rate</span><strong id="cache_ratio" class="stat-cache">0%</strong><small><i class="metric-dot amber"></i>In-process cache efficiency</small></article>
+            </section>
+
+            <div class="dashboard-grid ops-grid">
+                <div class="card traffic-card wide-card">
+                    <div class="stat-header"><span>Live query activity</span><span class="section-chip">Rolling window</span></div>
+                    <div class="mini-chart" id="miniChart"></div>
                 </div>
-            </div>
-
-            <div class="card">
-                <div class="stat-header">Query Type Breakdown</div>
-                <div id="typeBreakdown" class="type-breakdown">
-                    <!-- Type bars will be here -->
+                <div class="card">
+                    <div class="stat-header">Query type breakdown</div>
+                    <div id="typeBreakdown" class="type-breakdown"></div>
                 </div>
+                <div class="card"><div class="stat-header">Node traffic</div><ul class="top-list" id="nodeStats"></ul></div>
+                <div class="card"><div class="stat-header">Top domains</div><ul class="top-list" id="topDomains"></ul></div>
+                <div class="card"><div class="stat-header">Top clients</div><ul class="top-list" id="topClients"></ul></div>
+                <div class="card"><div class="stat-header"><span>Upstream health</span><span class="section-chip healthy">Monitoring</span></div><ul class="top-list" id="upstreamHealth"><li class="top-item"><span>Loading…</span></li></ul></div>
+                <div class="card wide-card heatmap-card"><div class="stat-header"><span>24-hour traffic intensity</span></div><div class="heatmap-container" id="trafficHeatmap"></div></div>
             </div>
 
-            <div class="card">
-                <div class="stat-header">Node Traffic (RPM/RPH)</div>
-                <ul class="top-list" id="nodeStats"></ul>
-            </div>
+            <section id="query-log" class="console-section query-log-section">
+                <div class="section-heading"><div><span class="page-kicker">Live stream</span><h2>DNS query log</h2></div><span class="section-chip healthy"><i class="metric-dot green"></i>Connected</span></div>
+                <div class="table-container">
+                    <div id="viewClearedBanner" class="view-cleared-banner is-hidden">View cleared — new events will appear as they arrive</div>
+                    <table>
+                        <thead><tr><th>Time</th><th>Node</th><th>Type</th><th>Domain</th><th>Client</th><th>Upstream</th><th>Latency</th><th>Action</th></tr></thead>
+                        <tbody id="eventTable"></tbody>
+                    </table>
+                </div>
+            </section>
 
-            <div class="card">
-                <div class="stat-header">Top Domains</div>
-                <ul class="top-list" id="topDomains"></ul>
-            </div>
-
-            <div class="card">
-                <div class="stat-header">Top Clients</div>
-                <ul class="top-list" id="topClients"></ul>
-            </div>
-            <div class="card">
-                <div class="stat-header"><span>Upstream Health</span></div>
-                <ul class="top-list" id="upstreamHealth">
-                    <li class="top-item"><span>Loading...</span></li>
-                </ul>
-            </div>
-            <div class="card wide-card">
-                <div class="stat-header"><span>24h Traffic Heatmap (Intensity)</span></div>
-                <div class="heatmap-container" id="trafficHeatmap"></div>
-            </div>
-        </div>
-
-        <div class="table-container">
-            <div id="viewClearedBanner" class="view-cleared-banner is-hidden">
-                View cleared — new events will appear as they arrive
-            </div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Time</th>
-                        <th>Node</th>
-                        <th>Type</th>
-                        <th>Domain</th>
-                        <th>Client</th>
-                        <th>Upstream</th>
-                        <th>Latency</th>
-                        <th>Action</th>
-                    </tr>
-                </thead>
-                <tbody id="eventTable"></tbody>
-            </table>
-        </div>
-
-        <!-- Node Status Panel (Items 92, 93) -->
-        {{if eq .Mode "controller"}}
-        <div class="node-status-panel" id="nodeStatusPanel">
-            <h3>Cluster Nodes</h3>
-            <div id="nodeCards" class="node-status-grid">
-                <p class="empty-state">No agent
-                    nodes connected</p>
-            </div>
-        </div>
-        {{end}}
+            {{if eq .Mode "controller"}}
+            <section id="cluster-nodes" class="node-status-panel console-section">
+                <div class="section-heading"><div><span class="page-kicker">Control plane</span><h2>Cluster nodes</h2></div></div>
+                <div id="nodeCards" class="node-status-grid"><p class="empty-state">No agent nodes connected</p></div>
+            </section>
+            {{end}}
+        </main>
     </div>
 
     <div id="clientModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-hidden="true">
@@ -145,6 +153,7 @@
             <button id="modalCloseBtn" class="btn btn-primary modal-close">Close</button>
         </div>
     </div>
+    <script nonce="{{.Nonce}}" src="static/js/shell.js"></script>
     <script nonce="{{.Nonce}}" src="static/js/index.js"></script>
 </body>
 

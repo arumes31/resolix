@@ -90,3 +90,17 @@ func TestUpdateUpstreamsFallsBackWhenNoHealthyServersRemain(t *testing.T) {
 		t.Fatalf("healthy = %v, want %v", healthy, replacement)
 	}
 }
+
+func TestUpdateBootstrapServersDefensivelyCopies(t *testing.T) {
+	checker := &Checker{}
+	servers := []string{"192.0.2.53"}
+	checker.UpdateBootstrapServers(servers)
+	servers[0] = "caller-mutated"
+
+	checker.mu.RLock()
+	got := append([]string(nil), checker.bootstrapServers...)
+	checker.mu.RUnlock()
+	if !slices.Equal(got, []string{"192.0.2.53"}) {
+		t.Fatalf("bootstrap servers = %v", got)
+	}
+}

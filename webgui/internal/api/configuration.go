@@ -37,6 +37,21 @@ func validateSnapshotRevision(snapshot configsync.Snapshot) error {
 	return nil
 }
 
+func validateSnapshotResolvers(snapshot configsync.Snapshot) error {
+	if len(snapshot.Upstreams) == 0 {
+		return errors.New("configuration snapshot has no upstreams")
+	}
+	for index, spec := range snapshot.Upstreams {
+		if _, err := upstream.Parse(spec); err != nil {
+			return fmt.Errorf("validate upstream %d: %w", index+1, err)
+		}
+	}
+	if err := upstream.ValidateBootstrapServers(snapshot.BootstrapServers); err != nil {
+		return fmt.Errorf("validate bootstrap resolvers: %w", err)
+	}
+	return nil
+}
+
 func logConfigApplyFailure(failed string, applied []string) {
 	completed := "none"
 	if len(applied) > 0 {
@@ -99,6 +114,16 @@ func (s *Server) configuredUpstreams() []string {
 	return strings.Fields(s.cfg.UpstreamDNS)
 }
 
+func (s *Server) configuredBootstrapServers() []string {
+	if path := s.cfg.FullUpstreamsPath(); path != "" {
+		settings := dnsroutes.LoadUpstreamSettings(path)
+		if settings.BootstrapConfigured {
+			return settings.BootstrapServers
+		}
+	}
+	return strings.Fields(s.cfg.BootstrapDNS)
+}
+
 func (s *Server) currentConfigSnapshot() (configsync.Snapshot, error) {
 	rules, err := os.ReadFile(s.userRulesPath()) // #nosec G304 -- path is derived from trusted HistoryDir configuration
 	if err != nil && !os.IsNotExist(err) {
@@ -127,7 +152,8 @@ func (s *Server) currentConfigSnapshot() (configsync.Snapshot, error) {
 		routes = dnsRoutes.GetRoutesMap()
 	}
 	return configsync.NewSnapshot(
-		s.configuredUpstreams(), routes, subscriptionItems, string(rules), rewritesList, clientsList,
+		s.configuredUpstreams(), s.configuredBootstrapServers(), routes,
+		subscriptionItems, string(rules), rewritesList, clientsList,
 	)
 }
 
@@ -150,7 +176,7 @@ func (s *Server) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
 		"runtime": map[string]interface{}{
 			"upstream_mode":          s.cfg.UpstreamMode,
 			"fallback_dns":           s.cfg.FallbackDNS,
-			"bootstrap_dns":          s.cfg.BootstrapDNS,
+			"bootstrap_dns":          strings.Join(s.configuredBootstrapServers(), " "),
 			"ecs_client_subnet":      s.cfg.ECSClientSubnet,
 			"blocking_mode":          s.cfg.BlockingMode,
 			"block_custom_ipv4":      s.cfg.BlockCustomIP4,
@@ -309,13 +335,8 @@ func (s *Server) ApplyConfigSnapshot(snapshot configsync.Snapshot) error {
 	if err := validateSnapshotRevision(snapshot); err != nil {
 		return err
 	}
-	if len(snapshot.Upstreams) == 0 {
-		return errors.New("configuration snapshot has no upstreams")
-	}
-	for index, spec := range snapshot.Upstreams {
-		if _, err := upstream.Parse(spec); err != nil {
-			return fmt.Errorf("validate upstream %d: %w", index+1, err)
-		}
+	if err := validateSnapshotResolvers(snapshot); err != nil {
+		return err
 	}
 	for pattern, spec := range snapshot.Routes {
 		if strings.TrimSpace(pattern) == "" {
@@ -375,7 +396,11 @@ func (s *Server) ApplyConfigSnapshot(snapshot configsync.Snapshot) error {
 		return fmt.Errorf("replace user rules: %w", err)
 	}
 	applied = append(applied, "user rules")
-	if err := dnsroutes.SaveUpstreams(s.cfg.FullUpstreamsPath(), snapshot.Upstreams); err != nil {
+	if err := dnsroutes.SaveUpstreamSettings(s.cfg.FullUpstreamsPath(), dnsroutes.UpstreamSettings{
+		Upstreams:           snapshot.Upstreams,
+		BootstrapServers:    snapshot.BootstrapServers,
+		BootstrapConfigured: true,
+	}); err != nil {
 		logConfigApplyFailure("upstreams", applied)
 		return fmt.Errorf("replace upstreams: %w", err)
 	}

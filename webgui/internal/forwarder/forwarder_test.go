@@ -37,7 +37,7 @@ func testEvents(domains ...string) []models.QueryEvent {
 }
 
 func TestSyncDNSConfigAppliesOnlyValidNewRevision(t *testing.T) {
-	snapshot, err := configsync.NewSnapshot([]string{"1.1.1.1"}, nil, nil, "||example.test^\n", nil, nil)
+	snapshot, err := configsync.NewSnapshot([]string{"1.1.1.1"}, []string{"9.9.9.9"}, nil, nil, "||example.test^\n", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

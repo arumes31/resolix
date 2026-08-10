@@ -3,6 +3,7 @@ package dnsroutes
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -69,4 +70,34 @@ func TestOnChangeOnlyFiresForSuccessfulChanges(t *testing.T) {
 	if changes != 2 {
 		t.Fatalf("changes after corrupt load = %d, want 2", changes)
 	}
+}
+
+func TestUpstreamSettingsRoundTripAndLegacyCompatibility(t *testing.T) {
+	t.Run("object settings", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "upstreams.json")
+		want := UpstreamSettings{
+			Upstreams:           []string{"tls://dns.example:853"},
+			BootstrapServers:    []string{"192.0.2.53"},
+			BootstrapConfigured: true,
+		}
+		if err := SaveUpstreamSettings(path, want); err != nil {
+			t.Fatal(err)
+		}
+		got := LoadUpstreamSettings(path)
+		if !slices.Equal(got.Upstreams, want.Upstreams) ||
+			!slices.Equal(got.BootstrapServers, want.BootstrapServers) || !got.BootstrapConfigured {
+			t.Fatalf("settings = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("legacy array inherits bootstrap environment", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "upstreams.json")
+		if err := os.WriteFile(path, []byte(`["1.1.1.1"]`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got := LoadUpstreamSettings(path)
+		if !slices.Equal(got.Upstreams, []string{"1.1.1.1"}) || got.BootstrapConfigured {
+			t.Fatalf("legacy settings = %+v", got)
+		}
+	})
 }

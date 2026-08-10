@@ -134,10 +134,15 @@ func NewPool(cfg PoolConfig) *Pool {
 // warnHostnameUpstreams logs a warning when hostname upstreams exist but no
 // bootstrap DNS is configured.
 func (p *Pool) warnHostnameUpstreams() {
-	if p.boot.Enabled() {
+	p.mu.RLock()
+	bootstrapEnabled := p.boot.Enabled()
+	resolvers := append([]Resolver(nil), p.primary...)
+	resolvers = append(resolvers, p.fallback...)
+	p.mu.RUnlock()
+	if bootstrapEnabled {
 		return
 	}
-	for _, r := range p.allResolvers() {
+	for _, r := range resolvers {
 		if dr, ok := r.(*dnsResolver); ok && dr.spec.Hostname() {
 			log.Printf("[WARN] Upstream %q uses a hostname but BOOTSTRAP_DNS is not set", dr.spec.Raw)
 		}
@@ -177,7 +182,25 @@ func (p *Pool) newResolver(spec Spec) Resolver {
 // hot-reload).
 func (p *Pool) SetPrimarySpecs(specs []string) {
 	p.mu.Lock()
+	p.cfg.PrimarySpecs = append([]string(nil), specs...)
 	p.primary = p.buildResolvers(specs)
+	p.mu.Unlock()
+	p.warnHostnameUpstreams()
+}
+
+// SetBootstrapServers replaces the bootstrap resolver set and rebuilds every
+// resolver that may hold the previous bootstrapper.
+func (p *Pool) SetBootstrapServers(servers []string) {
+	boot := newBootstrapper(servers)
+	boot.setTTLLimits(p.cfg.CacheMinTTL, p.cfg.CacheMaxTTL)
+
+	p.mu.Lock()
+	p.cfg.BootstrapServers = append([]string(nil), servers...)
+	p.boot = boot
+	p.primary = p.buildResolvers(p.cfg.PrimarySpecs)
+	p.fallback = p.buildResolvers(p.cfg.FallbackSpecs)
+	p.routes = make(map[string]Resolver)
+	p.groups = make(map[string][]Resolver)
 	p.mu.Unlock()
 	p.warnHostnameUpstreams()
 }
@@ -193,14 +216,6 @@ func (p *Pool) ClearRouteCache() {
 // negative = unhealthy). Called by main after the store is available.
 func (p *Pool) SetHealthProvider(fn func() map[string]float64) {
 	p.healthFn.Store(fn)
-}
-
-// allResolvers returns primary + fallback (for introspection).
-func (p *Pool) allResolvers() []Resolver {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	out := append([]Resolver(nil), p.primary...)
-	return append(out, p.fallback...)
 }
 
 // healthy filters resolvers by the health provider. Resolvers unknown to the
@@ -280,12 +295,12 @@ func (p *Pool) groupResolvers(specs []string) []Resolver {
 	if ok {
 		return rs
 	}
-	rs = p.buildResolvers(specs)
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	if cached, exists := p.groups[key]; exists {
-		p.mu.Unlock()
 		return cached
 	}
+	rs = p.buildResolvers(specs)
 	if len(p.groups) >= maxResolverGroups {
 		for oldestKey := range p.groups {
 			delete(p.groups, oldestKey)
@@ -293,7 +308,6 @@ func (p *Pool) groupResolvers(specs []string) []Resolver {
 		}
 	}
 	p.groups[key] = rs
-	p.mu.Unlock()
 	return rs
 }
 
@@ -309,10 +323,13 @@ func (p *Pool) routeResolver(raw string) (Resolver, error) {
 	if err != nil {
 		return nil, err
 	}
-	r = p.newResolver(spec)
 	p.mu.Lock()
+	defer p.mu.Unlock()
+	if cached, exists := p.routes[raw]; exists {
+		return cached, nil
+	}
+	r = p.newResolver(spec)
 	p.routes[raw] = r
-	p.mu.Unlock()
 	return r, nil
 }
 

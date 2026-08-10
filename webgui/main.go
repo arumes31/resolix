@@ -262,7 +262,7 @@ DB_PATH=dns.db
 # Upstream pool (Step 4): schemes udp:// tcp:// tls:// https:// (DoT/DoH)
 # UPSTREAM_MODE=load_balance (default) | parallel | strict
 # FALLBACK_DNS=9.9.9.9 (used only when all primary upstreams fail)
-# BOOTSTRAP_DNS=8.8.8.8 (plain UDP; required for hostname upstreams like tls://dns.google)
+# BOOTSTRAP_DNS="9.9.9.9 1.1.1.1" (initial plain UDP IP resolvers for hostname DoT/DoH; /config overrides)
 # ECS_CLIENT_SUBNET=192.0.2.0/24 (EDNS0 client subnet sent to upstreams)
 # DNS64=true (synthesize AAAA from A on empty AAAA answers)
 # DNS64_PREFIXES=64:ff9b::/96
@@ -417,20 +417,26 @@ func main() {
 	// Create static file server from embedded FS
 	staticHandler := newStaticHandler()
 
-	// Upstream specs: upstreams.json overrides env upstreams when the file
-	// contains entries (hot-reloaded below and after API saves).
-	loadSpecs := func() []string {
+	// Controller-managed upstream settings override their environment bootstrap
+	// values when present and are hot-reloaded below and after API saves.
+	loadResolverSettings := func() ([]string, []string) {
+		bootstrapServers := strings.Fields(cfg.BootstrapDNS)
 		if p := cfg.FullUpstreamsPath(); p != "" {
-			if list := dnsroutes.LoadUpstreams(p); len(list) > 0 {
-				return list
+			settings := dnsroutes.LoadUpstreamSettings(p)
+			if settings.BootstrapConfigured {
+				bootstrapServers = settings.BootstrapServers
+			}
+			if len(settings.Upstreams) > 0 {
+				return settings.Upstreams, bootstrapServers
 			}
 		}
-		return strings.Fields(cfg.UpstreamDNS)
+		return strings.Fields(cfg.UpstreamDNS), bootstrapServers
 	}
-	upstreamSpecs := loadSpecs()
+	upstreamSpecs, bootstrapServers := loadResolverSettings()
 
-	// Initialize health checker (UDP probe; covers plain-IP upstreams only)
-	checker := health.NewChecker(cfg, strings.Join(upstreamSpecs, " "))
+	// Initialize the protocol-aware health checker with the same bootstrap
+	// resolvers used by the live upstream pool.
+	checker := health.NewChecker(cfg, strings.Join(upstreamSpecs, " "), bootstrapServers)
 	go checker.Start(ctx, func(_ []string, latencies map[string]float64) {
 		store.SetUpstreamHealth(cfg.NodeName, latencies)
 		if cfg.Mode == config.ModeAgent {
@@ -490,7 +496,7 @@ func main() {
 	})
 
 	// Upstream pool (Step 4): modes, fallback, bootstrap, ECS, DNS64.
-	pool := setupUpstreamPool(ctx, cfg, store, srv, checker, loadSpecs, upstreamSpecs)
+	pool := setupUpstreamPool(ctx, cfg, store, srv, checker, loadResolverSettings, upstreamSpecs, bootstrapServers)
 	dr.SetOnChange(pool.ClearRouteCache)
 	fwd.SetDNSConfigFn(func(snapshot configsync.Snapshot) error {
 		return srv.ApplyConfigSnapshot(snapshot)
@@ -719,12 +725,21 @@ func loadRewritesStore(cfg *config.Config) *rewrites.Store {
 
 // setupUpstreamPool builds the upstream pool, wires health data and the API
 // reload callback, and starts the upstreams.json hot-reload poller.
-func setupUpstreamPool(ctx context.Context, cfg *config.Config, store *storage.Store, srv *api.Server, checker *health.Checker, loadSpecs func() []string, current []string) *upstream.Pool {
+func setupUpstreamPool(
+	ctx context.Context,
+	cfg *config.Config,
+	store *storage.Store,
+	srv *api.Server,
+	checker *health.Checker,
+	loadSettings func() ([]string, []string),
+	currentSpecs []string,
+	currentBootstrap []string,
+) *upstream.Pool {
 	pool := upstream.NewPool(upstream.PoolConfig{
 		Mode:             cfg.UpstreamMode,
-		PrimarySpecs:     current,
+		PrimarySpecs:     currentSpecs,
 		FallbackSpecs:    strings.Fields(cfg.FallbackDNS),
-		BootstrapServers: strings.Fields(cfg.BootstrapDNS),
+		BootstrapServers: currentBootstrap,
 		ECSClientSubnet:  cfg.ECSClientSubnet,
 		DNS64:            cfg.DNS64,
 		DNS64Prefixes:    strings.Fields(cfg.DNS64Prefixes),
@@ -739,10 +754,15 @@ func setupUpstreamPool(ctx context.Context, cfg *config.Config, store *storage.S
 	reload := func() {
 		reloadMu.Lock()
 		defer reloadMu.Unlock()
-		specs := loadSpecs()
+		specs, bootstrapServers := loadSettings()
+		if !equalStringSlices(bootstrapServers, currentBootstrap) {
+			pool.SetBootstrapServers(bootstrapServers)
+			checker.UpdateBootstrapServers(bootstrapServers)
+			currentBootstrap = append([]string(nil), bootstrapServers...)
+		}
 		pool.SetPrimarySpecs(specs)
 		checker.UpdateUpstreams(specs)
-		current = append([]string(nil), specs...)
+		currentSpecs = append([]string(nil), specs...)
 	}
 	srv.SetUpstreamReloadFunc(func() {
 		reload()
@@ -757,9 +777,10 @@ func setupUpstreamPool(ctx context.Context, cfg *config.Config, store *storage.S
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				specs := loadSpecs()
+				specs, bootstrapServers := loadSettings()
 				reloadMu.Lock()
-				changed := !equalStringSlices(specs, current)
+				changed := !equalStringSlices(specs, currentSpecs) ||
+					!equalStringSlices(bootstrapServers, currentBootstrap)
 				reloadMu.Unlock()
 				if changed {
 					logger.Info("Upstream list changed, reloading pool (%d upstreams)", len(specs))

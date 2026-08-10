@@ -29,7 +29,9 @@ func TestConfigPageIsDedicatedAndRootRejectsUnknownPaths(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config", nil))
-	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `id="configAuthority"`) {
+	if recorder.Code != http.StatusOK ||
+		!strings.Contains(recorder.Body.String(), `id="configAuthority"`) ||
+		!strings.Contains(recorder.Body.String(), `id="bootstrapList"`) {
 		t.Fatalf("config response = %d %q", recorder.Code, recorder.Body.String())
 	}
 
@@ -70,6 +72,7 @@ func TestSyncDNSConfigRequiresBearerAndReturnsValidRevision(t *testing.T) {
 		IngestSecret: "cluster-secret",
 		HistoryDir:   dir,
 		UpstreamDNS:  "1.1.1.1",
+		BootstrapDNS: "9.9.9.9",
 	})
 	recorder := httptest.NewRecorder()
 	server.handleSyncDNSConfig(recorder, httptest.NewRequest(http.MethodGet, "/api/sync/dns-config", nil))
@@ -92,8 +95,53 @@ func TestSyncDNSConfigRequiresBearerAndReturnsValidRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !validRevision || len(snapshot.Upstreams) != 1 {
+	if !validRevision || len(snapshot.Upstreams) != 1 || len(snapshot.BootstrapServers) != 1 {
 		t.Fatalf("snapshot = %+v", snapshot)
+	}
+}
+
+func TestUpstreamSettingsPersistBootstrapResolvers(t *testing.T) {
+	dir := t.TempDir()
+	server := testServer(&config.Config{
+		Mode:          config.ModeController,
+		HistoryDir:    dir,
+		UpstreamsFile: "upstreams.json",
+	})
+	reloads := 0
+	server.SetUpstreamReloadFunc(func() { reloads++ })
+
+	request := httptest.NewRequest(http.MethodPost, "/api/upstream-settings", strings.NewReader(`{
+		"upstreams":["tls://dns.example:853","https://doh.example/dns-query"],
+		"bootstrap_servers":["192.0.2.53"]
+	}`))
+	request.AddCookie(&http.Cookie{
+		Name: csrfCookieName, Value: "token", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
+	})
+	request.Header.Set("X-CSRF-Token", "token")
+	recorder := httptest.NewRecorder()
+	server.handleUpstreamSettings(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("save status = %d body=%q", recorder.Code, recorder.Body.String())
+	}
+	if reloads != 1 {
+		t.Fatalf("reloads = %d, want 1", reloads)
+	}
+	if got := server.configuredBootstrapServers(); len(got) != 1 || got[0] != "192.0.2.53" {
+		t.Fatalf("bootstrap resolvers = %v", got)
+	}
+
+	request = httptest.NewRequest(http.MethodPost, "/api/upstream-settings", strings.NewReader(`{
+		"upstreams":["tls://dns.example:853"],
+		"bootstrap_servers":["tls://bootstrap.example:853"]
+	}`))
+	request.AddCookie(&http.Cookie{
+		Name: csrfCookieName, Value: "token", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
+	})
+	request.Header.Set("X-CSRF-Token", "token")
+	recorder = httptest.NewRecorder()
+	server.handleUpstreamSettings(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid bootstrap status = %d body=%q", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -127,7 +175,7 @@ func TestApplyConfigSnapshotPersistsAllManagedSettings(t *testing.T) {
 	server.SetDNSRoutes(dnsRoutes)
 
 	snapshot, err := configsync.NewSnapshot(
-		[]string{"1.1.1.1"}, map[string]string{"internal": "9.9.9.9"}, nil, "||blocked.example^\n",
+		[]string{"1.1.1.1"}, []string{"8.8.8.8"}, map[string]string{"internal": "9.9.9.9"}, nil, "||blocked.example^\n",
 		[]rewrites.Rewrite{{
 			ID:          "rewrite-1",
 			Domain:      "printer.internal",
@@ -145,6 +193,9 @@ func TestApplyConfigSnapshotPersistsAllManagedSettings(t *testing.T) {
 	}
 	if got := server.configuredUpstreams(); len(got) != 1 || got[0] != "1.1.1.1" {
 		t.Fatalf("upstreams = %v", got)
+	}
+	if got := server.configuredBootstrapServers(); len(got) != 1 || got[0] != "8.8.8.8" {
+		t.Fatalf("bootstrap resolvers = %v", got)
 	}
 	rewriteItems := rewriteStore.List()
 	if len(rewriteItems) != 1 || len(clientRegistry.List()) != 1 {

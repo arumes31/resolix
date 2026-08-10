@@ -70,7 +70,7 @@ async function loadStatus() {
         ['Role', data.mode],
         ['Authority', data.editable ? 'Controller-owned' : 'Mirrored / read only'],
         ['Revision', data.revision || 'Not available'],
-        ['Snapshot contents', 'Upstreams, routes, blocklists, rules, rewrites, clients']
+        ['Snapshot contents', 'Upstreams, bootstrap resolvers, routes, blocklists, rules, rewrites, clients']
     ].map(([key, value]) => `<div class="runtime-item"><span>${escapeHtml(key)}</span><strong>${escapeHtml(value)}</strong></div>`).join('');
     document.getElementById('runtimeSettings').innerHTML = Object.entries(data.runtime || {}).map(([key, value]) =>
         `<div class="runtime-item"><span>${escapeHtml(formatRuntimeKey(key))}</span><strong>${escapeHtml(runtimeValue(value))}</strong></div>`
@@ -88,7 +88,7 @@ async function loadCluster() {
         ['Role', state.mode],
         ['Authority', state.editable ? 'Controller-owned' : 'Mirrored / read only'],
         ['Local revision', state.revision || 'Not available'],
-        ['Snapshot contents', 'Upstreams, routes, blocklists, rules, rewrites, clients']
+        ['Snapshot contents', 'Upstreams, bootstrap resolvers, routes, blocklists, rules, rewrites, clients']
     ];
     nodes.forEach(node => summary.push([
         node.name || 'Unnamed node',
@@ -102,20 +102,23 @@ async function loadCluster() {
 }
 
 async function loadUpstreams() {
-    const upstreams = await apiJSON('/api/upstreams');
-    document.getElementById('upstreamList').value = (upstreams || []).join('\n');
+    const data = await apiJSON('/api/upstream-settings');
+    const upstreams = data.upstreams || [];
+    document.getElementById('upstreamList').value = upstreams.join('\n');
+    document.getElementById('bootstrapList').value = (data.bootstrap_servers || []).join('\n');
     document.getElementById('upstreamCount').textContent = `${upstreams.length} ${upstreams.length === 1 ? 'server' : 'servers'}`;
 }
 
 async function saveUpstreams(event) {
     event.preventDefault();
     const upstreams = document.getElementById('upstreamList').value.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+    const bootstrapServers = document.getElementById('bootstrapList').value.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
     if (!upstreams.length) throw new Error('At least one upstream resolver is required');
-    await apiJSON('/api/upstreams', {
+    await apiJSON('/api/upstream-settings', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(upstreams.map(address => ({ address })))
+        body: JSON.stringify({ upstreams, bootstrap_servers: bootstrapServers })
     });
-    notice('Upstream resolvers saved and activated');
+    notice('Upstream and bootstrap resolvers saved and activated');
     await Promise.all([loadUpstreams(), loadStatus()]);
 }
 

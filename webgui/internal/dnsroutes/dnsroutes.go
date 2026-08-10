@@ -291,8 +291,38 @@ func LoadFromFile(path string) map[string]string {
 	return result
 }
 
-// SaveUpstreams writes the upstream server list to a JSON file.
+// UpstreamSettings contains the controller-managed upstream and bootstrap
+// resolver lists persisted in the upstreams file.
+type UpstreamSettings struct {
+	Upstreams           []string `json:"upstreams"`
+	BootstrapServers    []string `json:"bootstrap_servers"`
+	BootstrapConfigured bool     `json:"-"`
+}
+
+// SaveUpstreamSettings writes upstream and bootstrap resolver settings.
+func SaveUpstreamSettings(path string, settings UpstreamSettings) error {
+	data, err := json.MarshalIndent(struct {
+		Upstreams        []string `json:"upstreams"`
+		BootstrapServers []string `json:"bootstrap_servers"`
+	}{
+		Upstreams:        settings.Upstreams,
+		BootstrapServers: settings.BootstrapServers,
+	}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(path, data, 0o600)
+}
+
+// SaveUpstreams writes the upstream server list to a JSON file. Existing
+// object-format bootstrap settings are preserved; legacy array files remain
+// arrays until bootstrap settings are explicitly configured.
 func SaveUpstreams(path string, upstreams []string) error {
+	settings := LoadUpstreamSettings(path)
+	if settings.BootstrapConfigured {
+		settings.Upstreams = upstreams
+		return SaveUpstreamSettings(path, settings)
+	}
 	data, err := json.MarshalIndent(upstreams, "", "  ")
 	if err != nil {
 		return err
@@ -300,24 +330,46 @@ func SaveUpstreams(path string, upstreams []string) error {
 	return writeFileAtomic(path, data, 0o600)
 }
 
-// LoadUpstreams reads the upstream server list from a JSON file.
-func LoadUpstreams(path string) []string {
+// LoadUpstreamSettings reads object-format settings and legacy upstream-only
+// array/map formats. BootstrapConfigured distinguishes an explicit empty list
+// from a legacy file that should continue to inherit BOOTSTRAP_DNS.
+func LoadUpstreamSettings(path string) UpstreamSettings {
 	data, err := os.ReadFile(path) // #nosec G304 -- path comes from trusted config (upstreams file setting), not from request input
 	if err != nil {
-		return nil
+		return UpstreamSettings{}
 	}
-	var result []string
-	if err := json.Unmarshal(data, &result); err != nil {
-		// Try map format (legacy)
-		var m map[string]string
-		if err2 := json.Unmarshal(data, &m); err2 == nil {
-			for k := range m {
-				result = append(result, k)
+	var object struct {
+		Upstreams        []string        `json:"upstreams"`
+		BootstrapServers json.RawMessage `json:"bootstrap_servers"`
+	}
+	if err := json.Unmarshal(data, &object); err == nil && object.Upstreams != nil {
+		settings := UpstreamSettings{Upstreams: object.Upstreams}
+		if object.BootstrapServers != nil {
+			settings.BootstrapConfigured = true
+			if err := json.Unmarshal(object.BootstrapServers, &settings.BootstrapServers); err != nil {
+				return UpstreamSettings{}
 			}
 		}
-		return result
+		return settings
 	}
-	return result
+	var legacyList []string
+	if err := json.Unmarshal(data, &legacyList); err == nil {
+		return UpstreamSettings{Upstreams: legacyList}
+	}
+	var legacyMap map[string]string
+	if err := json.Unmarshal(data, &legacyMap); err == nil {
+		result := make([]string, 0, len(legacyMap))
+		for key := range legacyMap {
+			result = append(result, key)
+		}
+		return UpstreamSettings{Upstreams: result}
+	}
+	return UpstreamSettings{}
+}
+
+// LoadUpstreams reads the upstream server list from a JSON file.
+func LoadUpstreams(path string) []string {
+	return LoadUpstreamSettings(path).Upstreams
 }
 
 // ReadLines reads a file and returns non-empty, non-comment lines.

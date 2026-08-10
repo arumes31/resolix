@@ -938,6 +938,7 @@ func (s *Server) SetupMux() http.Handler {
 
 	// Item 62: Upstream configuration editor
 	mux.Handle("/api/upstreams", s.authMiddleware(http.HandlerFunc(s.handleUpstreams)))
+	mux.Handle("/api/upstream-settings", s.authMiddleware(http.HandlerFunc(s.handleUpstreamSettings)))
 
 	// Item 63: Cache clear endpoint
 	mux.Handle("/api/cache/clear", s.authMiddleware(http.HandlerFunc(s.handleCacheClear)))
@@ -2412,6 +2413,96 @@ func (s *Server) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetUpstreams(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(s.configuredUpstreams())
+}
+
+func (s *Server) handleUpstreamSettings(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"upstreams":         s.configuredUpstreams(),
+			"bootstrap_servers": s.configuredBootstrapServers(),
+		})
+	case http.MethodPost:
+		if !s.requireController(w) || !s.checkCSRF(w, r) {
+			return
+		}
+		var request struct {
+			Upstreams        []string `json:"upstreams"`
+			BootstrapServers []string `json:"bootstrap_servers"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&request); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+		upstreams, err := validateUpstreamList(request.Upstreams)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		bootstrapServers := compactStrings(request.BootstrapServers)
+		if err := upstream.ValidateBootstrapServers(bootstrapServers); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := s.saveUpstreamSettings(upstreams, bootstrapServers); err != nil {
+			http.Error(w, "Failed to save upstream settings", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":            "ok",
+			"upstreams":         upstreams,
+			"bootstrap_servers": bootstrapServers,
+		})
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func compactStrings(values []string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
+func validateUpstreamList(values []string) ([]string, error) {
+	upstreams := compactStrings(values)
+	if len(upstreams) == 0 {
+		return nil, errors.New("at least one upstream resolver is required")
+	}
+	for index, address := range upstreams {
+		if _, err := upstream.Parse(address); err != nil {
+			return nil, fmt.Errorf("upstream resolver %d is invalid: %w", index+1, err)
+		}
+	}
+	return upstreams, nil
+}
+
+func (s *Server) saveUpstreamSettings(upstreams, bootstrapServers []string) error {
+	path := s.cfg.FullUpstreamsPath()
+	if path == "" {
+		return errors.New("upstreams file not configured")
+	}
+	if err := dnsroutes.SaveUpstreamSettings(path, dnsroutes.UpstreamSettings{
+		Upstreams:           upstreams,
+		BootstrapServers:    bootstrapServers,
+		BootstrapConfigured: true,
+	}); err != nil {
+		return err
+	}
+	s.fieldsMu.RLock()
+	reload := s.upstreamReloadFn
+	s.fieldsMu.RUnlock()
+	if reload != nil {
+		reload()
+	}
+	return nil
 }
 
 func (s *Server) handlePostUpstreams(w http.ResponseWriter, r *http.Request) {

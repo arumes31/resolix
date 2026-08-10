@@ -131,6 +131,8 @@ Cache hits are measured inside the DNS request lifecycle. Query events are emitt
 
 Environment variables are the bootstrap layer. Settings that can be changed safely at runtime are managed from `/config` and synchronized from the controller to agents. Listener addresses, credentials, certificates, and storage paths remain environment-owned and require a restart.
 
+The **Upstreams** panel manages both upstream resolver specifications and the shared bootstrap resolver list. Bootstrap entries must be plain UDP IP literals (with an optional port); Resolix uses them to resolve hostname-based DoT and DoH endpoints, hot-reloads them without restarting DNS, and includes them in controller-to-agent configuration revisions. `BOOTSTRAP_DNS` supplies the initial list until the controller saves an explicit list in `/config`.
+
 ### Node, web, and cluster
 
 | Variable | Description | Default |
@@ -177,7 +179,7 @@ Environment variables are the bootstrap layer. Settings that can be changed safe
 | `UPSTREAM_DNS` | Space-separated `ip`, `ip#port`, `udp://`, `tcp://`, `tls://`, or `https://` endpoints | `8.8.8.8 8.8.4.4` |
 | `UPSTREAM_MODE` | `load_balance`, `parallel`, or `strict` | `load_balance` |
 | `FALLBACK_DNS` | Used only when every primary upstream fails | unset |
-| `BOOTSTRAP_DNS` | Plain UDP resolver for hostname-based DoT/DoH upstreams | unset |
+| `BOOTSTRAP_DNS` | Initial space-separated plain UDP IP resolvers for hostname-based DoT/DoH; `/config` overrides | unset |
 | `ECS_CLIENT_SUBNET` | EDNS Client Subnet sent upstream | unset |
 | `UPSTREAMS_FILE` | Persisted upstream list, relative to `HISTORY_DIR` unless absolute | `upstreams.json` |
 | `DNS_ROUTES_FILE` | Persisted domain-route map | unset |
@@ -309,13 +311,13 @@ Restore both directories while the container is stopped, retain ownership and pe
 
 [`webgui/VERSION`](webgui/VERSION) is the canonical application version. The binary, API, node status, and container metadata report that version; CI rejects a mismatched Dockerfile default.
 
-Merging code into `main` does not create a tag or release. When a version is ready to ship:
+Every code push to `main` builds and publishes a multi-platform GHCR image tagged with the application version, `latest`, and the immutable commit SHA. This does not create a Git tag or GitHub release. When a version is ready to become a formal release:
 
 1. Update `webgui/VERSION` and the matching `ARG VERSION` default in `Dockerfile`.
 2. Merge the tested change into `main`.
 3. Run the **Create Release** workflow manually in GitHub Actions.
 
-The workflow tags the current `main` commit with `v<version>`, dispatches the multi-platform GHCR build for that tag, and creates the GitHub release. The image receives version, revision, build-date, semver, `latest`, and SHA metadata/tags. The release and image workflows reject tags that do not exactly match `webgui/VERSION`.
+The manual workflow tags the current `main` commit with `v<version>`, dispatches the release-tagged multi-platform GHCR build, and creates the GitHub release. Release images receive version, revision, build-date, semver, `latest`, and SHA metadata/tags. The release and image workflows reject tags that do not exactly match `webgui/VERSION`.
 
 ## Operations
 

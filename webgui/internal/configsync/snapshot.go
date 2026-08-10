@@ -16,17 +16,18 @@ import (
 )
 
 // CurrentVersion is the supported configuration snapshot schema version.
-const CurrentVersion = 2
+const CurrentVersion = 3
 
 // snapshotPayload is the revisioned content of a configuration snapshot.
 type snapshotPayload struct {
-	Version       int                   `json:"version"`
-	Upstreams     []string              `json:"upstreams"`
-	Routes        map[string]string     `json:"routes"`
-	Subscriptions []filter.Subscription `json:"subscriptions"`
-	UserRules     string                `json:"user_rules"`
-	Rewrites      []rewrites.Rewrite    `json:"rewrites"`
-	Clients       []clients.Client      `json:"clients"`
+	Version          int                   `json:"version"`
+	Upstreams        []string              `json:"upstreams"`
+	BootstrapServers []string              `json:"bootstrap_servers"`
+	Routes           map[string]string     `json:"routes"`
+	Subscriptions    []filter.Subscription `json:"subscriptions"`
+	UserRules        string                `json:"user_rules"`
+	Rewrites         []rewrites.Rewrite    `json:"rewrites"`
+	Clients          []clients.Client      `json:"clients"`
 }
 
 // Snapshot is a complete controller-authoritative configuration revision.
@@ -38,6 +39,7 @@ type Snapshot struct {
 // NewSnapshot defensively copies values and computes a stable content hash.
 func NewSnapshot(
 	upstreams []string,
+	bootstrapServers []string,
 	routes map[string]string,
 	subscriptions []filter.Subscription,
 	userRules string,
@@ -46,13 +48,14 @@ func NewSnapshot(
 ) (Snapshot, error) {
 	snapshot := Snapshot{
 		snapshotPayload: snapshotPayload{
-			Version:       CurrentVersion,
-			Upstreams:     slices.Clone(upstreams),
-			Routes:        maps.Clone(routes),
-			Subscriptions: slices.Clone(subscriptions),
-			UserRules:     userRules,
-			Rewrites:      cloneRewrites(rewriteItems),
-			Clients:       slices.Clone(clientItems),
+			Version:          CurrentVersion,
+			Upstreams:        slices.Clone(upstreams),
+			BootstrapServers: slices.Clone(bootstrapServers),
+			Routes:           maps.Clone(routes),
+			Subscriptions:    slices.Clone(subscriptions),
+			UserRules:        userRules,
+			Rewrites:         cloneRewrites(rewriteItems),
+			Clients:          slices.Clone(clientItems),
 		},
 	}
 	revision, err := snapshotRevision(snapshot.snapshotPayload)

@@ -13,24 +13,26 @@ import (
 
 // Checker monitors the health of upstream DNS servers.
 type Checker struct {
-	cfg       *config.Config
-	upstreams []string
-	healthy   []string
-	latencies map[string]float64
-	mu        sync.RWMutex
+	cfg              *config.Config
+	upstreams        []string
+	bootstrapServers []string
+	healthy          []string
+	latencies        map[string]float64
+	mu               sync.RWMutex
 }
 
 // NewChecker initializes a new upstream health checker.
-func NewChecker(cfg *config.Config, upstreamDNS string) *Checker {
+func NewChecker(cfg *config.Config, upstreamDNS string, bootstrapServers []string) *Checker {
 	servers := strings.Fields(upstreamDNS)
 	if len(servers) == 0 {
 		servers = []string{"8.8.8.8", "8.8.4.4"}
 	}
 	c := &Checker{
-		cfg:       cfg,
-		upstreams: servers,
-		healthy:   servers,
-		latencies: make(map[string]float64),
+		cfg:              cfg,
+		upstreams:        servers,
+		bootstrapServers: append([]string(nil), bootstrapServers...),
+		healthy:          servers,
+		latencies:        make(map[string]float64),
 	}
 	var initialHealthy []string
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -53,11 +55,22 @@ func NewChecker(cfg *config.Config, upstreamDNS string) *Checker {
 
 // CheckUpstream verifies if a specific DNS server is responsive and measures latency.
 func (c *Checker) CheckUpstream(ctx context.Context, server string) (bool, float64) {
+	c.mu.RLock()
+	bootstrapServers := append([]string(nil), c.bootstrapServers...)
+	c.mu.RUnlock()
 	start := time.Now()
-	if err := upstream.Probe(ctx, server, c.cfg.HealthDomain, strings.Fields(c.cfg.BootstrapDNS)); err != nil {
+	if err := upstream.Probe(ctx, server, c.cfg.HealthDomain, bootstrapServers); err != nil {
 		return false, -1
 	}
 	return true, float64(time.Since(start).Microseconds()) / 1000.0
+}
+
+// UpdateBootstrapServers replaces the resolvers used for hostname-based DoT
+// and DoH health probes.
+func (c *Checker) UpdateBootstrapServers(servers []string) {
+	c.mu.Lock()
+	c.bootstrapServers = append([]string(nil), servers...)
+	c.mu.Unlock()
 }
 
 // UpdateUpstreams replaces the probe target set after a hot reload.

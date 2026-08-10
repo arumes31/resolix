@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -33,8 +34,18 @@ func (s Spec) Hostname() bool {
 	return net.ParseIP(s.Host) == nil
 }
 
-// String returns the original spec string.
-func (s Spec) String() string { return s.Raw }
+// String returns the original spec string when available, or a canonical
+// representation for programmatically constructed specs.
+func (s Spec) String() string {
+	if s.Raw != "" {
+		return s.Raw
+	}
+	result := s.Scheme + "://" + net.JoinHostPort(s.Host, s.Port)
+	if s.Scheme == SchemeHTTPS {
+		result += s.Path
+	}
+	return result
+}
 
 // Parse parses an upstream spec:
 //
@@ -101,6 +112,10 @@ func Parse(raw string) (Spec, error) {
 	}
 	if port == "" {
 		port = "53"
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return Spec{}, fmt.Errorf("plain upstream %q has an invalid port", raw)
 	}
 	return Spec{Scheme: SchemeUDP, Host: host, Port: port, Raw: raw}, nil
 }

@@ -79,10 +79,13 @@ func (dr *DNSRoutes) load() {
 	sortRoutes(newRoutes)
 
 	dr.mu.Lock()
-	dr.routes = newRoutes
+	changed := !routesEqual(dr.routes, newRoutes)
+	if changed {
+		dr.routes = newRoutes
+	}
 	onChange := dr.onChange
 	dr.mu.Unlock()
-	if onChange != nil {
+	if changed && onChange != nil {
 		onChange()
 	}
 
@@ -233,6 +236,18 @@ func sortRoutes(routes []Route) {
 		}
 		return routes[i].Pattern < routes[j].Pattern
 	})
+}
+
+func routesEqual(a, b []Route) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func writeFileAtomic(path string, data []byte, mode os.FileMode) (err error) {

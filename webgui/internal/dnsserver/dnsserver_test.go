@@ -2,8 +2,10 @@ package dnsserver
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -11,6 +13,35 @@ import (
 
 	"tailscale-dnsrewrite/webgui/internal/models"
 )
+
+type scriptedResetConn struct {
+	net.PacketConn
+	resets int
+	calls  int
+}
+
+func (c *scriptedResetConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	c.calls++
+	if c.resets < 0 || c.calls <= c.resets {
+		return 0, nil, fmt.Errorf("wrapped reset: %w", syscall.ECONNRESET)
+	}
+	n := copy(p, "ok")
+	return n, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 53}, nil
+}
+
+func TestResetTolerantConnRetriesWrappedResetsWithLimit(t *testing.T) {
+	succeeds := &scriptedResetConn{resets: 2}
+	buffer := make([]byte, 8)
+	n, _, err := (resetTolerantConn{succeeds}).ReadFrom(buffer)
+	if err != nil || string(buffer[:n]) != "ok" || succeeds.calls != 3 {
+		t.Fatalf("retry result: n=%d err=%v calls=%d", n, err, succeeds.calls)
+	}
+
+	alwaysReset := &scriptedResetConn{resets: -1}
+	if _, _, err := (resetTolerantConn{alwaysReset}).ReadFrom(buffer); err == nil {
+		t.Fatal("permanently resetting connection did not return an error")
+	}
+}
 
 // startTestServer runs srv on pre-bound :0 loopback sockets and returns the
 // UDP address clients should query. Binding happens before serving starts,
@@ -109,7 +140,17 @@ func TestEndToEndPipeline(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	<-events // discard warmup event
+	for {
+		select {
+		case event := <-events:
+			if event.Domain != "warmup.static.test" {
+				t.Fatalf("unexpected event during warmup: %+v", event)
+			}
+		default:
+			goto warmupDrained
+		}
+	}
+warmupDrained:
 
 	assertStaticRewritePhase(t, query, nextEvent, &upstreamHits)
 	assertForwardedPhase(t, query, nextEvent, upstreamAddr, &upstreamHits)

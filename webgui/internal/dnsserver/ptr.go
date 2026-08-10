@@ -160,6 +160,7 @@ func (s *Server) stagePrivatePTR(q dns.Question, resp *dns.Msg) (resolution, boo
 		},
 		Ptr: dns.Fqdn(name + "." + privatePTRSuffix),
 	}}
+	resp.Authoritative = true
 	return resolution{
 		upstream:    "Private PTR",
 		matchedRule: name,

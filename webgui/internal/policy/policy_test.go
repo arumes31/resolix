@@ -50,6 +50,19 @@ func TestSafeSearchTargets(t *testing.T) {
 	}
 }
 
+func TestEnginesReturnsDefensiveCopy(t *testing.T) {
+	policy := New(Config{SafeSearch: []string{"google"}})
+	engines := policy.Engines()
+	delete(engines, "google")
+	engines["bing"] = true
+	if policy.SafeSearchTarget("google.com") != googleTarget {
+		t.Fatal("mutating Engines result disabled the configured engine")
+	}
+	if policy.SafeSearchTarget("bing.com") != "" {
+		t.Fatal("mutating Engines result enabled a new engine")
+	}
+}
+
 func TestSafeSearchEngineSubset(t *testing.T) {
 	p := New(Config{SafeSearch: []string{"google"}})
 	if got := p.SafeSearchTarget("www.google.com"); got != googleTarget {

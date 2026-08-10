@@ -203,8 +203,16 @@ type Server struct {
 
 // SetBuildInfo publishes build metadata through the API and node status.
 func (s *Server) SetBuildInfo(version, buildInfo string) {
+	s.fieldsMu.Lock()
 	s.version = version
 	s.buildInfo = buildInfo
+	s.fieldsMu.Unlock()
+}
+
+func (s *Server) buildMetadata() (version, buildInfo string) {
+	s.fieldsMu.RLock()
+	defer s.fieldsMu.RUnlock()
+	return s.version, s.buildInfo
 }
 
 // NewServer initializes a new API server.
@@ -346,6 +354,28 @@ func generateCSRFToken() (string, error) {
 		return "", fmt.Errorf("generate CSRF token: %w", err)
 	}
 	return base64.StdEncoding.EncodeToString(b), nil
+}
+
+// checkCSRF validates the double-submit token used by authenticated browser
+// sessions. CSRF protection is unnecessary when web authentication is off.
+func (s *Server) checkCSRF(w http.ResponseWriter, r *http.Request) bool {
+	if s.cfg.WebUsername == "" && s.cfg.WebPassword == "" {
+		return true
+	}
+	cookie, err := r.Cookie(csrfCookieName)
+	if err != nil {
+		http.Error(w, apperr.NewErrCSRFMismatch("missing CSRF token", err).Error(), http.StatusForbidden)
+		return false
+	}
+	submitted := r.Header.Get("X-CSRF-Token")
+	if submitted == "" {
+		submitted = r.FormValue("csrf_token")
+	}
+	if subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(submitted)) != 1 {
+		http.Error(w, apperr.NewErrCSRFMismatch("invalid CSRF token", nil).Error(), http.StatusForbidden)
+		return false
+	}
+	return true
 }
 
 func remoteIP(r *http.Request) string {
@@ -970,11 +1000,12 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleVersion(w http.ResponseWriter, _ *http.Request) {
+	version, buildInfo := s.buildMetadata()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{
-		"version":    s.version,
+		"version":    version,
 		"go_version": runtime.Version(),
-		"build":      s.buildInfo,
+		"build":      buildInfo,
 	})
 }
 
@@ -1006,6 +1037,11 @@ func (s *Server) dohClientAllowed(r *http.Request) bool {
 	if token := s.cfg.DoHAuthToken; token != "" {
 		auth := r.Header.Get("Authorization")
 		return subtle.ConstantTimeCompare([]byte(auth), []byte("Bearer "+token)) == 1
+	}
+	peerIP := net.ParseIP(remoteIP(r))
+	forwarded := (r.Header.Get("X-Forwarded-For") != "" || r.Header.Get("Forwarded") != "") && s.isTrustedProxy(r)
+	if peerIP != nil && peerIP.IsLoopback() && !forwarded {
+		return false
 	}
 	ip := net.ParseIP(s.clientIP(r))
 	if ip == nil {
@@ -1927,6 +1963,9 @@ func (s *Server) handleFilteringPause(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !s.checkCSRF(w, r) {
+		return
+	}
 	eng := s.getFilter()
 	if eng == nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -1978,6 +2017,9 @@ func (s *Server) handleRewrites(w http.ResponseWriter, r *http.Request) {
 			"rewrites": store.List(),
 		})
 	case http.MethodPost:
+		if !s.checkCSRF(w, r) {
+			return
+		}
 		var req struct {
 			Domain string `json:"domain"`
 			Type   string `json:"type"`
@@ -1994,12 +2036,20 @@ func (s *Server) handleRewrites(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "rewrite": rw})
 	case http.MethodDelete:
+		if !s.checkCSRF(w, r) {
+			return
+		}
 		id := r.URL.Query().Get("id")
 		if id == "" {
 			http.Error(w, "Missing id parameter", http.StatusBadRequest)
 			return
 		}
-		if !store.Delete(id) {
+		found, err := store.Delete(id)
+		if err != nil {
+			http.Error(w, "Failed to delete rewrite", http.StatusInternalServerError)
+			return
+		}
+		if !found {
 			http.Error(w, "Rewrite not found", http.StatusNotFound)
 			return
 		}
@@ -2034,6 +2084,9 @@ func (s *Server) handleClients(w http.ResponseWriter, r *http.Request) {
 			"clients": reg.List(),
 		})
 	case http.MethodPost, http.MethodPut:
+		if !s.checkCSRF(w, r) {
+			return
+		}
 		var c clients.Client
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256*1024)).Decode(&c); err != nil {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
@@ -2055,6 +2108,9 @@ func (s *Server) handleClients(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
 	case http.MethodDelete:
+		if !s.checkCSRF(w, r) {
+			return
+		}
 		name := r.URL.Query().Get("name")
 		if name == "" {
 			http.Error(w, "Missing name parameter", http.StatusBadRequest)
@@ -2118,6 +2174,9 @@ func (s *Server) handleQuerylogAction(w http.ResponseWriter, r *http.Request, bl
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !s.checkCSRF(w, r) {
+		return
+	}
 	eng := s.getFilter()
 	if eng == nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -2136,7 +2195,13 @@ func (s *Server) handleQuerylogAction(w http.ResponseWriter, r *http.Request, bl
 		return
 	}
 	domain := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(req.Domain), "."))
-	if domain == "" || !strings.Contains(domain, ".") {
+	_, validDomain := dns.IsDomainName(domain)
+	invalidCharacter := strings.IndexFunc(domain, func(r rune) bool {
+		letter := r >= 'a' && r <= 'z'
+		digit := r >= '0' && r <= '9'
+		return !letter && !digit && r != '-' && r != '.'
+	}) >= 0
+	if domain == "" || !strings.Contains(domain, ".") || !validDomain || invalidCharacter {
 		http.Error(w, "Invalid domain", http.StatusBadRequest)
 		return
 	}
@@ -2293,6 +2358,9 @@ func (s *Server) handleGetUpstreams(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handlePostUpstreams(w http.ResponseWriter, r *http.Request) {
+	if !s.checkCSRF(w, r) {
+		return
+	}
 	var req []struct {
 		Address string `json:"address"`
 	}
@@ -2353,6 +2421,9 @@ func (s *Server) handleCacheClear(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.checkCSRF(w, r) {
 		return
 	}
 	dnsSrv := s.getDNSServer()
@@ -2418,6 +2489,9 @@ func (s *Server) handleGetDNSRoutes(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handlePostDNSRoutes(w http.ResponseWriter, r *http.Request) {
+	if !s.checkCSRF(w, r) {
+		return
+	}
 	var routesMap map[string]string
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&routesMap); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)

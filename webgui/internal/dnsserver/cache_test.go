@@ -103,6 +103,44 @@ func TestCacheTTLDecrementOnResponse(t *testing.T) {
 	}
 }
 
+func TestGetStaleCountsOnlyExpiredEntries(t *testing.T) {
+	c := newCache(2, 0, 0)
+	fresh := cacheKey{name: "fresh.test", qtype: dns.TypeA}
+	expired := cacheKey{name: "expired.test", qtype: dns.TypeA}
+	c.set(fresh, &cacheEntry{storedAt: time.Now(), ttl: 60})
+	c.set(expired, &cacheEntry{storedAt: time.Now().Add(-time.Minute), ttl: 1})
+	if _, ok := c.getStale(fresh); !ok {
+		t.Fatal("fresh entry is missing")
+	}
+	if got := c.staleHits.Load(); got != 0 {
+		t.Fatalf("stale hits after fresh lookup = %d, want 0", got)
+	}
+	if _, ok := c.getStale(expired); !ok {
+		t.Fatal("expired entry is missing")
+	}
+	if got := c.staleHits.Load(); got != 1 {
+		t.Fatalf("stale hits after expired lookup = %d, want 1", got)
+	}
+}
+
+func TestMinAnswerTTLPreservesZero(t *testing.T) {
+	records := []dns.RR{
+		aRecord("zero.test.", "192.0.2.1", 0),
+		aRecord("zero.test.", "192.0.2.2", 120),
+	}
+	if got := minAnswerTTL(records); got != 0 {
+		t.Fatalf("minAnswerTTL() = %d, want 0", got)
+	}
+}
+
+func TestCacheSeparatesQuestionClasses(t *testing.T) {
+	internet := cacheKey{name: "class.test", qtype: dns.TypeA, qclass: dns.ClassINET}
+	chaos := cacheKey{name: "class.test", qtype: dns.TypeA, qclass: dns.ClassCHAOS}
+	if internet == chaos {
+		t.Fatal("cache keys for different DNS classes are equal")
+	}
+}
+
 func TestCacheLRUEviction(t *testing.T) {
 	c := newCache(2, 0, 0)
 	mk := func(name string) cacheKey { return cacheKey{name: name, qtype: dns.TypeA} }

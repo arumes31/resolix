@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -324,8 +325,9 @@ func (s *Store) Add(domain, typ, value string) (Rewrite, error) {
 	return rw, nil
 }
 
-// Delete removes a rewrite by ID, persisting the store.
-func (s *Store) Delete(id string) bool {
+// Delete removes a rewrite by ID, persisting the store. found is false when
+// the ID does not exist; persistence failures are returned separately.
+func (s *Store) Delete(id string) (found bool, err error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
@@ -339,7 +341,7 @@ func (s *Store) Delete(id string) bool {
 	}
 	if idx < 0 {
 		s.mu.Unlock()
-		return false
+		return false, nil
 	}
 	removed := s.items[idx]
 	s.items = append(s.items[:idx], s.items[idx+1:]...)
@@ -354,9 +356,9 @@ func (s *Store) Delete(id string) bool {
 		}
 		s.items = append(s.items[:idx], append([]Rewrite{removed}, s.items[idx:]...)...)
 		s.mu.Unlock()
-		return false
+		return true, err
 	}
-	return true
+	return true, nil
 }
 
 // save persists the store atomically (temp file + rename). No-op for
@@ -399,7 +401,18 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) (err error) {
 	if err = tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, path)
+	if err = os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = dir.Close() }()
+	if err = dir.Sync(); err != nil && runtime.GOOS != "windows" {
+		return err
+	}
+	return nil
 }
 
 // newID returns a short random hex ID.

@@ -99,11 +99,12 @@ func TestParseLogBytes(t *testing.T) {
 	prs.ParseLogBytes(line6, node)
 
 	events = store.GetRecentEvents(0)
-	if events[0].Domain != "private.local" {
-		t.Errorf("Expected domain private.local, got %s", events[0].Domain)
+	latest := events[len(events)-1]
+	if latest.Domain != "private.local" {
+		t.Errorf("Expected domain private.local, got %s", latest.Domain)
 	}
-	if events[0].Upstream != "Local Override" {
-		t.Errorf("Expected 'Local Override' for 127.0.0.1#5353, got %s", events[0].Upstream)
+	if latest.Upstream != "Local Override" {
+		t.Errorf("Expected 'Local Override' for 127.0.0.1#5353, got %s", latest.Upstream)
 	}
 }
 
@@ -167,9 +168,9 @@ func TestApiIngestEvents(t *testing.T) {
 	if len(stored) != 2 {
 		t.Fatalf("Expected 2 events, got %d", len(stored))
 	}
-	// GetRecentEvents returns newest first.
-	if stored[1].Domain != "e1.example.com" || stored[1].Node != "slave-1" {
-		t.Errorf("Unexpected stored event: %+v", stored[1])
+	// GetRecentEvents returns oldest first.
+	if stored[0].Domain != "e1.example.com" || stored[0].Node != "slave-1" {
+		t.Errorf("Unexpected stored event: %+v", stored[0])
 	}
 
 	// Node status should have been created from the event node name.

@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 )
 
@@ -107,5 +108,16 @@ func (r *Registry) saveClients(clients []*Client) (err error) {
 	if err = tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, r.path)
+	if err = os.Rename(tmpPath, r.path); err != nil {
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(r.path))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = dir.Close() }()
+	if err = dir.Sync(); err != nil && runtime.GOOS != "windows" {
+		return err
+	}
+	return nil
 }

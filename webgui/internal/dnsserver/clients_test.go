@@ -167,20 +167,20 @@ func TestPerClientSafeSearchOverride(t *testing.T) {
 
 	// Global client: google rewritten.
 	resp := h.queryFrom(t, "100.64.0.10", "www.google.com")
-	if cn, ok := resp.Answer[0].(*dns.CNAME); !ok || cn.Target != "forcesafesearch.google.com." {
+	if cn, ok := firstAnswer(t, resp).(*dns.CNAME); !ok || cn.Target != "forcesafesearch.google.com." {
 		t.Errorf("global safe-search answer = %v", resp.Answer)
 	}
 	_ = h.nextEvent(t)
 
 	// Override client: google NOT rewritten, youtube rewritten.
 	resp = h.queryFrom(t, "100.64.0.21", "www.google.com")
-	if a, ok := resp.Answer[0].(*dns.A); !ok || a.A.String() != "93.184.216.34" {
+	if a, ok := firstAnswer(t, resp).(*dns.A); !ok || a.A.String() != "93.184.216.34" {
 		t.Errorf("override client google answer = %v, want forwarded", resp.Answer)
 	}
 	_ = h.nextEvent(t)
 
 	resp = h.queryFrom(t, "100.64.0.21", "www.youtube.com")
-	if cn, ok := resp.Answer[0].(*dns.CNAME); !ok || cn.Target != "restrict.youtube.com." {
+	if cn, ok := firstAnswer(t, resp).(*dns.CNAME); !ok || cn.Target != "restrict.youtube.com." {
 		t.Errorf("override client youtube answer = %v", resp.Answer)
 	}
 	_ = h.nextEvent(t)
@@ -254,7 +254,7 @@ func TestCustomUpstreamAndCacheIsolation(t *testing.T) {
 
 	// Client with custom upstreams gets B's answer.
 	resp := h.queryFrom(t, "100.64.0.30", "cacheme.test")
-	if got := resp.Answer[0].(*dns.A).A.String(); got != "10.9.9.9" {
+	if got := firstAnswer(t, resp).(*dns.A).A.String(); got != "10.9.9.9" {
 		t.Fatalf("custom client answer = %s, want 10.9.9.9", got)
 	}
 	if ev := h.nextEvent(t); ev.ev.Upstream != upstreamB {
@@ -264,14 +264,14 @@ func TestCustomUpstreamAndCacheIsolation(t *testing.T) {
 	// Global client gets A's answer; the client's answer must not pollute
 	// the shared cache (group discriminator).
 	resp = h.queryFrom(t, "100.64.0.10", "cacheme.test")
-	if got := resp.Answer[0].(*dns.A).A.String(); got != "93.184.216.34" {
+	if got := firstAnswer(t, resp).(*dns.A).A.String(); got != "93.184.216.34" {
 		t.Fatalf("global client answer = %s, want 93.184.216.34", got)
 	}
 	_ = h.nextEvent(t)
 
 	// Second global query: cache hit with the global answer.
 	resp = h.queryFrom(t, "100.64.0.10", "cacheme.test")
-	if got := resp.Answer[0].(*dns.A).A.String(); got != "93.184.216.34" {
+	if got := firstAnswer(t, resp).(*dns.A).A.String(); got != "93.184.216.34" {
 		t.Errorf("global cache answer = %s, want 93.184.216.34", got)
 	}
 	if ev := h.nextEvent(t); ev.ev.Upstream != "System Cache" {
@@ -280,13 +280,21 @@ func TestCustomUpstreamAndCacheIsolation(t *testing.T) {
 
 	// Second custom-client query: cache hit with B's answer (group cache).
 	resp = h.queryFrom(t, "100.64.0.30", "cacheme.test")
-	if got := resp.Answer[0].(*dns.A).A.String(); got != "10.9.9.9" {
+	if got := firstAnswer(t, resp).(*dns.A).A.String(); got != "10.9.9.9" {
 		t.Errorf("custom cache answer = %s, want 10.9.9.9", got)
 	}
 
 	if hitsA.Load() != 1 || hitsB.Load() != 1 {
 		t.Errorf("upstream hits A=%d B=%d, want 1/1", hitsA.Load(), hitsB.Load())
 	}
+}
+
+func firstAnswer(t *testing.T, resp *dns.Msg) dns.RR {
+	t.Helper()
+	if resp == nil || len(resp.Answer) == 0 {
+		t.Fatalf("DNS response has no answers: %+v", resp)
+	}
+	return resp.Answer[0]
 }
 
 func TestExcludeFromLogAndStats(t *testing.T) {

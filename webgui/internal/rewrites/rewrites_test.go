@@ -45,10 +45,10 @@ func TestStoreCRUDAndPersistence(t *testing.T) {
 	}
 
 	// Delete.
-	if !s2.Delete(items[0].ID) {
+	if found, err := s2.Delete(items[0].ID); err != nil || !found {
 		t.Error("Delete returned false for existing ID")
 	}
-	if s2.Delete(items[0].ID) {
+	if found, err := s2.Delete(items[0].ID); err != nil || found {
 		t.Error("Delete returned true for missing ID")
 	}
 	s3, err := Load(path, "")
@@ -57,6 +57,25 @@ func TestStoreCRUDAndPersistence(t *testing.T) {
 	}
 	if len(s3.List()) != 0 {
 		t.Error("delete was not persisted")
+	}
+}
+
+func TestDeleteReturnsPersistenceErrorAndRollsBack(t *testing.T) {
+	store, err := Load("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewrite, err := store.Add("example.test", "A", "192.0.2.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.path = filepath.Join(t.TempDir(), "missing", "rewrites.json")
+	found, err := store.Delete(rewrite.ID)
+	if !found || err == nil {
+		t.Fatalf("Delete() = found %v, err %v; want true and persistence error", found, err)
+	}
+	if len(store.List()) != 1 {
+		t.Fatal("failed delete was not rolled back")
 	}
 }
 

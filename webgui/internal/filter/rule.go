@@ -83,7 +83,11 @@ func parseLine(line string) (rule Rule, exception, ok bool) {
 
 	// Regex rule (with optional @@ prefix).
 	if len(body) >= 2 && strings.HasPrefix(body, "/") && strings.HasSuffix(body, "/") {
-		re, err := regexp.Compile(body[1 : len(body)-1])
+		pattern := body[1 : len(body)-1]
+		if pattern == "" {
+			return Rule{}, false, false
+		}
+		re, err := regexp.Compile(pattern)
 		if err != nil {
 			log.Printf("[DEBUG] filter: skipping invalid regex rule %q: %v", raw, err)
 			return Rule{}, false, false

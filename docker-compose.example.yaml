@@ -14,7 +14,7 @@ services:
       - BASE_URL=${BASE_URL:-/}
       - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}
       - COOKIE_SECURE=${COOKIE_SECURE:-false}
-      - INGEST_SECRET=my_super_secret_token
+      - INGEST_SECRET=${INGEST_SECRET:?INGEST_SECRET is required}
       - WEB_USERNAME=${WEB_USERNAME:?WEB_USERNAME is required}
       - WEB_PASSWORD=${WEB_PASSWORD:?WEB_PASSWORD is required}
       - DNS_ALLOWED_CLIENTS=${DNS_ALLOWED_CLIENTS:-}
@@ -31,7 +31,6 @@ services:
       - TLS_KEY_FILE=${TLS_KEY_FILE:-/etc/tailscale-dnsrewrite/tls.key}
     ports:
       - "127.0.0.1:${PORT:-35353}:35353"
-      - "${DOT_PORT:-853}:${DOT_PORT:-853}/tcp"
     volumes:
       - ./history:/var/lib/tailscale-dnsrewrite
       - ./tailscale:/var/lib/tailscale

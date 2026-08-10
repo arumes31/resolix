@@ -109,10 +109,16 @@ func (rl *rateLimiter) allow(ipStr string) bool {
 	now := time.Now()
 	b, ok := rl.buckets[key]
 	if !ok {
-		// Fail closed instead of allowing spoofed source addresses to grow the
-		// map without bound between cleanup passes.
 		if len(rl.buckets) >= rl.maxBuckets {
-			return false
+			oldestKey := ""
+			var oldest time.Time
+			for candidate, bucket := range rl.buckets {
+				if oldestKey == "" || bucket.last.Before(oldest) {
+					oldestKey = candidate
+					oldest = bucket.last
+				}
+			}
+			delete(rl.buckets, oldestKey)
 		}
 		b = &rateBucket{tokens: rl.qps, last: now}
 		rl.buckets[key] = b

@@ -24,6 +24,11 @@ import (
 // Version is set at build time via -ldflags.
 var Version = "dev"
 
+type backlogItem struct {
+	event models.QueryEvent
+	size  int64
+}
+
 // Forwarder handles sending batches of query events from slave to master.
 type Forwarder struct {
 	cfg              *config.Config
@@ -31,7 +36,7 @@ type Forwarder struct {
 	stopOnce         sync.Once
 	healthOnce       sync.Once
 	backlogMu        sync.Mutex
-	backlog          []models.QueryEvent
+	backlog          []backlogItem
 	backlogTotalSize int64
 	wakeChan         chan struct{}
 	healthReports    chan map[string]float64
@@ -131,17 +136,18 @@ func (f *Forwarder) EnqueueEvent(ev models.QueryEvent) {
 	if ev.Node == "" {
 		ev.Node = f.cfg.NodeName
 	}
+	item := backlogItem{event: ev, size: eventJSONSize(ev)}
 	f.backlogMu.Lock()
 	defer f.backlogMu.Unlock()
 
 	// Enforce a maximum backlog size in bytes to prevent OOM (only when limit is configured)
-	if f.cfg.MaxBacklogSize > 0 && f.backlogTotalSize+eventJSONSize(ev) > f.cfg.MaxBacklogSize {
+	if f.cfg.MaxBacklogSize > 0 && f.backlogTotalSize+item.size > f.cfg.MaxBacklogSize {
 		f.dropped.Add(1)
 		return
 	}
 
-	f.backlog = append(f.backlog, ev)
-	f.backlogTotalSize += eventJSONSize(ev)
+	f.backlog = append(f.backlog, item)
+	f.backlogTotalSize += item.size
 	select {
 	case f.wakeChan <- struct{}{}:
 	default:
@@ -543,10 +549,11 @@ func (f *Forwarder) Start() error {
 		if len(f.backlog) < batchSize {
 			batchSize = len(f.backlog)
 		}
-		events := append([]models.QueryEvent(nil), f.backlog[:batchSize]...)
-
-		for i := 0; i < len(events); i++ {
-			f.backlogTotalSize -= eventJSONSize(f.backlog[i])
+		items := append([]backlogItem(nil), f.backlog[:batchSize]...)
+		events := make([]models.QueryEvent, len(items))
+		for i, item := range items {
+			events[i] = item.event
+			f.backlogTotalSize -= item.size
 		}
 		f.backlog = f.backlog[batchSize:]
 		f.backlogMu.Unlock()
@@ -575,7 +582,7 @@ func (f *Forwarder) Start() error {
 				continue
 			}
 
-			f.requeueBatch(events)
+			f.requeueBatch(items)
 
 			backoffAttempt++
 			f.retries.Add(1)
@@ -607,34 +614,33 @@ func (f *Forwarder) Start() error {
 }
 
 // requeueBatch prepends a failed batch back onto the backlog, honoring the
-// configured byte limit (the oldest overflow events are dropped).
-func (f *Forwarder) requeueBatch(events []models.QueryEvent) {
+// configured byte limit (the newest overflow events are dropped).
+func (f *Forwarder) requeueBatch(items []backlogItem) {
 	f.backlogMu.Lock()
 	defer f.backlogMu.Unlock()
 
 	if f.cfg.MaxBacklogSize <= 0 {
-		f.backlog = append(events, f.backlog...)
-		for i := 0; i < len(events); i++ {
-			f.backlogTotalSize += eventJSONSize(events[i])
+		f.backlog = append(items, f.backlog...)
+		for _, item := range items {
+			f.backlogTotalSize += item.size
 		}
 		return
 	}
 
 	// Re-queue only what fits within the byte limit; drop the oldest overflow
 	kept := 0
-	for _, ev := range events {
-		size := eventJSONSize(ev)
-		if f.backlogTotalSize+size > f.cfg.MaxBacklogSize {
+	for _, item := range items {
+		if f.backlogTotalSize+item.size > f.cfg.MaxBacklogSize {
 			break
 		}
 		kept++
-		f.backlogTotalSize += size
+		f.backlogTotalSize += item.size
 	}
-	if kept < len(events) {
-		log.Printf("[WARN] Backlog byte limit (%d) reached, dropping %d newest events of failed batch", f.cfg.MaxBacklogSize, len(events)-kept)
+	if kept < len(items) {
+		log.Printf("[WARN] Backlog byte limit (%d) reached, dropping %d newest events of failed batch", f.cfg.MaxBacklogSize, len(items)-kept)
 	}
-	f.dropped.Add(int64(len(events) - kept))
-	f.backlog = append(events[:kept:kept], f.backlog...)
+	f.dropped.Add(int64(len(items) - kept))
+	f.backlog = append(items[:kept:kept], f.backlog...)
 }
 
 // startHeartbeat sends periodic heartbeats to the master (Item 92).

@@ -11,6 +11,7 @@ import (
 
 	"tailscale-dnsrewrite/webgui/internal/filter"
 	"tailscale-dnsrewrite/webgui/internal/models"
+	"tailscale-dnsrewrite/webgui/internal/rewrites"
 )
 
 // filterHarness bundles a server under test with a filter engine and a fake
@@ -157,6 +158,26 @@ func TestBlockingModes(t *testing.T) {
 			}
 			_ = h.nextEvent(t)
 		})
+	}
+}
+
+func TestCNAMEChasePropagatesBlockedState(t *testing.T) {
+	h := startFilteredServer(t, "nxdomain")
+	store, err := rewrites.Load("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Add("alias.test", "CNAME", "blocked.test"); err != nil {
+		t.Fatal(err)
+	}
+	h.srv.cfg.Rewrites = store
+
+	resp := h.query("alias.test", dns.TypeA)
+	if resp.Rcode != dns.RcodeNameError {
+		t.Fatalf("CNAME chase rcode = %s, want NXDOMAIN", dns.RcodeToString[resp.Rcode])
+	}
+	if event := h.nextEvent(t); !event.Blocked {
+		t.Fatalf("CNAME chase event is not blocked: %+v", event)
 	}
 }
 

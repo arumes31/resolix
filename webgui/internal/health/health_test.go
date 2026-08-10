@@ -3,6 +3,7 @@ package health
 import (
 	"context"
 	"net"
+	"slices"
 	"testing"
 	"time"
 
@@ -70,5 +71,22 @@ func TestUpdateUpstreamsRemovesStaleHealthyServers(t *testing.T) {
 	}
 	if got := checker.upstreams; len(got) != 2 || got[0] != "retained" || got[1] != "new" {
 		t.Fatalf("replacement upstreams = %v", got)
+	}
+}
+
+func TestUpdateUpstreamsFallsBackWhenNoHealthyServersRemain(t *testing.T) {
+	checker := &Checker{
+		upstreams: []string{"192.0.2.1"},
+		healthy:   []string{"192.0.2.1"},
+		latencies: make(map[string]float64),
+	}
+	replacement := []string{"198.51.100.1", "203.0.113.1"}
+	checker.UpdateUpstreams(replacement)
+
+	checker.mu.RLock()
+	healthy := append([]string(nil), checker.healthy...)
+	checker.mu.RUnlock()
+	if !slices.Equal(healthy, replacement) {
+		t.Fatalf("healthy = %v, want %v", healthy, replacement)
 	}
 }

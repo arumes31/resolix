@@ -1,8 +1,11 @@
 function escapeHtml(unsafe) {
     if (unsafe == null) return '';
-    const el = document.createElement('div');
-    el.textContent = unsafe;
-    return el.innerHTML;
+    return String(unsafe)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
 }
 
 function formatNumber(num) {
@@ -509,6 +512,11 @@ async function withFormBusy(form, action) {
 }
 
 async function apiJSON(path, options = {}) {
+    const method = (options.method || 'GET').toUpperCase();
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+        const csrfToken = document.body.dataset.csrfToken;
+        options.headers = { ...options.headers, 'X-CSRF-Token': csrfToken };
+    }
     const response = await fetch(apiPath(path), options);
     const contentType = response.headers.get('Content-Type') || '';
     const payload = contentType.includes('application/json') ? await response.json() : await response.text();

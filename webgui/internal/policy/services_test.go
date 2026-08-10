@@ -12,6 +12,8 @@ func TestMatchService(t *testing.T) {
 		{"facebook.com", []string{"facebook"}, "facebook", true},
 		{"www.facebook.com", []string{"facebook"}, "facebook", true},
 		{"deep.sub.tiktok.com", []string{"tiktok"}, "tiktok", true},
+		{"deep.sub.tiktok.com", []string{"  TiKToK  "}, "tiktok", true},
+		{"facebook.com", []string{"FACEBOOK"}, "facebook", true},
 		{"x.com", []string{"twitter"}, "twitter", true},
 		{"cdn.discordapp.com", []string{"discord"}, "discord", true},
 		{"steampowered.com", []string{"steam"}, "steam", true},

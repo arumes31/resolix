@@ -6,6 +6,10 @@ UPSTREAM_DNS=${UPSTREAM_DNS:-"8.8.8.8 8.8.4.4"}
 # Default health check domain if not provided
 HEALTHCHECK_DOMAIN=${HEALTHCHECK_DOMAIN:-"google.com"}
 
+# Enrollment credentials are optional after the node has persisted state.
+TS_AUTHKEY=${TS_AUTHKEY:-}
+TS_AUTHKEY_FILE=${TS_AUTHKEY_FILE:-}
+
 # Cleanup function for graceful shutdown
 cleanup() {
     trap - SIGINT SIGTERM

@@ -66,6 +66,9 @@ func (c *Checker) UpdateUpstreams(servers []string) {
 	c.mu.Lock()
 	c.upstreams = servers
 	c.healthy = retainServers(c.healthy, serverSet(servers))
+	if len(c.healthy) == 0 {
+		c.healthy = append([]string(nil), servers...)
+	}
 	c.mu.Unlock()
 }
 

@@ -10,14 +10,15 @@ import (
 	"github.com/miekg/dns"
 )
 
-// cacheKey identifies a cached DNS response by question name and type.
+// cacheKey identifies a cached DNS response by question name, type, and class.
 // group discriminates the shared cache for clients with custom upstreams
 // (empty for the global pool), so client-specific answers never pollute the
 // global cache space.
 type cacheKey struct {
-	name  string
-	qtype uint16
-	group string
+	name   string
+	qtype  uint16
+	qclass uint16
+	group  string
 }
 
 // cacheEntry holds a cached response with its clamped TTL and insertion time
@@ -139,8 +140,10 @@ func (c *cache) getStale(key cacheKey) (*cacheEntry, bool) {
 	if !ok {
 		return nil, false
 	}
-	c.staleHits.Add(1)
 	ent := el.Value.(entry).value
+	if ent.remainingTTL(time.Now()) <= 0 {
+		c.staleHits.Add(1)
+	}
 	return &cacheEntry{
 		answers:           copyRRs(ent.answers),
 		authority:         copyRRs(ent.authority),
@@ -248,13 +251,15 @@ func clampTTL(ttl uint32) uint32 {
 
 // minAnswerTTL returns the smallest TTL across answer records (0 when empty).
 func minAnswerTTL(rrs []dns.RR) uint32 {
-	var min uint32
+	var minimum uint32
+	initialized := false
 	for _, rr := range rrs {
-		if t := rr.Header().Ttl; min == 0 || t < min {
-			min = t
+		if ttl := rr.Header().Ttl; !initialized || ttl < minimum {
+			minimum = ttl
+			initialized = true
 		}
 	}
-	return min
+	return minimum
 }
 
 // soaTTL extracts the TTL of the first SOA record in the authority section.

@@ -179,17 +179,42 @@ func (e *Engine) setRulesStatus(src *Source, block, allow []Rule, loadErr string
 	defer e.mu.Unlock()
 	src.LastChecked = time.Now()
 	if loadErr == "" {
+		changed := !rulesEqual(e.blockRules[src], block) || !rulesEqual(e.allowRules[src], allow)
 		e.blockRules[src] = block
 		e.allowRules[src] = allow
 		e.rebuildIndexesLocked()
 		src.RuleCount = len(block)
 		src.AllowRuleCount = len(allow)
 		src.LastUpdate = src.LastChecked
-		src.LastChanged = src.LastChecked
+		if changed {
+			src.LastChanged = src.LastChecked
+		}
 		src.IgnoredCount = ignored
 		src.Truncated = truncated
 	}
 	src.LastError = loadErr
+}
+
+func rulesEqual(a, b []Rule) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Raw != b[i].Raw || a[i].kind != b[i].kind || a[i].domain != b[i].domain {
+			return false
+		}
+		aPattern, bPattern := "", ""
+		if a[i].re != nil {
+			aPattern = a[i].re.String()
+		}
+		if b[i].re != nil {
+			bPattern = b[i].re.String()
+		}
+		if aPattern != bPattern {
+			return false
+		}
+	}
+	return true
 }
 
 func (e *Engine) rebuildIndexesLocked() {

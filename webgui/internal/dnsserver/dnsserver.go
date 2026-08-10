@@ -11,12 +11,14 @@ import (
 	"context"
 	"crypto/tls"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/miekg/dns"
@@ -193,9 +195,11 @@ type resetTolerantConn struct {
 }
 
 func (c resetTolerantConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	for {
+	const maxConsecutiveResets = 8
+	for resets := 0; ; resets++ {
 		n, addr, err := c.PacketConn.ReadFrom(p)
-		if err != nil && strings.Contains(err.Error(), "connection reset") {
+		reset := errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.Errno(10054))
+		if reset && resets < maxConsecutiveResets {
 			continue
 		}
 		return n, addr, err
@@ -449,7 +453,7 @@ func (s *Server) resolve(r *dns.Msg, resp *dns.Msg, depth int, cl *clients.Clien
 	// custom upstreams get a distinct cache group so their answers never
 	// pollute the shared global cache.
 	group, specs := clientUpstreamGroup(cl)
-	key := cacheKey{name: domain, qtype: q.Qtype, group: group}
+	key := cacheKey{name: domain, qtype: q.Qtype, qclass: q.Qclass, group: group}
 	return s.resolveViaCacheOrUpstream(r, resp, key, specs)
 }
 
@@ -637,12 +641,12 @@ func (s *Server) chaseCNAME(q dns.Question, resp *dns.Msg, target, rule, label, 
 	subResp := new(dns.Msg)
 	subResp.SetReply(sub)
 	subResp.RecursionAvailable = true
-	s.resolve(sub, subResp, depth+1, cl)
+	subResolution := s.resolve(sub, subResp, depth+1, cl)
 
 	resp.Rcode = subResp.Rcode
 	resp.Answer = append([]dns.RR{cname}, subResp.Answer...)
 	resp.Ns = subResp.Ns
-	return resolution{upstream: label, matchedRule: rule, blockReason: reason}
+	return resolution{upstream: label, blocked: subResolution.blocked, matchedRule: rule, blockReason: reason}
 }
 
 // blockedResponse builds the response for a filtered query according to the

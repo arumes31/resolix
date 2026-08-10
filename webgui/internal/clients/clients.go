@@ -6,6 +6,7 @@ package clients
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"sort"
 	"strings"
@@ -52,7 +53,7 @@ func (s *Schedule) Active(now time.Time) bool {
 			continue
 		}
 		if end < start {
-			if mins >= start || mins < end {
+			if mins >= start {
 				return true
 			}
 		} else if mins >= start && mins < end {
@@ -312,7 +313,8 @@ func (r *Registry) Delete(name string) bool {
 	for i, existing := range proposed {
 		if existing.Name == name {
 			proposed = append(proposed[:i], proposed[i+1:]...)
-			if r.saveClients(proposed) != nil {
+			if err := r.saveClients(proposed); err != nil {
+				log.Printf("[WARN] clients: failed to persist deletion of %q: %v", name, err)
 				return false
 			}
 			r.mu.Lock()

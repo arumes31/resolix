@@ -95,7 +95,7 @@ func (e *Engine) findSource(name string) *Source {
 }
 
 // UpdateAll fetches every URL subscription once (conditional GET).
-func (e *Engine) UpdateAll() {
+func (e *Engine) UpdateAll(ctx context.Context) {
 	e.mu.RLock()
 	urls := make([]*Source, 0, len(e.sources))
 	for _, src := range e.sources {
@@ -114,9 +114,13 @@ func (e *Engine) UpdateAll() {
 		wg.Add(1)
 		go func(source *Source) {
 			defer wg.Done()
-			semaphore <- struct{}{}
+			select {
+			case semaphore <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 			defer func() { <-semaphore }()
-			e.fetchSource(source)
+			e.fetchSource(ctx, source)
 		}(src)
 	}
 	wg.Wait()
@@ -125,9 +129,9 @@ func (e *Engine) UpdateAll() {
 // fetchSource downloads a subscription with ETag/Last-Modified conditional
 // GET. On 304 the existing rules are kept; on 200 the rules are parsed and
 // atomically swapped; on any error the last good rules are kept.
-func (e *Engine) fetchSource(src *Source) {
+func (e *Engine) fetchSource(ctx context.Context, src *Source) {
 	logName := sourceLogName(src)
-	req, err := http.NewRequest(http.MethodGet, src.Name, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src.Name, nil)
 	if err != nil {
 		e.setRules(src, nil, nil, err.Error())
 		return
@@ -223,7 +227,7 @@ func (e *Engine) StartUpdateLoop(ctx context.Context, interval time.Duration) {
 		interval = 24 * time.Hour
 	}
 	go func() {
-		e.UpdateAll()
+		e.UpdateAll(ctx)
 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -233,7 +237,7 @@ func (e *Engine) StartUpdateLoop(ctx context.Context, interval time.Duration) {
 				return
 			case <-ticker.C:
 				e.LoadLocal()
-				e.UpdateAll()
+				e.UpdateAll(ctx)
 			}
 		}
 	}()

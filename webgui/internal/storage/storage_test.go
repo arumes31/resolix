@@ -414,6 +414,28 @@ func TestGetRecentEvents(t *testing.T) {
 	if len(recent) != 2 {
 		t.Errorf("expected 2 recent events, got %d", len(recent))
 	}
+	if recent[0].Domain != "recent.com" || recent[1].Domain != "newest.com" {
+		t.Fatalf("recent events are not oldest-first: %+v", recent)
+	}
+}
+
+func TestArchiveBatchDropsOldestWhenBounded(t *testing.T) {
+	cfg := &config.Config{MaxEvents: 10}
+	s := NewStore(cfg)
+	for i := 0; i <= maxArchiveBatchSize; i++ {
+		s.AddEvent(models.QueryEvent{UnixTime: int64(i + 1), Domain: fmt.Sprintf("event-%d.test", i)})
+	}
+	s.batchMu.Lock()
+	defer s.batchMu.Unlock()
+	if len(s.batch) != maxArchiveBatchSize {
+		t.Fatalf("batch length = %d, want %d", len(s.batch), maxArchiveBatchSize)
+	}
+	if s.batch[0].Domain != "event-1.test" {
+		t.Fatalf("oldest retained event = %q, want event-1.test", s.batch[0].Domain)
+	}
+	if got := s.batchDropped.Load(); got != 1 {
+		t.Fatalf("dropped count = %d, want 1", got)
+	}
 }
 
 func TestGetOrderedEvents_Limit(t *testing.T) {

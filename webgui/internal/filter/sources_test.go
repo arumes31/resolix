@@ -23,6 +23,29 @@ func writeTempList(t *testing.T, content string) string {
 	return path
 }
 
+func TestLoadLocalUpdatesLastChangedOnlyForRuleChanges(t *testing.T) {
+	path := writeTempList(t, "||one.test^\n")
+	engine := New()
+	source := engine.AddFileSource(path, false)
+	firstChanged := source.LastChanged
+	time.Sleep(time.Millisecond)
+	engine.LoadLocal()
+	if !source.LastChanged.Equal(firstChanged) {
+		t.Fatalf("LastChanged moved for identical rules: %v -> %v", firstChanged, source.LastChanged)
+	}
+	if !source.LastUpdate.After(firstChanged) {
+		t.Fatalf("LastUpdate was not refreshed: changed=%v update=%v", firstChanged, source.LastUpdate)
+	}
+	if err := os.WriteFile(path, []byte("||two.test^\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond)
+	engine.LoadLocal()
+	if !source.LastChanged.After(firstChanged) {
+		t.Fatalf("LastChanged did not move after a rule change: %v", source.LastChanged)
+	}
+}
+
 func TestFileSourceLoadAndKeepLastGood(t *testing.T) {
 	path := writeTempList(t, "||ads.example.com^\n")
 	e := New()
@@ -68,7 +91,7 @@ func TestSubscriptionUpdate(t *testing.T) {
 	e.AddURLSource(server.URL, false)
 
 	// First fetch: rules loaded, ETag captured.
-	e.UpdateAll()
+	e.UpdateAll(context.Background())
 	if !e.Match("subscribed.example.com").Blocked {
 		t.Fatal("subscription rules not active after first fetch")
 	}
@@ -78,7 +101,7 @@ func TestSubscriptionUpdate(t *testing.T) {
 	}
 
 	// Second fetch: conditional GET → 304, rules unchanged.
-	e.UpdateAll()
+	e.UpdateAll(context.Background())
 	if requests.Load() != 2 {
 		t.Errorf("expected 2 requests, got %d", requests.Load())
 	}
@@ -104,13 +127,13 @@ func TestSubscriptionFailureKeepsLastGood(t *testing.T) {
 
 	e := New()
 	e.AddURLSource(server.URL, false)
-	e.UpdateAll()
+	e.UpdateAll(context.Background())
 	if !e.Match("stable.example.com").Blocked {
 		t.Fatal("initial fetch failed")
 	}
 
 	fail.Store(true)
-	e.UpdateAll()
+	e.UpdateAll(context.Background())
 	src := e.findSource(server.URL)
 	if src.LastError == "" {
 		t.Error("expected LastError after failed fetch")
@@ -135,11 +158,11 @@ func TestOversizedSubscriptionKeepsLastGoodAndMetadata(t *testing.T) {
 
 	e := New()
 	e.AddURLSource(server.URL, false)
-	e.UpdateAll()
+	e.UpdateAll(context.Background())
 	src := e.findSource(server.URL)
 	lastUpdate, etag := src.LastUpdate, src.etag
 	oversized.Store(true)
-	e.UpdateAll()
+	e.UpdateAll(context.Background())
 
 	if src.LastError == "" {
 		t.Fatal("oversized response did not record an error")

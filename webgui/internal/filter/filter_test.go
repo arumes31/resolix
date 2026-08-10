@@ -50,6 +50,8 @@ func TestParseLineFormats(t *testing.T) {
 		{name: "single label", line: "localhost", wantOK: false},
 		{name: "hosts localhost entry", line: "127.0.0.1 localhost", wantOK: false},
 		{name: "bad regex", line: "/[unclosed/", wantOK: false},
+		{name: "empty regex", line: "//", wantOK: false},
+		{name: "empty regex exception", line: "@@//", wantOK: false},
 	}
 
 	for _, tt := range tests {

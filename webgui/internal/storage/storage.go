@@ -16,6 +16,8 @@ import (
 	"tailscale-dnsrewrite/webgui/internal/models"
 )
 
+const maxArchiveBatchSize = 10000
+
 // Store manages the in-memory ring buffer of events and SQLite disk persistence.
 type Store struct {
 	cfg      *config.Config
@@ -33,9 +35,10 @@ type Store struct {
 	idCounter uint64
 
 	// Database Batching
-	batchMu   sync.Mutex
-	batch     []models.QueryEvent
-	archiveMu sync.Mutex
+	batchMu      sync.Mutex
+	batch        []models.QueryEvent
+	batchDropped atomic.Int64
+	archiveMu    sync.Mutex
 
 	statsMu sync.RWMutex
 
@@ -315,7 +318,16 @@ func (s *Store) AddEvent(e models.QueryEvent) {
 
 	// Add to SQLite batch
 	s.batchMu.Lock()
-	s.batch = append(s.batch, e)
+	if len(s.batch) >= maxArchiveBatchSize {
+		dropCount := len(s.batch) - maxArchiveBatchSize + 1
+		kept := append([]models.QueryEvent(nil), s.batch[dropCount:]...)
+		s.batch = kept
+		s.batch = append(s.batch, e)
+		total := s.batchDropped.Add(int64(dropCount))
+		log.Printf("[WARN] SQLite archive batch full; dropped %d oldest event(s) (%d total)", dropCount, total)
+	} else {
+		s.batch = append(s.batch, e)
+	}
 	s.batchMu.Unlock()
 }
 
@@ -463,6 +475,9 @@ func (s *Store) GetRecentEvents(since int64) []models.QueryEvent {
 			result = append(result, event)
 		}
 	}
+	for left, right := 0, len(result)-1; left < right; left, right = left+1, right-1 {
+		result[left], result[right] = result[right], result[left]
+	}
 	return result
 }
 
@@ -498,7 +513,10 @@ func (s *Store) GetEventsAfter(cursor string, since int64, limit int) []models.Q
 //nolint:gocyclo
 func (s *Store) GetStats() map[string]interface{} {
 	s.archiveMu.Lock()
-	defer s.archiveMu.Unlock()
+	s.batchMu.Lock()
+	pending := append([]models.QueryEvent(nil), s.batch...)
+	s.batchMu.Unlock()
+	s.archiveMu.Unlock()
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
@@ -574,9 +592,6 @@ func (s *Store) GetStats() map[string]interface{} {
 		}
 	}
 
-	s.batchMu.Lock()
-	pending := append([]models.QueryEvent(nil), s.batch...)
-	s.batchMu.Unlock()
 	totalEvents += int64(len(pending))
 	for _, event := range pending {
 		if event.UnixTime < cutoff24h {
@@ -957,9 +972,17 @@ func (s *Store) ArchiveStep(now time.Time) int {
 	}
 
 	s.batchMu.Lock()
-	if len(s.batch) >= len(toInsert) {
-		s.batch = s.batch[len(toInsert):]
+	committed := make(map[string]struct{}, len(toInsert))
+	for _, event := range toInsert {
+		committed[event.ID] = struct{}{}
 	}
+	remaining := make([]models.QueryEvent, 0, len(s.batch))
+	for _, event := range s.batch {
+		if _, ok := committed[event.ID]; !ok {
+			remaining = append(remaining, event)
+		}
+	}
+	s.batch = remaining
 	s.batchMu.Unlock()
 
 	s.pruneOldEvents(now)

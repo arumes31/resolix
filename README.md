@@ -84,6 +84,7 @@ docker-compose -f docker-compose.example.yaml up -d
 | `CLIENT_ALIASES_FILE` | Path to a file with `IP=Alias` mappings (reloaded every 30s) | - |
 | `CLIENT_ALIASES` | Comma-separated `IP:Alias` mappings (alternative to file) | - |
 | `BLOCKLIST_URLS` | Space/comma-separated filter subscription URLs (auto-updated) | - |
+| `BLOCKLIST_FILE` | Path to a local blocklist filter file; loaded at startup and watched for creation or changes | `blocklist.hosts` |
 | `ALLOWLIST_URLS` | Space/comma-separated exception subscription URLs | - |
 | `ALLOWLIST_FILE` | Local exceptions-only filter list path | - |
 | `FILTER_UPDATE_INTERVAL` | Filter subscription refresh interval | `24h` |

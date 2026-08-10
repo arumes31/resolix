@@ -11,7 +11,7 @@
     <link rel="stylesheet" href="static/css/style.css">
 </head>
 
-<body data-base-url="{{.BaseURL}}">
+<body data-base-url="{{.BaseURL}}" data-csrf-token="{{.CSRFToken}}">
     <div class="container">
         <header>
             <div>
@@ -149,18 +149,19 @@
 
             <div class="settings-shell">
                 <div class="settings-tabs" role="tablist" aria-label="DNS settings">
-                    <button type="button" class="settings-tab active" role="tab" aria-selected="true"
-                        data-settings-tab="filters">Filters</button>
-                    <button type="button" class="settings-tab" role="tab" aria-selected="false"
-                        data-settings-tab="rewrites">Rewrites</button>
-                    <button type="button" class="settings-tab" role="tab" aria-selected="false"
-                        data-settings-tab="clients">Clients</button>
-                    <button type="button" class="settings-tab" role="tab" aria-selected="false"
-                        data-settings-tab="services">Services</button>
+                    <button type="button" id="settings-tab-filters" class="settings-tab active" role="tab"
+                        aria-selected="true" aria-controls="settings-filters" data-settings-tab="filters">Filters</button>
+                    <button type="button" id="settings-tab-rewrites" class="settings-tab" role="tab"
+                        aria-selected="false" aria-controls="settings-rewrites" data-settings-tab="rewrites">Rewrites</button>
+                    <button type="button" id="settings-tab-clients" class="settings-tab" role="tab"
+                        aria-selected="false" aria-controls="settings-clients" data-settings-tab="clients">Clients</button>
+                    <button type="button" id="settings-tab-services" class="settings-tab" role="tab"
+                        aria-selected="false" aria-controls="settings-services" data-settings-tab="services">Services</button>
                 </div>
 
                 <div class="settings-panels">
-                    <div id="settings-filters" class="settings-panel active" role="tabpanel">
+                    <div id="settings-filters" class="settings-panel active" role="tabpanel"
+                        aria-labelledby="settings-tab-filters">
                         <div class="panel-heading">
                             <div>
                                 <span class="panel-index">01</span>
@@ -181,7 +182,8 @@
                         <div id="filterSources" class="settings-list"></div>
                     </div>
 
-                    <div id="settings-rewrites" class="settings-panel" role="tabpanel" hidden>
+                    <div id="settings-rewrites" class="settings-panel" role="tabpanel"
+                        aria-labelledby="settings-tab-rewrites" hidden>
                         <div class="panel-heading">
                             <div><span class="panel-index">02</span><h3>DNS rewrites</h3></div>
                             <span id="rewriteCount" class="state-pill">0 rules</span>
@@ -199,7 +201,8 @@
                         <div id="rewriteList" class="settings-list"></div>
                     </div>
 
-                    <div id="settings-clients" class="settings-panel" role="tabpanel" hidden>
+                    <div id="settings-clients" class="settings-panel" role="tabpanel"
+                        aria-labelledby="settings-tab-clients" hidden>
                         <div class="panel-heading">
                             <div><span class="panel-index">03</span><h3>Client policies</h3></div>
                             <span id="clientCount" class="state-pill">0 clients</span>
@@ -228,7 +231,8 @@
                         <div id="clientList" class="settings-list"></div>
                     </div>
 
-                    <div id="settings-services" class="settings-panel" role="tabpanel" hidden>
+                    <div id="settings-services" class="settings-panel" role="tabpanel"
+                        aria-labelledby="settings-tab-services" hidden>
                         <div class="panel-heading">
                             <div><span class="panel-index">04</span><h3>Blocked services</h3></div>
                             <span class="state-pill">Catalog</span>

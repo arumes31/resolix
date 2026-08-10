@@ -28,6 +28,8 @@ func TestParse(t *testing.T) {
 		{"dns.google", "", "", "", "", true},        // hostname without scheme
 		{"quic://dns.google", "", "", "", "", true}, // unsupported scheme
 		{"https://", "", "", "", "", true},
+		{"8.8.8.8:not-a-port", "", "", "", "", true},
+		{"8.8.8.8:70000", "", "", "", "", true},
 		{"", "", "", "", "", true},
 	}
 	for _, tt := range tests {
@@ -49,6 +51,17 @@ func TestParse(t *testing.T) {
 		if spec.String() != tt.in {
 			t.Errorf("Parse(%q).String() = %q", tt.in, spec.String())
 		}
+	}
+}
+
+func TestSpecStringCanonicalizesConstructedSpec(t *testing.T) {
+	spec, err := Parse("https://1.1.1.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec.Raw = ""
+	if got, want := spec.String(), "https://1.1.1.1:443/dns-query"; got != want {
+		t.Fatalf("Spec.String() = %q, want %q", got, want)
 	}
 }
 

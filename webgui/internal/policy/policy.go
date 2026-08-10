@@ -4,6 +4,7 @@ package policy
 
 import (
 	"log"
+	"maps"
 	"net"
 	"strings"
 
@@ -120,7 +121,7 @@ func (p *Policy) Engines() map[string]bool {
 	if p == nil {
 		return nil
 	}
-	return p.engines
+	return maps.Clone(p.engines)
 }
 
 // SafeSearchTarget returns the restricted-variant CNAME target for the

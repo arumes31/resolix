@@ -69,9 +69,13 @@ func TestOptimisticCache(t *testing.T) {
 	}
 
 	// Force the entry to expire quickly for the test.
-	key := cacheKey{name: "example.org", qtype: dns.TypeA}
+	key := cacheKey{name: "example.org", qtype: dns.TypeA, qclass: dns.ClassINET}
 	srv.cache.mu.Lock()
-	el := srv.cache.items[key]
+	el, ok := srv.cache.items[key]
+	if !ok {
+		srv.cache.mu.Unlock()
+		t.Fatalf("cache entry %v is missing", key)
+	}
 	el.Value = entry{key: key, value: &cacheEntry{
 		answers:  el.Value.(entry).value.answers,
 		rcode:    dns.RcodeSuccess,

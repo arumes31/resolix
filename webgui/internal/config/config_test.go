@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -94,15 +95,23 @@ func TestResolveBlockingTrimsAndValidatesAddressFamilies(t *testing.T) {
 
 func TestVerifyStep6Config(t *testing.T) {
 	base := func() *Config {
-		return &Config{Port: DefaultPort, HistoryDir: t.TempDir(), DBPath: DefaultDBPath}
+		return &Config{Port: DefaultPort, HistoryDir: t.TempDir(), DBPath: DefaultDBPath, IngestSecret: "test-secret"}
+	}
+	hasErr := func(errs []string, want string) bool {
+		for _, err := range errs {
+			if strings.Contains(err, want) {
+				return true
+			}
+		}
+		return false
 	}
 
 	cfg := base()
 	cfg.DoTEnabled = true
 	cfg.DoTPort = DefaultDoTPort
 	errs, _ := cfg.VerifyConfig()
-	if len(errs) == 0 {
-		t.Fatal("DoT without certificate files passed verification")
+	if !hasErr(errs, "DOT_ENABLED requires TLS_CERT_FILE and TLS_KEY_FILE") {
+		t.Fatalf("DoT certificate errors = %v", errs)
 	}
 
 	cfg = base()
@@ -111,16 +120,16 @@ func TestVerifyStep6Config(t *testing.T) {
 	cfg.TLSCertFile = "cert.pem"
 	cfg.TLSKeyFile = "key.pem"
 	errs, _ = cfg.VerifyConfig()
-	if len(errs) == 0 {
-		t.Fatal("out-of-range DoT port passed verification")
+	if !hasErr(errs, "DOT_PORT must be between 1 and 65535") {
+		t.Fatalf("DoT port errors = %v", errs)
 	}
 
 	cfg = base()
 	cfg.DoHEnabled = true
 	cfg.DoHPath = "/api/events"
 	errs, _ = cfg.VerifyConfig()
-	if len(errs) == 0 {
-		t.Fatal("conflicting DoH path passed verification")
+	if !hasErr(errs, "DOH_PATH must be a non-conflicting literal HTTP path") {
+		t.Fatalf("DoH path errors = %v", errs)
 	}
 }
 

@@ -158,7 +158,7 @@ TS_AUTHKEY=tskey-auth-xxxxx
 # TS_AUTHKEY_FILE=/run/secrets/tailscale_authkey
 
 # Space-separated upstream DNS servers
-UPSTREAM_DNS=8.8.8.8 8.8.4.4
+UPSTREAM_DNS="8.8.8.8 8.8.4.4"
 
 # Comma-separated domain:ip mappings
 DOMAINS=.internal.net:100.1.2.3,app.example.com:100.4.5.6
@@ -714,19 +714,21 @@ func setupUpstreamPool(ctx context.Context, cfg *config.Config, store *storage.S
 		ECSClientSubnet:  cfg.ECSClientSubnet,
 		DNS64:            cfg.DNS64,
 		DNS64Prefixes:    strings.Fields(cfg.DNS64Prefixes),
+		CacheMinTTL:      cfg.CacheMinTTL,
+		CacheMaxTTL:      cfg.CacheMaxTTL,
 	})
 	pool.SetHealthProvider(func() map[string]float64 {
 		return store.GetUpstreamHealth()[cfg.NodeName]
 	})
 	srv.SetUpstreamPool(pool)
-	var currentMu sync.Mutex
+	var reloadMu sync.Mutex
 	reload := func() {
+		reloadMu.Lock()
+		defer reloadMu.Unlock()
 		specs := loadSpecs()
 		pool.SetPrimarySpecs(specs)
 		checker.UpdateUpstreams(specs)
-		currentMu.Lock()
 		current = append([]string(nil), specs...)
-		currentMu.Unlock()
 	}
 	srv.SetUpstreamReloadFunc(func() {
 		reload()
@@ -742,9 +744,9 @@ func setupUpstreamPool(ctx context.Context, cfg *config.Config, store *storage.S
 				return
 			case <-ticker.C:
 				specs := loadSpecs()
-				currentMu.Lock()
+				reloadMu.Lock()
 				changed := !equalStringSlices(specs, current)
-				currentMu.Unlock()
+				reloadMu.Unlock()
 				if changed {
 					logger.Info("Upstream list changed, reloading pool (%d upstreams)", len(specs))
 					reload()

@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"container/list"
 	"context"
 	"net"
 	"sync"
@@ -26,12 +27,14 @@ const (
 type cacheEntry struct {
 	hostname   string
 	resolvedAt time.Time
+	order      *list.Element
 }
 
 // Resolver performs background reverse DNS lookups for client IPs.
 type Resolver struct {
 	cacheMu sync.Mutex
 	cache   map[string]cacheEntry
+	order   *list.List
 	pending sync.Map // map[string]struct{}
 	queue   chan string
 }
@@ -41,6 +44,7 @@ func New() *Resolver {
 	return &Resolver{
 		queue: make(chan string, queueSize),
 		cache: make(map[string]cacheEntry),
+		order: list.New(),
 	}
 }
 
@@ -153,16 +157,21 @@ func entryTTL(entry cacheEntry) time.Duration {
 func (r *Resolver) store(ip, hostname string) {
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
-	if _, exists := r.cache[ip]; !exists && len(r.cache) >= maxCacheEntries {
-		oldestIP := ""
-		var oldest time.Time
-		for candidate, entry := range r.cache {
-			if oldestIP == "" || entry.resolvedAt.Before(oldest) {
-				oldestIP = candidate
-				oldest = entry.resolvedAt
-			}
-		}
-		delete(r.cache, oldestIP)
+	now := time.Now()
+	if existing, ok := r.cache[ip]; ok {
+		existing.hostname = hostname
+		existing.resolvedAt = now
+		r.order.MoveToBack(existing.order)
+		r.cache[ip] = existing
+		return
 	}
-	r.cache[ip] = cacheEntry{hostname: hostname, resolvedAt: time.Now()}
+	if len(r.cache) >= maxCacheEntries {
+		oldest := r.order.Front()
+		if oldest != nil {
+			delete(r.cache, oldest.Value.(string))
+			r.order.Remove(oldest)
+		}
+	}
+	element := r.order.PushBack(ip)
+	r.cache[ip] = cacheEntry{hostname: hostname, resolvedAt: now, order: element}
 }

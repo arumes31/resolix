@@ -16,9 +16,10 @@ import (
 
 // Pool modes (UPSTREAM_MODE).
 const (
-	ModeLoadBalance = "load_balance"
-	ModeParallel    = "parallel"
-	ModeStrict      = "strict"
+	ModeLoadBalance   = "load_balance"
+	ModeParallel      = "parallel"
+	ModeStrict        = "strict"
+	maxResolverGroups = 256
 )
 
 // PoolConfig configures the upstream pool.
@@ -36,6 +37,9 @@ type PoolConfig struct {
 	DNS64 bool
 	// DNS64Prefixes are the synthesis prefixes (default 64:ff9b::/96).
 	DNS64Prefixes []string
+	// CacheMinTTL/CacheMaxTTL also bound bootstrap address caching.
+	CacheMinTTL uint32
+	CacheMaxTTL uint32
 }
 
 // stat tracks per-upstream performance.
@@ -91,6 +95,7 @@ func NewPool(cfg PoolConfig) *Pool {
 		stats:  make(map[string]*stat),
 		boot:   newBootstrapper(cfg.BootstrapServers),
 	}
+	p.boot.setTTLLimits(cfg.CacheMinTTL, cfg.CacheMaxTTL)
 	if cfg.Mode == "" {
 		p.cfg.Mode = ModeLoadBalance
 	}
@@ -101,21 +106,23 @@ func NewPool(cfg PoolConfig) *Pool {
 		}
 	}
 
-	prefixes := cfg.DNS64Prefixes
-	if cfg.DNS64 && len(prefixes) == 0 {
-		prefixes = []string{"64:ff9b::/96"}
-	}
-	for _, raw := range prefixes {
-		ip, n, err := net.ParseCIDR(strings.TrimSpace(raw))
-		ones, bits := 0, 0
-		if err == nil {
-			ones, bits = n.Mask.Size()
+	if cfg.DNS64 {
+		prefixes := cfg.DNS64Prefixes
+		if len(prefixes) == 0 {
+			prefixes = []string{"64:ff9b::/96"}
 		}
-		if err != nil || ip.To4() != nil || ones != 96 || bits != 128 {
-			log.Printf("[WARN] Invalid DNS64 prefix %q (ignoring)", raw)
-			continue
+		for _, raw := range prefixes {
+			ip, n, err := net.ParseCIDR(strings.TrimSpace(raw))
+			ones, bits := 0, 0
+			if err == nil {
+				ones, bits = n.Mask.Size()
+			}
+			if err != nil || ip.To4() != nil || ones != 96 || bits != 128 {
+				log.Printf("[WARN] Invalid DNS64 prefix %q (ignoring)", raw)
+				continue
+			}
+			p.dns64Prefixes = append(p.dns64Prefixes, n)
 		}
-		p.dns64Prefixes = append(p.dns64Prefixes, n)
 	}
 
 	p.primary = p.buildResolvers(cfg.PrimarySpecs)
@@ -225,9 +232,10 @@ func (p *Pool) healthy(rs []Resolver) []Resolver {
 // It returns the response and the upstream spec actually used.
 func (p *Pool) Exchange(m *dns.Msg) (*dns.Msg, string, error) {
 	p.mu.RLock()
-	primary := p.healthy(p.primary)
-	fallback := p.fallback
+	primary := append([]Resolver(nil), p.primary...)
+	fallback := append([]Resolver(nil), p.fallback...)
 	p.mu.RUnlock()
+	primary = p.healthy(primary)
 
 	resp, used, err := p.exchangeByMode(primary, m)
 	if err == nil {
@@ -274,6 +282,16 @@ func (p *Pool) groupResolvers(specs []string) []Resolver {
 	}
 	rs = p.buildResolvers(specs)
 	p.mu.Lock()
+	if cached, exists := p.groups[key]; exists {
+		p.mu.Unlock()
+		return cached
+	}
+	if len(p.groups) >= maxResolverGroups {
+		for oldestKey := range p.groups {
+			delete(p.groups, oldestKey)
+			break
+		}
+	}
 	p.groups[key] = rs
 	p.mu.Unlock()
 	return rs

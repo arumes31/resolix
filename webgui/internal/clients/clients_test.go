@@ -213,7 +213,7 @@ func TestScheduleActive(t *testing.T) {
 	on := &Schedule{Days: map[string][]TimeRange{
 		"mon": {{Start: "22:00", End: "06:00"}},
 	}}
-	if !on.Active(mon("23:30")) || !on.Active(mon("05:59")) {
+	if !on.Active(mon("23:30")) || !on.Active(mon("05:59").AddDate(0, 0, 1)) {
 		t.Error("overnight window must cover past-midnight hours")
 	}
 	if on.Active(mon("12:00")) {
@@ -239,6 +239,12 @@ func TestSchedulePreviousDayOvernightAndValidation(t *testing.T) {
 	tuesday := time.Date(2024, time.January, 2, 1, 0, 0, 0, location)
 	if !schedule.Active(tuesday) {
 		t.Fatal("Monday overnight schedule should remain active early Tuesday")
+	}
+	tuesdayOnly := &Schedule{Timezone: "Europe/Vienna", Days: map[string][]TimeRange{
+		"tue": {{Start: "22:00", End: "02:00"}},
+	}}
+	if tuesdayOnly.Active(tuesday) {
+		t.Fatal("Tuesday overnight schedule must not start before Tuesday evening")
 	}
 	bad := Client{Name: "bad", IDs: []string{"192.0.2.1"}, Schedule: &Schedule{Timezone: "Not/AZone"}}
 	if err := bad.compile(); err == nil {

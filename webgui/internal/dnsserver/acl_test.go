@@ -2,8 +2,9 @@ package dnsserver
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -130,11 +131,14 @@ func TestRateLimiterBucketBound(t *testing.T) {
 	if !rl.allow("192.0.2.1") {
 		t.Fatal("first subnet was refused")
 	}
-	if rl.allow("198.51.100.1") {
-		t.Fatal("new subnet was allowed after the bucket limit was reached")
+	if !rl.allow("198.51.100.1") {
+		t.Fatal("new subnet was refused after the bucket limit was reached")
 	}
 	if got := rl.bucketCount(); got != 1 {
 		t.Fatalf("bucket count = %d, want 1", got)
+	}
+	if _, ok := rl.buckets["192.0.2.0/24"]; ok {
+		t.Fatal("least-recently-used bucket was not evicted")
 	}
 }
 
@@ -209,6 +213,9 @@ func TestPrivatePTR(t *testing.T) {
 	}
 
 	resp := ptrQuery("60.0.64.100.in-addr.arpa.")
+	if !resp.Authoritative {
+		t.Fatal("private PTR response is not authoritative")
+	}
 	if len(resp.Answer) != 1 {
 		t.Fatalf("registry PTR answer = %v", resp.Answer)
 	}
@@ -221,6 +228,9 @@ func TestPrivatePTR(t *testing.T) {
 
 	// Alias fallback (sanitized).
 	resp = ptrQuery("61.0.64.100.in-addr.arpa.")
+	if len(resp.Answer) == 0 {
+		t.Fatalf("alias PTR response has no answers: %+v", resp)
+	}
 	if ptr := resp.Answer[0].(*dns.PTR); ptr.Ptr != "alias-host.lan." {
 		t.Errorf("alias PTR = %q, want alias-host.lan.", ptr.Ptr)
 	}
@@ -422,7 +432,7 @@ func TestDoTWithoutCertsFails(t *testing.T) {
 // selfSignedCertForDoT generates a self-signed certificate for tests.
 func selfSignedCertForDoT(t *testing.T) tls.Certificate {
 	t.Helper()
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,7 +451,11 @@ func selfSignedCertForDoT(t *testing.T) tls.Certificate {
 		t.Fatal(err)
 	}
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		t.Fatal(err)

@@ -10,6 +10,11 @@ import (
 	"github.com/miekg/dns"
 )
 
+const (
+	defaultBootstrapMinTTL = 60
+	defaultBootstrapMaxTTL = 600
+)
+
 // bootEntry pins bootstrap-resolved IPs with the TTL from the answer.
 type bootEntry struct {
 	ips       []string
@@ -22,6 +27,8 @@ type bootEntry struct {
 type bootstrapper struct {
 	servers []string
 	client  *dns.Client
+	minTTL  uint32
+	maxTTL  uint32
 
 	mu    sync.Mutex
 	cache map[string]*bootEntry
@@ -45,7 +52,32 @@ func newBootstrapper(servers []string) *bootstrapper {
 		servers: normalized,
 		client:  &dns.Client{Timeout: exchangeTimeout},
 		cache:   make(map[string]*bootEntry),
+		minTTL:  defaultBootstrapMinTTL,
+		maxTTL:  defaultBootstrapMaxTTL,
 	}
+}
+
+func (b *bootstrapper) setTTLLimits(minimum, maximum uint32) {
+	if minimum == 0 {
+		minimum = defaultBootstrapMinTTL
+	}
+	if maximum == 0 {
+		maximum = defaultBootstrapMaxTTL
+	}
+	if minimum > maximum {
+		minimum, maximum = maximum, minimum
+	}
+	b.minTTL, b.maxTTL = minimum, maximum
+}
+
+func (b *bootstrapper) clampTTL(ttl uint32) uint32 {
+	if ttl < b.minTTL {
+		return b.minTTL
+	}
+	if ttl > b.maxTTL {
+		return b.maxTTL
+	}
+	return ttl
 }
 
 // Enabled reports whether any usable bootstrap servers are configured.
@@ -78,13 +110,15 @@ func (b *bootstrapper) Lookup(host string) ([]string, error) {
 		return nil, fmt.Errorf("bootstrap resolve %s: %w", host, err)
 	}
 
+	ttl = b.clampTTL(ttl)
 	b.mu.Lock()
 	b.cache[host] = &bootEntry{ips: ips, expiresAt: time.Now().Add(time.Duration(ttl) * time.Second)}
 	b.mu.Unlock()
 	return ips, nil
 }
 
-// resolve queries A and AAAA records for host through the bootstrap servers.
+// resolve queries A records first and returns immediately when that family
+// succeeds. It queries AAAA only when no A addresses were returned.
 func (b *bootstrapper) resolve(host string) (ips []string, ttl uint32, err error) {
 	for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA} {
 		m := new(dns.Msg)

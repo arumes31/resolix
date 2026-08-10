@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"fmt"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -296,14 +297,47 @@ func TestBootstrapLookup(t *testing.T) {
 	// Expire the entry and kill the server: last-known IPs are kept.
 	boot.mu.Lock()
 	boot.cache["dns.test"].expiresAt = time.Now().Add(-time.Minute)
-	boot.mu.Unlock()
 	boot.servers = []string{deadAddr(t)}
+	boot.mu.Unlock()
 	ips, err = boot.Lookup("dns.test")
 	if err != nil {
 		t.Fatalf("expected last-known IPs on failure, got %v", err)
 	}
 	if len(ips) != 1 || ips[0] != "10.99.0.1" {
 		t.Errorf("last-known ips = %v", ips)
+	}
+}
+
+func TestBootstrapTTLClamp(t *testing.T) {
+	boot := newBootstrapper(nil)
+	boot.setTTLLimits(60, 600)
+	for _, test := range []struct {
+		ttl  uint32
+		want uint32
+	}{{ttl: 0, want: 60}, {ttl: 30, want: 60}, {ttl: 300, want: 300}, {ttl: 3600, want: 600}} {
+		if got := boot.clampTTL(test.ttl); got != test.want {
+			t.Errorf("clampTTL(%d) = %d, want %d", test.ttl, got, test.want)
+		}
+	}
+}
+
+func TestPoolBoundsResolverGroups(t *testing.T) {
+	pool := NewPool(PoolConfig{})
+	for i := 0; i <= maxResolverGroups; i++ {
+		pool.groupResolvers([]string{fmt.Sprintf("192.0.2.1:%d", 1000+i)})
+	}
+	pool.mu.RLock()
+	count := len(pool.groups)
+	pool.mu.RUnlock()
+	if count != maxResolverGroups {
+		t.Fatalf("resolver groups = %d, want %d", count, maxResolverGroups)
+	}
+}
+
+func TestPoolIgnoresDNS64PrefixesWhenDisabled(t *testing.T) {
+	pool := NewPool(PoolConfig{DNS64Prefixes: []string{"64:ff9b::/96"}})
+	if len(pool.dns64Prefixes) != 0 {
+		t.Fatalf("DNS64 prefixes loaded while disabled: %v", pool.dns64Prefixes)
 	}
 }
 

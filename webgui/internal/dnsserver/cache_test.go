@@ -47,21 +47,6 @@ func TestClampTTL(t *testing.T) {
 	}
 }
 
-func TestCacheTTLConversion(t *testing.T) {
-	if got := cacheTTL(-1); got != 0 {
-		t.Fatalf("cacheTTL(-1) = %d, want 0", got)
-	}
-	if got := cacheTTL(600); got != 600 {
-		t.Fatalf("cacheTTL(600) = %d, want 600", got)
-	}
-	if uint64(^uint(0)) > uint64(^uint32(0)) {
-		maxInt := int(^uint(0) >> 1)
-		if got := cacheTTL(maxInt); got != ^uint32(0) {
-			t.Fatalf("cacheTTL(maxInt) = %d, want %d", got, ^uint32(0))
-		}
-	}
-}
-
 func TestCacheSetGetExpiry(t *testing.T) {
 	c := newCache(10, 0, 0)
 	key := cacheKey{name: "example.com", qtype: dns.TypeA}

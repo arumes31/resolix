@@ -209,8 +209,8 @@ type Config struct {
 	DNS64         bool
 	DNS64Prefixes string
 	// CacheMinTTL/CacheMaxTTL override cache TTL bounds (seconds).
-	CacheMinTTL int
-	CacheMaxTTL int
+	CacheMinTTL uint32
+	CacheMaxTTL uint32
 	// CacheOptimistic serves stale entries while refreshing in background.
 	CacheOptimistic bool
 	// ClientsFile is the per-client registry JSON file.
@@ -485,6 +485,20 @@ func parseIntEnv(key string, defaultVal int) int {
 		return defaultVal
 	}
 	return n
+}
+
+// parseUint32Env reads a non-negative 32-bit integer environment variable.
+func parseUint32Env(key string, defaultVal uint32) uint32 {
+	val := os.Getenv(key)
+	if val == "" {
+		return defaultVal
+	}
+	n, err := strconv.ParseUint(val, 10, 32)
+	if err != nil {
+		log.Printf("[WARN] Invalid %s '%s', falling back to %d: %v", key, sanitizeForLog(val), defaultVal, err) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		return defaultVal
+	}
+	return uint32(n)
 }
 
 // resolveMode reads and validates the MODE environment variable.
@@ -794,8 +808,8 @@ func LoadConfig() *Config {
 		log.Printf("[WARN] Invalid UPSTREAM_MODE '%s', falling back to load_balance", sanitizeForLog(upstreamMode)) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
 		upstreamMode = "load_balance"
 	}
-	cacheMinTTL := parseIntEnv("CACHE_MIN_TTL", minCacheTTLDefault)
-	cacheMaxTTL := parseIntEnv("CACHE_MAX_TTL", maxCacheTTLDefault)
+	cacheMinTTL := parseUint32Env("CACHE_MIN_TTL", minCacheTTLDefault)
+	cacheMaxTTL := parseUint32Env("CACHE_MAX_TTL", maxCacheTTLDefault)
 	if cacheMaxTTL < cacheMinTTL {
 		log.Printf("[WARN] CACHE_MAX_TTL %d < CACHE_MIN_TTL %d, using defaults %d/%d", cacheMaxTTL, cacheMinTTL, minCacheTTLDefault, maxCacheTTLDefault)
 		cacheMinTTL, cacheMaxTTL = minCacheTTLDefault, maxCacheTTLDefault

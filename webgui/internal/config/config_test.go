@@ -22,6 +22,22 @@ func TestParseDurationEnvRequiresPositiveDuration(t *testing.T) {
 	}
 }
 
+func TestParseUint32EnvEnforcesBitSize(t *testing.T) {
+	const key = "TEST_UINT32"
+	for _, value := range []string{"-1", "4294967296", "not-a-number"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv(key, value)
+			if got := parseUint32Env(key, 600); got != 600 {
+				t.Fatalf("parseUint32Env(%q) = %d, want 600", value, got)
+			}
+		})
+	}
+	t.Setenv(key, "4294967295")
+	if got := parseUint32Env(key, 600); got != ^uint32(0) {
+		t.Fatalf("parseUint32Env(max) = %d, want %d", got, ^uint32(0))
+	}
+}
+
 func TestClientAliasesAreCopied(t *testing.T) {
 	cfg := &Config{}
 	aliases := map[string]string{"192.0.2.1": "router"}

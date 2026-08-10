@@ -13,7 +13,6 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"math"
 	"net"
 	"strings"
 	"sync"
@@ -87,8 +86,8 @@ type Config struct {
 	// a matching registry client's name takes precedence.
 	AliasFunc func(ip string) string
 	// CacheMinTTL/CacheMaxTTL override cache TTL bounds (0 = 60/600).
-	CacheMinTTL     int
-	CacheMaxTTL     int
+	CacheMinTTL     uint32
+	CacheMaxTTL     uint32
 	CacheOptimistic bool
 
 	// AllowedClients restricts service to these IPs/CIDRs when non-empty.
@@ -150,7 +149,7 @@ type Server struct {
 func New(cfg Config, emit func(models.QueryEvent, bool)) *Server {
 	s := &Server{
 		cfg:             cfg,
-		cache:           newCache(cfg.CacheSize, cacheTTL(cfg.CacheMinTTL), cacheTTL(cfg.CacheMaxTTL)),
+		cache:           newCache(cfg.CacheSize, cfg.CacheMinTTL, cfg.CacheMaxTTL),
 		emit:            emit,
 		refreshInFlight: make(map[cacheKey]bool),
 		client: &dns.Client{
@@ -178,16 +177,6 @@ func New(cfg Config, emit func(models.QueryEvent, bool)) *Server {
 	s.udp = &dns.Server{Net: "udp", Handler: handler}
 	s.tcp = &dns.Server{Net: "tcp", Handler: handler}
 	return s
-}
-
-func cacheTTL(value int) uint32 {
-	if value > 0 && int64(value) <= math.MaxUint32 {
-		return uint32(value)
-	}
-	if value <= 0 {
-		return 0
-	}
-	return math.MaxUint32
 }
 
 // ListenAddr returns the host:port the server binds to.

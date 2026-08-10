@@ -181,13 +181,13 @@ func New(cfg Config, emit func(models.QueryEvent, bool)) *Server {
 }
 
 func cacheTTL(value int) uint32 {
+	if value > 0 && int64(value) <= math.MaxUint32 {
+		return uint32(value)
+	}
 	if value <= 0 {
 		return 0
 	}
-	if int64(value) > int64(math.MaxUint32) {
-		return ^uint32(0)
-	}
-	return uint32(value)
+	return math.MaxUint32
 }
 
 // ListenAddr returns the host:port the server binds to.

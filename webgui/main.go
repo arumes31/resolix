@@ -184,7 +184,8 @@ WEB_LISTEN_ADDR=0.0.0.0
 # Direct controller HTTPS. Leave off behind a TLS-terminating reverse proxy.
 # Auto mode requires a Tailscale IPv4 address and manages its own CA/leaf.
 # WEB_TLS_MODE=off
-# WEB_TLS_IP=100.64.0.10 (falls back to TAILSCALE_IP from entrypoint.sh)
+# WEB_TLS_IP falls back to TAILSCALE_IP from entrypoint.sh.
+# WEB_TLS_IP=100.64.0.10
 
 # Run mode (controller or agent)
 MODE=controller

@@ -81,30 +81,110 @@ flowchart LR
     AgentB -- events and heartbeat --> Controller
 ```
 
-### Cluster roles
+### Configure a controller and agents
 
-| Role | Purpose | Configuration |
+| Role | Purpose | Required cluster settings |
 | --- | --- | --- |
 | `controller` | Authoritative dashboard, query history, configuration editor, and cluster status | `MODE=controller` (default) |
-| `agent` | Managed resolver that forwards events and pulls verified configuration snapshots | `MODE=agent`, `CONTROLLER_URL=https://...`, matching `INGEST_SECRET` |
+| `agent` | Managed resolver that forwards events and applies verified configuration snapshots | `MODE=agent`, an HTTPS `CONTROLLER_URL`, and the controller's `INGEST_SECRET` |
 
-`CONTROLLER_URL` must use HTTPS. Direct `100.64.0.0/10` connections can use Resolix's generated controller CA with trust-on-first-use pinning; public names and TLS-terminating reverse proxies continue to use normal system trust. Agents expose `/config` as read-only and report their last applied revision in heartbeats.
+Run each node as a separate Compose deployment with its own `history` and `tailscale` directories. Use the same immutable `IMAGE_VERSION` and `INGEST_SECRET` on every node, but give every node a unique `NODE_NAME` and Tailscale identity. Never share persistent directories between nodes.
+
+Generate the cluster secret once and keep it out of source control:
+
+```bash
+openssl rand -hex 32
+```
+
+#### 1. Configure the controller
+
+Copy `.env.example` to `.env` on the controller host and set:
+
+```dotenv
+IMAGE_VERSION=vX.Y.Z
+MODE=controller
+NODE_NAME=resolix-controller
+TS_AUTHKEY=tskey-auth-REPLACE_ME
+INGEST_SECRET=<paste-generated-secret>
+
+# Serve HTTPS directly on the container's Tailscale address.
+WEB_TLS_MODE=auto
+# Leave empty to use the address exported by the bundled Tailscale client.
+WEB_TLS_IP=
+```
+
+Start the controller and record its Tailscale IPv4 address:
+
+```bash
+docker compose -f docker-compose.example.yaml up -d
+docker exec resolix tailscale ip -4
+docker exec resolix wget --no-check-certificate -qO- https://127.0.0.1:35353/readyz
+```
+
+`WEB_TLS_MODE=auto` accepts only a `100.64.0.0/10` address. It creates the private controller CA under `history/tls`, serves TLS 1.3, and rotates the IP-SAN server certificate automatically. Back up `history`; agents remain pinned to this CA across leaf rotations.
+
+#### 2. Configure each agent
+
+Create a fresh deployment directory on the agent host, then configure its `.env` with the controller address returned above:
+
+```dotenv
+IMAGE_VERSION=vX.Y.Z
+MODE=agent
+NODE_NAME=resolix-agent-1
+TS_AUTHKEY=tskey-auth-REPLACE_ME
+INGEST_SECRET=<paste-the-same-generated-secret>
+
+CONTROLLER_URL=https://100.64.10.20:35353
+CONTROLLER_TLS_TRUST=tofu-tailnet
+CONTROLLER_TLS_PIN_FILE=tls/controller-ca-pin.json
+WEB_TLS_MODE=off
+```
+
+Start the agent and inspect its enrollment:
+
+```bash
+docker compose -f docker-compose.example.yaml up -d
+docker compose -f docker-compose.example.yaml logs --tail=100 resolix
+docker exec resolix cat /var/lib/resolix/tls/controller-ca-pin.json
+```
+
+Tailnet TOFU is available only for direct HTTPS URLs using an exact `100.64.0.0/10` IPv4 address. On the first connection, the agent validates the server chain and IP SAN, saves the controller CA fingerprint before transmitting `INGEST_SECRET`, and rejects later CA changes. Compare the saved fingerprint with the controller's `CA sha256:...` startup log through an independent trusted channel.
+
+Repeat this step for additional agents, changing `NODE_NAME`, `TS_AUTHKEY`, and the local persistent directories for every node. A persisted `tailscale` directory removes the need to retain `TS_AUTHKEY` after successful enrollment.
+
+#### 3. Configure DNS once on the controller
+
+Open the controller's `/config` page and manage upstreams, bootstrap resolvers, DNS routes, filter subscriptions, custom rules, rewrites, and client policies there. Agents expose `/config` as read-only, periodically pull the controller's content-addressed snapshot, persist it locally, and report their applied revision. Query events and heartbeats flow back to the controller using the shared `INGEST_SECRET`.
+
+Point clients at the Tailscale IPv4 address of the desired controller or agent on UDP/TCP port 53. Ensure Tailscale ACLs permit clients to reach DNS on the resolver nodes and permit agents to reach the controller's HTTPS port.
+
+#### Reverse-proxy certificate instead of generated TLS
+
+When a reverse proxy terminates HTTPS for the controller, use a hostname with a publicly or privately trusted certificate:
 
 ```dotenv
 # Controller
-MODE=controller
-NODE_NAME=dns-controller
-WEB_TLS_MODE=auto
-WEB_TLS_IP=100.64.10.20
-INGEST_SECRET=shared-cluster-secret
+WEB_TLS_MODE=off
+TRUSTED_PROXIES=100.64.10.5/32
+WEB_USERNAME=resolix-admin
+WEB_PASSWORD=<generated-dashboard-password>
 
-# Agent
-MODE=agent
-NODE_NAME=dns-agent-1
-CONTROLLER_URL=https://100.64.10.20:35353
-CONTROLLER_TLS_TRUST=tofu-tailnet
-INGEST_SECRET=shared-cluster-secret
+# Agents
+CONTROLLER_URL=https://resolix.example.com
+CONTROLLER_TLS_TRUST=system
 ```
+
+The proxy must preserve the `/api` paths and provide HTTPS all the way to the agent-visible controller URL. Restrict the plain HTTP backend to the proxy, and list only the proxy's actual address or CIDR in `TRUSTED_PROXIES`.
+
+#### Cluster troubleshooting
+
+| Symptom | Check |
+| --- | --- |
+| Agent exits during startup | `MODE=agent` requires an HTTPS `CONTROLLER_URL`; confirm the controller address and port. |
+| Agent does not appear on the controller | Confirm network reachability, unique `NODE_NAME` values, and an identical `INGEST_SECRET` on both nodes. |
+| Agent rejects the controller certificate | Confirm the URL uses the controller's exact Tailscale IPv4 address. After an intentional CA replacement, stop the agent, independently verify the new controller fingerprint, remove its configured pin file, and restart. |
+| Agent configuration is read-only | Expected: edit `/config` on the controller and wait for the revision to synchronize. |
+| DNS is unreachable | Confirm the node is connected to Tailscale and that ACLs allow UDP and TCP port 53 to its Tailscale address. |
 
 Legacy `MODE=master`, `MODE=slave`, and `MASTER_URL` values are accepted for upgrades and normalized to the new names. `CONTROLLER_URL` takes precedence when both URL variables are present.
 
@@ -314,7 +394,7 @@ tar -czf resolix-backup.tgz history tailscale
 docker compose start resolix
 ```
 
-Restore both directories while the container is stopped, retain ownership and permissions, start the same image tag, and confirm `/readyz` before upgrading. `history/tls` contains the generated controller CA or agent pin and must remain private.
+Restore both directories while the container is stopped, retain ownership and permissions, start the same image tag, and confirm `/readyz` before upgrading. `history/tls` contains the generated controller CA and is the default controller TLS pin location. If `CONTROLLER_TLS_PIN_FILE` is absolute, also back up that configured path. These files must remain private.
 
 ### Migration from the former project name
 
@@ -328,7 +408,7 @@ Restore both directories while the container is stopped, retain ownership and pe
 
 [`webgui/VERSION`](webgui/VERSION) is the canonical application version. The binary, API, node status, and container metadata report that version; CI rejects a mismatched Dockerfile default.
 
-Every code push to `main` builds and publishes a multi-platform GHCR image tagged with the application version, `latest`, and the immutable commit SHA. This does not create a Git tag or GitHub release. When a version is ready to become a formal release:
+Every code push to `main` builds and publishes a multi-platform GHCR image tagged `main` and with the immutable commit SHA. Version and `latest` tags are applied only to validated release builds. A main push does not create a Git tag or GitHub release. When a version is ready to become a formal release:
 
 1. Update `webgui/VERSION` and the matching `ARG VERSION` default in `Dockerfile`.
 2. Merge the tested change into `main`.

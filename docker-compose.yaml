@@ -8,8 +8,8 @@ services:
       - DOMAINS=.overridedomain.local:100.77.35.105,override1.example.com:100.83.17.42
       - UPSTREAM_DNS=8.8.8.8 8.8.4.4
       - HEALTHCHECK_DOMAIN=google.com
-      - MODE=controller
-      - CONTROLLER_URL=
+      - MODE=${MODE:-controller}
+      - CONTROLLER_URL=${CONTROLLER_URL:-}
       - NODE_NAME=${NODE_NAME:-resolix-1}
       - WEB_LISTEN_ADDR=${WEB_LISTEN_ADDR:-0.0.0.0}
       - WEB_TLS_MODE=${WEB_TLS_MODE:-off}

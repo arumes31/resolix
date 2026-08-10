@@ -108,6 +108,28 @@ func TestPoolLoadBalanceSpreads(t *testing.T) {
 	}
 }
 
+func TestSelectionWeight(t *testing.T) {
+	tests := []struct {
+		name           string
+		ewmaMS         float64
+		failurePenalty int64
+		want           float64
+	}{
+		{name: "unobserved", want: 1},
+		{name: "sub-millisecond", ewmaMS: 0.001, want: 1 / 1.001},
+		{name: "ten milliseconds", ewmaMS: 9, want: 0.1},
+		{name: "one failure", failurePenalty: 1, want: 0.5},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := selectionWeight(test.ewmaMS, test.failurePenalty)
+			if diff := got - test.want; diff < -1e-12 || diff > 1e-12 {
+				t.Fatalf("selectionWeight(%g, %d) = %g, want %g", test.ewmaMS, test.failurePenalty, got, test.want)
+			}
+		})
+	}
+}
+
 func TestPoolSkipsUnhealthy(t *testing.T) {
 	var hitsA, hitsB atomic.Int32
 	a := startUDPUpstreamHandler(t, ipAnswerHandler(t, "1.1.1.1", 0, &hitsA))

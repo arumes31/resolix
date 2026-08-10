@@ -18,7 +18,11 @@ import (
 
 func TestOptimisticCache(t *testing.T) {
 	var hits atomic.Int32
-	upstreamAddr := startFakeUpstream(t, &hits) // answers TTL 120
+	releaseRefresh := make(chan struct{})
+	upstreamAddr := startGatedFakeUpstream(t, &hits, releaseRefresh)
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseRefresh) }) }
+	t.Cleanup(release)
 
 	events := make(chan models.QueryEvent, 10)
 	srv := New(Config{
@@ -113,14 +117,18 @@ func TestOptimisticCache(t *testing.T) {
 			t.Errorf("stale event upstream = %q", ev.Upstream)
 		}
 	}
+	release()
 
 	// Wait for the single background refresh.
 	deadline := time.Now().Add(2 * time.Second)
-	for hits.Load() != 2 {
+	for srv.cache.refreshes.Load() != 1 {
 		if time.Now().After(deadline) {
-			t.Fatalf("background refresh did not run once, hits = %d", hits.Load())
+			t.Fatalf("background refresh did not finish, hits = %d", hits.Load())
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+	if hits.Load() != 2 {
+		t.Fatalf("upstream hits after refresh = %d, want 2", hits.Load())
 	}
 
 	// Entry is fresh again.
@@ -135,6 +143,30 @@ func TestOptimisticCache(t *testing.T) {
 	if hits.Load() != 2 {
 		t.Errorf("post-refresh hits = %d, want 2 (cache was fresh)", hits.Load())
 	}
+}
+
+// startGatedFakeUpstream blocks the first refresh response so concurrent stale
+// queries deterministically observe the stale entry before it is replaced.
+func startGatedFakeUpstream(t *testing.T, hits *atomic.Int32, releaseRefresh <-chan struct{}) string {
+	t.Helper()
+	pc := mustListenPacket(t)
+	fake := &dns.Server{
+		PacketConn: pc,
+		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+			if hits.Add(1) == 2 {
+				<-releaseRefresh
+			}
+			m := new(dns.Msg)
+			m.SetReply(r)
+			if len(r.Question) > 0 {
+				m.Answer = []dns.RR{aRecord(r.Question[0].Name, "93.184.216.34", 120)}
+			}
+			_ = w.WriteMsg(m)
+		}),
+	}
+	go func() { _ = fake.ActivateAndServe() }()
+	t.Cleanup(func() { _ = fake.Shutdown() })
+	return pc.LocalAddr().String()
 }
 
 func TestRoutePrecedenceThroughPool(t *testing.T) {

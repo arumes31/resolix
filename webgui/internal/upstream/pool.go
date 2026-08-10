@@ -394,10 +394,7 @@ func (p *Pool) weightedOrder(candidates []Resolver) []Resolver {
 		p.statsMu.Lock()
 		ewma := st.ewmaMS
 		p.statsMu.Unlock()
-		if ewma <= 0 {
-			ewma = 1
-		}
-		weights[i] = 1 / (ewma * float64(1+st.failurePenalty.Load()))
+		weights[i] = selectionWeight(ewma, st.failurePenalty.Load())
 	}
 
 	out := make([]Resolver, 0, len(candidates))
@@ -422,6 +419,10 @@ func (p *Pool) weightedOrder(candidates []Resolver) []Resolver {
 		w = append(w[:idx], w[idx+1:]...)
 	}
 	return out
+}
+
+func selectionWeight(ewmaMS float64, failurePenalty int64) float64 {
+	return 1 / ((1 + ewmaMS) * float64(1+failurePenalty))
 }
 
 // exchange runs one upstream exchange with ECS, stats, and DNS64 handling.

@@ -25,6 +25,7 @@ func TestParse(t *testing.T) {
 		{"https://dns.google/dns-query", "https", "dns.google", "443", "/dns-query", false},
 		{"https://1.1.1.1", "https", "1.1.1.1", "443", "/dns-query", false},
 		{"https://1.1.1.1:4443/custom", "https", "1.1.1.1", "4443", "/custom", false},
+		{"udp://192.0.2.53:70000", "", "", "", "", true},
 		{"dns.google", "", "", "", "", true},        // hostname without scheme
 		{"quic://dns.google", "", "", "", "", true}, // unsupported scheme
 		{"https://", "", "", "", "", true},
@@ -86,6 +87,7 @@ func TestValidateBootstrapServers(t *testing.T) {
 		{name: "UDP scheme", servers: []string{"udp://1.1.1.1:5353"}},
 		{name: "encrypted transport", servers: []string{"tls://dns.example"}, wantErr: true},
 		{name: "hostname", servers: []string{"udp://dns.example"}, wantErr: true},
+		{name: "out-of-range port", servers: []string{"udp://192.0.2.53:70000"}, wantErr: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

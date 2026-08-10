@@ -65,6 +65,41 @@ func TestControllerRejectsEmptyUpstreamList(t *testing.T) {
 	}
 }
 
+func TestValidateSnapshotResolversRequiresBootstrapForHostname(t *testing.T) {
+	tests := []struct {
+		name             string
+		upstreams        []string
+		bootstrapServers []string
+		wantError        bool
+	}{
+		{name: "IP upstream", upstreams: []string{"1.1.1.1"}},
+		{
+			name:      "hostname upstream without bootstrap",
+			upstreams: []string{"tls://dns.example:853"},
+			wantError: true,
+		},
+		{
+			name:             "hostname upstream with bootstrap",
+			upstreams:        []string{"tls://dns.example:853"},
+			bootstrapServers: []string{"192.0.2.53"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot, err := configsync.NewSnapshot(
+				test.upstreams, test.bootstrapServers, nil, nil, "", nil, nil,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = validateSnapshotResolvers(snapshot)
+			if (err != nil) != test.wantError {
+				t.Fatalf("validateSnapshotResolvers() error = %v, wantError %v", err, test.wantError)
+			}
+		})
+	}
+}
+
 func TestSyncDNSConfigRequiresBearerAndReturnsValidRevision(t *testing.T) {
 	dir := t.TempDir()
 	server := testServer(&config.Config{
@@ -128,6 +163,23 @@ func TestUpstreamSettingsPersistBootstrapResolvers(t *testing.T) {
 	}
 	if got := server.configuredBootstrapServers(); len(got) != 1 || got[0] != "192.0.2.53" {
 		t.Fatalf("bootstrap resolvers = %v", got)
+	}
+
+	request = httptest.NewRequest(http.MethodPost, "/api/upstream-settings", strings.NewReader(`{
+		"upstreams":["tls://dns.example:853"],
+		"bootstrap_servers":[]
+	}`))
+	request.AddCookie(&http.Cookie{
+		Name: csrfCookieName, Value: "token", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
+	})
+	request.Header.Set("X-CSRF-Token", "token")
+	recorder = httptest.NewRecorder()
+	server.handleUpstreamSettings(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("empty bootstrap status = %d body=%q", recorder.Code, recorder.Body.String())
+	}
+	if got := server.configuredBootstrapServers(); len(got) != 1 || got[0] != "192.0.2.53" {
+		t.Fatalf("bootstrap resolvers after rejected request = %v", got)
 	}
 
 	request = httptest.NewRequest(http.MethodPost, "/api/upstream-settings", strings.NewReader(`{

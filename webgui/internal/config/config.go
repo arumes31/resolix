@@ -16,6 +16,8 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	"github.com/arumes31/resolix/webgui/internal/controllertls"
 )
 
 const (
@@ -158,6 +160,15 @@ type Config struct {
 	Debug            bool
 	LogLevel         string
 	BaseURL          string
+	// WebTLSMode controls direct web HTTPS: off for reverse-proxy termination,
+	// or auto for the generated controller CA and rotating leaf certificate.
+	WebTLSMode string
+	// WebTLSIP is the exact Tailscale IPv4 address placed in the generated leaf.
+	WebTLSIP string
+	// ControllerTLSTrust selects system roots or tailnet-restricted TOFU.
+	ControllerTLSTrust string
+	// ControllerTLSPinFile stores the agent's pinned controller CA fingerprint.
+	ControllerTLSPinFile string
 
 	// ClientAliasesFile is the path to a file with IP=Alias entries.
 	ClientAliasesFile string
@@ -813,6 +824,22 @@ func LoadConfig() *Config {
 	}
 
 	baseURL := normalizeBaseURL()
+	webTLSMode := strings.ToLower(strings.TrimSpace(os.Getenv("WEB_TLS_MODE")))
+	if webTLSMode == "" {
+		webTLSMode = controllertls.WebTLSOff
+	}
+	webTLSIP := strings.TrimSpace(os.Getenv("WEB_TLS_IP"))
+	if webTLSIP == "" {
+		webTLSIP = strings.TrimSpace(os.Getenv("TAILSCALE_IP"))
+	}
+	controllerTLSTrust := strings.ToLower(strings.TrimSpace(os.Getenv("CONTROLLER_TLS_TRUST")))
+	if controllerTLSTrust == "" {
+		controllerTLSTrust = controllertls.TrustSystem
+	}
+	controllerTLSPinFile := strings.TrimSpace(os.Getenv("CONTROLLER_TLS_PIN_FILE"))
+	if controllerTLSPinFile == "" {
+		controllerTLSPinFile = controllertls.DefaultPinFile
+	}
 
 	// Load new configuration values
 	blocklistFile := os.Getenv("BLOCKLIST_FILE")
@@ -934,6 +961,10 @@ func LoadConfig() *Config {
 		Debug:                      strings.ToLower(os.Getenv("DEBUG")) == "true",
 		LogLevel:                   logLevel,
 		BaseURL:                    baseURL,
+		WebTLSMode:                 webTLSMode,
+		WebTLSIP:                   webTLSIP,
+		ControllerTLSTrust:         controllerTLSTrust,
+		ControllerTLSPinFile:       controllerTLSPinFile,
 		ClientAliasesFile:          clientAliasesFile,
 		aliasesProvider:            provider,
 		BlocklistFile:              blocklistFile,
@@ -1075,6 +1106,17 @@ func (c *Config) FullBlocklistPath() string {
 	return filepath.Join(c.HistoryDir, c.BlocklistFile)
 }
 
+// FullControllerTLSPinPath returns the configured controller CA pin path.
+func (c *Config) FullControllerTLSPinPath() string {
+	if c.ControllerTLSPinFile == "" {
+		return ""
+	}
+	if filepath.IsAbs(c.ControllerTLSPinFile) {
+		return c.ControllerTLSPinFile
+	}
+	return filepath.Join(c.HistoryDir, c.ControllerTLSPinFile)
+}
+
 // VerifyConfig checks critical configuration values before the server starts.
 // Returns a slice of error messages for critical failures and a slice of warning messages.
 //
@@ -1102,6 +1144,33 @@ func (c *Config) VerifyConfig() ([]string, []string) {
 	// 2. CONTROLLER_URL schema validation (if set)
 	if c.ControllerURL != "" && !isValidControllerURL(c.ControllerURL) {
 		errs = append(errs, fmt.Sprintf("CONTROLLER_URL must start with https:// (got: %s)", c.ControllerURL))
+	}
+	switch c.WebTLSMode {
+	case "", controllertls.WebTLSOff:
+	case controllertls.WebTLSAuto:
+		if c.Mode != "" && c.Mode != ModeController {
+			errs = append(errs, "WEB_TLS_MODE=auto is supported only in controller mode")
+		}
+		if _, err := controllertls.ParseTailnetIPv4(c.WebTLSIP); err != nil {
+			errs = append(errs, "WEB_TLS_MODE=auto requires WEB_TLS_IP or TAILSCALE_IP in 100.64.0.0/10")
+		}
+	default:
+		errs = append(errs, "WEB_TLS_MODE must be off or auto")
+	}
+	switch c.ControllerTLSTrust {
+	case "", controllertls.TrustSystem:
+	case controllertls.TrustTOFUTailnet:
+		if c.Mode != ModeAgent {
+			errs = append(errs, "CONTROLLER_TLS_TRUST=tofu-tailnet is supported only in agent mode")
+		}
+		if err := controllertls.ValidateTOFUControllerURL(c.ControllerURL); err != nil {
+			errs = append(errs, "CONTROLLER_TLS_TRUST=tofu-tailnet requires CONTROLLER_URL to use a 100.64.0.0/10 address")
+		}
+		if c.FullControllerTLSPinPath() == "" {
+			errs = append(errs, "CONTROLLER_TLS_PIN_FILE is required for tofu-tailnet trust")
+		}
+	default:
+		errs = append(errs, "CONTROLLER_TLS_TRUST must be system or tofu-tailnet")
 	}
 
 	// 3. Authentication must be either fully configured or explicitly backed

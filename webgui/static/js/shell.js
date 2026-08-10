@@ -6,11 +6,25 @@
 
     if (!sidebar || !toggle || !scrim) return;
 
-    const setSidebarOpen = open => {
-        body.classList.toggle('sidebar-open', open);
-        toggle.setAttribute('aria-expanded', String(open));
-        toggle.setAttribute('aria-label', open ? 'Close navigation' : 'Open navigation');
-        scrim.setAttribute('aria-hidden', String(!open));
+    const drawerLayout = window.matchMedia('(max-width: 900px)');
+    const focusableSelector = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+    const setSidebarOpen = (open, moveFocus = true) => {
+        const drawerOpen = drawerLayout.matches && open;
+        body.classList.toggle('sidebar-open', drawerOpen);
+        toggle.setAttribute('aria-expanded', String(drawerOpen));
+        toggle.setAttribute('aria-label', drawerOpen ? 'Close navigation' : 'Open navigation');
+        scrim.setAttribute('aria-hidden', String(!drawerOpen));
+
+        const drawerClosed = drawerLayout.matches && !drawerOpen;
+        sidebar.inert = drawerClosed;
+        if (drawerClosed && sidebar.contains(document.activeElement)) {
+            toggle.focus();
+        } else if (drawerOpen && moveFocus) {
+            const focusTarget = sidebar.querySelector(focusableSelector) || sidebar;
+            if (focusTarget === sidebar) sidebar.setAttribute('tabindex', '-1');
+            focusTarget.focus();
+        }
     };
 
     const closeSidebar = () => setSidebarOpen(false);
@@ -24,6 +38,14 @@
             toggle.focus();
         }
     });
+
+    const handleLayoutChange = () => setSidebarOpen(false, false);
+    if (typeof drawerLayout.addEventListener === 'function') {
+        drawerLayout.addEventListener('change', handleLayoutChange);
+    } else {
+        drawerLayout.addListener(handleLayoutChange);
+    }
+    setSidebarOpen(false, false);
 
     const syncDashboardSection = () => {
         const section = location.hash === '#query-log' || location.hash === '#cluster-nodes'

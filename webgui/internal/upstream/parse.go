@@ -92,6 +92,10 @@ func Parse(raw string) (Spec, error) {
 		if spec.Host == "" {
 			return Spec{}, fmt.Errorf("missing host in upstream %q", raw)
 		}
+		portNumber, err := strconv.Atoi(spec.Port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return Spec{}, fmt.Errorf("upstream %q has an invalid port", raw)
+		}
 		return spec, nil
 	}
 

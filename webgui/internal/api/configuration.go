@@ -22,6 +22,8 @@ import (
 
 const maxUserRulesBytes = 1 << 20
 
+var errUpstreamResolverRequired = errors.New("at least one upstream resolver is required")
+
 func (s *Server) isController() bool {
 	return s.cfg.Mode == "" || s.cfg.Mode == config.ModeController
 }
@@ -37,19 +39,33 @@ func validateSnapshotRevision(snapshot configsync.Snapshot) error {
 	return nil
 }
 
-func validateSnapshotResolvers(snapshot configsync.Snapshot) error {
-	if len(snapshot.Upstreams) == 0 {
-		return errors.New("configuration snapshot has no upstreams")
+func validateResolverSettings(upstreams, bootstrapServers []string) error {
+	if len(upstreams) == 0 {
+		return errUpstreamResolverRequired
 	}
-	for index, spec := range snapshot.Upstreams {
-		if _, err := upstream.Parse(spec); err != nil {
-			return fmt.Errorf("validate upstream %d: %w", index+1, err)
+	requiresBootstrap := false
+	for index, raw := range upstreams {
+		spec, err := upstream.Parse(raw)
+		if err != nil {
+			return fmt.Errorf("upstream resolver %d is invalid: %w", index+1, err)
 		}
+		requiresBootstrap = requiresBootstrap || spec.Hostname()
 	}
-	if err := upstream.ValidateBootstrapServers(snapshot.BootstrapServers); err != nil {
+	if requiresBootstrap && len(bootstrapServers) == 0 {
+		return errors.New("hostname upstreams require at least one bootstrap resolver")
+	}
+	if err := upstream.ValidateBootstrapServers(bootstrapServers); err != nil {
 		return fmt.Errorf("validate bootstrap resolvers: %w", err)
 	}
 	return nil
+}
+
+func validateSnapshotResolvers(snapshot configsync.Snapshot) error {
+	err := validateResolverSettings(snapshot.Upstreams, snapshot.BootstrapServers)
+	if errors.Is(err, errUpstreamResolverRequired) {
+		return errors.New("configuration snapshot has no upstreams")
+	}
+	return err
 }
 
 func logConfigApplyFailure(failed string, applied []string) {
@@ -105,23 +121,26 @@ func (s *Server) handleConfigPage(w http.ResponseWriter, r *http.Request) {
 	_, _ = buf.WriteTo(w)
 }
 
-func (s *Server) configuredUpstreams() []string {
+func (s *Server) configuredResolverSettings() dnsroutes.UpstreamSettings {
+	settings := dnsroutes.UpstreamSettings{}
 	if path := s.cfg.FullUpstreamsPath(); path != "" {
-		if configured := dnsroutes.LoadUpstreams(path); len(configured) > 0 {
-			return configured
-		}
+		settings = dnsroutes.LoadUpstreamSettings(path)
 	}
-	return strings.Fields(s.cfg.UpstreamDNS)
+	if len(settings.Upstreams) == 0 {
+		settings.Upstreams = strings.Fields(s.cfg.UpstreamDNS)
+	}
+	if !settings.BootstrapConfigured {
+		settings.BootstrapServers = strings.Fields(s.cfg.BootstrapDNS)
+	}
+	return settings
+}
+
+func (s *Server) configuredUpstreams() []string {
+	return s.configuredResolverSettings().Upstreams
 }
 
 func (s *Server) configuredBootstrapServers() []string {
-	if path := s.cfg.FullUpstreamsPath(); path != "" {
-		settings := dnsroutes.LoadUpstreamSettings(path)
-		if settings.BootstrapConfigured {
-			return settings.BootstrapServers
-		}
-	}
-	return strings.Fields(s.cfg.BootstrapDNS)
+	return s.configuredResolverSettings().BootstrapServers
 }
 
 func (s *Server) currentConfigSnapshot() (configsync.Snapshot, error) {
@@ -151,8 +170,9 @@ func (s *Server) currentConfigSnapshot() (configsync.Snapshot, error) {
 	if dnsRoutes != nil {
 		routes = dnsRoutes.GetRoutesMap()
 	}
+	resolverSettings := s.configuredResolverSettings()
 	return configsync.NewSnapshot(
-		s.configuredUpstreams(), s.configuredBootstrapServers(), routes,
+		resolverSettings.Upstreams, resolverSettings.BootstrapServers, routes,
 		subscriptionItems, string(rules), rewritesList, clientsList,
 	)
 }
@@ -176,7 +196,7 @@ func (s *Server) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
 		"runtime": map[string]interface{}{
 			"upstream_mode":          s.cfg.UpstreamMode,
 			"fallback_dns":           s.cfg.FallbackDNS,
-			"bootstrap_dns":          strings.Join(s.configuredBootstrapServers(), " "),
+			"bootstrap_dns":          strings.Join(snapshot.BootstrapServers, " "),
 			"ecs_client_subnet":      s.cfg.ECSClientSubnet,
 			"blocking_mode":          s.cfg.BlockingMode,
 			"block_custom_ipv4":      s.cfg.BlockCustomIP4,

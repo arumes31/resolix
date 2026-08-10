@@ -37,6 +37,7 @@ import (
 	"github.com/arumes31/resolix/webgui/internal/blocklist"
 	"github.com/arumes31/resolix/webgui/internal/clients"
 	"github.com/arumes31/resolix/webgui/internal/config"
+	"github.com/arumes31/resolix/webgui/internal/controllertls"
 	"github.com/arumes31/resolix/webgui/internal/dnsroutes"
 	"github.com/arumes31/resolix/webgui/internal/dnsserver"
 	apperr "github.com/arumes31/resolix/webgui/internal/errors"
@@ -2435,13 +2436,9 @@ func (s *Server) handleUpstreamSettings(w http.ResponseWriter, r *http.Request) 
 			http.Error(w, "Invalid JSON", http.StatusBadRequest)
 			return
 		}
-		upstreams, err := validateUpstreamList(request.Upstreams)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
+		upstreams := compactStrings(request.Upstreams)
 		bootstrapServers := compactStrings(request.BootstrapServers)
-		if err := upstream.ValidateBootstrapServers(bootstrapServers); err != nil {
+		if err := validateResolverSettings(upstreams, bootstrapServers); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -2469,19 +2466,6 @@ func compactStrings(values []string) []string {
 		}
 	}
 	return result
-}
-
-func validateUpstreamList(values []string) ([]string, error) {
-	upstreams := compactStrings(values)
-	if len(upstreams) == 0 {
-		return nil, errors.New("at least one upstream resolver is required")
-	}
-	for index, address := range upstreams {
-		if _, err := upstream.Parse(address); err != nil {
-			return nil, fmt.Errorf("upstream resolver %d is invalid: %w", index+1, err)
-		}
-	}
-	return upstreams, nil
 }
 
 func (s *Server) saveUpstreamSettings(upstreams, bootstrapServers []string) error {
@@ -2946,6 +2930,15 @@ func (s *Server) Start(ctx context.Context, staticHandler http.Handler, cspMiddl
 		WriteTimeout:      s.cfg.HTTPWriteTimeout,
 		IdleTimeout:       120 * time.Second,
 	}
+	var tlsManager *controllertls.Manager
+	if s.cfg.WebTLSMode == controllertls.WebTLSAuto {
+		manager, err := controllertls.NewManager(s.cfg.HistoryDir, s.cfg.WebTLSIP)
+		if err != nil {
+			return fmt.Errorf("configure generated web TLS: %w", err)
+		}
+		tlsManager = manager
+		server.TLSConfig = manager.TLSConfig()
+	}
 
 	ln, err := net.Listen("tcp", server.Addr)
 	if err != nil {
@@ -2965,8 +2958,16 @@ func (s *Server) Start(ctx context.Context, staticHandler http.Handler, cspMiddl
 		close(shutdownDone)
 	}()
 
-	log.Printf("Starting Advanced Web GUI on %s", server.Addr)
-	err = server.Serve(ln)
+	if tlsManager != nil {
+		go tlsManager.Run(ctx, func(rotationErr error) {
+			log.Printf("Controller TLS certificate rotation failed: %v", rotationErr)
+		})
+		log.Printf("Starting Advanced Web GUI with generated HTTPS on %s (CA %s)", server.Addr, tlsManager.CAFingerprint())
+		err = server.ServeTLS(ln, "", "")
+	} else {
+		log.Printf("Starting Advanced Web GUI on %s", server.Addr)
+		err = server.Serve(ln)
+	}
 	if ctx.Err() != nil {
 		<-shutdownDone
 	}

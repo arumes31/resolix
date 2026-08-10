@@ -12,6 +12,10 @@ services:
       - CONTROLLER_URL=
       - NODE_NAME=${NODE_NAME:-resolix-1}
       - WEB_LISTEN_ADDR=${WEB_LISTEN_ADDR:-0.0.0.0}
+      - WEB_TLS_MODE=${WEB_TLS_MODE:-off}
+      - WEB_TLS_IP=${WEB_TLS_IP:-}
+      - CONTROLLER_TLS_TRUST=${CONTROLLER_TLS_TRUST:-system}
+      - CONTROLLER_TLS_PIN_FILE=${CONTROLLER_TLS_PIN_FILE:-tls/controller-ca-pin.json}
       - BASE_URL=${BASE_URL:-/}
       - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}
       - INGEST_SECRET=${INGEST_SECRET:?INGEST_SECRET is required}

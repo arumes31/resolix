@@ -239,6 +239,72 @@ func TestVerifyConfigRejectsAuthenticationAndNetworkMisconfiguration(t *testing.
 	}
 }
 
+func TestLoadConfigControllerTLSModes(t *testing.T) {
+	t.Setenv("MODE", ModeController)
+	t.Setenv("CONTROLLER_URL", "")
+	t.Setenv("WEB_TLS_MODE", "")
+	t.Setenv("CONTROLLER_TLS_TRUST", "")
+	t.Setenv("CONTROLLER_TLS_PIN_FILE", "")
+	cfg := LoadConfig()
+	if cfg.WebTLSMode != "off" || cfg.ControllerTLSTrust != "system" {
+		t.Fatalf("default TLS modes = %q/%q, want off/system", cfg.WebTLSMode, cfg.ControllerTLSTrust)
+	}
+	if cfg.ControllerTLSPinFile != "tls/controller-ca-pin.json" {
+		t.Fatalf("default controller pin file = %q", cfg.ControllerTLSPinFile)
+	}
+
+	t.Setenv("MODE", ModeAgent)
+	t.Setenv("CONTROLLER_URL", "https://100.64.10.20:35353")
+	t.Setenv("CONTROLLER_TLS_TRUST", "tofu-tailnet")
+	t.Setenv("CONTROLLER_TLS_PIN_FILE", "custom-pin.json")
+	cfg = LoadConfig()
+	if cfg.ControllerTLSTrust != "tofu-tailnet" || cfg.ControllerTLSPinFile != "custom-pin.json" {
+		t.Fatalf("configured controller TLS = %q/%q", cfg.ControllerTLSTrust, cfg.ControllerTLSPinFile)
+	}
+}
+
+func TestVerifyConfigControllerTLSBoundaries(t *testing.T) {
+	base := func() *Config {
+		return &Config{
+			Mode: ModeController, Port: DefaultPort, WebListenAddr: DefaultWebListenAddr,
+			HistoryDir: t.TempDir(), DBPath: DefaultDBPath, IngestSecret: "test-secret",
+		}
+	}
+	hasTLSFailure := func(cfg *Config) bool {
+		errs, _ := cfg.VerifyConfig()
+		return strings.Contains(strings.Join(errs, "\n"), "TLS") ||
+			strings.Contains(strings.Join(errs, "\n"), "tofu-tailnet")
+	}
+
+	cfg := base()
+	cfg.WebTLSMode = "auto"
+	cfg.WebTLSIP = "100.64.10.20"
+	if hasTLSFailure(cfg) {
+		t.Fatal("valid generated controller TLS configuration failed verification")
+	}
+
+	cfg = base()
+	cfg.WebTLSMode = "auto"
+	cfg.WebTLSIP = "192.168.1.10"
+	if !hasTLSFailure(cfg) {
+		t.Fatal("generated controller TLS accepted a non-Tailscale address")
+	}
+
+	cfg = base()
+	cfg.Mode = ModeAgent
+	cfg.ControllerURL = "https://100.64.10.20:35353"
+	cfg.ControllerTLSTrust = "tofu-tailnet"
+	cfg.ControllerTLSPinFile = "tls/pin.json"
+	if hasTLSFailure(cfg) {
+		t.Fatal("valid tailnet TOFU configuration failed verification")
+	}
+
+	cfg.ControllerURL = "https://controller.example.test"
+	if !hasTLSFailure(cfg) {
+		t.Fatal("tailnet TOFU accepted a hostname controller URL")
+	}
+}
+
 func TestResolveDoHPathRejectsProtocolRelativeForms(t *testing.T) {
 	tests := []struct {
 		name  string

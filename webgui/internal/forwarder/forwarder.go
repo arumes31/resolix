@@ -21,6 +21,7 @@ import (
 
 	"github.com/arumes31/resolix/webgui/internal/config"
 	"github.com/arumes31/resolix/webgui/internal/configsync"
+	"github.com/arumes31/resolix/webgui/internal/controllertls"
 	"github.com/arumes31/resolix/webgui/internal/models"
 )
 
@@ -78,12 +79,36 @@ func NewForwarder(cfg *config.Config) *Forwarder {
 		_, f.transportErr = controllerEndpoint(cfg, "/api/sync/dns-config")
 	}
 	if f.transportErr == nil {
-		f.httpClient = &http.Client{
-			Timeout:       10 * time.Second,
-			CheckRedirect: rejectControllerRedirect,
-		}
+		f.httpClient, f.transportErr = newControllerHTTPClient(cfg)
 	}
 	return f
+}
+
+func newControllerHTTPClient(cfg *config.Config) (*http.Client, error) {
+	client := &http.Client{
+		Timeout:       10 * time.Second,
+		CheckRedirect: rejectControllerRedirect,
+	}
+	if cfg.Mode != config.ModeAgent || cfg.ControllerURL == "" {
+		return client, nil
+	}
+
+	switch cfg.ControllerTLSTrust {
+	case "", controllertls.TrustSystem:
+		return client, nil
+	case controllertls.TrustTOFUTailnet:
+		transport, err := controllertls.NewTOFUTransport(
+			cfg.ControllerURL,
+			cfg.FullControllerTLSPinPath(),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("configure tailnet TOFU: %w", err)
+		}
+		client.Transport = transport
+		return client, nil
+	default:
+		return nil, fmt.Errorf("unsupported controller TLS trust mode %q", cfg.ControllerTLSTrust)
+	}
 }
 
 func rejectControllerRedirect(_ *http.Request, _ []*http.Request) error {
@@ -893,5 +918,8 @@ func (f *Forwarder) Stats() (backlog int, backlogBytes, retries, dropped, sent i
 func (f *Forwarder) Stop() {
 	f.stopOnce.Do(func() {
 		close(f.stopChan)
+		if f.httpClient != nil {
+			f.httpClient.CloseIdleConnections()
+		}
 	})
 }

@@ -174,6 +174,33 @@ func TestNewForwarder(t *testing.T) {
 	}
 }
 
+func TestNewForwarderConfiguresTailnetTOFU(t *testing.T) {
+	cfg := &config.Config{
+		Mode:                 config.ModeAgent,
+		ControllerURL:        "https://100.64.20.30:35353",
+		ControllerTLSTrust:   "tofu-tailnet",
+		ControllerTLSPinFile: "pin.json",
+		HistoryDir:           t.TempDir(),
+	}
+	fwd := NewForwarder(cfg)
+	if fwd.transportErr != nil {
+		t.Fatalf("NewForwarder() transport error = %v", fwd.transportErr)
+	}
+	transport, ok := fwd.httpClient.Transport.(*http.Transport)
+	if !ok || transport.TLSClientConfig == nil || transport.TLSClientConfig.VerifyConnection == nil {
+		t.Fatal("NewForwarder() did not install the TOFU TLS verifier")
+	}
+	if transport.Proxy != nil {
+		t.Fatal("NewForwarder() allowed a proxy to intercept tailnet TOFU enrollment")
+	}
+
+	cfg.ControllerURL = "https://controller.example.test"
+	fwd = NewForwarder(cfg)
+	if fwd.transportErr == nil || fwd.httpClient != nil {
+		t.Fatal("NewForwarder() did not fail closed for non-tailnet TOFU")
+	}
+}
+
 func TestEnqueue_AgentMode(t *testing.T) {
 	cfg := &config.Config{Mode: config.ModeAgent, ControllerURL: "http://localhost:12345", NodeName: "test-node"}
 	fwd := NewForwarder(cfg)

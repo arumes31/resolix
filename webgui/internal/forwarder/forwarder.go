@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"tailscale-dnsrewrite/webgui/internal/config"
+	"tailscale-dnsrewrite/webgui/internal/configsync"
 	"tailscale-dnsrewrite/webgui/internal/models"
 )
 
@@ -55,6 +56,8 @@ type Forwarder struct {
 	setDNSRoutesFn      func(routes map[string]string)
 	setAliasesFn        func(aliases map[string]string)
 	setUpstreamHealthFn func(node string, health map[string]float64)
+	setDNSConfigFn      func(snapshot configsync.Snapshot) error
+	configRevision      string
 }
 
 // NewForwarder creates a new log forwarder for slave nodes.
@@ -90,6 +93,20 @@ func (f *Forwarder) SetUpstreamHealthFn(fn func(node string, health map[string]f
 	f.syncMu.Lock()
 	defer f.syncMu.Unlock()
 	f.setUpstreamHealthFn = fn
+}
+
+// SetDNSConfigFn sets the callback that validates and applies a master snapshot.
+func (f *Forwarder) SetDNSConfigFn(fn func(snapshot configsync.Snapshot) error) {
+	f.syncMu.Lock()
+	defer f.syncMu.Unlock()
+	f.setDNSConfigFn = fn
+}
+
+// ConfigRevision returns the last successfully applied master revision.
+func (f *Forwarder) ConfigRevision() string {
+	f.syncMu.RLock()
+	defer f.syncMu.RUnlock()
+	return f.configRevision
 }
 
 // GetSyncedAliases returns the latest aliases synced from master (Item 90).
@@ -281,14 +298,15 @@ func (f *Forwarder) sendHeartbeat(client *http.Client, health map[string]float64
 	dbSizeMB := getDBSizeMB(f.cfg)
 
 	hb := models.HeartbeatPayload{
-		Node:       f.cfg.NodeName,
-		Version:    Version,
-		GoVersion:  runtime.Version(),
-		BuildInfo:  fmt.Sprintf("%s/%s", Version, runtime.Version()),
-		MemoryMB:   memoryMB,
-		Goroutines: goroutines,
-		DBSizeMB:   dbSizeMB,
-		Health:     health,
+		Node:           f.cfg.NodeName,
+		Version:        Version,
+		GoVersion:      runtime.Version(),
+		BuildInfo:      fmt.Sprintf("%s/%s", Version, runtime.Version()),
+		MemoryMB:       memoryMB,
+		Goroutines:     goroutines,
+		DBSizeMB:       dbSizeMB,
+		Health:         health,
+		ConfigRevision: f.ConfigRevision(),
 	}
 
 	data, err := json.Marshal(hb)
@@ -464,6 +482,42 @@ func (f *Forwarder) syncUpstreamHealth(client *http.Client) {
 		totalUpstreams += len(health)
 	}
 	log.Printf("[INFO] Synced upstream health for %d nodes (%d upstreams) from master", len(result), totalUpstreams)
+}
+
+func (f *Forwarder) syncDNSConfig(client *http.Client) {
+	data, err := f.syncFromMaster(client, "/api/sync/dns-config")
+	if err != nil {
+		log.Printf("[WARN] Failed to sync DNS configuration from master: %v", err)
+		return
+	}
+	var snapshot configsync.Snapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		log.Printf("[WARN] Failed to parse DNS configuration snapshot: %v", err)
+		return
+	}
+	if !snapshot.ValidRevision() {
+		log.Printf("[WARN] Rejected DNS configuration snapshot with invalid revision")
+		return
+	}
+	f.syncMu.RLock()
+	currentRevision := f.configRevision
+	apply := f.setDNSConfigFn
+	f.syncMu.RUnlock()
+	if snapshot.Revision == currentRevision {
+		return
+	}
+	if apply == nil {
+		log.Printf("[WARN] DNS configuration sync callback is not configured")
+		return
+	}
+	if err := apply(snapshot); err != nil {
+		log.Printf("[WARN] Failed to apply DNS configuration revision: %v", err)
+		return
+	}
+	f.syncMu.Lock()
+	f.configRevision = snapshot.Revision
+	f.syncMu.Unlock()
+	log.Printf("[INFO] Applied DNS configuration revision %.12s", snapshot.Revision)
 }
 
 // calculateBackoff computes the backoff duration with exponential growth and jitter (Item 86).
@@ -653,13 +707,14 @@ func (f *Forwarder) startHeartbeat(client *http.Client) {
 	memoryMB, goroutines := getResourceStats()
 	dbSizeMB := getDBSizeMB(f.cfg)
 	hb := models.HeartbeatPayload{
-		Node:       f.cfg.NodeName,
-		Version:    Version,
-		GoVersion:  runtime.Version(),
-		BuildInfo:  fmt.Sprintf("%s/%s", Version, runtime.Version()),
-		MemoryMB:   memoryMB,
-		Goroutines: goroutines,
-		DBSizeMB:   dbSizeMB,
+		Node:           f.cfg.NodeName,
+		Version:        Version,
+		GoVersion:      runtime.Version(),
+		BuildInfo:      fmt.Sprintf("%s/%s", Version, runtime.Version()),
+		MemoryMB:       memoryMB,
+		Goroutines:     goroutines,
+		DBSizeMB:       dbSizeMB,
+		ConfigRevision: f.ConfigRevision(),
 	}
 	if err := f.sendHeartbeat(client, hb.Health); err != nil {
 		log.Printf("[WARN] Initial heartbeat failed: %v", err)
@@ -679,7 +734,8 @@ func (f *Forwarder) startHeartbeat(client *http.Client) {
 	}
 }
 
-// startSyncLoops runs periodic sync operations for aliases, DNS routes, and upstream health.
+// startSyncLoops runs periodic sync operations for aliases, DNS routes,
+// master-owned DNS configuration, and upstream health.
 func (f *Forwarder) startSyncLoops(client *http.Client) {
 	// Item 90: Sync client aliases
 	aliasesInterval := safeInterval(f.cfg.SyncAliasesInterval, config.DefaultSyncAliasesInterval)
@@ -700,6 +756,7 @@ func (f *Forwarder) startSyncLoops(client *http.Client) {
 	f.syncAliases(client)
 	f.syncDNSRoutes(client)
 	f.syncUpstreamHealth(client)
+	f.syncDNSConfig(client)
 
 	for {
 		select {
@@ -709,6 +766,7 @@ func (f *Forwarder) startSyncLoops(client *http.Client) {
 			f.syncAliases(client)
 		case <-routesTicker.C:
 			f.syncDNSRoutes(client)
+			f.syncDNSConfig(client)
 		case <-healthTicker.C:
 			f.syncUpstreamHealth(client)
 		}

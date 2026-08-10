@@ -237,6 +237,36 @@ func (r *Registry) List() []Client {
 	return out
 }
 
+// Replace validates and atomically persists a complete client registry.
+func (r *Registry) Replace(items []Client) error {
+	proposed := make([]*Client, 0, len(items))
+	seenNames := make(map[string]struct{}, len(items))
+	for i := range items {
+		candidate := cloneClient(items[i])
+		if _, exists := seenNames[candidate.Name]; exists {
+			return fmt.Errorf("client %q appears more than once", candidate.Name)
+		}
+		if err := candidate.compile(); err != nil {
+			return err
+		}
+		if err := validateConflicts(proposed, &candidate); err != nil {
+			return err
+		}
+		seenNames[candidate.Name] = struct{}{}
+		proposed = append(proposed, &candidate)
+	}
+
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+	if err := r.saveClients(proposed); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.clients = proposed
+	r.mu.Unlock()
+	return nil
+}
+
 // Add validates and adds a client, persisting the registry.
 func (r *Registry) Add(c Client) error {
 	r.writeMu.Lock()

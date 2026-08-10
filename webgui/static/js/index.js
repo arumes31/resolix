@@ -37,6 +37,7 @@ function applyDynamicStyles(root) {
 
 // Base URL prefix for API requests (empty for root deployments)
 const apiBase = (document.body.dataset.baseUrl || '/').replace(/\/$/, '');
+const configReadOnly = document.body.dataset.mode === 'slave';
 
 function apiPath(path) {
     return apiBase + path;
@@ -180,7 +181,7 @@ function createRowHtml(e) {
         </td>
         <td>${e.upstream ? `<span class="upstream-badge">${escapeHtml(e.upstream)}</span>` : '-'}</td>
         <td class="latency-cell ${latencyClass}">${escapeHtml(latencyText)}</td>
-        <td><button type="button" class="query-action-btn ${action === 'unblock' ? 'is-unblock' : ''}" aria-label="${actionLabel} ${escapeHtml(e.domain)}" data-domain="${escapeHtml(e.domain)}" data-action="${action}">${actionLabel}</button></td>
+        <td>${configReadOnly ? '<span class="settings-list-meta">Master managed</span>' : `<button type="button" class="query-action-btn ${action === 'unblock' ? 'is-unblock' : ''}" aria-label="${actionLabel} ${escapeHtml(e.domain)}" data-domain="${escapeHtml(e.domain)}" data-action="${action}">${actionLabel}</button>`}</td>
     `;
 }
 
@@ -836,7 +837,6 @@ async function applyQueryAction(button) {
             if (event.domain === domain) event.user_rule_action = nextAction;
         });
         showSettingsNotice(`${domain}: ${data.action.replaceAll('_', ' ')}`);
-        await loadFilterSettings();
     } finally {
         button.disabled = false;
     }
@@ -878,51 +878,6 @@ document.addEventListener('keydown', event => {
 
 document.getElementById('searchInput').addEventListener('input', renderEvents);
 
-document.querySelectorAll('.settings-tab').forEach(tab => {
-    tab.addEventListener('click', () => {
-        document.querySelectorAll('.settings-tab').forEach(candidate => {
-            const active = candidate === tab;
-            candidate.classList.toggle('active', active);
-            candidate.setAttribute('aria-selected', String(active));
-        });
-        document.querySelectorAll('.settings-panel').forEach(panel => {
-            const active = panel.id === `settings-${tab.dataset.settingsTab}`;
-            panel.classList.toggle('active', active);
-            panel.hidden = !active;
-        });
-        document.querySelector('.dns-console').scrollIntoView({
-            behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
-            block: 'start'
-        });
-        if (!loadedSettings.has(tab.dataset.settingsTab)) {
-            loadSettings(tab.dataset.settingsTab).catch(error => showSettingsNotice(error.message, true));
-        }
-    });
-});
-
-document.querySelectorAll('.filter-pause-btn').forEach(button => {
-    button.addEventListener('click', () => {
-        setFilterPause(Number(button.dataset.minutes)).catch(error => showSettingsNotice(error.message, true));
-    });
-});
-document.getElementById('rewriteType').addEventListener('change', rewriteValueState);
-document.getElementById('rewriteForm').addEventListener('submit', event => {
-    addRewrite(event).catch(error => showSettingsNotice(error.message, true));
-});
-document.getElementById('clientUseGlobal').addEventListener('change', setClientPolicyState);
-document.getElementById('clientForm').addEventListener('submit', event => {
-    saveClient(event).catch(error => showSettingsNotice(error.message, true));
-});
-document.getElementById('clientCancelBtn').addEventListener('click', resetClientForm);
-document.getElementById('refreshSettingsBtn').addEventListener('click', () => {
-    loadSettings()
-        .then(() => showSettingsNotice('Settings refreshed'))
-        .catch(error => showSettingsNotice(error.message, true));
-});
-document.getElementById('clearCacheBtn').addEventListener('click', () => {
-    clearDNSCache().catch(error => showSettingsNotice(error.message, true));
-});
-
 function updateVisibility() {
     isTabVisible = document.visibilityState === 'visible';
     if (statsInterval) clearInterval(statsInterval);
@@ -947,21 +902,6 @@ document.addEventListener('click', function (e) {
         applyQueryAction(queryAction).catch(error => showSettingsNotice(error.message, true));
         return;
     }
-    const rewriteDelete = e.target.closest('.rewrite-delete-btn');
-    if (rewriteDelete) {
-        deleteRewrite(rewriteDelete.dataset.id).catch(error => showSettingsNotice(error.message, true));
-        return;
-    }
-    const clientEdit = e.target.closest('.client-edit-btn');
-    if (clientEdit) {
-        editClient(clientEdit.dataset.name);
-        return;
-    }
-    const clientDelete = e.target.closest('.client-delete-btn');
-    if (clientDelete) {
-        deleteClient(clientDelete.dataset.name).catch(error => showSettingsNotice(error.message, true));
-        return;
-    }
     const btn = e.target.closest('.test-domain-btn');
     if (btn) {
         e.stopPropagation();
@@ -971,10 +911,7 @@ document.addEventListener('click', function (e) {
     if (clientCell) showClientStats(clientCell.dataset.clientIp);
 });
 
-rewriteValueState();
-resetClientForm();
 startStream();
-loadSettings().catch(error => showSettingsNotice(error.message, true));
 updateVisibility(); // Initial set
 setInterval(() => {
     if (isTabVisible && !isFrozen) refreshEventTimes();

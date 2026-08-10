@@ -2665,6 +2665,8 @@ tr:hover .test-domain-btn {
 }
 
 .settings-form input[type='text'],
+.settings-form input[type='url'],
+.settings-form textarea,
 .settings-form select {
   width: 100%;
   margin-top: 0.35rem;
@@ -2676,7 +2678,15 @@ tr:hover .test-domain-btn {
   color: var(--text-primary);
 }
 
+.settings-form textarea {
+  min-height: 9rem;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  line-height: 1.55;
+}
+
 .settings-form input:focus,
+.settings-form textarea:focus,
 .settings-form select:focus {
   border-color: var(--accent);
 }
@@ -2771,6 +2781,112 @@ tr:hover .test-domain-btn {
   text-align: center;
 }
 
+.header-link {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+}
+
+.config-page {
+  min-height: 100vh;
+}
+
+.config-container {
+  max-width: 1220px;
+}
+
+.config-header {
+  align-items: flex-start;
+}
+
+.authority-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 1rem 0;
+  padding: 0.9rem 1rem;
+  border: 1px solid var(--border-color);
+  border-radius: 0.85rem;
+  background: linear-gradient(120deg, var(--card-inner-bg), transparent);
+}
+
+.authority-banner > div {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+}
+
+.revision-label {
+  color: var(--text-secondary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.72rem;
+}
+
+.config-tabs {
+  top: 0.75rem;
+  z-index: 5;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+
+.config-panels {
+  min-height: 36rem;
+  border: 1px solid var(--border-color);
+  border-radius: 1rem;
+  background: var(--card-bg);
+  box-shadow: var(--shadow-card);
+}
+
+.config-panels .settings-panel {
+  padding: 1.25rem;
+}
+
+.single-column-form {
+  grid-template-columns: 1fr;
+}
+
+.subscription-form {
+  grid-template-columns: minmax(180px, 0.8fr) minmax(280px, 2fr);
+}
+
+.runtime-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.7rem;
+  margin: 1rem 0;
+}
+
+.runtime-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  min-width: 0;
+  padding: 0.85rem;
+  border: 1px solid var(--border-color);
+  border-radius: 0.7rem;
+  background: var(--card-inner-bg);
+}
+
+.runtime-item span {
+  color: var(--text-secondary);
+  font-size: 0.64rem;
+  letter-spacing: 0.06em;
+}
+
+.runtime-item strong {
+  overflow-wrap: anywhere;
+  font-size: 0.8rem;
+}
+
+.read-only-config .master-edit {
+  opacity: 0.58;
+}
+
+.read-only-config .master-edit::after {
+  color: var(--text-secondary);
+}
+
 @media (max-width: 900px) {
   .compact-form {
     grid-template-columns: 1fr 1fr;
@@ -2810,5 +2926,16 @@ tr:hover .test-domain-btn {
   .field-wide,
   .service-picker {
     grid-column: 1;
+  }
+
+  .config-header,
+  .authority-banner,
+  .authority-banner > div {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .subscription-form {
+    grid-template-columns: 1fr;
   }
 }

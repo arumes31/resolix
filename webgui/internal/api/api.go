@@ -171,7 +171,8 @@ type Server struct {
 	blocklist *blocklist.Blocklist
 
 	// Filter engine (Step 2: rule-based filtering with subscriptions)
-	filterEngine *filter.Engine
+	filterEngine      *filter.Engine
+	subscriptionStore *filter.SubscriptionStore
 
 	// Typed rewrites store (Step 3) and DNS server (pipeline metrics)
 	rewritesStore *rewrites.Store
@@ -282,6 +283,13 @@ func (s *Server) SetFilter(eng *filter.Engine) {
 	s.fieldsMu.Lock()
 	defer s.fieldsMu.Unlock()
 	s.filterEngine = eng
+}
+
+// SetSubscriptionStore configures persistent URL filter subscriptions.
+func (s *Server) SetSubscriptionStore(store *filter.SubscriptionStore) {
+	s.fieldsMu.Lock()
+	defer s.fieldsMu.Unlock()
+	s.subscriptionStore = store
 }
 
 // SetRewritesStore configures the typed-rewrites store for the CRUD API.
@@ -883,6 +891,7 @@ func (s *Server) SetupMux() http.Handler {
 
 	// Protected routes
 	mux.Handle("/", s.authMiddleware(http.HandlerFunc(s.handleRoot)))
+	mux.Handle("/config", s.authMiddleware(http.HandlerFunc(s.handleConfigPage)))
 	mux.Handle("/api/events", s.authMiddleware(http.HandlerFunc(s.handleEvents)))
 	mux.Handle("/api/stats", s.authMiddleware(http.HandlerFunc(s.handleStats)))
 	mux.Handle("/api/client_stats", s.authMiddleware(http.HandlerFunc(s.handleClientStats)))
@@ -894,6 +903,9 @@ func (s *Server) SetupMux() http.Handler {
 	// Filter engine: pause/resume protection and status
 	mux.Handle("/api/filtering/pause", s.authMiddleware(http.HandlerFunc(s.handleFilteringPause)))
 	mux.Handle("/api/filtering/status", s.authMiddleware(http.HandlerFunc(s.handleFilteringStatus)))
+	mux.Handle("/api/config/status", s.authMiddleware(http.HandlerFunc(s.handleConfigStatus)))
+	mux.Handle("/api/config/subscriptions", s.authMiddleware(http.HandlerFunc(s.handleFilterSubscriptions)))
+	mux.Handle("/api/config/user-rules", s.authMiddleware(http.HandlerFunc(s.handleUserRules)))
 
 	// Typed DNS rewrites CRUD
 	mux.Handle("/api/rewrites", s.authMiddleware(http.HandlerFunc(s.handleRewrites)))
@@ -936,6 +948,7 @@ func (s *Server) SetupMux() http.Handler {
 	mux.Handle("/api/sync/aliases", s.internalAuth(http.HandlerFunc(s.handleSyncAliases)))
 	mux.Handle("/api/sync/dns-routes", s.internalAuth(http.HandlerFunc(s.handleSyncDNSRoutes)))
 	mux.Handle("/api/sync/upstream-health", s.internalAuth(http.HandlerFunc(s.handleSyncUpstreamHealth)))
+	mux.Handle("/api/sync/dns-config", s.internalAuth(http.HandlerFunc(s.handleSyncDNSConfig)))
 
 	// Item 89: Node discovery and status endpoint
 	mux.Handle("/api/nodes", s.authMiddleware(http.HandlerFunc(s.handleNodes)))
@@ -1727,6 +1740,10 @@ func (s *Server) handleIngestEvents(w http.ResponseWriter, r *http.Request, body
 }
 
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
 	nonce := ""
 	if s.nonceFromCtx != nil {
 		nonce = s.nonceFromCtx(r.Context())
@@ -1737,7 +1754,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		csrfToken = cookie.Value
 	}
 	var buf bytes.Buffer
-	if err := s.tmpl.Execute(&buf, map[string]interface{}{
+	if err := s.tmpl.ExecuteTemplate(&buf, "index.html", map[string]interface{}{
 		"Nonce":     nonce,
 		"BaseURL":   s.cfg.BaseURL,
 		"Mode":      s.cfg.Mode,
@@ -2018,6 +2035,9 @@ func (s *Server) handleFilteringPause(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !s.requireMaster(w) {
+		return
+	}
 	if !s.checkCSRF(w, r) {
 		return
 	}
@@ -2053,6 +2073,9 @@ func (s *Server) handleFilteringPause(w http.ResponseWriter, r *http.Request) {
 // typed DNS rewrites. Changes take effect live in the DNS pipeline.
 func (s *Server) handleRewrites(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodGet && !s.requireMaster(w) {
+		return
+	}
 	s.fieldsMu.RLock()
 	store := s.rewritesStore
 	s.fieldsMu.RUnlock()
@@ -2120,6 +2143,9 @@ func (s *Server) handleRewrites(w http.ResponseWriter, r *http.Request) {
 // DELETE (?name=) for the per-client registry. Changes take effect live.
 func (s *Server) handleClients(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodGet && !s.requireMaster(w) {
+		return
+	}
 	s.fieldsMu.RLock()
 	reg := s.clientsRegistry
 	s.fieldsMu.RUnlock()
@@ -2227,6 +2253,9 @@ func (s *Server) handleQuerylogAction(w http.ResponseWriter, r *http.Request, bl
 	w.Header().Set("Content-Type", "application/json")
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.requireMaster(w) {
 		return
 	}
 	if !s.checkCSRF(w, r) {
@@ -2399,20 +2428,13 @@ func (s *Server) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetUpstreams(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-
-	upstreamsPath := s.cfg.FullUpstreamsPath()
-	var upstreams []string
-	if upstreamsPath != "" {
-		upstreams = dnsroutes.LoadUpstreams(upstreamsPath)
-	}
-	if upstreams == nil {
-		upstreams = []string{}
-	}
-
-	_ = json.NewEncoder(w).Encode(upstreams)
+	_ = json.NewEncoder(w).Encode(s.configuredUpstreams())
 }
 
 func (s *Server) handlePostUpstreams(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMaster(w) {
+		return
+	}
 	if !s.checkCSRF(w, r) {
 		return
 	}
@@ -2441,6 +2463,10 @@ func (s *Server) handlePostUpstreams(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		upstreams = append(upstreams, addr)
+	}
+	if len(upstreams) == 0 {
+		http.Error(w, "At least one upstream resolver is required", http.StatusBadRequest)
+		return
 	}
 
 	// Save to file
@@ -2544,6 +2570,9 @@ func (s *Server) handleGetDNSRoutes(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handlePostDNSRoutes(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMaster(w) {
+		return
+	}
 	if !s.checkCSRF(w, r) {
 		return
 	}
@@ -2677,6 +2706,7 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		Goroutines:     hb.Goroutines,
 		DBSizeMB:       hb.DBSizeMB,
 		UpstreamHealth: hb.Health,
+		ConfigRevision: hb.ConfigRevision,
 	}
 	s.store.SetNodeStatus(hb.Node, status)
 

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"tailscale-dnsrewrite/webgui/internal/config"
+	"tailscale-dnsrewrite/webgui/internal/configsync"
 	"tailscale-dnsrewrite/webgui/internal/models"
 )
 
@@ -32,6 +33,33 @@ func testEvents(domains ...string) []models.QueryEvent {
 		}
 	}
 	return events
+}
+
+func TestSyncDNSConfigAppliesOnlyValidNewRevision(t *testing.T) {
+	snapshot := configsync.NewSnapshot([]string{"1.1.1.1"}, nil, nil, "||example.test^\n", nil, nil)
+	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/sync/dns-config" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(snapshot)
+	}))
+	defer master.Close()
+
+	forwarder := NewForwarder(&config.Config{Mode: "slave", MasterURL: master.URL, MaxRequestSize: 1 << 20})
+	var calls atomic.Int32
+	forwarder.SetDNSConfigFn(func(got configsync.Snapshot) error {
+		if got.Revision != snapshot.Revision {
+			t.Fatalf("revision = %q, want %q", got.Revision, snapshot.Revision)
+		}
+		calls.Add(1)
+		return nil
+	})
+	forwarder.syncDNSConfig(master.Client())
+	forwarder.syncDNSConfig(master.Client())
+	if calls.Load() != 1 || forwarder.ConfigRevision() != snapshot.Revision {
+		t.Fatalf("calls/revision = %d/%q", calls.Load(), forwarder.ConfigRevision())
+	}
 }
 
 // decodeJSONBody handles both gzip-compressed and uncompressed request bodies.

@@ -301,6 +301,37 @@ func (s *Store) List() []Rewrite {
 	return out
 }
 
+// Replace validates and atomically persists a complete rewrite set.
+func (s *Store) Replace(items []Rewrite) error {
+	validated := make([]Rewrite, len(items))
+	for i, item := range items {
+		item.Domain = NormalizeDomain(item.Domain)
+		item.Type = strings.ToUpper(strings.TrimSpace(item.Type))
+		item.Value = strings.TrimSpace(item.Value)
+		if err := Validate(item.Domain, item.Type, item.Value); err != nil {
+			return fmt.Errorf("rewrite %d: %w", i+1, err)
+		}
+		if item.ID == "" {
+			item.ID = newID()
+		}
+		validated[i] = item
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	s.mu.Lock()
+	previous := s.items
+	s.items = validated
+	s.mu.Unlock()
+	if err := s.save(); err != nil {
+		s.mu.Lock()
+		s.items = previous
+		s.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
 // Add validates and stores a new rewrite, persisting the store.
 func (s *Store) Add(domain, typ, value string) (Rewrite, error) {
 	domain = NormalizeDomain(domain)

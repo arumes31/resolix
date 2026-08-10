@@ -26,6 +26,7 @@ import (
 	"tailscale-dnsrewrite/webgui/internal/blocklist"
 	"tailscale-dnsrewrite/webgui/internal/clients"
 	"tailscale-dnsrewrite/webgui/internal/config"
+	"tailscale-dnsrewrite/webgui/internal/configsync"
 	"tailscale-dnsrewrite/webgui/internal/dnsroutes"
 	"tailscale-dnsrewrite/webgui/internal/dnsserver"
 	"tailscale-dnsrewrite/webgui/internal/filter"
@@ -452,13 +453,6 @@ func main() {
 
 	errChan := make(chan error, 2)
 
-	// Start Forwarder for Slave mode
-	go func() {
-		if err := fwd.Start(); err != nil {
-			errChan <- err
-		}
-	}()
-
 	// Embedded DNS server (replaces dnsmasq). Pipeline: refuse-ANY/AAAA-disable
 	// → typed rewrites → private PTR → safe-search → filter → blocked services
 	// → cache → client upstreams → route → global pool → bogus-NXDOMAIN →
@@ -469,7 +463,7 @@ func main() {
 
 	// Filter engine (Step 2): local files (BLOCKLIST_FILE entries now
 	// actually block) plus URL subscriptions with conditional auto-update.
-	filterEng := setupFilterEngine(ctx, cfg, srv)
+	filterEng, _ := setupFilterEngine(ctx, cfg, srv)
 
 	// Typed rewrites store (Step 3): loaded from the persistence file, or
 	// seeded from the DOMAINS env on first boot only.
@@ -490,6 +484,17 @@ func main() {
 	// Upstream pool (Step 4): modes, fallback, bootstrap, ECS, DNS64.
 	pool := setupUpstreamPool(ctx, cfg, store, srv, checker, loadSpecs, upstreamSpecs)
 	dr.SetOnChange(pool.ClearRouteCache)
+	fwd.SetDNSConfigFn(func(snapshot configsync.Snapshot) error {
+		return srv.ApplyConfigSnapshot(snapshot)
+	})
+
+	// Start forwarding only after every config-sync target is initialized, so
+	// the initial slave sync cannot race application startup.
+	go func() {
+		if err := fwd.Start(); err != nil {
+			errChan <- err
+		}
+	}()
 
 	dnsSrv := dnsserver.New(dnsserver.Config{
 		Addr:            cfg.DNSListenAddr,
@@ -613,7 +618,7 @@ func main() {
 
 // setupFilterEngine builds and starts the filter engine from configuration
 // and wires it into the API server.
-func setupFilterEngine(ctx context.Context, cfg *config.Config, srv *api.Server) *filter.Engine {
+func setupFilterEngine(ctx context.Context, cfg *config.Config, srv *api.Server) (*filter.Engine, *filter.SubscriptionStore) {
 	eng := filter.New()
 
 	// User rules (query-log block/unblock actions) — a plain file source.
@@ -631,15 +636,23 @@ func setupFilterEngine(ctx context.Context, cfg *config.Config, srv *api.Server)
 	if cfg.AllowlistFile != "" {
 		eng.AddFileSource(cfg.AllowlistFile, true)
 	}
+	seeds := make([]filter.Subscription, 0)
 	for _, u := range splitListEnv(cfg.BlocklistURLs) {
-		eng.AddURLSource(u, false)
+		seeds = append(seeds, filter.Subscription{URL: u, Enabled: true})
 	}
 	for _, u := range splitListEnv(cfg.AllowlistURLs) {
-		eng.AddURLSource(u, true)
+		seeds = append(seeds, filter.Subscription{URL: u, AllowOnly: true, Enabled: true})
 	}
+	subscriptionPath := filepath.Join(cfg.HistoryDir, "filter-subscriptions.json")
+	subscriptions, err := filter.LoadSubscriptionStore(subscriptionPath, seeds)
+	if err != nil {
+		logger.Fatal("Failed to load filter subscriptions: %v", err)
+	}
+	eng.ReplaceURLSources(subscriptions.List())
 	eng.StartUpdateLoop(ctx, cfg.FilterUpdateInterval)
 	srv.SetFilter(eng)
-	return eng
+	srv.SetSubscriptionStore(subscriptions)
+	return eng, subscriptions
 }
 
 // parseTemplates parses the embedded HTML templates, exiting fatally on error.

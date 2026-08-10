@@ -132,7 +132,7 @@ DoH uses the dashboard HTTP listener and is available at `DOH_PATH` when enabled
 
 DoT listens directly on `DOT_PORT`. Enabling it requires readable PEM files in `TLS_CERT_FILE` and `TLS_KEY_FILE`; startup fails before binding DNS if the keypair cannot be loaded.
 
-The dashboard’s **DNS Control Plane** provides filter pause/status, rewrite and client policy management, the blocked-services catalog, query-log block/unblock actions, and in-process cache clearing.
+The dashboard at `/` is dedicated to live telemetry and query-log actions. The authenticated `/config` control plane manages upstream resolvers, URL blocklists/allowlists, custom filter rules, rewrites, client policies, the blocked-services catalog, and in-process cache clearing. Listener, credential, TLS-key, database-path, and other restart-bound bootstrap settings are shown separately and remain environment-owned.
 
 ### Performance Optimization
 
@@ -179,6 +179,8 @@ For a slave node to report logs to the master, set:
 `MODE=slave`
 `MASTER_URL=http://100.x.y.z:35353` (Tailscale IP of your master node)
 `INGEST_SECRET=your-secret-token` (Must match Master's secret)
+
+Configuration changes are accepted only by the master. Resolver nodes expose `/config` as read-only and periodically pull a content-addressed revision containing upstreams, domain routes, filter subscriptions, custom rules, rewrites, and client policies. The last applied revision is included in node heartbeats so configuration drift is visible from the master.
 
 ### Client Aliases
 Map client IP addresses to friendly names in the dashboard:

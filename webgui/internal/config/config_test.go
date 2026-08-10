@@ -130,6 +130,9 @@ func TestNormalizeBaseURL(t *testing.T) {
 		{name: "slash backslash", value: `/\evil.example`, want: DefaultBaseURL},
 		{name: "escaped protocol relative", value: "/%2f%2fevil.example", want: DefaultBaseURL},
 		{name: "escaped backslash", value: "/%5cevil.example", want: DefaultBaseURL},
+		{name: "escaped query", value: "/dns%3Fnext=evil.example", want: DefaultBaseURL},
+		{name: "escaped fragment", value: "/dns%23fragment", want: DefaultBaseURL},
+		{name: "escaped control", value: "/dns%0A", want: DefaultBaseURL},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

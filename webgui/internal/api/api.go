@@ -435,16 +435,20 @@ func (s *Server) isHTTPS(r *http.Request) bool {
 	if !s.isTrustedProxy(r) {
 		return false
 	}
-	forwardedEntries := strings.Split(r.Header.Get("Forwarded"), ",")
+	forwardedEntries := strings.Split(strings.Join(r.Header.Values("Forwarded"), ","), ",")
 	for i := len(forwardedEntries) - 1; i >= 0; i-- {
+		if strings.TrimSpace(forwardedEntries[i]) == "" {
+			continue
+		}
 		for _, parameter := range strings.Split(forwardedEntries[i], ";") {
 			key, value, ok := strings.Cut(strings.TrimSpace(parameter), "=")
 			if ok && strings.EqualFold(key, "proto") {
 				return strings.EqualFold(strings.Trim(value, `"`), "https")
 			}
 		}
+		break
 	}
-	protos := strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")
+	protos := strings.Split(strings.Join(r.Header.Values("X-Forwarded-Proto"), ","), ",")
 	for i := len(protos) - 1; i >= 0; i-- {
 		if proto := strings.TrimSpace(protos[i]); proto != "" {
 			return strings.EqualFold(proto, "https")

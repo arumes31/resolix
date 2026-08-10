@@ -86,6 +86,26 @@ func TestForwardedHeadersRequireTrustedProxy(t *testing.T) {
 	if !s.isHTTPS(r) {
 		t.Fatal("HTTPS proto from the trusted proxy hop was ignored")
 	}
+
+	r.Header.Del("X-Forwarded-Proto")
+	r.Header.Add("X-Forwarded-Proto", "https")
+	r.Header.Add("X-Forwarded-Proto", "http")
+	if s.isHTTPS(r) {
+		t.Fatal("client-supplied repeated HTTPS header was accepted before the proxy HTTP header")
+	}
+
+	r.Header.Del("X-Forwarded-Proto")
+	r.Header.Add("Forwarded", "for=203.0.113.9;proto=https")
+	r.Header.Add("Forwarded", "for=10.1.2.3;proto=http")
+	if s.isHTTPS(r) {
+		t.Fatal("client-supplied repeated Forwarded proto was accepted before the proxy HTTP entry")
+	}
+	r.Header.Del("Forwarded")
+	r.Header.Add("Forwarded", "for=203.0.113.9;proto=https")
+	r.Header.Add("Forwarded", "for=10.1.2.3")
+	if s.isHTTPS(r) {
+		t.Fatal("proto from an earlier Forwarded entry was accepted when the proxy entry omitted proto")
+	}
 }
 
 func TestStandardForwardedHeaderRequiresTrustedProxy(t *testing.T) {

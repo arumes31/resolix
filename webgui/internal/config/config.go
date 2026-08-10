@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 const (
@@ -669,7 +670,8 @@ func normalizeBaseURL() string {
 		return DefaultBaseURL
 	}
 	decodedPath, err := url.PathUnescape(parsed.EscapedPath())
-	if err != nil || strings.HasPrefix(decodedPath, "//") || strings.Contains(decodedPath, "\\") {
+	if err != nil || strings.HasPrefix(decodedPath, "//") || strings.ContainsAny(decodedPath, "\\?#") ||
+		strings.IndexFunc(decodedPath, unicode.IsControl) >= 0 {
 		log.Printf("[WARN] Invalid BASE_URL '%s', falling back to %s", sanitizeForLog(raw), DefaultBaseURL) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
 		return DefaultBaseURL
 	}

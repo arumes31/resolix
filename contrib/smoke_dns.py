@@ -41,10 +41,10 @@ def exchange(args: argparse.Namespace, wire: bytes) -> bytes:
             raise RuntimeError(f"DoH returned HTTP {response.status}: {body!r}")
         return body
 
+    if args.protocol == "dot" and not args.ca_file:
+        raise RuntimeError("DoT requires --ca-file")
     raw = socket.create_connection((args.host, args.port), timeout=5)
     if args.protocol == "dot":
-        if not args.ca_file:
-            raise RuntimeError("DoT requires --ca-file")
         context = ssl.create_default_context(cafile=args.ca_file)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         raw = context.wrap_socket(raw, server_hostname="localhost")

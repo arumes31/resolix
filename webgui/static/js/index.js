@@ -42,6 +42,27 @@ function apiPath(path) {
     return apiBase + path;
 }
 
+const inFlightRequests = new Map();
+const renderedHTML = new WeakMap();
+
+function coalesceRequest(key, task) {
+    const existing = inFlightRequests.get(key);
+    if (existing) return existing;
+
+    const request = Promise.resolve().then(task).finally(() => {
+        if (inFlightRequests.get(key) === request) inFlightRequests.delete(key);
+    });
+    inFlightRequests.set(key, request);
+    return request;
+}
+
+function replaceHTMLIfChanged(element, html) {
+    if (renderedHTML.get(element) === html) return false;
+    element.innerHTML = html;
+    renderedHTML.set(element, html);
+    return true;
+}
+
 let allEvents = [];
 let rpmHistory = Array(20).fill(0);
 let lastEventTimestamp = 0;
@@ -58,6 +79,7 @@ let frozenEvents = [];
 let lastModalFocus = null;
 let streamConnected = false;
 let pollingHealthy = true;
+const loadedSettings = new Set();
 
 function renderSystemStatus() {
     const status = document.getElementById('systemStatus');
@@ -148,7 +170,7 @@ function createRowHtml(e) {
     const actionLabel = action === 'unblock' ? 'Unblock' : 'Block';
 
     return `
-        <td class="timestamp"><div class="timestamp-primary">${escapeHtml(timeStr)}</div><div class="timestamp-relative">${escapeHtml(relTime)}</div></td>
+        <td class="timestamp" data-unix-time="${escapeHtml(e.unix_time)}"><div class="timestamp-primary">${escapeHtml(timeStr)}</div><div class="timestamp-relative">${escapeHtml(relTime)}</div></td>
         <td><span class="badge node-badge">${escapeHtml(e.node || 'local')}</span></td>
         <td><span class="badge badge-type">${escapeHtml(e.type)}</span></td>
         <td class="domain cell-with-copy">${escapeHtml(e.domain)}<button type="button" class="test-domain-btn" title="Test in simulator" aria-label="Test ${escapeHtml(e.domain)} in simulator" data-domain="${escapeHtml(e.domain)}"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></button></td>
@@ -183,11 +205,12 @@ function updateRowInDom(e) {
 }
 
 async function fetchAll() {
-    await Promise.all([fetchEvents(), fetchStats(), fetchNodeStatus()]);
+    await Promise.allSettled([fetchEvents(), fetchStats(), fetchNodeStatus()]);
 }
 
-async function fetchEvents() {
-    try {
+function fetchEvents() {
+    return coalesceRequest('events', async () => {
+        try {
         const cursorQuery = lastEventID ? `?cursor=${encodeURIComponent(lastEventID)}&limit=1000` : '?limit=1000';
         const response = await fetch(apiPath('/api/events' + cursorQuery));
         if (!response.ok) throw new Error(`Events API failed (${response.status})`);
@@ -197,7 +220,7 @@ async function fetchEvents() {
 
         if (newEvents.length > 0) {
             if (allEvents.length === 0) {
-                allEvents = newEvents.slice(0, 1000);
+                allEvents = newEvents.slice(0, 1000).reverse();
             } else {
                 newEvents.forEach(event => mergeEvent(event, false));
             }
@@ -208,11 +231,13 @@ async function fetchEvents() {
     } catch (e) {
         console.error(e);
         setPollingStatus(false);
-    }
+        }
+    });
 }
 
-async function fetchStats() {
-    try {
+function fetchStats() {
+    return coalesceRequest('stats', async () => {
+        try {
         const response = await fetch(apiPath('/api/stats'));
         if (!response.ok) throw new Error(`Stats API failed (${response.status})`);
         const stats = await response.json();
@@ -229,7 +254,7 @@ async function fetchStats() {
         // Update health list with sparklines (Per Node)
         const healthEl = document.getElementById('upstreamHealth');
         if (stats.node_health) {
-            healthEl.innerHTML = Object.entries(stats.node_health).map(([node, upstreams]) => {
+            const healthHTML = Object.entries(stats.node_health).map(([node, upstreams]) => {
                 const nodeHtml = Object.entries(upstreams).map(([ip, lat]) => {
                     const hist = (stats.node_health_hist && stats.node_health_hist[node]) ? stats.node_health_hist[node][ip] || [] : [];
                     const maxLat = Math.max(...hist.filter(l => l > 0), 1);
@@ -256,7 +281,7 @@ async function fetchStats() {
                     </li>
                 `;
             }).join('');
-            applyDynamicStyles(healthEl);
+            if (replaceHTMLIfChanged(healthEl, healthHTML)) applyDynamicStyles(healthEl);
         }
 
         // Update type breakdown bars
@@ -264,10 +289,10 @@ async function fetchStats() {
         if (stats.type_counts) {
             const total = Object.values(stats.type_counts).reduce((a, b) => a + b, 0);
             if (total === 0) {
-                typeEl.innerHTML = '<div class="empty-small">No data</div>';
+                replaceHTMLIfChanged(typeEl, '<div class="empty-small">No data</div>');
             } else {
                 const sortedTypes = Object.entries(stats.type_counts).sort((a, b) => b[1] - a[1]).slice(0, 5);
-                typeEl.innerHTML = sortedTypes.map(([type, count]) => {
+                const typeHTML = sortedTypes.map(([type, count]) => {
                     const pct = (count / total) * 100;
                     return `
                         <div class="type-item">
@@ -281,7 +306,7 @@ async function fetchStats() {
                         </div>
                     `;
                 }).join('');
-                applyDynamicStyles(typeEl);
+                if (replaceHTMLIfChanged(typeEl, typeHTML)) applyDynamicStyles(typeEl);
             }
         }
 
@@ -290,33 +315,37 @@ async function fetchStats() {
         if (stats.heatmap) {
             const sortedHours = Object.entries(stats.heatmap).sort();
             const maxCount = Math.max(...sortedHours.map(h => h[1]), 1);
-            heatmapEl.innerHTML = sortedHours.map(([hour, count]) => {
+            const heatmapHTML = sortedHours.map(([hour, count]) => {
                 const level = count === 0 ? 0 : Math.max(1, Math.ceil((count / maxCount) * 10));
                 return `<div class="heatmap-box heatmap-level-${level}" title="${escapeHtml(hour)}: ${count} queries">${escapeHtml(hour.split(':')[0])}</div>`;
             }).join('');
+            replaceHTMLIfChanged(heatmapEl, heatmapHTML);
         }
 
         // Update node list
         const nodeStats = document.getElementById('nodeStats');
         if (stats.nodes) {
-            nodeStats.innerHTML = Object.entries(stats.nodes).map(([name, s]) => `
+            const nodeHTML = Object.entries(stats.nodes).map(([name, s]) => `
                 <li class="top-item">
                     <span>${escapeHtml(name)}</span>
                     <span><span class="top-count">${formatNumber(s.rpm)}</span> <span class="top-count node-rph">${formatNumber(s.rph)}</span></span>
                 </li>
             `).join('');
+            replaceHTMLIfChanged(nodeStats, nodeHTML);
         } else {
-            nodeStats.innerHTML = '';
+            replaceHTMLIfChanged(nodeStats, '');
         }
 
         // Update chart locally
         rpmHistory.push(stats.rpm);
         rpmHistory.shift();
         renderMiniChart();
-    } catch (e) { console.error(e); }
+        } catch (e) { console.error(e); }
+    });
 }
-async function fetchNodeStatus() {
-    try {
+function fetchNodeStatus() {
+    return coalesceRequest('nodes', async () => {
+        try {
         const response = await fetch(apiPath('/api/nodes'));
         if (!response.ok) return;
         const data = await response.json();
@@ -324,10 +353,10 @@ async function fetchNodeStatus() {
         const container = document.getElementById('nodeCards');
         if (!container) return;
         if (!nodes || nodes.length === 0) {
-            container.innerHTML = '<p class="empty-state">No slave nodes connected</p>';
+            replaceHTMLIfChanged(container, '<p class="empty-state">No slave nodes connected</p>');
             return;
         }
-        container.innerHTML = nodes.map(node => {
+        const nodeCardsHTML = nodes.map(node => {
             const statusClass = node.online ? 'online' : 'offline';
             const statusText = node.online ? 'Online' : 'Offline';
             const lastSeen = node.last_seen ? getRelativeTime(new Date(node.last_seen).getTime() / 1000) : 'Never';
@@ -353,9 +382,11 @@ async function fetchNodeStatus() {
                 (node.version ? '<div class="node-version">' + escapeHtml(node.version) + '</div>' : '') +
                 '</div>';
         }).join('');
-    } catch (e) {
+        replaceHTMLIfChanged(container, nodeCardsHTML);
+        } catch (e) {
         // Silently fail - node status is non-critical
-    }
+        }
+    });
 }
 
 
@@ -428,9 +459,17 @@ function renderEvents() {
     tableBody.innerHTML = filtered.map(e => `<tr id="row-${e.id}">${createRowHtml(e)}</tr>`).join('');
 }
 
+function refreshEventTimes() {
+    document.querySelectorAll('#eventTable .timestamp[data-unix-time]').forEach(cell => {
+        const relative = cell.querySelector('.timestamp-relative');
+        const unixTime = Number(cell.dataset.unixTime);
+        if (relative && Number.isFinite(unixTime)) relative.textContent = getRelativeTime(unixTime);
+    });
+}
+
 function renderTopList(id, list) {
     const el = document.getElementById(id);
-    el.innerHTML = list.map(item => {
+    const html = (list || []).map(item => {
         let trendIcon = '';
         if (item.trend === 'up') trendIcon = '<span class="trend-up">↑</span>';
         if (item.trend === 'down') trendIcon = '<span class="trend-down">↓</span>';
@@ -447,6 +486,7 @@ function renderTopList(id, list) {
             </li>
         `;
     }).join('');
+    replaceHTMLIfChanged(el, html);
 }
 
 function updateMainStats() {
@@ -749,10 +789,24 @@ async function loadServices() {
     setClientPolicyState();
 }
 
-async function loadSettings() {
-    const results = await Promise.allSettled([loadFilterSettings(), loadRewrites(), loadServices(), loadClients()]);
-    const failed = results.find(result => result.status === 'rejected');
-    if (failed) throw new Error(`Some settings could not be loaded: ${failed.reason.message}`);
+function activeSettingsPanel() {
+    return document.querySelector('.settings-tab.active')?.dataset.settingsTab || 'filters';
+}
+
+async function loadSettings(panelName = activeSettingsPanel()) {
+    const loaders = {
+        filters: loadFilterSettings,
+        rewrites: loadRewrites,
+        clients: async () => {
+            if (!loadedSettings.has('services')) await loadSettings('services');
+            await loadClients();
+        },
+        services: loadServices
+    };
+    const loader = loaders[panelName];
+    if (!loader) return;
+    await coalesceRequest(`settings:${panelName}`, loader);
+    loadedSettings.add(panelName);
 }
 
 async function clearDNSCache() {
@@ -836,6 +890,13 @@ document.querySelectorAll('.settings-tab').forEach(tab => {
             panel.classList.toggle('active', active);
             panel.hidden = !active;
         });
+        document.querySelector('.dns-console').scrollIntoView({
+            behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
+            block: 'start'
+        });
+        if (!loadedSettings.has(tab.dataset.settingsTab)) {
+            loadSettings(tab.dataset.settingsTab).catch(error => showSettingsNotice(error.message, true));
+        }
     });
 });
 
@@ -867,9 +928,9 @@ function updateVisibility() {
     if (statsInterval) clearInterval(statsInterval);
     if (nodeStatusInterval) clearInterval(nodeStatusInterval);
 
-    const rate = isTabVisible ? 5000 : 60000;
-    statsInterval = setInterval(fetchStats, rate);
-    nodeStatusInterval = setInterval(fetchNodeStatus, 30000);
+    const rate = isTabVisible ? 10000 : 60000;
+    statsInterval = setInterval(() => { void fetchStats(); }, rate);
+    nodeStatusInterval = setInterval(() => { void fetchNodeStatus(); }, 30000);
 
     if (isTabVisible) {
         fetchAll(); // Catch up immediately
@@ -912,9 +973,9 @@ document.addEventListener('click', function (e) {
 
 rewriteValueState();
 resetClientForm();
+startStream();
 loadSettings().catch(error => showSettingsNotice(error.message, true));
 updateVisibility(); // Initial set
-startStream();
 setInterval(() => {
-    if (isTabVisible && !isFrozen) renderEvents();
+    if (isTabVisible && !isFrozen) refreshEventTimes();
 }, 30000);

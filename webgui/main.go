@@ -288,7 +288,11 @@ DB_PATH=dns.db
 
 # Configurable timeout values (Item 80)
 # SSE_KEEPALIVE_INTERVAL=30s
+# Maximum periodic interval; busy queues also archive at the trigger size.
 # BATCH_ARCHIVE_INTERVAL=30m
+# ARCHIVE_QUEUE_CAPACITY=100000
+# ARCHIVE_TRIGGER_SIZE=5000
+# ARCHIVE_WRITE_BATCH_SIZE=5000
 # CLEANUP_INTERVAL=1h
 # FORWARDER_RETRY_INTERVAL=5s
 # HTTP_READ_TIMEOUT=10s
@@ -429,19 +433,8 @@ func main() {
 	// Start Trend Analysis
 	store.StartStatsTrends(ctx)
 
-	// History Archiver (uses configurable BatchArchiveInterval)
-	go func() {
-		ticker := time.NewTicker(cfg.BatchArchiveInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				store.ArchiveStep(time.Now())
-			}
-		}
-	}()
+	// History Archiver (periodic plus automatic high-water draining)
+	go store.RunArchiver(ctx, cfg.BatchArchiveInterval)
 
 	// Cleanup (uses configurable CleanupPendingInterval)
 	go func() {

@@ -58,6 +58,8 @@ const (
 	sessionTokenBytes   = 32
 	sessionLifetime     = 7 * 24 * time.Hour
 	maxIngestFutureSkew = 5 * time.Minute
+	statsResponseTTL    = 5 * time.Second
+	staticAssetCaching  = "public, max-age=300"
 )
 
 var userRulesMu sync.Mutex
@@ -193,6 +195,12 @@ type Server struct {
 	dnsLoopDetected bool
 	dnsLoopMu       sync.Mutex
 	dnsLoopDetails  string
+
+	// Short-lived response cache coalesces expensive SQLite stats aggregation
+	// across dashboard clients while keeping live counters reasonably fresh.
+	statsCacheMu   sync.Mutex
+	statsCacheBody []byte
+	statsCacheAt   time.Time
 
 	// Prometheus metrics (Item 77)
 	metrics   *Metrics
@@ -936,15 +944,19 @@ func (s *Server) SetupMux() http.Handler {
 	handler := s.requestMetricsMiddleware(s.gzipMiddleware(mux))
 
 	rootMux := http.NewServeMux()
+	var staticAssets http.Handler
+	if s.staticHandler != nil {
+		staticAssets = staticCacheMiddleware(s.gzipMiddleware(s.staticHandler))
+	}
 
 	if s.cfg.BaseURL != "/" {
 		// Subpath mode: all routes are under the base URL prefix
 		base := s.cfg.BaseURL
 
-		// Static file server at <base>/static/ (no auth, no gzip for static assets)
-		if s.staticHandler != nil {
+		// Static file server at <base>/static/ (public, compressed, and cacheable).
+		if staticAssets != nil {
 			staticPrefix := base + "/static/"
-			rootMux.Handle(staticPrefix, http.StripPrefix(staticPrefix, s.staticHandler))
+			rootMux.Handle(staticPrefix, http.StripPrefix(staticPrefix, staticAssets))
 		}
 
 		// Strip the base URL prefix before passing to the app handler
@@ -960,8 +972,8 @@ func (s *Server) SetupMux() http.Handler {
 		rootMux.Handle("/", http.RedirectHandler(base+"/", http.StatusMovedPermanently))
 	} else {
 		// Default mode: no subpath prefix
-		if s.staticHandler != nil {
-			rootMux.Handle("/static/", http.StripPrefix("/static/", s.staticHandler))
+		if staticAssets != nil {
+			rootMux.Handle("/static/", http.StripPrefix("/static/", staticAssets))
 		}
 		rootMux.Handle("/", s.maxBytesMiddleware(handler))
 		rootMux.Handle("/api/stream", s.authMiddleware(http.HandlerFunc(s.handleStream)))
@@ -1204,6 +1216,24 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(&buf, "# HELP sse_subscriber_drops_total Events dropped for slow SSE subscribers\n")
 	fmt.Fprintf(&buf, "# TYPE sse_subscriber_drops_total counter\n")
 	fmt.Fprintf(&buf, "sse_subscriber_drops_total %d\n", s.subDropCnt.Load())
+	if s.store != nil {
+		archiveMetrics := s.store.ArchiveMetrics()
+		fmt.Fprintf(&buf, "# HELP sqlite_archive_pending_events Events waiting to be archived to SQLite\n")
+		fmt.Fprintf(&buf, "# TYPE sqlite_archive_pending_events gauge\n")
+		fmt.Fprintf(&buf, "sqlite_archive_pending_events %d\n", archiveMetrics.Pending)
+		fmt.Fprintf(&buf, "# HELP sqlite_archive_queue_capacity Maximum events held while waiting for SQLite\n")
+		fmt.Fprintf(&buf, "# TYPE sqlite_archive_queue_capacity gauge\n")
+		fmt.Fprintf(&buf, "sqlite_archive_queue_capacity %d\n", archiveMetrics.Capacity)
+		fmt.Fprintf(&buf, "# HELP sqlite_archive_trigger_events Pending events that trigger an archive pass\n")
+		fmt.Fprintf(&buf, "# TYPE sqlite_archive_trigger_events gauge\n")
+		fmt.Fprintf(&buf, "sqlite_archive_trigger_events %d\n", archiveMetrics.Trigger)
+		fmt.Fprintf(&buf, "# HELP sqlite_archive_write_batch_events Maximum events written per SQLite transaction\n")
+		fmt.Fprintf(&buf, "# TYPE sqlite_archive_write_batch_events gauge\n")
+		fmt.Fprintf(&buf, "sqlite_archive_write_batch_events %d\n", archiveMetrics.WriteBatch)
+		fmt.Fprintf(&buf, "# HELP sqlite_archive_dropped_events_total Events dropped after the SQLite archive queue reached its hard limit\n")
+		fmt.Fprintf(&buf, "# TYPE sqlite_archive_dropped_events_total counter\n")
+		fmt.Fprintf(&buf, "sqlite_archive_dropped_events_total %d\n", archiveMetrics.Dropped)
+	}
 
 	fmt.Fprintf(&buf, "# HELP http_requests_total HTTP requests by method and status\n")
 	fmt.Fprintf(&buf, "# TYPE http_requests_total counter\n")
@@ -1702,14 +1732,12 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		nonce = s.nonceFromCtx(r.Context())
 	}
 
-	currentEvents := s.store.GetOrderedEvents(s.cfg.ScanLimit)
 	csrfToken := ""
 	if cookie, err := r.Cookie(csrfCookieName); err == nil {
 		csrfToken = cookie.Value
 	}
 	var buf bytes.Buffer
 	if err := s.tmpl.Execute(&buf, map[string]interface{}{
-		"Events":    currentEvents,
 		"Nonce":     nonce,
 		"BaseURL":   s.cfg.BaseURL,
 		"Mode":      s.cfg.Mode,
@@ -1773,10 +1801,35 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(result)
 }
 
+func (s *Server) statsResponse() ([]byte, error) {
+	s.statsCacheMu.Lock()
+	defer s.statsCacheMu.Unlock()
+
+	now := time.Now()
+	cacheAge := now.Sub(s.statsCacheAt)
+	if len(s.statsCacheBody) > 0 && cacheAge >= 0 && cacheAge < statsResponseTTL {
+		return s.statsCacheBody, nil
+	}
+
+	body, err := json.Marshal(s.store.GetStats())
+	if err != nil {
+		return nil, fmt.Errorf("encode stats response: %w", err)
+	}
+	s.statsCacheBody = body
+	s.statsCacheAt = now
+	return body, nil
+}
+
 func (s *Server) handleStats(w http.ResponseWriter, _ *http.Request) {
-	stats := s.store.GetStats()
+	body, err := s.statsResponse()
+	if err != nil {
+		log.Printf("Stats response error: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(stats)
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(body)
 }
 
 func (s *Server) handleClientStats(w http.ResponseWriter, r *http.Request) {
@@ -2739,6 +2792,7 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) gzipMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Vary", "Accept-Encoding")
 		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 			next.ServeHTTP(w, r)
 			return
@@ -2750,13 +2804,26 @@ func (s *Server) gzipMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+func staticCacheMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", staticAssetCaching)
+		next.ServeHTTP(w, r)
+	})
+}
+
 type gzipResponseWriter struct {
 	io.Writer
 	http.ResponseWriter
 }
 
 func (w gzipResponseWriter) Write(b []byte) (int, error) {
+	w.Header().Del("Content-Length")
 	return w.Writer.Write(b)
+}
+
+func (w gzipResponseWriter) WriteHeader(statusCode int) {
+	w.Header().Del("Content-Length")
+	w.ResponseWriter.WriteHeader(statusCode)
 }
 
 // Start launches the HTTP server and listens for requests.

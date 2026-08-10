@@ -90,6 +90,12 @@ const (
 	DefaultSSEKeepaliveInterval = 30 * time.Second
 	// DefaultBatchArchiveInterval is the default interval for batch archiving to SQLite.
 	DefaultBatchArchiveInterval = 30 * time.Minute
+	// DefaultArchiveQueueCapacity is the maximum number of events waiting for SQLite.
+	DefaultArchiveQueueCapacity = 100000
+	// DefaultArchiveTriggerSize starts an archive pass before the queue is full.
+	DefaultArchiveTriggerSize = 5000
+	// DefaultArchiveWriteBatchSize bounds each SQLite transaction.
+	DefaultArchiveWriteBatchSize = 5000
 	// DefaultCleanupPendingInterval is the default interval for cleaning up stale pending queries.
 	DefaultCleanupPendingInterval = 1 * time.Hour
 	// DefaultForwarderRetryInterval is the default initial retry interval for the forwarder.
@@ -245,6 +251,12 @@ type Config struct {
 	SSEKeepaliveInterval time.Duration
 	// BatchArchiveInterval is the interval for batch archiving events to SQLite.
 	BatchArchiveInterval time.Duration
+	// ArchiveQueueCapacity bounds events waiting for SQLite persistence.
+	ArchiveQueueCapacity int
+	// ArchiveTriggerSize starts an archive pass at this many pending events.
+	ArchiveTriggerSize int
+	// ArchiveWriteBatchSize bounds the number of events in each transaction.
+	ArchiveWriteBatchSize int
 	// CleanupPendingInterval is the interval for cleaning up stale pending queries.
 	CleanupPendingInterval time.Duration
 	// ForwarderRetryInterval is the initial retry interval for the log forwarder.
@@ -485,6 +497,29 @@ func parseIntEnv(key string, defaultVal int) int {
 		return defaultVal
 	}
 	return n
+}
+
+func resolveArchiveQueueSettings() (capacity, trigger, writeBatch int) {
+	capacity = parseIntEnv("ARCHIVE_QUEUE_CAPACITY", DefaultArchiveQueueCapacity)
+	if capacity < 1 {
+		log.Printf("[WARN] ARCHIVE_QUEUE_CAPACITY must be positive; using %d", DefaultArchiveQueueCapacity)
+		capacity = DefaultArchiveQueueCapacity
+	}
+
+	trigger = parseIntEnv("ARCHIVE_TRIGGER_SIZE", DefaultArchiveTriggerSize)
+	if trigger < 1 || trigger > capacity {
+		fallback := min(DefaultArchiveTriggerSize, max(1, capacity/2))
+		log.Printf("[WARN] ARCHIVE_TRIGGER_SIZE must be between 1 and ARCHIVE_QUEUE_CAPACITY; using %d", fallback)
+		trigger = fallback
+	}
+
+	writeBatch = parseIntEnv("ARCHIVE_WRITE_BATCH_SIZE", DefaultArchiveWriteBatchSize)
+	if writeBatch < 1 || writeBatch > capacity {
+		fallback := min(DefaultArchiveWriteBatchSize, capacity)
+		log.Printf("[WARN] ARCHIVE_WRITE_BATCH_SIZE must be between 1 and ARCHIVE_QUEUE_CAPACITY; using %d", fallback)
+		writeBatch = fallback
+	}
+	return capacity, trigger, writeBatch
 }
 
 // parseUint32Env reads a non-negative 32-bit integer environment variable.
@@ -820,6 +855,7 @@ func LoadConfig() *Config {
 	// Parse configurable timeout values (Item 80)
 	sseKeepalive := parseDurationEnv("SSE_KEEPALIVE_INTERVAL", DefaultSSEKeepaliveInterval)
 	batchArchive := parseDurationEnv("BATCH_ARCHIVE_INTERVAL", DefaultBatchArchiveInterval)
+	archiveCapacity, archiveTrigger, archiveWriteBatch := resolveArchiveQueueSettings()
 	cleanupPending := parseDurationEnv("CLEANUP_INTERVAL", DefaultCleanupPendingInterval)
 	forwarderRetry := parseDurationEnv("FORWARDER_RETRY_INTERVAL", DefaultForwarderRetryInterval)
 	httpReadTimeout := parseDurationEnv("HTTP_READ_TIMEOUT", DefaultHTTPReadTimeout)
@@ -911,6 +947,9 @@ func LoadConfig() *Config {
 		UpstreamLatencyThreshold:   latencyThreshold,
 		SSEKeepaliveInterval:       sseKeepalive,
 		BatchArchiveInterval:       batchArchive,
+		ArchiveQueueCapacity:       archiveCapacity,
+		ArchiveTriggerSize:         archiveTrigger,
+		ArchiveWriteBatchSize:      archiveWriteBatch,
 		CleanupPendingInterval:     cleanupPending,
 		ForwarderRetryInterval:     forwarderRetry,
 		HTTPReadTimeout:            httpReadTimeout,

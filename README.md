@@ -119,7 +119,10 @@ docker-compose -f docker-compose.example.yaml up -d
 | `TLS_KEY_FILE` | PEM private key used by the DoT listener | - |
 | `TRUSTED_PROXIES` | Comma-separated proxy IPs/CIDRs whose `X-Forwarded-*` headers are honored | - |
 | `COOKIE_SECURE` | Force the `Secure` attribute on session/CSRF cookies (`true`/`false`) | `false` |
-| `BATCH_ARCHIVE_INTERVAL` | SQLite batch archive interval | `30m` |
+| `BATCH_ARCHIVE_INTERVAL` | Maximum SQLite archive interval; a full trigger also starts a pass | `30m` |
+| `ARCHIVE_QUEUE_CAPACITY` | Maximum events retained while waiting for SQLite | `100000` |
+| `ARCHIVE_TRIGGER_SIZE` | Pending events that wake the asynchronous archiver | `5000` |
+| `ARCHIVE_WRITE_BATCH_SIZE` | Maximum events written per SQLite transaction | `5000` |
 
 > **Note on cookies and reverse proxies**: Session cookies are marked `Secure` automatically when the request arrives over HTTPS. When running behind a TLS-terminating reverse proxy, either list the proxy in `TRUSTED_PROXIES` (so `X-Forwarded-Proto` is honored) or set `COOKIE_SECURE=true` — otherwise browsers will refuse the non-Secure cookie over HTTPS and login will fail.
 
@@ -278,7 +281,7 @@ Each code-changing push to `main` creates the next patch tag and GitHub release;
 1. **Tailscale Connection**: The container joins your Tailnet and gets a unique IP.
 2. **DNS Logic**: An embedded Go DNS server (miekg/dns) listens on the Tailscale IP port 53 — dnsmasq is no longer used. The pipeline is: refuse-ANY/AAAA-disable → typed rewrites → private PTR → safe search → filter → blocked services → cache → client upstreams → domain route → global upstream pool → bogus-NXDOMAIN → cache store → response. The upstream pool supports UDP/TCP/DoT/DoH and defaults to `load_balance`; `parallel` and `strict` are opt-in modes.
 3. **In-Process Events**: Every answered query becomes a structured event fed directly into the Web GUI's RAM buffer and SSE stream (no log pipe).
-4. **Persistent Storage**: Events are batched and persisted to local SQLite on `BATCH_ARCHIVE_INTERVAL` (30 minutes by default); failed transactions remain queued for retry.
+4. **Persistent Storage**: Events are queued in memory and persisted to local SQLite at `ARCHIVE_TRIGGER_SIZE` or on `BATCH_ARCHIVE_INTERVAL`. The archiver continuously drains bounded `ARCHIVE_WRITE_BATCH_SIZE` transactions until caught up. Failed transactions remain queued and retry with bounded backoff; queue pressure, limits, and dropped counts are exported through `/metrics`.
 
 ---
 

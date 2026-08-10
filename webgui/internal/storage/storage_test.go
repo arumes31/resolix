@@ -4,6 +4,7 @@
 package storage
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -93,11 +94,9 @@ func TestArchiveStepRetainsBatchOnDatabaseFailure(t *testing.T) {
 	if archived := s.ArchiveStep(time.Now()); archived != 0 {
 		t.Fatalf("archived = %d, want 0", archived)
 	}
-	s.batchMu.Lock()
-	pending := len(s.batch)
-	s.batchMu.Unlock()
-	if pending != 1 {
-		t.Fatalf("pending batch = %d, want 1", pending)
+	metrics := s.ArchiveMetrics()
+	if metrics.Pending != 1 {
+		t.Fatalf("pending batch = %d, want 1", metrics.Pending)
 	}
 }
 
@@ -316,6 +315,34 @@ func TestArchiveStep(t *testing.T) {
 	}
 }
 
+func TestArchiveStepDrainsMultipleWriteBatches(t *testing.T) {
+	s, cleanup := newTestStore(t)
+	defer cleanup()
+	s.archiveBatch = 2
+
+	now := time.Now().Unix()
+	for i := range 5 {
+		s.AddEvent(models.QueryEvent{
+			UnixTime: now + int64(i),
+			Domain:   fmt.Sprintf("chunk-%d.test", i),
+			Type:     "A",
+		})
+	}
+	if archived := s.ArchiveStep(time.Now()); archived != 5 {
+		t.Fatalf("archived = %d, want 5", archived)
+	}
+	if metrics := s.ArchiveMetrics(); metrics.Pending != 0 {
+		t.Fatalf("pending after multi-batch drain = %d, want 0", metrics.Pending)
+	}
+	var total int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM queries").Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if total != 5 {
+		t.Fatalf("archived rows = %d, want 5", total)
+	}
+}
+
 func TestArchiveStep_EmptyBatch(t *testing.T) {
 	s, cleanup := newTestStore(t)
 	defer cleanup()
@@ -400,6 +427,40 @@ func TestGetStats_EmptyStore(t *testing.T) {
 	}
 }
 
+func BenchmarkGetStatsWithArchivedEvents(b *testing.B) {
+	cfg := &config.Config{
+		MaxEvents:                10000,
+		HistoryDir:               b.TempDir(),
+		DBPath:                   "benchmark.db",
+		HistoryRetention:         72 * time.Hour,
+		UpstreamLatencyThreshold: 200,
+		ArchiveQueueCapacity:     10000,
+		ArchiveTriggerSize:       5000,
+		ArchiveWriteBatchSize:    5000,
+	}
+	s := NewStore(cfg)
+	s.Init()
+	b.Cleanup(s.Close)
+	now := time.Now().Unix()
+	for i := range 10000 {
+		s.AddEvent(models.QueryEvent{
+			UnixTime: now - int64(i%86400),
+			Domain:   fmt.Sprintf("domain-%d.example", i%100),
+			Type:     "A",
+			ClientIP: fmt.Sprintf("100.64.0.%d", i%100),
+			Upstream: "1.1.1.1",
+		})
+	}
+	for s.ArchiveStep(time.Now()) > 0 {
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		_ = s.GetStats()
+	}
+}
+
 func TestGetRecentEvents(t *testing.T) {
 	s, cleanup := newTestStore(t)
 	defer cleanup()
@@ -420,21 +481,219 @@ func TestGetRecentEvents(t *testing.T) {
 }
 
 func TestArchiveBatchDropsOldestWhenBounded(t *testing.T) {
-	cfg := &config.Config{MaxEvents: 10}
+	const capacity = 8
+	cfg := &config.Config{
+		MaxEvents:             10,
+		ArchiveQueueCapacity:  capacity,
+		ArchiveTriggerSize:    4,
+		ArchiveWriteBatchSize: 4,
+	}
 	s := NewStore(cfg)
-	for i := 0; i <= maxArchiveBatchSize; i++ {
+	for i := range 3 * capacity {
 		s.AddEvent(models.QueryEvent{UnixTime: int64(i + 1), Domain: fmt.Sprintf("event-%d.test", i)})
 	}
 	s.batchMu.Lock()
 	defer s.batchMu.Unlock()
-	if len(s.batch) != maxArchiveBatchSize {
-		t.Fatalf("batch length = %d, want %d", len(s.batch), maxArchiveBatchSize)
+	if got := s.pendingBatchLenLocked(); got != capacity {
+		t.Fatalf("batch length = %d, want %d", got, capacity)
 	}
-	if s.batch[0].Domain != "event-1.test" {
-		t.Fatalf("oldest retained event = %q, want event-1.test", s.batch[0].Domain)
+	if oldest := s.pendingBatchLocked()[0].Domain; oldest != "event-16.test" {
+		t.Fatalf("oldest retained event = %q, want event-16.test", oldest)
 	}
-	if got := s.batchDropped.Load(); got != 1 {
-		t.Fatalf("dropped count = %d, want 1", got)
+	if got := s.batchDropped.Load(); got != 2*capacity {
+		t.Fatalf("dropped count = %d, want %d", got, 2*capacity)
+	}
+	if len(s.batch) > capacity+capacity/4 {
+		t.Fatalf("backing queue grew to %d entries for capacity %d", len(s.batch), capacity)
+	}
+}
+
+func TestArchiveStepPersistsRetainedQueueAfterOverflow(t *testing.T) {
+	const capacity = 8
+	cfg := &config.Config{
+		MaxEvents:                10,
+		HistoryDir:               t.TempDir(),
+		DBPath:                   "overflow.db",
+		HistoryRetention:         72 * time.Hour,
+		UpstreamLatencyThreshold: 200,
+		ArchiveQueueCapacity:     capacity,
+		ArchiveTriggerSize:       4,
+		ArchiveWriteBatchSize:    3,
+	}
+	s := NewStore(cfg)
+	s.Init()
+	defer s.Close()
+
+	now := time.Now().Unix()
+	for i := range capacity + 4 {
+		s.AddEvent(models.QueryEvent{
+			UnixTime: now + int64(i),
+			Domain:   fmt.Sprintf("overflow-%d.test", i),
+			Type:     "A",
+		})
+	}
+	if archived := s.ArchiveStep(time.Now()); archived != capacity {
+		t.Fatalf("archived = %d, want %d", archived, capacity)
+	}
+	metrics := s.ArchiveMetrics()
+	if metrics.Pending != 0 || metrics.Dropped != 4 {
+		t.Fatalf("archive metrics = pending %d, dropped %d; want 0/4", metrics.Pending, metrics.Dropped)
+	}
+
+	var count int
+	var oldest int64
+	if err := s.db.QueryRow("SELECT COUNT(*), MIN(unix_time) FROM queries").Scan(&count, &oldest); err != nil {
+		t.Fatal(err)
+	}
+	if count != capacity || oldest != now+4 {
+		t.Fatalf("persisted rows/oldest = %d/%d, want %d/%d", count, oldest, capacity, now+4)
+	}
+}
+
+func TestArchiveBatchSignalsAtHighWaterMark(t *testing.T) {
+	cfg := &config.Config{
+		MaxEvents:             10,
+		ArchiveQueueCapacity:  10,
+		ArchiveTriggerSize:    3,
+		ArchiveWriteBatchSize: 3,
+	}
+	s := NewStore(cfg)
+
+	s.AddEvent(models.QueryEvent{UnixTime: 1, Domain: "event-1.test"})
+	s.AddEvent(models.QueryEvent{UnixTime: 2, Domain: "event-2.test"})
+	select {
+	case <-s.archiveReady:
+		t.Fatal("archive signaled before the high-water mark")
+	default:
+	}
+
+	s.AddEvent(models.QueryEvent{UnixTime: 3, Domain: "event-3.test"})
+	select {
+	case <-s.archiveReady:
+	default:
+		t.Fatal("archive was not signaled at the high-water mark")
+	}
+}
+
+func TestRunArchiverDrainsHighWaterBatch(t *testing.T) {
+	s, cleanup := newTestStore(t)
+	defer cleanup()
+	s.archiveMark = 3
+	s.archiveBatch = 2
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.RunArchiver(ctx, time.Hour)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	now := time.Now().Unix()
+	for i := range 3 {
+		s.AddEvent(models.QueryEvent{
+			UnixTime: now + int64(i),
+			Domain:   fmt.Sprintf("event-%d.test", i+1),
+			Type:     "A",
+		})
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		metrics := s.ArchiveMetrics()
+		if metrics.Pending == 0 {
+			if metrics.Dropped != 0 {
+				t.Fatalf("dropped events = %d, want 0", metrics.Dropped)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("archive queue did not drain; %d events remain", metrics.Pending)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	var total int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM queries").Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if total != 3 {
+		t.Fatalf("archived rows = %d, want 3", total)
+	}
+}
+
+func TestRunArchiverConcurrentProducers(t *testing.T) {
+	const (
+		workers         = 10
+		eventsPerWorker = 500
+		wantEvents      = workers * eventsPerWorker
+	)
+	cfg := &config.Config{
+		MaxEvents:                1000,
+		HistoryDir:               t.TempDir(),
+		DBPath:                   "load.db",
+		HistoryRetention:         72 * time.Hour,
+		UpstreamLatencyThreshold: 200,
+		ArchiveQueueCapacity:     20000,
+		ArchiveTriggerSize:       100,
+		ArchiveWriteBatchSize:    250,
+	}
+	s := NewStore(cfg)
+	s.Init()
+	defer s.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.RunArchiver(ctx, time.Hour)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	now := time.Now().Unix()
+	var wg sync.WaitGroup
+	for worker := range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range eventsPerWorker {
+				s.AddEvent(models.QueryEvent{
+					UnixTime: now,
+					Domain:   fmt.Sprintf("load-%d-%d.test", worker, i),
+					Type:     "A",
+				})
+			}
+		}()
+	}
+	wg.Wait()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		metrics := s.ArchiveMetrics()
+		if metrics.Pending == 0 {
+			if metrics.Dropped != 0 {
+				t.Fatalf("dropped events = %d, want 0", metrics.Dropped)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("archive queue did not drain; %d events remain", metrics.Pending)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	var total int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM queries").Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if total != wantEvents {
+		t.Fatalf("archived rows = %d, want %d", total, wantEvents)
 	}
 }
 

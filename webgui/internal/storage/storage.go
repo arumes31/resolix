@@ -16,7 +16,11 @@ import (
 	"tailscale-dnsrewrite/webgui/internal/models"
 )
 
-const maxArchiveBatchSize = 10000
+const (
+	archiveRetryInitialDelay = time.Second
+	archiveRetryMaxDelay     = time.Minute
+	archiveDropLogInterval   = time.Minute
+)
 
 // Store manages the in-memory ring buffer of events and SQLite disk persistence.
 type Store struct {
@@ -37,8 +41,17 @@ type Store struct {
 	// Database Batching
 	batchMu      sync.Mutex
 	batch        []models.QueryEvent
+	batchStart   int
 	batchDropped atomic.Int64
 	archiveMu    sync.Mutex
+	archiveReady chan struct{}
+	archiveMark  int
+	archiveLimit int
+	archiveBatch int
+
+	// Protected by batchMu.
+	batchDropLogAt      time.Time
+	batchDropUnreported int64
 
 	statsMu sync.RWMutex
 
@@ -90,8 +103,34 @@ type pendingInfo struct {
 	upstream  string
 }
 
+// ArchiveQueueMetrics describes current SQLite archive queue pressure and limits.
+type ArchiveQueueMetrics struct {
+	Pending    int
+	Dropped    int64
+	Capacity   int
+	Trigger    int
+	WriteBatch int
+}
+
+func archiveLimits(cfg *config.Config) (capacity, trigger, writeBatch int) {
+	capacity = cfg.ArchiveQueueCapacity
+	if capacity < 1 {
+		capacity = config.DefaultArchiveQueueCapacity
+	}
+	trigger = cfg.ArchiveTriggerSize
+	if trigger < 1 || trigger > capacity {
+		trigger = min(config.DefaultArchiveTriggerSize, max(1, capacity/2))
+	}
+	writeBatch = cfg.ArchiveWriteBatchSize
+	if writeBatch < 1 || writeBatch > capacity {
+		writeBatch = min(config.DefaultArchiveWriteBatchSize, capacity)
+	}
+	return capacity, trigger, writeBatch
+}
+
 // NewStore initializes a new Store with the provided configuration.
 func NewStore(cfg *config.Config) *Store {
+	archiveCapacity, archiveTrigger, archiveWriteBatch := archiveLimits(cfg)
 	return &Store{
 		cfg:                       cfg,
 		events:                    make([]models.QueryEvent, cfg.MaxEvents),
@@ -110,10 +149,32 @@ func NewStore(cfg *config.Config) *Store {
 		clientRPHBuckets:          make(map[string]*[60]int),
 		clientRPHTimes:            make(map[string]*[60]int64),
 		clientLastSeen:            make(map[string]int64),
-		batch:                     make([]models.QueryEvent, 0, 1000),
+		batch:                     make([]models.QueryEvent, 0, min(1000, archiveCapacity)),
+		archiveReady:              make(chan struct{}, 1),
+		archiveMark:               archiveTrigger,
+		archiveLimit:              archiveCapacity,
+		archiveBatch:              archiveWriteBatch,
 		vacuumInterval:            24 * time.Hour,
 		checkpointInterval:        5 * time.Minute,
 	}
+}
+
+func (s *Store) pendingBatchLenLocked() int {
+	return len(s.batch) - s.batchStart
+}
+
+func (s *Store) pendingBatchLocked() []models.QueryEvent {
+	return s.batch[s.batchStart:]
+}
+
+func (s *Store) compactBatchLocked() {
+	if s.batchStart == 0 {
+		return
+	}
+	pending := copy(s.batch, s.batch[s.batchStart:])
+	clear(s.batch[pending:])
+	s.batch = s.batch[:pending]
+	s.batchStart = 0
 }
 
 // DB returns the underlying database connection for testing purposes.
@@ -316,19 +377,36 @@ func (s *Store) AddEvent(e models.QueryEvent) {
 	}
 	s.eventsMu.Unlock()
 
-	// Add to SQLite batch
+	// Add to SQLite batch. Crossing the high-water mark wakes the asynchronous
+	// archiver so normal traffic does not have to wait for the periodic timer.
+	var droppedSinceWarning, droppedTotal int64
 	s.batchMu.Lock()
-	if len(s.batch) >= maxArchiveBatchSize {
-		dropCount := len(s.batch) - maxArchiveBatchSize + 1
-		kept := append([]models.QueryEvent(nil), s.batch[dropCount:]...)
-		s.batch = kept
-		s.batch = append(s.batch, e)
-		total := s.batchDropped.Add(int64(dropCount))
-		log.Printf("[WARN] SQLite archive batch full; dropped %d oldest event(s) (%d total)", dropCount, total)
-	} else {
-		s.batch = append(s.batch, e)
+	if s.pendingBatchLenLocked() >= s.archiveLimit {
+		s.batch[s.batchStart] = models.QueryEvent{}
+		s.batchStart++
+		if s.batchStart >= max(1, s.archiveLimit/4) {
+			s.compactBatchLocked()
+		}
+		droppedTotal = s.batchDropped.Add(1)
+		s.batchDropUnreported++
+		now := time.Now()
+		if s.batchDropLogAt.IsZero() || now.Sub(s.batchDropLogAt) >= archiveDropLogInterval {
+			droppedSinceWarning = s.batchDropUnreported
+			s.batchDropUnreported = 0
+			s.batchDropLogAt = now
+		}
+	}
+	s.batch = append(s.batch, e)
+	if s.pendingBatchLenLocked() >= s.archiveMark {
+		select {
+		case s.archiveReady <- struct{}{}:
+		default:
+		}
 	}
 	s.batchMu.Unlock()
+	if droppedSinceWarning > 0 {
+		log.Printf("[WARN] SQLite archive batch full; dropped %d oldest event(s) since the previous warning (%d total)", droppedSinceWarning, droppedTotal)
+	}
 }
 
 // UpdateEvent searches for a matching pending event and updates its latency and upstream in memory and batch.
@@ -358,7 +436,7 @@ func (s *Store) UpdateEvent(node, domain string, latency float64, upstream strin
 
 			// Also try to update it in the pending batch if it hasn't been written to SQLite yet
 			s.batchMu.Lock()
-			for b := len(s.batch) - 1; b >= 0; b-- {
+			for b := len(s.batch) - 1; b >= s.batchStart; b-- {
 				if s.batch[b].Domain == domain && s.batch[b].Node == node && !s.batch[b].Latency.Valid {
 					s.batch[b].Latency = sql.NullFloat64{Float64: latency, Valid: true}
 					s.batch[b].Upstream = upstream
@@ -398,7 +476,7 @@ func (s *Store) SetBlocked(node, domain string) bool {
 
 			// Also update in the pending batch
 			s.batchMu.Lock()
-			for b := len(s.batch) - 1; b >= 0; b-- {
+			for b := len(s.batch) - 1; b >= s.batchStart; b-- {
 				if s.batch[b].Domain == domain && s.batch[b].Node == node {
 					if !s.batch[b].Blocked {
 						s.batch[b].Blocked = true
@@ -432,7 +510,7 @@ func (s *Store) SetClientHostname(node, clientIP, hostname string) bool {
 
 			// Also update in the pending batch
 			s.batchMu.Lock()
-			for b := len(s.batch) - 1; b >= 0; b-- {
+			for b := len(s.batch) - 1; b >= s.batchStart; b-- {
 				if s.batch[b].ClientIP == clientIP && s.batch[b].Node == node {
 					s.batch[b].ClientHostname = hostname
 					break
@@ -514,7 +592,7 @@ func (s *Store) GetEventsAfter(cursor string, since int64, limit int) []models.Q
 func (s *Store) GetStats() map[string]interface{} {
 	s.archiveMu.Lock()
 	s.batchMu.Lock()
-	pending := append([]models.QueryEvent(nil), s.batch...)
+	pending := append([]models.QueryEvent(nil), s.pendingBatchLocked()...)
 	s.batchMu.Unlock()
 	s.archiveMu.Unlock()
 	s.dbMu.RLock()
@@ -568,27 +646,20 @@ func (s *Store) GetStats() map[string]interface{} {
 	// Query SQLite for long-term aggregates
 	var totalEvents int64
 	var rpd int
+	var cacheHits, totalReplies int64
 	var queryErrors []string
 	if s.db != nil {
 		if err := s.db.QueryRow("SELECT COUNT(*) FROM queries").Scan(&totalEvents); err != nil && err != sql.ErrNoRows {
 			log.Printf("Error getting totalEvents: %v", err)
 			queryErrors = append(queryErrors, "total")
 		}
-		if err := s.db.QueryRow("SELECT COUNT(*) FROM queries WHERE unix_time >= ?", cutoff24h).Scan(&rpd); err != nil && err != sql.ErrNoRows {
-			log.Printf("Error getting rpd: %v", err)
-			queryErrors = append(queryErrors, "rpd")
-		}
-	}
-
-	var cacheHits, totalReplies int64
-	if s.db != nil {
-		if err := s.db.QueryRow("SELECT COUNT(*) FROM queries WHERE upstream = 'System Cache' AND unix_time >= ?", cutoff24h).Scan(&cacheHits); err != nil && err != sql.ErrNoRows {
-			log.Printf("Error getting cacheHits: %v", err)
-			queryErrors = append(queryErrors, "cache_hits")
-		}
-		if err := s.db.QueryRow("SELECT COUNT(*) FROM queries WHERE upstream != '' AND unix_time >= ?", cutoff24h).Scan(&totalReplies); err != nil && err != sql.ErrNoRows {
-			log.Printf("Error getting totalReplies: %v", err)
-			queryErrors = append(queryErrors, "total_replies")
+		err := s.db.QueryRow(`SELECT COUNT(*),
+			COALESCE(SUM(CASE WHEN upstream = 'System Cache' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN upstream != '' THEN 1 ELSE 0 END), 0)
+			FROM queries WHERE unix_time >= ?`, cutoff24h).Scan(&rpd, &cacheHits, &totalReplies)
+		if err != nil && err != sql.ErrNoRows {
+			log.Printf("Error getting daily aggregates: %v", err)
+			queryErrors = append(queryErrors, "rpd", "cache_hits", "total_replies")
 		}
 	}
 
@@ -623,7 +694,6 @@ func (s *Store) GetStats() map[string]interface{} {
 		if s.stmtGetTopDomains != nil {
 			rowsDomains, err := s.stmtGetTopDomains.Query(cutoff24h)
 			if err == nil {
-				defer func() { _ = rowsDomains.Close() }()
 				for rowsDomains.Next() {
 					var d string
 					var c int
@@ -634,6 +704,7 @@ func (s *Store) GetStats() map[string]interface{} {
 				if err := rowsDomains.Err(); err != nil {
 					log.Printf("Error iterating domain rows: %v", err)
 				}
+				_ = rowsDomains.Close()
 			}
 		}
 
@@ -641,7 +712,6 @@ func (s *Store) GetStats() map[string]interface{} {
 		if s.stmtGetTopClients != nil {
 			rowsClients, err := s.stmtGetTopClients.Query(cutoff24h)
 			if err == nil {
-				defer func() { _ = rowsClients.Close() }()
 				for rowsClients.Next() {
 					var ip string
 					var c int
@@ -652,6 +722,7 @@ func (s *Store) GetStats() map[string]interface{} {
 				if err := rowsClients.Err(); err != nil {
 					log.Printf("Error iterating client rows: %v", err)
 				}
+				_ = rowsClients.Close()
 			}
 		}
 
@@ -659,7 +730,6 @@ func (s *Store) GetStats() map[string]interface{} {
 		currentHour := now / 3600
 		rowsHeatmap, err := s.db.Query("SELECT unix_time / 3600 as hr, COUNT(*) FROM queries WHERE unix_time >= ? GROUP BY hr", cutoff24h)
 		if err == nil {
-			defer func() { _ = rowsHeatmap.Close() }()
 			for rowsHeatmap.Next() {
 				var hr int64
 				var c int
@@ -671,6 +741,7 @@ func (s *Store) GetStats() map[string]interface{} {
 			if err := rowsHeatmap.Err(); err != nil {
 				log.Printf("Error iterating heatmap rows: %v", err)
 			}
+			_ = rowsHeatmap.Close()
 		}
 
 		// Fill missing hours in heatmap
@@ -899,7 +970,7 @@ func (s *Store) SetDNSSEC(node, domain, result string) {
 			s.events[idx].DNSSEC = result
 			// Also update in the pending batch
 			s.batchMu.Lock()
-			for b := len(s.batch) - 1; b >= 0; b-- {
+			for b := len(s.batch) - 1; b >= s.batchStart; b-- {
 				if s.batch[b].Domain == domain && s.batch[b].Node == node {
 					s.batch[b].DNSSEC = result
 					break
@@ -911,91 +982,186 @@ func (s *Store) SetDNSSEC(node, domain, result string) {
 	}
 }
 
+// RunArchiver persists queued events when the queue reaches its high-water mark
+// or the periodic interval expires. Failed writes retry with bounded backoff.
+func (s *Store) RunArchiver(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = config.DefaultArchiveInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		case <-s.archiveReady:
+		}
+
+		retryDelay := archiveRetryInitialDelay
+		for {
+			_, err := s.archiveStep(ctx, time.Now())
+			if err == nil {
+				break
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			metrics := s.ArchiveMetrics()
+			log.Printf("SQLite archive failed; retaining %d events and retrying in %s: %v", metrics.Pending, retryDelay, err)
+
+			retryTimer := time.NewTimer(retryDelay)
+			select {
+			case <-ctx.Done():
+				if !retryTimer.Stop() {
+					<-retryTimer.C
+				}
+				return
+			case <-retryTimer.C:
+			}
+			retryDelay = min(retryDelay*2, archiveRetryMaxDelay)
+		}
+	}
+}
+
 // ArchiveStep performs a batch insert of recent queries into SQLite and deletes old ones.
 func (s *Store) ArchiveStep(now time.Time) int {
+	archived, err := s.archiveStep(context.Background(), now)
+	if err != nil {
+		metrics := s.ArchiveMetrics()
+		log.Printf("SQLite archive failed; retaining %d events: %v", metrics.Pending, err)
+	}
+	return archived
+}
+
+func (s *Store) archiveStep(ctx context.Context, now time.Time) (int, error) {
 	s.archiveMu.Lock()
 	defer s.archiveMu.Unlock()
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 	if s.closed || s.db == nil {
-		return 0
+		return 0, nil
 	}
 
-	s.batchMu.Lock()
-	toInsert := append([]models.QueryEvent(nil), s.batch...)
-	s.batchMu.Unlock()
-	if len(toInsert) == 0 {
-		s.pruneOldEvents(now)
-		return 0
+	archived := 0
+	for {
+		s.batchMu.Lock()
+		pending := s.pendingBatchLocked()
+		chunkSize := min(len(pending), s.archiveBatch)
+		toInsert := append([]models.QueryEvent(nil), pending[:chunkSize]...)
+		s.batchMu.Unlock()
+		if len(toInsert) == 0 {
+			break
+		}
+
+		if err := s.insertArchiveBatch(ctx, toInsert); err != nil {
+			return archived, err
+		}
+		s.removeArchivedBatch(toInsert)
+		archived += len(toInsert)
 	}
 
-	tx, err := s.db.BeginTx(context.Background(), nil)
+	s.pruneOldEvents(ctx, now)
+	s.flushArchiveDropWarning()
+	return archived, nil
+}
+
+func (s *Store) insertArchiveBatch(ctx context.Context, events []models.QueryEvent) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		log.Printf("Failed to begin SQLite transaction; retaining %d events for retry: %v", len(toInsert), err)
-		return 0
+		return fmt.Errorf("begin transaction for %d events: %w", len(events), err)
 	}
 
-	// Use cached prepared statement within the transaction via tx.Stmt()
 	var stmt *sql.Stmt
 	if s.stmtInsertQuery != nil {
 		stmt = tx.Stmt(s.stmtInsertQuery)
 	} else {
-		stmt, err = tx.Prepare("INSERT INTO queries (unix_time, node, client_ip, domain, type, upstream, latency, dnssec, response_code, client_hostname, blocked, latency_alert, matched_rule, block_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+		stmt, err = tx.PrepareContext(ctx, "INSERT INTO queries (unix_time, node, client_ip, domain, type, upstream, latency, dnssec, response_code, client_hostname, blocked, latency_alert, matched_rule, block_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
 		if err != nil {
 			_ = tx.Rollback()
-			log.Printf("Failed to prepare SQLite statement; retaining %d events for retry: %v", len(toInsert), err)
-			return 0
+			return fmt.Errorf("prepare insert for %d events: %w", len(events), err)
 		}
 	}
 	defer func() { _ = stmt.Close() }()
 
-	for _, e := range toInsert {
-		blockedInt := 0
-		if e.Blocked {
-			blockedInt = 1
+	for _, event := range events {
+		blocked := 0
+		if event.Blocked {
+			blocked = 1
 		}
-		latencyAlertInt := 0
-		if e.LatencyAlert {
-			latencyAlertInt = 1
+		latencyAlert := 0
+		if event.LatencyAlert {
+			latencyAlert = 1
 		}
-		_, err = stmt.Exec(e.UnixTime, e.Node, e.ClientIP, e.Domain, e.Type, e.Upstream, e.Latency, e.DNSSEC, e.ResponseCode, e.ClientHostname, blockedInt, latencyAlertInt, e.MatchedRule, e.BlockReason)
+		_, err = stmt.ExecContext(ctx, event.UnixTime, event.Node, event.ClientIP, event.Domain, event.Type, event.Upstream, event.Latency, event.DNSSEC, event.ResponseCode, event.ClientHostname, blocked, latencyAlert, event.MatchedRule, event.BlockReason)
 		if err != nil {
 			_ = tx.Rollback()
-			log.Printf("Failed to insert SQLite batch; retaining %d events for retry: %v", len(toInsert), err)
-			return 0
+			return fmt.Errorf("insert batch of %d events: %w", len(events), err)
 		}
 	}
-
 	if err := tx.Commit(); err != nil {
-		log.Printf("Failed to commit SQLite transaction; retaining %d events for retry: %v", len(toInsert), err)
-		return 0
+		return fmt.Errorf("commit batch of %d events: %w", len(events), err)
+	}
+	return nil
+}
+
+func (s *Store) removeArchivedBatch(events []models.QueryEvent) {
+	committed := make(map[string]struct{}, len(events))
+	for _, event := range events {
+		committed[event.ID] = struct{}{}
 	}
 
 	s.batchMu.Lock()
-	committed := make(map[string]struct{}, len(toInsert))
-	for _, event := range toInsert {
-		committed[event.ID] = struct{}{}
-	}
-	remaining := make([]models.QueryEvent, 0, len(s.batch))
-	for _, event := range s.batch {
-		if _, ok := committed[event.ID]; !ok {
-			remaining = append(remaining, event)
+	for s.batchStart < len(s.batch) {
+		if _, ok := committed[s.batch[s.batchStart].ID]; !ok {
+			break
 		}
+		s.batch[s.batchStart] = models.QueryEvent{}
+		s.batchStart++
 	}
-	s.batch = remaining
+	if s.pendingBatchLenLocked() == 0 || s.batchStart >= max(1, s.archiveLimit/4) {
+		s.compactBatchLocked()
+	}
 	s.batchMu.Unlock()
-
-	s.pruneOldEvents(now)
-	return len(toInsert)
 }
 
-func (s *Store) pruneOldEvents(now time.Time) {
+// ArchiveMetrics returns current queue pressure, configured limits, and the
+// lifetime number of events dropped at the hard limit.
+func (s *Store) ArchiveMetrics() ArchiveQueueMetrics {
+	s.batchMu.Lock()
+	pending := s.pendingBatchLenLocked()
+	s.batchMu.Unlock()
+	return ArchiveQueueMetrics{
+		Pending:    pending,
+		Dropped:    s.batchDropped.Load(),
+		Capacity:   s.archiveLimit,
+		Trigger:    s.archiveMark,
+		WriteBatch: s.archiveBatch,
+	}
+}
+
+func (s *Store) flushArchiveDropWarning() {
+	s.batchMu.Lock()
+	unreported := s.batchDropUnreported
+	s.batchDropUnreported = 0
+	if unreported > 0 {
+		s.batchDropLogAt = time.Now()
+	}
+	pending := s.pendingBatchLenLocked()
+	s.batchMu.Unlock()
+	if unreported > 0 {
+		log.Printf("[WARN] SQLite archive recovered after dropping %d additional event(s) (%d total); %d event(s) remain pending", unreported, s.batchDropped.Load(), pending)
+	}
+}
+
+func (s *Store) pruneOldEvents(ctx context.Context, now time.Time) {
 	cutoff := now.Add(-s.cfg.HistoryRetention).Unix()
 	var err error
 	if s.stmtCleanup != nil {
-		_, err = s.stmtCleanup.Exec(cutoff)
+		_, err = s.stmtCleanup.ExecContext(ctx, cutoff)
 	} else {
-		_, err = s.db.Exec("DELETE FROM queries WHERE unix_time < ?", cutoff)
+		_, err = s.db.ExecContext(ctx, "DELETE FROM queries WHERE unix_time < ?", cutoff)
 	}
 	if err != nil {
 		log.Printf("Failed to prune old SQLite data: %v", err)

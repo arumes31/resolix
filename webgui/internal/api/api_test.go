@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html/template"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -163,6 +165,163 @@ func TestEventsRejectInvalidSinceAndReturnCursor(t *testing.T) {
 	}
 }
 
+func BenchmarkHandleRootWithFullEventBuffer(b *testing.B) {
+	tmpl, err := template.ParseFiles("../../templates/index.html")
+	if err != nil {
+		b.Fatal(err)
+	}
+	cfg := &config.Config{MaxEvents: config.DefaultScanLimit, ScanLimit: config.DefaultScanLimit}
+	s := testServer(cfg)
+	s.store = storage.NewStore(cfg)
+	s.tmpl = tmpl
+	now := time.Now().Unix()
+	for i := range config.DefaultScanLimit {
+		s.store.AddEvent(models.QueryEvent{
+			UnixTime: now,
+			Domain:   fmt.Sprintf("query-%d.example", i),
+			Type:     "A",
+			ClientIP: "100.64.0.1",
+		})
+	}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	responseBytes := 0
+	for b.Loop() {
+		recorder := httptest.NewRecorder()
+		s.handleRoot(recorder, req)
+		responseBytes = recorder.Body.Len()
+	}
+	b.ReportMetric(float64(responseBytes), "response-B")
+}
+
+func TestHandleRootDoesNotEmbedQueryHistory(t *testing.T) {
+	tmpl, err := template.ParseFiles("../../templates/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{MaxEvents: 10, ScanLimit: config.DefaultScanLimit}
+	s := testServer(cfg)
+	s.store = storage.NewStore(cfg)
+	s.tmpl = tmpl
+	s.store.AddEvent(models.QueryEvent{
+		UnixTime: time.Now().Unix(),
+		Domain:   "must-not-be-in-page.example",
+		Type:     "A",
+		ClientIP: "100.64.0.1",
+	})
+
+	recorder := httptest.NewRecorder()
+	s.handleRoot(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+	if strings.Contains(recorder.Body.String(), "must-not-be-in-page.example") {
+		t.Fatal("root response embedded query history that the events API loads separately")
+	}
+}
+
+func TestHandleStatsCachesShortLivedResponse(t *testing.T) {
+	cfg := &config.Config{MaxEvents: 10}
+	s := testServer(cfg)
+	s.store = storage.NewStore(cfg)
+	now := time.Now().Unix()
+	s.store.AddEvent(models.QueryEvent{UnixTime: now, Domain: "first.example", Type: "A"})
+
+	readTotal := func() int64 {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		s.handleStats(recorder, httptest.NewRequest(http.MethodGet, "/api/stats", nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d", recorder.Code)
+		}
+		if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
+			t.Fatalf("Cache-Control = %q", got)
+		}
+		var response struct {
+			Total int64 `json:"total"`
+		}
+		if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+			t.Fatal(err)
+		}
+		return response.Total
+	}
+
+	if got := readTotal(); got != 1 {
+		t.Fatalf("initial total = %d", got)
+	}
+	s.store.AddEvent(models.QueryEvent{UnixTime: now, Domain: "second.example", Type: "A"})
+	if got := readTotal(); got != 1 {
+		t.Fatalf("cached total = %d, want 1", got)
+	}
+	s.statsCacheAt = time.Now().Add(-statsResponseTTL)
+	if got := readTotal(); got != 2 {
+		t.Fatalf("refreshed total = %d, want 2", got)
+	}
+}
+
+func TestStaticAssetsAreCompressedAndCacheable(t *testing.T) {
+	asset := strings.Repeat("const value = 'compressible';\n", 100)
+	s := testServer(&config.Config{BaseURL: "/"})
+	s.staticHandler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Header().Set("Content-Length", fmt.Sprint(len(asset)))
+		_, _ = io.WriteString(w, asset)
+	})
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/static/js/app.js", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+
+	s.SetupMux().ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+	if got := recorder.Header().Get("Cache-Control"); got != staticAssetCaching {
+		t.Fatalf("Cache-Control = %q", got)
+	}
+	if got := recorder.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding = %q", got)
+	}
+	if got := recorder.Header().Get("Content-Length"); got != "" {
+		t.Fatalf("compressed response retained Content-Length %q", got)
+	}
+	if got := recorder.Header().Values("Vary"); len(got) != 1 || got[0] != "Accept-Encoding" {
+		t.Fatalf("Vary = %v", got)
+	}
+	reader, err := gzip.NewReader(recorder.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decompressed, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if string(decompressed) != asset {
+		t.Fatal("decompressed static asset does not match original")
+	}
+}
+
+func BenchmarkHandleStatsCached(b *testing.B) {
+	cfg := &config.Config{MaxEvents: 10}
+	s := testServer(cfg)
+	s.store = storage.NewStore(cfg)
+	s.store.AddEvent(models.QueryEvent{UnixTime: time.Now().Unix(), Domain: "cached.example", Type: "A"})
+	s.statsCacheBody = []byte(`{"rpm":1,"rph":1,"rpd":1,"total":1}`)
+	s.statsCacheAt = time.Now()
+	req := httptest.NewRequest(http.MethodGet, "/api/stats", nil)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		recorder := httptest.NewRecorder()
+		s.handleStats(recorder, req)
+	}
+}
+
 func TestBroadcastAndUnsubscribeAreSerialized(_ *testing.T) {
 	s := testServer(&config.Config{})
 	ch := s.Subscribe()
@@ -184,6 +343,28 @@ func TestBroadcastAndUnsubscribeAreSerialized(_ *testing.T) {
 func TestEscapePrometheusLabel(t *testing.T) {
 	if got, want := escapePrometheusLabel("a\\b\n\"c"), `a\\b\n\"c`; got != want {
 		t.Fatalf("escapePrometheusLabel() = %q; want %q", got, want)
+	}
+}
+
+func TestHandleMetricsIncludesArchivePressure(t *testing.T) {
+	cfg := &config.Config{MaxEvents: 10}
+	s := testServer(cfg)
+	s.store = storage.NewStore(cfg)
+	s.store.AddEvent(models.QueryEvent{UnixTime: time.Now().Unix(), Domain: "pending.test"})
+
+	recorder := httptest.NewRecorder()
+	s.handleMetrics(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := recorder.Body.String()
+	if !strings.Contains(body, "sqlite_archive_pending_events 1\n") {
+		t.Fatalf("archive pending metric missing from response:\n%s", body)
+	}
+	if !strings.Contains(body, "sqlite_archive_dropped_events_total 0\n") {
+		t.Fatalf("archive dropped metric missing from response:\n%s", body)
+	}
+	if !strings.Contains(body, "sqlite_archive_queue_capacity 100000\n") ||
+		!strings.Contains(body, "sqlite_archive_trigger_events 5000\n") ||
+		!strings.Contains(body, "sqlite_archive_write_batch_events 5000\n") {
+		t.Fatalf("archive limit metrics missing from response:\n%s", body)
 	}
 }
 

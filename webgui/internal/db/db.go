@@ -53,7 +53,8 @@ PRAGMA foreign_keys=ON;
 		return nil, fmt.Errorf("failed to set pragmas: %w", err)
 	}
 
-	// Create table and indexes
+	// Create the table before migrations. Indexes are created after migrations
+	// because existing databases may not have all indexed columns yet.
 	schema := `
 CREATE TABLE IF NOT EXISTS queries (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,13 +73,6 @@ CREATE TABLE IF NOT EXISTS queries (
 	matched_rule TEXT DEFAULT '',
 	block_reason TEXT DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS idx_queries_unix_time ON queries(unix_time);
-CREATE INDEX IF NOT EXISTS idx_queries_domain_time ON queries(domain, unix_time);
-CREATE INDEX IF NOT EXISTS idx_queries_client_time ON queries(client_ip, unix_time);
-CREATE INDEX IF NOT EXISTS idx_queries_node ON queries(node);
-CREATE INDEX IF NOT EXISTS idx_queries_node_time ON queries(node, unix_time);
-CREATE INDEX IF NOT EXISTS idx_queries_blocked ON queries(blocked);
-CREATE INDEX IF NOT EXISTS idx_queries_response_code ON queries(response_code);
 `
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("failed to create schema: %w", err)
@@ -114,6 +108,19 @@ CREATE INDEX IF NOT EXISTS idx_queries_response_code ON queries(response_code);
 			log.Printf("[WARN] Migration: failed to inspect column %s: %v", m.col, err)
 			return nil, fmt.Errorf("migration: inspect column %s: %w", m.col, err)
 		}
+	}
+
+	indexes := `
+CREATE INDEX IF NOT EXISTS idx_queries_unix_time ON queries(unix_time);
+CREATE INDEX IF NOT EXISTS idx_queries_domain_time ON queries(domain, unix_time);
+CREATE INDEX IF NOT EXISTS idx_queries_client_time ON queries(client_ip, unix_time);
+CREATE INDEX IF NOT EXISTS idx_queries_node ON queries(node);
+CREATE INDEX IF NOT EXISTS idx_queries_node_time ON queries(node, unix_time);
+CREATE INDEX IF NOT EXISTS idx_queries_blocked ON queries(blocked);
+CREATE INDEX IF NOT EXISTS idx_queries_response_code ON queries(response_code);
+`
+	if _, err := db.Exec(indexes); err != nil {
+		return nil, fmt.Errorf("failed to create indexes: %w", err)
 	}
 
 	log.Printf("[INFO] SQLite database initialized at %s", fullDBPath)

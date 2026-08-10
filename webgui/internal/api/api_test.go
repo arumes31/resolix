@@ -1,10 +1,16 @@
 package api
 
 import (
+	"bytes"
+	"compress/gzip"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"testing/fstest"
@@ -13,6 +19,7 @@ import (
 	"tailscale-dnsrewrite/webgui/internal/blocklist"
 	"tailscale-dnsrewrite/webgui/internal/config"
 	"tailscale-dnsrewrite/webgui/internal/models"
+	"tailscale-dnsrewrite/webgui/internal/storage"
 )
 
 func testServer(cfg *config.Config) *Server {
@@ -22,6 +29,26 @@ func testServer(cfg *config.Config) *Server {
 		subscribers: make(map[chan models.QueryEvent]int),
 		rateLimits:  make(map[string]*rateLimitEntry),
 		metrics:     &Metrics{StartTime: time.Now()},
+	}
+}
+
+func TestMetricMethodUsesFixedAllowlist(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		want   string
+	}{
+		{name: "get", method: http.MethodGet, want: http.MethodGet},
+		{name: "patch", method: http.MethodPatch, want: http.MethodPatch},
+		{name: "unknown", method: "CUSTOM-METHOD", want: "OTHER"},
+		{name: "empty", method: "", want: "OTHER"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := metricMethod(test.method); got != test.want {
+				t.Fatalf("metricMethod(%q) = %q, want %q", test.method, got, test.want)
+			}
+		})
 	}
 }
 
@@ -44,6 +71,19 @@ func TestForwardedHeadersRequireTrustedProxy(t *testing.T) {
 	}
 	if !s.isHTTPS(r) {
 		t.Fatal("trusted X-Forwarded-Proto was ignored")
+	}
+}
+
+func TestStandardForwardedHeaderRequiresTrustedProxy(t *testing.T) {
+	s := testServer(&config.Config{TrustedProxies: []string{"127.0.0.1"}})
+	r := httptest.NewRequest(http.MethodGet, "http://example.test", nil)
+	r.RemoteAddr = "127.0.0.1:1234"
+	r.Header.Set("Forwarded", `for="[2001:db8::10]";proto=https`)
+	if got := s.clientIP(r); got != "2001:db8::10" {
+		t.Fatalf("forwarded client IP = %q", got)
+	}
+	if !s.isHTTPS(r) {
+		t.Fatal("trusted Forwarded proto was ignored")
 	}
 }
 
@@ -76,6 +116,53 @@ func TestInternalRoutesUseWebAuthWithoutIngestSecret(t *testing.T) {
 	}
 }
 
+func TestInternalRoutesFailClosedWithoutAnyAuthentication(t *testing.T) {
+	s := testServer(&config.Config{BaseURL: "/"})
+	req := httptest.NewRequest(http.MethodPost, "/api/ingest", nil)
+	rec := httptest.NewRecorder()
+	s.SetupMux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d; want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestReadRequestBodyLimitsDecompressedSize(t *testing.T) {
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write(bytes.Repeat([]byte("a"), 2048)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(compressed.Bytes()))
+	req.Header.Set("Content-Encoding", "gzip")
+	_, err := readRequestBody(httptest.NewRecorder(), req, 1024)
+	var tooLarge *http.MaxBytesError
+	if !errors.As(err, &tooLarge) {
+		t.Fatalf("error = %v, want MaxBytesError", err)
+	}
+}
+
+func TestEventsRejectInvalidSinceAndReturnCursor(t *testing.T) {
+	cfg := &config.Config{MaxEvents: 10}
+	s := testServer(cfg)
+	s.store = storage.NewStore(cfg)
+	s.store.AddEvent(models.QueryEvent{UnixTime: time.Now().Unix(), Domain: "cursor.test"})
+
+	recorder := httptest.NewRecorder()
+	s.handleEvents(recorder, httptest.NewRequest(http.MethodGet, "/api/events?since=bad", nil))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid since status = %d", recorder.Code)
+	}
+
+	recorder = httptest.NewRecorder()
+	s.handleEvents(recorder, httptest.NewRequest(http.MethodGet, "/api/events?limit=1", nil))
+	if recorder.Code != http.StatusOK || recorder.Header().Get("X-Next-Cursor") == "" {
+		t.Fatalf("events status/cursor = %d/%q", recorder.Code, recorder.Header().Get("X-Next-Cursor"))
+	}
+}
+
 func TestBroadcastAndUnsubscribeAreSerialized(_ *testing.T) {
 	s := testServer(&config.Config{})
 	ch := s.Subscribe()
@@ -97,6 +184,66 @@ func TestBroadcastAndUnsubscribeAreSerialized(_ *testing.T) {
 func TestEscapePrometheusLabel(t *testing.T) {
 	if got, want := escapePrometheusLabel("a\\b\n\"c"), `a\\b\n\"c`; got != want {
 		t.Fatalf("escapePrometheusLabel() = %q; want %q", got, want)
+	}
+}
+
+func TestHandleIngestEventsNormalizesInvalidTimestamps(t *testing.T) {
+	cfg := &config.Config{MaxEvents: 10}
+	s := testServer(cfg)
+	s.store = storage.NewStore(cfg)
+	now := time.Now().Unix()
+	events := []models.QueryEvent{
+		{Domain: "negative.example", UnixTime: -1},
+		{Domain: "future.example", UnixTime: now + int64((24 * time.Hour).Seconds())},
+		{Domain: "valid.example", UnixTime: now - 60},
+	}
+	body, err := json.Marshal(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/ingest", bytes.NewReader(body))
+	s.handleIngestEvents(rec, req, body)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	got := s.store.GetOrderedEvents(10)
+	byDomain := make(map[string]int64, len(got))
+	for _, event := range got {
+		byDomain[event.Domain] = event.UnixTime
+	}
+	if byDomain["negative.example"] < now || byDomain["future.example"] < now {
+		t.Fatalf("invalid timestamps were not normalized: %v", byDomain)
+	}
+	if byDomain["valid.example"] != now-60 {
+		t.Fatalf("valid timestamp changed to %d", byDomain["valid.example"])
+	}
+}
+
+func TestModifyUserRuleConcurrentUpdatesDoNotOverwrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "user_rules.txt")
+	const count = 32
+	var wg sync.WaitGroup
+	for i := range count {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rule := fmt.Sprintf("||domain-%d.example^", i)
+			if _, err := modifyUserRule(path, rule, false); err != nil {
+				t.Errorf("modifyUserRule: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	data, err := os.ReadFile(path) // #nosec G304 -- path is created under t.TempDir by this test
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range count {
+		rule := fmt.Sprintf("||domain-%d.example^", i)
+		if !strings.Contains(string(data), rule+"\n") {
+			t.Errorf("missing rule %q", rule)
+		}
 	}
 }
 

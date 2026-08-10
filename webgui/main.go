@@ -5,8 +5,6 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/rand"
 	"embed"
@@ -19,23 +17,35 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"tailscale-dnsrewrite/webgui/internal/api"
 	"tailscale-dnsrewrite/webgui/internal/blocklist"
+	"tailscale-dnsrewrite/webgui/internal/clients"
 	"tailscale-dnsrewrite/webgui/internal/config"
 	"tailscale-dnsrewrite/webgui/internal/dnsroutes"
+	"tailscale-dnsrewrite/webgui/internal/dnsserver"
+	"tailscale-dnsrewrite/webgui/internal/filter"
 	"tailscale-dnsrewrite/webgui/internal/forwarder"
 	"tailscale-dnsrewrite/webgui/internal/health"
 	"tailscale-dnsrewrite/webgui/internal/logger"
+	"tailscale-dnsrewrite/webgui/internal/models"
 	"tailscale-dnsrewrite/webgui/internal/parser"
+	"tailscale-dnsrewrite/webgui/internal/policy"
 	"tailscale-dnsrewrite/webgui/internal/resolver"
+	"tailscale-dnsrewrite/webgui/internal/rewrites"
 	"tailscale-dnsrewrite/webgui/internal/storage"
+	"tailscale-dnsrewrite/webgui/internal/upstream"
 )
 
 // Version represents the current application version.
-var Version = "2.0.0" // Changed from const to var for -ldflags build-time setting (Item 88)
+var (
+	Version   = "dev"
+	BuildInfo = "local"
+)
 
 //go:embed templates static
 var embedFS embed.FS
@@ -144,9 +154,11 @@ func generateEnvFile() {
 func defaultEnvContent() string {
 	return `# Tailscale Authentication Key
 TS_AUTHKEY=tskey-auth-xxxxx
+# Prefer a mounted secret file in containers; TS_AUTHKEY takes precedence.
+# TS_AUTHKEY_FILE=/run/secrets/tailscale_authkey
 
 # Space-separated upstream DNS servers
-UPSTREAM_DNS=8.8.8.8 8.8.4.4
+UPSTREAM_DNS="8.8.8.8 8.8.4.4"
 
 # Comma-separated domain:ip mappings
 DOMAINS=.internal.net:100.1.2.3,app.example.com:100.4.5.6
@@ -156,6 +168,8 @@ HEALTHCHECK_DOMAIN=google.com
 
 # Web GUI listening port
 PORT=35353
+# Web/API bind address
+WEB_LISTEN_ADDR=0.0.0.0
 
 # Run mode (master or slave)
 MODE=master
@@ -173,7 +187,8 @@ NODE_NAME=dns-server-1
 # Secret token to authenticate logs from slave nodes
 # INGEST_SECRET=your-secret-token
 
-# Web GUI authentication (leave empty to disable auth)
+# Web GUI authentication. Set both values together. INGEST_SECRET is required
+# when web authentication is disabled.
 # WEB_USERNAME=admin
 # WEB_PASSWORD=
 
@@ -183,6 +198,9 @@ LOG_LEVEL=INFO
 # Base URL for hosting behind a reverse proxy subpath (default: /)
 # Example: BASE_URL=/dashboard
 BASE_URL=/
+# Comma-separated proxy IPs/CIDRs allowed to supply Forwarded/X-Forwarded-*.
+# TRUSTED_PROXIES=127.0.0.1,10.0.0.0/8
+# COOKIE_SECURE=true
 
 # Database file name or absolute path (default: dns.db)
 # If relative, it is placed inside HISTORY_DIR
@@ -203,8 +221,67 @@ DB_PATH=dns.db
 # Path to a JSON file with domain-specific DNS routing rules (Item 66)
 # DNS_ROUTES_FILE=/etc/tailscale-dnsrewrite/dns-routes.json
 
-# Path to the dnsmasq PID file for cache clearing (Item 63)
-# DNSMASQ_PID_FILE=/run/dnsmasq.pid
+# DNS server listen address and port for the embedded DNS server (replaces dnsmasq)
+# DNS_LISTEN_ADDR defaults to TAILSCALE_IP (set by entrypoint.sh), then 0.0.0.0
+# DNS_LISTEN_ADDR=0.0.0.0
+# DNS_LISTEN_PORT=53
+
+# Filter engine (blocklists with adblock/hosts/domain-list/regex syntax)
+# Space- or comma-separated subscription URLs, auto-updated with ETag/Last-Modified
+# BLOCKLIST_URLS=https://example.com/blocklist.txt
+# ALLOWLIST_URLS=https://example.com/allowlist.txt
+# Local exceptions-only list (@@ semantics for every entry)
+# ALLOWLIST_FILE=/etc/tailscale-dnsrewrite/allowlist.txt
+# FILTER_UPDATE_INTERVAL=24h
+
+# Blocking response mode: nxdomain (default), null_ip (0.0.0.0/::), refused,
+# or custom_ip (BLOCK_CUSTOM_IP4/BLOCK_CUSTOM_IP6)
+# BLOCKING_MODE=nxdomain
+# BLOCK_CUSTOM_IP4=0.0.0.0
+# BLOCK_CUSTOM_IP6=::
+
+# Typed DNS rewrites (A/AAAA/CNAME/PTR/MX/TXT/SRV + RCODE), managed via
+# /api/rewrites and persisted here. DOMAINS seeds it on first boot only.
+# REWRITES_FILE=rewrites.json
+
+# Policy features
+# SAFE_SEARCH=google,bing,ddg,youtube
+# BOGUS_NXDOMAIN=10.0.0.0/8,192.0.2.33 (answers fully inside these become NXDOMAIN)
+# AAAA_DISABLED=true (AAAA queries get NOERROR-empty answers)
+# REFUSE_ANY=true (default; QTYPE ANY is refused)
+
+# Upstream pool (Step 4): schemes udp:// tcp:// tls:// https:// (DoT/DoH)
+# UPSTREAM_MODE=load_balance (default) | parallel | strict
+# FALLBACK_DNS=9.9.9.9 (used only when all primary upstreams fail)
+# BOOTSTRAP_DNS=8.8.8.8 (plain UDP; required for hostname upstreams like tls://dns.google)
+# ECS_CLIENT_SUBNET=192.0.2.0/24 (EDNS0 client subnet sent to upstreams)
+# DNS64=true (synthesize AAAA from A on empty AAAA answers)
+# DNS64_PREFIXES=64:ff9b::/96
+# CACHE_OPTIMISTIC=true (serve stale entries while refreshing in background)
+# CACHE_MIN_TTL=60
+# CACHE_MAX_TTL=600
+
+# Per-client policies (Step 5)
+# CLIENTS_FILE=clients.json (per-client registry: filtering/safe-search/blocked
+#   services/custom upstreams/schedules, hot-reloaded every 30s)
+# BLOCKED_SERVICES=facebook,tiktok (global blocked-service IDs; per-client
+#   overrides live in the clients file)
+
+# DNS access and encrypted serving (Step 6)
+# Comma/space-separated IPs or CIDRs. Disallowed clients are dropped; when an
+# allowed list is set, all clients outside it receive REFUSED.
+# DNS_ALLOWED_CLIENTS=100.64.0.0/10,192.168.0.0/16
+# DNS_DISALLOWED_CLIENTS=100.64.0.5
+# RATE_LIMIT_QPS=20 (per IPv4 /24 or IPv6 /56; 0 disables)
+# PRIVATE_PTR=true (answer known RFC1918/CGNAT/ULA client PTRs as <name>.lan)
+# DNSSEC=false (pass the DNSSEC DO bit upstream; no local validation)
+# DOH_ENABLED=false
+# DOH_PATH=/dns-query
+# DOH_AUTH_TOKEN=change-me (Bearer token; when unset, only private/tailnet clients)
+# DOT_ENABLED=false
+# DOT_PORT=853
+# TLS_CERT_FILE=/etc/tailscale-dnsrewrite/tls.crt
+# TLS_KEY_FILE=/etc/tailscale-dnsrewrite/tls.key
 
 # Upstream latency alert threshold in milliseconds (Item 68, default: 200)
 # UPSTREAM_LATENCY_THRESHOLD=200
@@ -278,13 +355,10 @@ func main() {
 	defer cancel()
 	cfg.StartClientAliasesReload(ctx)
 
-	tmpl, err := template.ParseFS(embedFS, "templates/*.html")
-	if err != nil {
-		logger.Fatal("Fatal error parsing templates: %v", err)
-	}
-
+	tmpl := parseTemplates()
 	prs := parser.NewParser(store, cfg.Debug)
 	srv := api.NewServer(cfg, store, prs, tmpl)
+	srv.SetBuildInfo(Version, BuildInfo)
 
 	// Item 59: Initialize and start reverse DNS resolver
 	res := resolver.New()
@@ -309,6 +383,7 @@ func main() {
 	logger.Info("DNS loop detection started")
 
 	fwd := forwarder.NewForwarder(cfg)
+	srv.SetForwarder(fwd)
 
 	// Item 88: Set forwarder version to match main version (settable via -ldflags)
 	forwarder.Version = Version
@@ -327,14 +402,22 @@ func main() {
 	})
 
 	// Create static file server from embedded FS
-	staticFS, err := fs.Sub(embedFS, "static")
-	if err != nil {
-		logger.Fatal("Fatal error creating static FS: %v", err)
-	}
-	staticHandler := http.FileServer(http.FS(staticFS))
+	staticHandler := newStaticHandler()
 
-	// Initialize health checker
-	checker := health.NewChecker(cfg, cfg.UpstreamDNS)
+	// Upstream specs: upstreams.json overrides env upstreams when the file
+	// contains entries (hot-reloaded below and after API saves).
+	loadSpecs := func() []string {
+		if p := cfg.FullUpstreamsPath(); p != "" {
+			if list := dnsroutes.LoadUpstreams(p); len(list) > 0 {
+				return list
+			}
+		}
+		return strings.Fields(cfg.UpstreamDNS)
+	}
+	upstreamSpecs := loadSpecs()
+
+	// Initialize health checker (UDP probe; covers plain-IP upstreams only)
+	checker := health.NewChecker(cfg, strings.Join(upstreamSpecs, " "))
 	go checker.Start(ctx, func(_ []string, latencies map[string]float64) {
 		store.SetUpstreamHealth(cfg.NodeName, latencies)
 		if cfg.Mode == "slave" {
@@ -348,7 +431,7 @@ func main() {
 
 	// History Archiver (uses configurable BatchArchiveInterval)
 	go func() {
-		ticker := time.NewTicker(cfg.ArchiveInterval)
+		ticker := time.NewTicker(cfg.BatchArchiveInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -383,11 +466,90 @@ func main() {
 		}
 	}()
 
-	// Log Ingestion — ingestDone closes when the parser loop has fully exited.
-	ingestDone := make(chan struct{})
+	// Embedded DNS server (replaces dnsmasq). Pipeline: refuse-ANY/AAAA-disable
+	// → typed rewrites → private PTR → safe-search → filter → blocked services
+	// → cache → client upstreams → route → global pool → bogus-NXDOMAIN →
+	// cache store → respond.
+	// Each answered query becomes a QueryEvent fed into Store + SSE (and the
+	// forwarder in slave mode). dnsDone closes when both listeners have
+	// stopped, so shutdown can archive after events have ceased.
+
+	// Filter engine (Step 2): local files (BLOCKLIST_FILE entries now
+	// actually block) plus URL subscriptions with conditional auto-update.
+	filterEng := setupFilterEngine(ctx, cfg, srv)
+
+	// Typed rewrites store (Step 3): loaded from the persistence file, or
+	// seeded from the DOMAINS env on first boot only.
+	rwStore := loadRewritesStore(cfg)
+	srv.SetRewritesStore(rwStore)
+
+	// Per-client registry (Step 5): JSON-persisted, hot-reloaded.
+	clientReg := setupClientsRegistry(ctx, cfg, srv)
+
+	// Policy (Step 3): safe search, bogus NXDOMAIN, AAAA disable, refuse ANY.
+	pol := policy.New(policy.Config{
+		SafeSearch:   splitListEnv(cfg.SafeSearch),
+		BogusNets:    splitListEnv(cfg.BogusNXDOMAIN),
+		AAAADisabled: cfg.AAAADisabled,
+		RefuseANY:    cfg.RefuseANY,
+	})
+
+	// Upstream pool (Step 4): modes, fallback, bootstrap, ECS, DNS64.
+	pool := setupUpstreamPool(ctx, cfg, store, srv, checker, loadSpecs, upstreamSpecs)
+	dr.SetOnChange(pool.ClearRouteCache)
+
+	dnsSrv := dnsserver.New(dnsserver.Config{
+		Addr:            cfg.DNSListenAddr,
+		Port:            cfg.DNSListenPort,
+		Upstreams:       upstreamSpecs,
+		Rewrites:        rwStore,
+		Policy:          pol,
+		Pool:            pool,
+		Routes:          dr,
+		Clients:         clientReg,
+		BlockedServices: splitListEnv(cfg.BlockedServices),
+		AliasFunc:       store.GetAlias,
+		CacheMinTTL:     cfg.CacheMinTTL,
+		CacheMaxTTL:     cfg.CacheMaxTTL,
+		CacheOptimistic: cfg.CacheOptimistic,
+		// Step 6: ACL, rate limit, private PTR, DNSSEC, DoT.
+		AllowedClients:    cfg.DNSAllowedClients,
+		DisallowedClients: cfg.DNSDisallowedClients,
+		RateLimitQPS:      cfg.RateLimitQPS,
+		PrivatePTR:        cfg.PrivatePTR,
+		DNSSEC:            cfg.DNSSEC,
+		Resolver:          res,
+		DoTEnabled:        cfg.DoTEnabled,
+		DoTPort:           cfg.DoTPort,
+		TLSCertFile:       cfg.TLSCertFile,
+		TLSKeyFile:        cfg.TLSKeyFile,
+		NodeName:          cfg.NodeName,
+		Filter:            filterEng,
+		BlockingMode:      cfg.BlockingMode,
+		BlockCustomIP4:    cfg.BlockCustomIP4,
+		BlockCustomIP6:    cfg.BlockCustomIP6,
+	}, func(ev models.QueryEvent, excludeFromStats bool) {
+		// exclude_from_stats clients emit to SSE only (no store/forwarder).
+		if !excludeFromStats {
+			store.AddEvent(ev)
+			if cfg.Mode == "slave" {
+				fwd.EnqueueEvent(ev)
+			}
+		}
+		srv.BroadcastEvent(ev)
+	})
+	dnsDone := make(chan struct{})
+	srv.SetDNSServer(dnsSrv)
 	go func() {
-		defer close(ingestDone)
-		startLogIngestion(ctx, cfg, fwd, prs, srv)
+		defer close(dnsDone)
+		protocols := "UDP+TCP"
+		if cfg.DoTEnabled {
+			protocols += fmt.Sprintf("+DoT:%d", cfg.DoTPort)
+		}
+		logger.Info("DNS server listening on %s (%s)", dnsSrv.ListenAddr(), protocols)
+		if err := dnsSrv.Start(ctx); err != nil {
+			errChan <- err
+		}
 	}()
 
 	// Start HTTP server and report completion so shutdown can wait before
@@ -436,10 +598,10 @@ func main() {
 		waitForHTTPServer(cfg, serverDone)
 	}
 
-	// Step 6: Flush pending batch buffers to SQLite. Wait for the ingestion
-	// parser loop to exit first so no in-flight parse races the archive.
-	logger.Info("Shutdown step 6: Waiting for log ingestion to stop...")
-	<-ingestDone
+	// Step 6: Flush pending batch buffers to SQLite. Wait for the DNS
+	// listeners to stop first so no in-flight query races the archive.
+	logger.Info("Shutdown step 6: Waiting for DNS server to stop...")
+	waitForDNSServer(cfg, dnsDone)
 	logger.Info("Shutdown step 6: Flushing pending batch buffers to SQLite...")
 	archived := store.ArchiveStep(time.Now())
 	logger.Info("Shutdown step 6: Archived %d events to SQLite", archived)
@@ -456,61 +618,163 @@ func main() {
 	logger.Info("Graceful shutdown complete")
 }
 
-// startLogIngestion reads dnsmasq log lines from stdin, mirrors them to the
-// logs, forwards them to the master in slave mode, and broadcasts parsed
-// events to SSE subscribers. It returns when ctx is canceled or stdin closes.
-func startLogIngestion(ctx context.Context, cfg *config.Config, fwd *forwarder.Forwarder, prs *parser.Parser, srv *api.Server) {
-	linesCh := make(chan []byte)
-	go func() {
-		logger.Info("Log ingestion scanner started on stdin")
-		scanner := bufio.NewScanner(os.Stdin)
-		for scanner.Scan() {
-			buf := scanner.Bytes()
-			line := make([]byte, len(buf))
-			copy(line, buf)
-			// Cancellation-aware send: never stay blocked on a full channel
-			// while the parser loop is shutting down.
-			select {
-			case linesCh <- line:
-			case <-ctx.Done():
-				return
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			logger.Warning("stdin scan error: %v", err)
-		}
-		logger.Info("Log ingestion scanner reached EOF")
-		close(linesCh)
-	}()
+// setupFilterEngine builds and starts the filter engine from configuration
+// and wires it into the API server.
+func setupFilterEngine(ctx context.Context, cfg *config.Config, srv *api.Server) *filter.Engine {
+	eng := filter.New()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case line, ok := <-linesCh:
-			if !ok {
-				logger.Info("Log ingestion loop exiting: channel closed")
-				return
-			}
-			isData := bytes.Contains(line, []byte("query[")) || bytes.Contains(line, []byte("reply"))
-			if isData {
-				if cfg.Debug {
-					logger.Debug("[INGEST] %s", string(line))
-				}
-			} else {
-				// Always print non-query/reply lines as they are likely errors or important info
-				logger.Info("[DNSMASQ] %s", string(line))
-			}
-
-			if cfg.Mode == "slave" {
-				fwd.Enqueue(string(line))
-			}
-			ev := prs.ParseLogBytes(line, cfg.NodeName)
-			if ev != nil {
-				srv.BroadcastEvent(*ev)
-			}
+	// User rules (query-log block/unblock actions) — a plain file source.
+	userRulesPath := filepath.Join(cfg.HistoryDir, "user_rules.txt")
+	if _, err := os.Stat(userRulesPath); os.IsNotExist(err) {
+		if err := os.WriteFile(userRulesPath, []byte("! user rules (managed via /api/querylog)\n"), 0o600); err != nil {
+			logger.Warning("Failed to create user rules file: %v", err)
 		}
 	}
+	eng.AddFileSource(userRulesPath, false)
+
+	if p := cfg.FullBlocklistPath(); p != "" {
+		eng.AddFileSource(p, false)
+	}
+	if cfg.AllowlistFile != "" {
+		eng.AddFileSource(cfg.AllowlistFile, true)
+	}
+	for _, u := range splitListEnv(cfg.BlocklistURLs) {
+		eng.AddURLSource(u, false)
+	}
+	for _, u := range splitListEnv(cfg.AllowlistURLs) {
+		eng.AddURLSource(u, true)
+	}
+	eng.StartUpdateLoop(ctx, cfg.FilterUpdateInterval)
+	srv.SetFilter(eng)
+	return eng
+}
+
+// parseTemplates parses the embedded HTML templates, exiting fatally on error.
+func parseTemplates() *template.Template {
+	tmpl, err := template.ParseFS(embedFS, "templates/*.html")
+	if err != nil {
+		logger.Fatal("Fatal error parsing templates: %v", err)
+	}
+	return tmpl
+}
+
+// newStaticHandler creates the static file server from the embedded FS,
+// exiting fatally on error.
+func newStaticHandler() http.Handler {
+	staticFS, err := fs.Sub(embedFS, "static")
+	if err != nil {
+		logger.Fatal("Fatal error creating static FS: %v", err)
+	}
+	return http.FileServer(http.FS(staticFS))
+}
+
+// setupClientsRegistry loads the per-client registry and starts hot-reload.
+func setupClientsRegistry(ctx context.Context, cfg *config.Config, srv *api.Server) *clients.Registry {
+	reg, err := clients.Load(cfg.FullClientsPath())
+	if err != nil {
+		logger.Warning("Failed to load clients registry: %v", err)
+		reg, err = clients.Load("") // in-memory fallback
+		if err != nil || reg == nil {
+			logger.Fatal("Failed to initialize fallback clients registry: %v", err)
+		}
+	}
+	if reg == nil {
+		logger.Fatal("Clients registry initialization returned nil")
+	}
+	reg.StartReload(ctx)
+	srv.SetClients(reg)
+	return reg
+}
+
+// loadRewritesStore loads the typed rewrites store, seeding from the DOMAINS
+// env on first boot; falls back to an in-memory store on load errors.
+func loadRewritesStore(cfg *config.Config) *rewrites.Store {
+	rwStore, err := rewrites.Load(cfg.FullRewritesPath(), cfg.Domains)
+	if err != nil {
+		logger.Warning("Failed to load rewrites store: %v", err)
+		rwStore, err = rewrites.Load("", cfg.Domains) // in-memory fallback
+		if err != nil || rwStore == nil {
+			logger.Fatal("Failed to initialize fallback rewrites store: %v", err)
+		}
+	}
+	if rwStore == nil {
+		logger.Fatal("Rewrites store initialization returned nil")
+	}
+	return rwStore
+}
+
+// setupUpstreamPool builds the upstream pool, wires health data and the API
+// reload callback, and starts the upstreams.json hot-reload poller.
+func setupUpstreamPool(ctx context.Context, cfg *config.Config, store *storage.Store, srv *api.Server, checker *health.Checker, loadSpecs func() []string, current []string) *upstream.Pool {
+	pool := upstream.NewPool(upstream.PoolConfig{
+		Mode:             cfg.UpstreamMode,
+		PrimarySpecs:     current,
+		FallbackSpecs:    strings.Fields(cfg.FallbackDNS),
+		BootstrapServers: strings.Fields(cfg.BootstrapDNS),
+		ECSClientSubnet:  cfg.ECSClientSubnet,
+		DNS64:            cfg.DNS64,
+		DNS64Prefixes:    strings.Fields(cfg.DNS64Prefixes),
+		CacheMinTTL:      cfg.CacheMinTTL,
+		CacheMaxTTL:      cfg.CacheMaxTTL,
+	})
+	pool.SetHealthProvider(func() map[string]float64 {
+		return store.GetUpstreamHealth()[cfg.NodeName]
+	})
+	srv.SetUpstreamPool(pool)
+	var reloadMu sync.Mutex
+	reload := func() {
+		reloadMu.Lock()
+		defer reloadMu.Unlock()
+		specs := loadSpecs()
+		pool.SetPrimarySpecs(specs)
+		checker.UpdateUpstreams(specs)
+		current = append([]string(nil), specs...)
+	}
+	srv.SetUpstreamReloadFunc(func() {
+		reload()
+	})
+
+	// Hot-reload upstreams.json: poll for changes (covers external edits).
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				specs := loadSpecs()
+				reloadMu.Lock()
+				changed := !equalStringSlices(specs, current)
+				reloadMu.Unlock()
+				if changed {
+					logger.Info("Upstream list changed, reloading pool (%d upstreams)", len(specs))
+					reload()
+				}
+			}
+		}
+	}()
+	return pool
+}
+
+// splitListEnv splits a space/comma-separated env list into trimmed entries.
+func splitListEnv(v string) []string {
+	return strings.FieldsFunc(v, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	})
+}
+
+// equalStringSlices reports whether two string slices are equal.
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // waitForHTTPServer waits for the HTTP server goroutine to finish, giving up
@@ -524,6 +788,21 @@ func waitForHTTPServer(cfg *config.Config, serverDone chan error) {
 		}
 	case <-timer.C:
 		logger.Warning("HTTP server did not stop within %s", cfg.HTTPShutdownTimeout)
+	}
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+}
+
+func waitForDNSServer(cfg *config.Config, dnsDone <-chan struct{}) {
+	timer := time.NewTimer(cfg.HTTPShutdownTimeout)
+	select {
+	case <-dnsDone:
+	case <-timer.C:
+		logger.Warning("DNS server did not stop within %s", cfg.HTTPShutdownTimeout)
 	}
 	if !timer.Stop() {
 		select {

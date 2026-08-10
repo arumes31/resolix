@@ -6,21 +6,35 @@ UPSTREAM_DNS=${UPSTREAM_DNS:-"8.8.8.8 8.8.4.4"}
 # Default health check domain if not provided
 HEALTHCHECK_DOMAIN=${HEALTHCHECK_DOMAIN:-"google.com"}
 
+# Enrollment credentials are optional after the node has persisted state.
+TS_AUTHKEY=${TS_AUTHKEY:-}
+TS_AUTHKEY_FILE=${TS_AUTHKEY_FILE:-}
+
 # Cleanup function for graceful shutdown
 cleanup() {
+    trap - SIGINT SIGTERM
     echo "Shutting down..."
-    kill "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" 2>/dev/null
-    wait "$DNSMASQ_PID" "$TAILSCALED_PID" "$WEBGUI_PID" 2>/dev/null
-    exit 0
+    kill "$TAILSCALED_PID" "$WEBGUI_PID" 2>/dev/null
+    wait "$TAILSCALED_PID" "$WEBGUI_PID" 2>/dev/null
 }
 
-trap cleanup SIGINT SIGTERM
+trap 'cleanup; exit 143' SIGINT SIGTERM
 
 # Sanitize environment variables for CRLF and whitespace
 UPSTREAM_DNS=$(echo "$UPSTREAM_DNS" | tr -d '\r' | xargs)
 HEALTHCHECK_DOMAIN=$(echo "$HEALTHCHECK_DOMAIN" | tr -d '\r' | xargs)
 DOMAINS=$(echo "$DOMAINS" | tr -d '\r' | xargs)
 TS_AUTHKEY=$(echo "$TS_AUTHKEY" | tr -d '\r' | xargs)
+NODE_NAME=$(echo "${NODE_NAME:-dns-server}" | tr -d '\r' | xargs)
+export NODE_NAME
+
+if [ -z "$TS_AUTHKEY" ] && [ -n "$TS_AUTHKEY_FILE" ]; then
+    if [ ! -f "$TS_AUTHKEY_FILE" ] || [ ! -r "$TS_AUTHKEY_FILE" ]; then
+        echo "Error: TS_AUTHKEY_FILE is not a readable regular file"
+        exit 1
+    fi
+    TS_AUTHKEY=$(tr -d '\r\n' < "$TS_AUTHKEY_FILE")
+fi
 
 # Start tailscaled
 echo "Starting tailscaled"
@@ -49,7 +63,7 @@ else
     # Run tailscale up if TS_AUTHKEY is provided
     if [ -n "$TS_AUTHKEY" ]; then
         echo "Running tailscale up with authkey"
-        /usr/bin/tailscale up --authkey="$TS_AUTHKEY" --hostname=dns-server --accept-dns=false
+        /usr/bin/tailscale up --authkey="$TS_AUTHKEY" --hostname="$NODE_NAME" --accept-dns=false
         if [ $? -eq 0 ]; then
             echo "tailscale up completed successfully"
         else
@@ -72,93 +86,37 @@ else
     exit 1
 fi
 
-# Function to generate dnsmasq.conf (single instance, direct address overrides)
-generate_dnsmasq_conf() {
-    echo "Generating configuration files..."
-
-    cat > /etc/dnsmasq.conf <<EOL
-listen-address=$TAILSCALE_IP
-port=53
-bind-interfaces
-cache-size=25000
-dns-forward-max=150
-strict-order
-log-queries
-log-async=25
-log-facility=-
-local-ttl=60
-max-ttl=600
-EOL
-
-    # Add upstream DNS servers
-    for server in $UPSTREAM_DNS; do
-        server=$(echo "$server" | tr -d '[:space:]\r')
-        if [ -n "$server" ]; then
-            echo "server=$server" >> /etc/dnsmasq.conf
-        fi
-    done
-
-    # Parse DOMAINS env variable (format: domain1:ip1,domain2:ip2)
-    # Directly add address= directives to the single dnsmasq instance
-    if [ -n "$DOMAINS" ]; then
-        IFS=',' read -ra DOMAIN_LIST <<< "$DOMAINS"
-        for entry in "${DOMAIN_LIST[@]}"; do
-            entry=$(echo "$entry" | tr -d '[:space:]\r')
-            domain=$(echo "$entry" | cut -d':' -f1)
-            ip=$(echo "$entry" | cut -d':' -f2)
-            if [ -n "$domain" ] && [ -n "$ip" ]; then
-                echo "address=/$domain/$ip" >> /etc/dnsmasq.conf
-            fi
-        done
-    fi
-
-    # Strip carriage returns and clean up config
-    tr -d '\r' < /etc/dnsmasq.conf > /tmp/dnsmasq.conf.tmp && cat /tmp/dnsmasq.conf.tmp > /etc/dnsmasq.conf
-    sed -i 's/[[:space:]]*$//' /etc/dnsmasq.conf
-    sed -i '/^$/d' /etc/dnsmasq.conf
-
-    echo "Config file /etc/dnsmasq.conf content:"
-    cat -v /etc/dnsmasq.conf
-}
-
-# Generate initial configuration
-generate_dnsmasq_conf
+# Export the Tailscale IP so the embedded DNS server binds to it by default
+export TAILSCALE_IP
 
 # Check for port conflicts
-echo "Checking for existing processes on port 53..."
+echo "Checking for existing processes on port ${DNS_LISTEN_PORT:-53}..."
 if command -v netstat >/dev/null; then
-    netstat -tuln | grep ':53' || echo "No conflicts found via netstat"
+    netstat -tuln | grep ":${DNS_LISTEN_PORT:-53} " || echo "No conflicts found via netstat"
 elif command -v ss >/dev/null; then
-    ss -tuln | grep ':53' || echo "No conflicts found via ss"
+    ss -tuln | grep ":${DNS_LISTEN_PORT:-53} " || echo "No conflicts found via ss"
 fi
 
-# Start processes
-echo "Starting dnsmasq and Web GUI..."
-mkfifo /tmp/dnsmasq_logs 2>/dev/null || true
-
-# Start Web GUI reading from the pipe
-/usr/bin/webgui < /tmp/dnsmasq_logs &
+# Start Web GUI with the embedded DNS server (dnsmasq is no longer used)
+DNS_EFFECTIVE_ADDR=${DNS_LISTEN_ADDR:-${TAILSCALE_IP:-0.0.0.0}}
+echo "Starting Web GUI (embedded DNS server on ${DNS_EFFECTIVE_ADDR}:${DNS_LISTEN_PORT:-53})..."
+/usr/bin/webgui &
 WEBGUI_PID=$!
 
-# Start single dnsmasq instance
-/usr/sbin/dnsmasq -k --conf-file=/etc/dnsmasq.conf >> /tmp/dnsmasq_logs 2>&1 &
-DNSMASQ_PID=$!
+echo "Processes started: GUI(PID:$WEBGUI_PID), tailscaled(PID:$TAILSCALED_PID)"
 
-echo "Processes started: dnsmasq(PID:$DNSMASQ_PID), GUI(PID:$WEBGUI_PID)"
-
-# Monitor processes
-while true; do
-    if ! kill -0 $TAILSCALED_PID 2>/dev/null; then
-        echo "Error: tailscaled process (PID: $TAILSCALED_PID) died."
-        exit 1
-    fi
-    if ! kill -0 $DNSMASQ_PID 2>/dev/null; then
-        echo "Error: dnsmasq process (PID: $DNSMASQ_PID) died. Details should be in GUI logs above."
-        exit 1
-    fi
-    if ! kill -0 $WEBGUI_PID 2>/dev/null; then
-        echo "Error: Web GUI process (PID: $WEBGUI_PID) died."
-        exit 1
-    fi
-    sleep 5
-done
+# Exit when either child exits and terminate the survivor cleanly.
+set +e
+wait -n "$TAILSCALED_PID" "$WEBGUI_PID"
+STATUS=$?
+set -e
+if kill -0 "$TAILSCALED_PID" 2>/dev/null; then
+    echo "Error: Web GUI exited (status: $STATUS)."
+else
+    echo "Error: tailscaled exited (status: $STATUS)."
+fi
+cleanup
+if [ "$STATUS" -eq 0 ]; then
+    STATUS=1
+fi
+exit "$STATUS"

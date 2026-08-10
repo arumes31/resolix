@@ -4,18 +4,38 @@ services:
     container_name: dns-tailscale-1
     environment:
       - TS_AUTHKEY=${TS_AUTHKEY}
+      - TS_AUTHKEY_FILE=${TS_AUTHKEY_FILE:-}
       - DOMAINS=.overridedomain.local:100.77.35.105,override1.example.com:100.83.17.42
       - UPSTREAM_DNS=8.8.8.8 8.8.4.4
       - HEALTHCHECK_DOMAIN=google.com
       - MODE=master
       - MASTER_URL=
-      - NODE_NAME=dns-server-1
-      - INGEST_SECRET=my_super_secret_token
+      - NODE_NAME=${NODE_NAME:-dns-server-1}
+      - WEB_LISTEN_ADDR=${WEB_LISTEN_ADDR:-0.0.0.0}
+      - BASE_URL=${BASE_URL:-/}
+      - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}
+      - COOKIE_SECURE=${COOKIE_SECURE:-false}
+      - INGEST_SECRET=${INGEST_SECRET:?INGEST_SECRET is required}
+      - DNS_ALLOWED_CLIENTS=${DNS_ALLOWED_CLIENTS:-}
+      - DNS_DISALLOWED_CLIENTS=${DNS_DISALLOWED_CLIENTS:-}
+      - RATE_LIMIT_QPS=${RATE_LIMIT_QPS:-20}
+      - PRIVATE_PTR=${PRIVATE_PTR:-true}
+      - DNSSEC=${DNSSEC:-false}
+      - DOH_ENABLED=${DOH_ENABLED:-false}
+      - DOH_PATH=${DOH_PATH:-/dns-query}
+      - DOH_AUTH_TOKEN=${DOH_AUTH_TOKEN:-}
+      - DOT_ENABLED=${DOT_ENABLED:-false}
+      - DOT_PORT=${DOT_PORT:-853}
+      - TLS_CERT_FILE=${TLS_CERT_FILE:-}
+      - TLS_KEY_FILE=${TLS_KEY_FILE:-}
     ports:
       - "127.0.0.1:${PORT:-35353}:35353"
     volumes:
       - ./history:/var/lib/tailscale-dnsrewrite
       - ./tailscale:/var/lib/tailscale
+      # Mount certificates when DOT_ENABLED=true:
+      # - ./certs:/etc/tailscale-dnsrewrite/certs:ro
+      # - ./secrets/tailscale_authkey:/run/secrets/tailscale_authkey:ro
     sysctls:
       - net.core.somaxconn=1024
       - net.ipv4.tcp_fastopen=3

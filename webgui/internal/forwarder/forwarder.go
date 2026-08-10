@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"tailscale-dnsrewrite/webgui/internal/config"
@@ -22,14 +24,26 @@ import (
 // Version is set at build time via -ldflags.
 var Version = "dev"
 
-// Forwarder handles sending batches of logs from slave to master.
+type backlogItem struct {
+	event models.QueryEvent
+	size  int64
+}
+
+// Forwarder handles sending batches of query events from slave to master.
 type Forwarder struct {
 	cfg              *config.Config
 	stopChan         chan struct{}
 	stopOnce         sync.Once
+	healthOnce       sync.Once
 	backlogMu        sync.Mutex
-	backlog          []string
+	backlog          []backlogItem
 	backlogTotalSize int64
+	wakeChan         chan struct{}
+	healthReports    chan map[string]float64
+	httpClient       *http.Client
+	retries          atomic.Int64
+	dropped          atomic.Int64
+	sent             atomic.Int64
 
 	// Sync state (Items 90, 91, 94)
 	syncedAliases map[string]string
@@ -47,6 +61,9 @@ type Forwarder struct {
 func NewForwarder(cfg *config.Config) *Forwarder {
 	return &Forwarder{
 		stopChan:      make(chan struct{}),
+		wakeChan:      make(chan struct{}, 1),
+		healthReports: make(chan map[string]float64, 1),
+		httpClient:    &http.Client{Timeout: 10 * time.Second},
 		cfg:           cfg,
 		syncedAliases: make(map[string]string),
 		syncedRoutes:  make(map[string]string),
@@ -111,21 +128,50 @@ func (f *Forwarder) GetSyncedUpstreamHealth() map[string]map[string]float64 {
 	return result
 }
 
-// Enqueue adds a log line to the forwarding queue.
-func (f *Forwarder) Enqueue(line string) {
+// EnqueueEvent adds a query event to the forwarding queue.
+func (f *Forwarder) EnqueueEvent(ev models.QueryEvent) {
 	if f.cfg.Mode != "slave" || f.cfg.MasterURL == "" {
 		return
 	}
+	if ev.Node == "" {
+		ev.Node = f.cfg.NodeName
+	}
+	item := backlogItem{event: ev, size: eventJSONSize(ev)}
 	f.backlogMu.Lock()
 	defer f.backlogMu.Unlock()
 
 	// Enforce a maximum backlog size in bytes to prevent OOM (only when limit is configured)
-	if f.cfg.MaxBacklogSize > 0 && f.backlogTotalSize+int64(len(line)) > f.cfg.MaxBacklogSize {
+	if f.cfg.MaxBacklogSize > 0 && f.backlogTotalSize+item.size > f.cfg.MaxBacklogSize {
+		f.dropped.Add(1)
 		return
 	}
 
-	f.backlog = append(f.backlog, line)
-	f.backlogTotalSize += int64(len(line))
+	f.backlog = append(f.backlog, item)
+	f.backlogTotalSize += item.size
+	select {
+	case f.wakeChan <- struct{}{}:
+	default:
+	}
+}
+
+type responseStatusError struct{ status int }
+
+func (e *responseStatusError) Error() string {
+	return fmt.Sprintf("unexpected status code: %d", e.status)
+}
+
+func (e *responseStatusError) permanent() bool {
+	return e.status >= 400 && e.status < 500 && e.status != http.StatusRequestTimeout && e.status != http.StatusTooManyRequests
+}
+
+// eventJSONSize approximates the serialized size of an event for backlog
+// byte accounting.
+func eventJSONSize(ev models.QueryEvent) int64 {
+	data, err := json.Marshal(ev)
+	if err != nil {
+		return int64(len(ev.Domain) + 64)
+	}
+	return int64(len(data))
 }
 
 // getResourceStats collects current resource usage statistics (Item 93).
@@ -173,16 +219,21 @@ func gzipCompress(data []byte) ([]byte, bool) {
 	return compressed, true
 }
 
-// sendBatch sends a batch of log lines to the master with gzip compression (Item 85).
-func (f *Forwarder) sendBatch(client *http.Client, lines []string, health map[string]float64) error {
-	payload := map[string]interface{}{"node": f.cfg.NodeName}
-	if len(lines) > 0 {
-		payload["batch"] = lines
+// sendBatch sends a batch of query events to the master with gzip
+// compression (Item 85). Events are sent as a top-level JSON array (the new
+// ingest format); health-only payloads keep the legacy object shape.
+func (f *Forwarder) sendBatch(client *http.Client, events []models.QueryEvent, health map[string]float64) error {
+	var data []byte
+	var err error
+	if len(events) > 0 {
+		data, err = json.Marshal(events)
+	} else {
+		payload := map[string]interface{}{"node": f.cfg.NodeName}
+		if len(health) > 0 {
+			payload["health"] = health
+		}
+		data, err = json.Marshal(payload)
 	}
-	if len(health) > 0 {
-		payload["health"] = health
-	}
-	data, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
@@ -219,7 +270,7 @@ func (f *Forwarder) sendBatch(client *http.Client, lines []string, health map[st
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return &responseStatusError{status: resp.StatusCode}
 	}
 	return nil
 }
@@ -453,7 +504,7 @@ func (f *Forwarder) Start() error {
 	if f.cfg.Mode != "slave" || f.cfg.MasterURL == "" {
 		return nil
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := f.httpClient
 	backoffAttempt := 0
 
 	var draining bool
@@ -464,6 +515,7 @@ func (f *Forwarder) Start() error {
 
 	// Items 90, 91, 94: Start sync goroutines
 	go f.startSyncLoops(client)
+	f.ensureHealthReporter(client)
 
 	for {
 		if !draining {
@@ -486,7 +538,7 @@ func (f *Forwarder) Start() error {
 				return nil
 			}
 			select {
-			case <-time.After(100 * time.Millisecond):
+			case <-f.wakeChan:
 			case <-f.stopChan:
 				draining = true
 				drainEnd = time.Now().Add(5 * time.Second)
@@ -497,31 +549,43 @@ func (f *Forwarder) Start() error {
 		if len(f.backlog) < batchSize {
 			batchSize = len(f.backlog)
 		}
-		lines := append([]string(nil), f.backlog[:batchSize]...)
-
-		for i := 0; i < len(lines); i++ {
-			f.backlogTotalSize -= int64(len(f.backlog[i]))
+		items := append([]backlogItem(nil), f.backlog[:batchSize]...)
+		events := make([]models.QueryEvent, len(items))
+		for i, item := range items {
+			events[i] = item.event
+			f.backlogTotalSize -= item.size
 		}
 		f.backlog = f.backlog[batchSize:]
 		f.backlogMu.Unlock()
 
-		err := f.sendBatch(client, lines, nil)
+		err := f.sendBatch(client, events, nil)
 		if err == nil {
-			log.Printf("Successfully sent batch of %d lines to master", len(lines))
+			log.Printf("Successfully sent batch of %d events to master", len(events))
 			backoffAttempt = 0 // Reset on success (Item 86)
+			f.sent.Add(int64(len(events)))
 		} else {
 			log.Printf("Error sending batch to master: %v", err)
 
-			// Item 86: Check max retry attempts
-			if f.cfg.MaxRetryAttempts > 0 && backoffAttempt >= f.cfg.MaxRetryAttempts {
-				log.Printf("[WARN] Max retry attempts (%d) reached, dropping batch of %d lines", f.cfg.MaxRetryAttempts, len(lines))
+			var statusErr *responseStatusError
+			if errors.As(err, &statusErr) && statusErr.permanent() {
+				log.Printf("[WARN] Master rejected batch permanently with HTTP %d; dropping %d events", statusErr.status, len(events))
+				f.dropped.Add(int64(len(events)))
 				backoffAttempt = 0
 				continue
 			}
 
-			f.requeueBatch(lines)
+			// Item 86: Check max retry attempts
+			if f.cfg.MaxRetryAttempts > 0 && backoffAttempt >= f.cfg.MaxRetryAttempts {
+				log.Printf("[WARN] Max retry attempts (%d) reached, dropping batch of %d events", f.cfg.MaxRetryAttempts, len(events))
+				backoffAttempt = 0
+				f.dropped.Add(int64(len(events)))
+				continue
+			}
+
+			f.requeueBatch(items)
 
 			backoffAttempt++
+			f.retries.Add(1)
 			// Item 80: use the configured initial retry interval (falls back to 1s when unset/invalid)
 			waitDur := calculateBackoff(backoffAttempt, safeInterval(f.cfg.ForwarderRetryInterval, time.Second))
 
@@ -550,32 +614,33 @@ func (f *Forwarder) Start() error {
 }
 
 // requeueBatch prepends a failed batch back onto the backlog, honoring the
-// configured byte limit (the oldest overflow lines are dropped).
-func (f *Forwarder) requeueBatch(lines []string) {
+// configured byte limit (the newest overflow events are dropped).
+func (f *Forwarder) requeueBatch(items []backlogItem) {
 	f.backlogMu.Lock()
 	defer f.backlogMu.Unlock()
 
 	if f.cfg.MaxBacklogSize <= 0 {
-		f.backlog = append(lines, f.backlog...)
-		for i := 0; i < len(lines); i++ {
-			f.backlogTotalSize += int64(len(lines[i]))
+		f.backlog = append(items, f.backlog...)
+		for _, item := range items {
+			f.backlogTotalSize += item.size
 		}
 		return
 	}
 
 	// Re-queue only what fits within the byte limit; drop the oldest overflow
 	kept := 0
-	for _, line := range lines {
-		if f.backlogTotalSize+int64(len(line)) > f.cfg.MaxBacklogSize {
+	for _, item := range items {
+		if f.backlogTotalSize+item.size > f.cfg.MaxBacklogSize {
 			break
 		}
 		kept++
-		f.backlogTotalSize += int64(len(line))
+		f.backlogTotalSize += item.size
 	}
-	if kept < len(lines) {
-		log.Printf("[WARN] Backlog byte limit (%d) reached, dropping %d oldest lines of failed batch", f.cfg.MaxBacklogSize, len(lines)-kept)
+	if kept < len(items) {
+		log.Printf("[WARN] Backlog byte limit (%d) reached, dropping %d newest events of failed batch", f.cfg.MaxBacklogSize, len(items)-kept)
 	}
-	f.backlog = append(lines[:kept:kept], f.backlog...)
+	f.dropped.Add(int64(len(items) - kept))
+	f.backlog = append(items[:kept:kept], f.backlog...)
 }
 
 // startHeartbeat sends periodic heartbeats to the master (Item 92).
@@ -655,13 +720,49 @@ func (f *Forwarder) ReportHealth(health map[string]float64) {
 	if f.cfg.Mode != "slave" || f.cfg.MasterURL == "" {
 		return
 	}
-	// Send health reports asynchronously to avoid blocking the health checker
-	go func() {
-		client := &http.Client{Timeout: 5 * time.Second}
-		if err := f.sendBatch(client, nil, health); err != nil {
-			log.Printf("Error reporting health to master: %v", err)
+	f.ensureHealthReporter(f.httpClient)
+	copyHealth := make(map[string]float64, len(health))
+	for key, value := range health {
+		copyHealth[key] = value
+	}
+	select {
+	case f.healthReports <- copyHealth:
+	default:
+		select {
+		case <-f.healthReports:
+		default:
 		}
-	}()
+		select {
+		case f.healthReports <- copyHealth:
+		default:
+		}
+	}
+}
+
+func (f *Forwarder) ensureHealthReporter(client *http.Client) {
+	f.healthOnce.Do(func() { go f.startHealthReporter(client) })
+}
+
+func (f *Forwarder) startHealthReporter(client *http.Client) {
+	for {
+		select {
+		case <-f.stopChan:
+			return
+		case health := <-f.healthReports:
+			if err := f.sendBatch(client, nil, health); err != nil {
+				log.Printf("Error reporting health to master: %v", err)
+			}
+		}
+	}
+}
+
+// Stats returns the current forwarding queue and delivery counters.
+func (f *Forwarder) Stats() (backlog int, backlogBytes, retries, dropped, sent int64) {
+	f.backlogMu.Lock()
+	backlog = len(f.backlog)
+	backlogBytes = f.backlogTotalSize
+	f.backlogMu.Unlock()
+	return backlog, backlogBytes, f.retries.Load(), f.dropped.Load(), f.sent.Load()
 }
 
 // Stop cleanly shuts down the forwarder

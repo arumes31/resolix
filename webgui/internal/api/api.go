@@ -18,9 +18,11 @@ import (
 	"io"
 	"log"
 	"math"
+	"mime"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -30,23 +32,35 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/miekg/dns"
+
 	"tailscale-dnsrewrite/webgui/internal/blocklist"
+	"tailscale-dnsrewrite/webgui/internal/clients"
 	"tailscale-dnsrewrite/webgui/internal/config"
 	"tailscale-dnsrewrite/webgui/internal/dnsroutes"
+	"tailscale-dnsrewrite/webgui/internal/dnsserver"
 	apperr "tailscale-dnsrewrite/webgui/internal/errors"
+	"tailscale-dnsrewrite/webgui/internal/filter"
+	"tailscale-dnsrewrite/webgui/internal/forwarder"
 	"tailscale-dnsrewrite/webgui/internal/models"
 	"tailscale-dnsrewrite/webgui/internal/parser"
+	"tailscale-dnsrewrite/webgui/internal/policy"
 	"tailscale-dnsrewrite/webgui/internal/resolver"
+	"tailscale-dnsrewrite/webgui/internal/rewrites"
 	"tailscale-dnsrewrite/webgui/internal/storage"
+	"tailscale-dnsrewrite/webgui/internal/upstream"
 )
 
 const (
-	sessionCookieName = "ts_dns_session"
-	csrfCookieName    = "ts_dns_csrf"
-	csrfTokenBytes    = 32
-	sessionTokenBytes = 32
-	sessionLifetime   = 7 * 24 * time.Hour
+	sessionCookieName   = "ts_dns_session"
+	csrfCookieName      = "ts_dns_csrf"
+	csrfTokenBytes      = 32
+	sessionTokenBytes   = 32
+	sessionLifetime     = 7 * 24 * time.Hour
+	maxIngestFutureSkew = 5 * time.Minute
 )
+
+var userRulesMu sync.Mutex
 
 // rateLimitEntry tracks failed login attempts for a single IP.
 type rateLimitEntry struct {
@@ -64,6 +78,8 @@ type Metrics struct {
 	StartTime         time.Time
 	queriesByType     sync.Map // map[string]*atomic.Int64
 	upstreamLatencies sync.Map // map[string]*latencyBucket
+	httpRequests      sync.Map // map["method status"]*atomic.Int64
+	httpDurationNanos atomic.Int64
 }
 
 // latencyBucket tracks upstream latency samples for histogram emulation.
@@ -108,14 +124,14 @@ func (m *Metrics) IncQueriesByType(qtype string) {
 }
 
 // RecordUpstreamLatency records a latency measurement for an upstream server.
-func (m *Metrics) RecordUpstreamLatency(upstream string, latencyMs float64) {
-	if v, ok := m.upstreamLatencies.Load(upstream); ok {
+func (m *Metrics) RecordUpstreamLatency(upstreamName string, latencyMs float64) {
+	if v, ok := m.upstreamLatencies.Load(upstreamName); ok {
 		v.(*latencyBucket).addSample(latencyMs)
 		return
 	}
 	newV := &latencyBucket{}
 	newV.addSample(latencyMs)
-	if actual, loaded := m.upstreamLatencies.LoadOrStore(upstream, newV); loaded {
+	if actual, loaded := m.upstreamLatencies.LoadOrStore(upstreamName, newV); loaded {
 		actual.(*latencyBucket).addSample(latencyMs)
 	}
 }
@@ -152,6 +168,21 @@ type Server struct {
 	// Blocklist (Item 61)
 	blocklist *blocklist.Blocklist
 
+	// Filter engine (Step 2: rule-based filtering with subscriptions)
+	filterEngine *filter.Engine
+
+	// Typed rewrites store (Step 3) and DNS server (pipeline metrics)
+	rewritesStore *rewrites.Store
+	dnsServer     *dnsserver.Server
+
+	// Per-client registry (Step 5)
+	clientsRegistry *clients.Registry
+
+	// upstreamReloadFn reloads the upstream pool after upstreams.json saves
+	upstreamReloadFn func()
+	upstreamPool     *upstream.Pool
+	forwarder        *forwarder.Forwarder
+
 	// DNS routes (Item 66)
 	dnsRoutes *dnsroutes.DNSRoutes
 
@@ -164,7 +195,24 @@ type Server struct {
 	dnsLoopDetails  string
 
 	// Prometheus metrics (Item 77)
-	metrics *Metrics
+	metrics   *Metrics
+	webReady  atomic.Bool
+	version   string
+	buildInfo string
+}
+
+// SetBuildInfo publishes build metadata through the API and node status.
+func (s *Server) SetBuildInfo(version, buildInfo string) {
+	s.fieldsMu.Lock()
+	s.version = version
+	s.buildInfo = buildInfo
+	s.fieldsMu.Unlock()
+}
+
+func (s *Server) buildMetadata() (version, buildInfo string) {
+	s.fieldsMu.RLock()
+	defer s.fieldsMu.RUnlock()
+	return s.version, s.buildInfo
 }
 
 // NewServer initializes a new API server.
@@ -221,6 +269,70 @@ func (s *Server) SetDNSRoutes(dr *dnsroutes.DNSRoutes) {
 	s.dnsRoutes = dr
 }
 
+// SetFilter configures the filter engine for status/pause endpoints and metrics.
+func (s *Server) SetFilter(eng *filter.Engine) {
+	s.fieldsMu.Lock()
+	defer s.fieldsMu.Unlock()
+	s.filterEngine = eng
+}
+
+// SetRewritesStore configures the typed-rewrites store for the CRUD API.
+func (s *Server) SetRewritesStore(store *rewrites.Store) {
+	s.fieldsMu.Lock()
+	defer s.fieldsMu.Unlock()
+	s.rewritesStore = store
+}
+
+// SetDNSServer configures the DNS server for pipeline metrics.
+func (s *Server) SetDNSServer(srv *dnsserver.Server) {
+	s.fieldsMu.Lock()
+	defer s.fieldsMu.Unlock()
+	s.dnsServer = srv
+}
+
+// SetClients configures the per-client registry for the clients API.
+func (s *Server) SetClients(reg *clients.Registry) {
+	s.fieldsMu.Lock()
+	defer s.fieldsMu.Unlock()
+	s.clientsRegistry = reg
+}
+
+// SetUpstreamReloadFunc configures the callback invoked after the upstreams
+// file is saved via the API, so the pool picks up changes immediately.
+func (s *Server) SetUpstreamReloadFunc(fn func()) {
+	s.fieldsMu.Lock()
+	defer s.fieldsMu.Unlock()
+	s.upstreamReloadFn = fn
+}
+
+// SetUpstreamPool configures upstream runtime metrics.
+func (s *Server) SetUpstreamPool(pool *upstream.Pool) {
+	s.fieldsMu.Lock()
+	s.upstreamPool = pool
+	s.fieldsMu.Unlock()
+}
+
+// SetForwarder configures forwarding queue metrics.
+func (s *Server) SetForwarder(fwd *forwarder.Forwarder) {
+	s.fieldsMu.Lock()
+	s.forwarder = fwd
+	s.fieldsMu.Unlock()
+}
+
+// getFilter returns the configured filter engine (may be nil).
+func (s *Server) getFilter() *filter.Engine {
+	s.fieldsMu.RLock()
+	defer s.fieldsMu.RUnlock()
+	return s.filterEngine
+}
+
+// getDNSServer returns the configured DNS server (may be nil).
+func (s *Server) getDNSServer() *dnsserver.Server {
+	s.fieldsMu.RLock()
+	defer s.fieldsMu.RUnlock()
+	return s.dnsServer
+}
+
 // isBcryptHash returns true if the string looks like a bcrypt hash.
 func isBcryptHash(s string) bool {
 	return strings.HasPrefix(s, "$2a$") ||
@@ -242,6 +354,28 @@ func generateCSRFToken() (string, error) {
 		return "", fmt.Errorf("generate CSRF token: %w", err)
 	}
 	return base64.StdEncoding.EncodeToString(b), nil
+}
+
+// checkCSRF validates the double-submit token used by authenticated browser
+// sessions. CSRF protection is unnecessary when web authentication is off.
+func (s *Server) checkCSRF(w http.ResponseWriter, r *http.Request) bool {
+	if s.cfg.WebUsername == "" && s.cfg.WebPassword == "" {
+		return true
+	}
+	cookie, err := r.Cookie(csrfCookieName)
+	if err != nil {
+		http.Error(w, apperr.NewErrCSRFMismatch("missing CSRF token", err).Error(), http.StatusForbidden)
+		return false
+	}
+	submitted := r.Header.Get("X-CSRF-Token")
+	if submitted == "" {
+		submitted = r.FormValue("csrf_token")
+	}
+	if subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(submitted)) != 1 {
+		http.Error(w, apperr.NewErrCSRFMismatch("invalid CSRF token", nil).Error(), http.StatusForbidden)
+		return false
+	}
+	return true
 }
 
 func remoteIP(r *http.Request) string {
@@ -285,6 +419,15 @@ func (s *Server) isHTTPS(r *http.Request) bool {
 	if !s.isTrustedProxy(r) {
 		return false
 	}
+	forwardedEntries := strings.Split(r.Header.Get("Forwarded"), ",")
+	for i := len(forwardedEntries) - 1; i >= 0; i-- {
+		for _, parameter := range strings.Split(forwardedEntries[i], ";") {
+			key, value, ok := strings.Cut(strings.TrimSpace(parameter), "=")
+			if ok && strings.EqualFold(key, "proto") {
+				return strings.EqualFold(strings.Trim(value, `"`), "https")
+			}
+		}
+	}
 	proto, _, _ := strings.Cut(r.Header.Get("X-Forwarded-Proto"), ",")
 	return strings.EqualFold(strings.TrimSpace(proto), "https")
 }
@@ -316,7 +459,33 @@ func (s *Server) clientIP(r *http.Request) string {
 			}
 		}
 	}
+	if forwarded := r.Header.Get("Forwarded"); forwarded != "" && s.isTrustedProxy(r) {
+		entries := strings.Split(forwarded, ",")
+		for i := len(entries) - 1; i >= 0; i-- {
+			for _, parameter := range strings.Split(entries[i], ";") {
+				key, value, ok := strings.Cut(strings.TrimSpace(parameter), "=")
+				if !ok || !strings.EqualFold(key, "for") {
+					continue
+				}
+				ip := strings.Trim(strings.TrimSpace(value), `"`)
+				if host, _, err := net.SplitHostPort(ip); err == nil {
+					ip = host
+				}
+				ip = strings.Trim(ip, "[]")
+				if net.ParseIP(ip) != nil && !s.isTrustedProxyIP(ip) {
+					return ip
+				}
+			}
+		}
+	}
 	return remoteIP(r)
+}
+
+func (s *Server) cookiePath() string {
+	if s.cfg.BaseURL == "" {
+		return "/"
+	}
+	return s.cfg.BaseURL
 }
 
 func (s *Server) newSession() (string, error) {
@@ -483,8 +652,9 @@ func (s *Server) BroadcastEvent(e models.QueryEvent) {
 		}
 	}
 
-	// Item 61: Check blocklist
-	if bl != nil && e.Domain != "" {
+	// Item 61: Check blocklist — fallback for legacy-ingested events only;
+	// the DNS pipeline (filter engine) is the source of truth for Blocked.
+	if !e.Blocked && bl != nil && e.Domain != "" {
 		if bl.IsBlocked(e.Domain) {
 			e.Blocked = true
 		}
@@ -630,14 +800,75 @@ func (s *Server) maxBytesMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+type statusResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusResponseWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusResponseWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *statusResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func metricMethod(method string) string {
+	switch method {
+	case http.MethodConnect,
+		http.MethodDelete,
+		http.MethodGet,
+		http.MethodHead,
+		http.MethodOptions,
+		http.MethodPatch,
+		http.MethodPost,
+		http.MethodPut,
+		http.MethodTrace:
+		return method
+	default:
+		return "OTHER"
+	}
+}
+
+func (s *Server) requestMetricsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started := time.Now()
+		requestIDBytes := make([]byte, 12)
+		if _, err := rand.Read(requestIDBytes); err == nil {
+			w.Header().Set("X-Request-ID", base64.RawURLEncoding.EncodeToString(requestIDBytes))
+		}
+		rw := &statusResponseWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rw, r)
+		key := metricMethod(r.Method) + " " + strconv.Itoa(rw.status)
+		counter := &atomic.Int64{}
+		actual, _ := s.metrics.httpRequests.LoadOrStore(key, counter)
+		actual.(*atomic.Int64).Add(1)
+		s.metrics.httpDurationNanos.Add(time.Since(started).Nanoseconds())
+	})
+}
+
 // SetupMux configures the API routes and middleware.
 func (s *Server) SetupMux() http.Handler {
 	mux := http.NewServeMux()
 
 	// Public routes (no auth required)
 	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.HandleFunc("/readyz", s.handleReadyz)
 	mux.HandleFunc("/login", s.handleLogin)
 	mux.HandleFunc("/logout", s.handleLogout)
+
+	// DoH endpoint (RFC 8484): functional without session auth — protected
+	// by DOH_AUTH_TOKEN when set, otherwise restricted to private client IPs.
+	if s.cfg.DoHEnabled {
+		mux.HandleFunc(s.cfg.DoHPath, s.handleDoH)
+	}
 
 	// Metrics can leak internal state; require authentication.
 	mux.Handle("/metrics", s.authMiddleware(http.HandlerFunc(s.handleMetrics)))
@@ -651,6 +882,25 @@ func (s *Server) SetupMux() http.Handler {
 
 	// Item 61: Blocklist status endpoint
 	mux.Handle("/api/blocklist/status", s.authMiddleware(http.HandlerFunc(s.handleBlocklistStatus)))
+
+	// Filter engine: pause/resume protection and status
+	mux.Handle("/api/filtering/pause", s.authMiddleware(http.HandlerFunc(s.handleFilteringPause)))
+	mux.Handle("/api/filtering/status", s.authMiddleware(http.HandlerFunc(s.handleFilteringStatus)))
+
+	// Typed DNS rewrites CRUD
+	mux.Handle("/api/rewrites", s.authMiddleware(http.HandlerFunc(s.handleRewrites)))
+
+	// Per-client registry CRUD (Step 5)
+	mux.Handle("/api/clients", s.authMiddleware(http.HandlerFunc(s.handleClients)))
+	mux.Handle("/api/services", s.authMiddleware(http.HandlerFunc(s.handleServices)))
+
+	// Query-log actions: block/unblock a domain via filter user rules
+	mux.Handle("/api/querylog/block", s.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.handleQuerylogAction(w, r, true)
+	})))
+	mux.Handle("/api/querylog/unblock", s.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.handleQuerylogAction(w, r, false)
+	})))
 
 	// Item 62: Upstream configuration editor
 	mux.Handle("/api/upstreams", s.authMiddleware(http.HandlerFunc(s.handleUpstreams)))
@@ -681,8 +931,9 @@ func (s *Server) SetupMux() http.Handler {
 
 	// Item 89: Node discovery and status endpoint
 	mux.Handle("/api/nodes", s.authMiddleware(http.HandlerFunc(s.handleNodes)))
+	mux.Handle("/api/version", s.authMiddleware(http.HandlerFunc(s.handleVersion)))
 
-	handler := s.gzipMiddleware(mux)
+	handler := s.requestMetricsMiddleware(s.gzipMiddleware(mux))
 
 	rootMux := http.NewServeMux()
 
@@ -700,6 +951,10 @@ func (s *Server) SetupMux() http.Handler {
 		appHandler := http.StripPrefix(base, handler)
 		rootMux.Handle(base+"/", s.maxBytesMiddleware(appHandler))
 		rootMux.Handle(base+"/api/stream", s.authMiddleware(http.HandlerFunc(s.handleStream)))
+		// Keep infrastructure probes stable when the dashboard is mounted at
+		// a reverse-proxy subpath.
+		rootMux.HandleFunc("/healthz", s.handleHealthz)
+		rootMux.HandleFunc("/readyz", s.handleReadyz)
 
 		// Redirect bare root to the base URL
 		rootMux.Handle("/", http.RedirectHandler(base+"/", http.StatusMovedPermanently))
@@ -721,6 +976,168 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = fmt.Fprintf(w, `{"status":"ok"}`)
+}
+
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	dnsReady := false
+	if dnsSrv := s.getDNSServer(); dnsSrv != nil {
+		dnsReady = dnsSrv.Ready()
+	}
+
+	dbReady := s.store.DB() != nil
+	if dbReady {
+		ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+		defer cancel()
+		dbReady = s.store.DB().PingContext(ctx) == nil
+	}
+	if !s.webReady.Load() || !dnsReady || !dbReady {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "not_ready", "dns": dnsReady, "database": dbReady})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+}
+
+func (s *Server) handleVersion(w http.ResponseWriter, _ *http.Request) {
+	version, buildInfo := s.buildMetadata()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"version":    version,
+		"go_version": runtime.Version(),
+		"build":      buildInfo,
+	})
+}
+
+// ===== DNS-over-HTTPS (RFC 8484) =====
+
+// dohPrivateNets are the client ranges allowed to use DoH when no
+// DOH_AUTH_TOKEN is configured: loopback, RFC1918, Tailscale CGNAT, ULA.
+var dohPrivateNets = mustParseCIDRs([]string{
+	"127.0.0.0/8", "::1/128",
+	"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+	"100.64.0.0/10", "fc00::/7",
+})
+
+func mustParseCIDRs(raws []string) []*net.IPNet {
+	out := make([]*net.IPNet, 0, len(raws))
+	for _, raw := range raws {
+		_, n, err := net.ParseCIDR(raw)
+		if err != nil {
+			panic(err)
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+// dohClientAllowed enforces the DoH auth model: Bearer token when
+// DOH_AUTH_TOKEN is set, otherwise private/tailnet client IPs only.
+func (s *Server) dohClientAllowed(r *http.Request) bool {
+	if token := s.cfg.DoHAuthToken; token != "" {
+		auth := r.Header.Get("Authorization")
+		return subtle.ConstantTimeCompare([]byte(auth), []byte("Bearer "+token)) == 1
+	}
+	peerIP := net.ParseIP(remoteIP(r))
+	// Forwarded headers are not proof that a loopback peer is a proxy: any
+	// local process can forge them. Loopback proxies must authenticate with
+	// DOH_AUTH_TOKEN, which is handled above.
+	if peerIP != nil && peerIP.IsLoopback() {
+		return false
+	}
+	ip := net.ParseIP(s.clientIP(r))
+	if ip == nil {
+		return false
+	}
+	for _, n := range dohPrivateNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// handleDoH serves DNS-over-HTTPS (RFC 8484 GET+POST) through the same
+// pipeline as the UDP/TCP/DoT listeners.
+func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
+	dnsSrv := s.getDNSServer()
+	if dnsSrv == nil {
+		http.Error(w, "DNS server not available", http.StatusServiceUnavailable)
+		return
+	}
+	if !s.dohClientAllowed(r) {
+		if s.cfg.DoHAuthToken != "" {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		} else {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+		}
+		return
+	}
+
+	var wire []byte
+	switch r.Method {
+	case http.MethodGet:
+		raw := r.URL.Query().Get("dns")
+		if raw == "" {
+			http.Error(w, "Missing dns parameter", http.StatusBadRequest)
+			return
+		}
+		decoded, err := base64.RawURLEncoding.DecodeString(raw)
+		if err != nil {
+			http.Error(w, "Invalid dns parameter", http.StatusBadRequest)
+			return
+		}
+		if len(decoded) > 65535 {
+			http.Error(w, "DNS message too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		wire = decoded
+	case http.MethodPost:
+		mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if err != nil || mediaType != "application/dns-message" {
+			http.Error(w, "Unsupported content type", http.StatusUnsupportedMediaType)
+			return
+		}
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64*1024))
+		if err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				http.Error(w, "DNS message too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			http.Error(w, "Failed to read body", http.StatusBadRequest)
+			return
+		}
+		if len(body) > 65535 {
+			http.Error(w, "DNS message too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		wire = body
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	req := new(dns.Msg)
+	if err := req.Unpack(wire); err != nil {
+		http.Error(w, "Invalid DNS message", http.StatusBadRequest)
+		return
+	}
+
+	resp, drop := dnsSrv.Resolve(req, s.clientIP(r))
+	if drop || resp == nil {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+	out, err := resp.Pack()
+	if err != nil {
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/dns-message")
+	_, _ = w.Write(out) // #nosec G705 -- RFC 8484 response is packed binary DNS, not HTML
 }
 
 // handleMetrics exposes Prometheus-format metrics on the /metrics endpoint.
@@ -757,9 +1174,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		lb.mu.Lock()
 		defer lb.mu.Unlock()
 		if lb.count > 0 {
-			avg := lb.sum / float64(lb.count) / 1000.0 // ms to seconds
 			label := escapePrometheusLabel(fmt.Sprint(key))
-			fmt.Fprintf(&buf, "dns_upstream_latency_seconds{upstream=\"%s\",quantile=\"avg\"} %f\n", label, avg)
 			fmt.Fprintf(&buf, "dns_upstream_latency_seconds_count{upstream=\"%s\"} %d\n", label, lb.count)
 			fmt.Fprintf(&buf, "dns_upstream_latency_seconds_sum{upstream=\"%s\"} %f\n", label, lb.sum/1000.0)
 		}
@@ -786,6 +1201,125 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(&buf, "# HELP process_uptime_seconds Application uptime in seconds\n")
 	fmt.Fprintf(&buf, "# TYPE process_uptime_seconds gauge\n")
 	fmt.Fprintf(&buf, "process_uptime_seconds %f\n", uptime)
+	fmt.Fprintf(&buf, "# HELP sse_subscriber_drops_total Events dropped for slow SSE subscribers\n")
+	fmt.Fprintf(&buf, "# TYPE sse_subscriber_drops_total counter\n")
+	fmt.Fprintf(&buf, "sse_subscriber_drops_total %d\n", s.subDropCnt.Load())
+
+	fmt.Fprintf(&buf, "# HELP http_requests_total HTTP requests by method and status\n")
+	fmt.Fprintf(&buf, "# TYPE http_requests_total counter\n")
+	var requestCount int64
+	m.httpRequests.Range(func(key, value interface{}) bool {
+		parts := strings.SplitN(fmt.Sprint(key), " ", 2)
+		if len(parts) == 2 {
+			count := value.(*atomic.Int64).Load()
+			requestCount += count
+			fmt.Fprintf(&buf, "http_requests_total{method=\"%s\",status=\"%s\"} %d\n", escapePrometheusLabel(parts[0]), escapePrometheusLabel(parts[1]), count)
+		}
+		return true
+	})
+	fmt.Fprintf(&buf, "# HELP http_request_duration_seconds_sum Total HTTP request duration\n")
+	fmt.Fprintf(&buf, "# TYPE http_request_duration_seconds_sum counter\n")
+	fmt.Fprintf(&buf, "http_request_duration_seconds_sum %f\n", float64(m.httpDurationNanos.Load())/float64(time.Second))
+	fmt.Fprintf(&buf, "# HELP http_request_duration_seconds_count Total timed HTTP requests\n")
+	fmt.Fprintf(&buf, "# TYPE http_request_duration_seconds_count counter\n")
+	fmt.Fprintf(&buf, "http_request_duration_seconds_count %d\n", requestCount)
+
+	// Filter engine metrics
+	if eng := s.getFilter(); eng != nil {
+		blocked, allowed := eng.Stats()
+		fmt.Fprintf(&buf, "# HELP filter_blocked_total Queries blocked by the filter engine\n")
+		fmt.Fprintf(&buf, "# TYPE filter_blocked_total counter\n")
+		fmt.Fprintf(&buf, "filter_blocked_total %d\n", blocked)
+		fmt.Fprintf(&buf, "# HELP filter_allowed_total Queries allowed by filter exception rules\n")
+		fmt.Fprintf(&buf, "# TYPE filter_allowed_total counter\n")
+		fmt.Fprintf(&buf, "filter_allowed_total %d\n", allowed)
+		fmt.Fprintf(&buf, "# HELP filter_rules_total Loaded filter rules per source\n")
+		fmt.Fprintf(&buf, "# TYPE filter_rules_total gauge\n")
+		for _, src := range eng.Sources() {
+			label := escapePrometheusLabel(src.Name)
+			kind := escapePrometheusLabel(src.Kind)
+			fmt.Fprintf(&buf, "filter_rules_total{source=\"%s\",kind=\"%s\",type=\"block\"} %d\n", label, kind, src.RuleCount)
+			fmt.Fprintf(&buf, "filter_rules_total{source=\"%s\",kind=\"%s\",type=\"allow\"} %d\n", label, kind, src.AllowRuleCount)
+		}
+		fmt.Fprintf(&buf, "# HELP filter_paused Whether filtering is currently paused (1) or active (0)\n")
+		fmt.Fprintf(&buf, "# TYPE filter_paused gauge\n")
+		paused := 0
+		if eng.Paused() {
+			paused = 1
+		}
+		fmt.Fprintf(&buf, "filter_paused %d\n", paused)
+	}
+
+	// DNS pipeline counters (rewrites / safe-search / bogus-NXDOMAIN)
+	if dnsSrv := s.getDNSServer(); dnsSrv != nil {
+		rewriteHits, safeSearchHits, bogusNXHits := dnsSrv.Stats()
+		fmt.Fprintf(&buf, "# HELP rewrites_hits_total Queries answered by typed rewrites\n")
+		fmt.Fprintf(&buf, "# TYPE rewrites_hits_total counter\n")
+		fmt.Fprintf(&buf, "rewrites_hits_total %d\n", rewriteHits)
+		fmt.Fprintf(&buf, "# HELP safesearch_hits_total Queries rewritten by safe search\n")
+		fmt.Fprintf(&buf, "# TYPE safesearch_hits_total counter\n")
+		fmt.Fprintf(&buf, "safesearch_hits_total %d\n", safeSearchHits)
+		fmt.Fprintf(&buf, "# HELP bogus_nxdomain_total Upstream answers converted to NXDOMAIN (bogus ranges)\n")
+		fmt.Fprintf(&buf, "# TYPE bogus_nxdomain_total counter\n")
+		fmt.Fprintf(&buf, "bogus_nxdomain_total %d\n", bogusNXHits)
+
+		fmt.Fprintf(&buf, "# HELP dns_ratelimit_dropped_total Queries refused by the per-subnet rate limiter\n")
+		fmt.Fprintf(&buf, "# TYPE dns_ratelimit_dropped_total counter\n")
+		fmt.Fprintf(&buf, "dns_ratelimit_dropped_total %d\n", dnsSrv.RateLimitDropped())
+		aclDropped, aclRefused, rateBuckets := dnsSrv.ACLStats()
+		fmt.Fprintf(&buf, "# HELP dns_acl_dropped_total Queries silently dropped by the DNS deny ACL\n")
+		fmt.Fprintf(&buf, "# TYPE dns_acl_dropped_total counter\n")
+		fmt.Fprintf(&buf, "dns_acl_dropped_total %d\n", aclDropped)
+		fmt.Fprintf(&buf, "# HELP dns_acl_refused_total Queries refused by the DNS allow ACL\n")
+		fmt.Fprintf(&buf, "# TYPE dns_acl_refused_total counter\n")
+		fmt.Fprintf(&buf, "dns_acl_refused_total %d\n", aclRefused)
+		fmt.Fprintf(&buf, "# HELP dns_ratelimit_buckets Active per-subnet rate-limit buckets\n")
+		fmt.Fprintf(&buf, "# TYPE dns_ratelimit_buckets gauge\n")
+		fmt.Fprintf(&buf, "dns_ratelimit_buckets %d\n", rateBuckets)
+
+		cacheStats := dnsSrv.CacheStats()
+		fmt.Fprintf(&buf, "# HELP dns_cache_entries Current cache entries\n# TYPE dns_cache_entries gauge\ndns_cache_entries %d\n", cacheStats.Entries)
+		fmt.Fprintf(&buf, "# HELP dns_cache_capacity Maximum cache entries\n# TYPE dns_cache_capacity gauge\ndns_cache_capacity %d\n", cacheStats.Capacity)
+		fmt.Fprintf(&buf, "# HELP dns_cache_stale_hits_total Optimistic stale responses served\n# TYPE dns_cache_stale_hits_total counter\ndns_cache_stale_hits_total %d\n", cacheStats.StaleHits)
+		fmt.Fprintf(&buf, "# HELP dns_cache_evictions_total LRU cache evictions\n# TYPE dns_cache_evictions_total counter\ndns_cache_evictions_total %d\n", cacheStats.Evictions)
+		fmt.Fprintf(&buf, "# HELP dns_cache_cleared_entries_total Entries removed by cache clears\n# TYPE dns_cache_cleared_entries_total counter\ndns_cache_cleared_entries_total %d\n", cacheStats.Cleared)
+		fmt.Fprintf(&buf, "# HELP dns_cache_refreshes_total Successful optimistic cache refreshes\n# TYPE dns_cache_refreshes_total counter\ndns_cache_refreshes_total %d\n", cacheStats.Refreshes)
+
+		fmt.Fprintf(&buf, "# HELP blocked_service_hits_total Queries blocked per blocked-service ID\n")
+		fmt.Fprintf(&buf, "# TYPE blocked_service_hits_total counter\n")
+		for id, count := range dnsSrv.ServiceStats() {
+			fmt.Fprintf(&buf, "blocked_service_hits_total{service=\"%s\"} %d\n", escapePrometheusLabel(id), count)
+		}
+	}
+
+	s.fieldsMu.RLock()
+	pool := s.upstreamPool
+	fwd := s.forwarder
+	s.fieldsMu.RUnlock()
+	if pool != nil {
+		fmt.Fprintf(&buf, "# HELP dns_upstream_requests_total Upstream requests by result\n# TYPE dns_upstream_requests_total counter\n")
+		fmt.Fprintf(&buf, "# HELP dns_upstream_ewma_seconds Upstream latency EWMA\n# TYPE dns_upstream_ewma_seconds gauge\n")
+		fmt.Fprintf(&buf, "# HELP dns_upstream_healthy Upstream health state\n# TYPE dns_upstream_healthy gauge\n")
+		for _, stat := range pool.StatsSnapshot() {
+			label := escapePrometheusLabel(stat.Spec)
+			fmt.Fprintf(&buf, "dns_upstream_requests_total{upstream=\"%s\",result=\"success\"} %d\n", label, stat.Successes)
+			fmt.Fprintf(&buf, "dns_upstream_requests_total{upstream=\"%s\",result=\"failure\"} %d\n", label, stat.Failures)
+			fmt.Fprintf(&buf, "dns_upstream_ewma_seconds{upstream=\"%s\"} %f\n", label, stat.EWMAms/1000)
+			healthy := 0
+			if stat.Healthy {
+				healthy = 1
+			}
+			fmt.Fprintf(&buf, "dns_upstream_healthy{upstream=\"%s\"} %d\n", label, healthy)
+		}
+	}
+	if fwd != nil {
+		backlog, backlogBytes, retries, dropped, sent := fwd.Stats()
+		fmt.Fprintf(&buf, "# HELP forwarder_backlog_events Events waiting for master delivery\n# TYPE forwarder_backlog_events gauge\nforwarder_backlog_events %d\n", backlog)
+		fmt.Fprintf(&buf, "# HELP forwarder_backlog_bytes Bytes waiting for master delivery\n# TYPE forwarder_backlog_bytes gauge\nforwarder_backlog_bytes %d\n", backlogBytes)
+		fmt.Fprintf(&buf, "# HELP forwarder_retries_total Master delivery retries\n# TYPE forwarder_retries_total counter\nforwarder_retries_total %d\n", retries)
+		fmt.Fprintf(&buf, "# HELP forwarder_dropped_events_total Events dropped by forwarding limits or permanent errors\n# TYPE forwarder_dropped_events_total counter\nforwarder_dropped_events_total %d\n", dropped)
+		fmt.Fprintf(&buf, "# HELP forwarder_sent_events_total Events delivered to the master\n# TYPE forwarder_sent_events_total counter\nforwarder_sent_events_total %d\n", sent)
+	}
 
 	_, _ = buf.WriteTo(w)
 }
@@ -800,14 +1334,23 @@ func (s *Server) internalAuth(next http.Handler) http.Handler {
 	if s.cfg.IngestSecret != "" {
 		return next
 	}
+	if s.cfg.WebUsername == "" || s.cfg.WebPassword == "" {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "Internal API authentication is not configured", http.StatusServiceUnavailable)
+		})
+	}
 	return s.authMiddleware(next)
 }
 
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// If no auth is configured, allow all
-		if s.cfg.WebUsername == "" || s.cfg.WebPassword == "" {
+		if s.cfg.WebUsername == "" && s.cfg.WebPassword == "" {
 			next.ServeHTTP(w, r)
+			return
+		}
+		if s.cfg.WebUsername == "" || s.cfg.WebPassword == "" {
+			http.Error(w, "Web authentication is misconfigured", http.StatusServiceUnavailable)
 			return
 		}
 
@@ -847,7 +1390,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via cookieSecure(r) (COOKIE_SECURE override or HTTPS request): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
 			Name:     csrfCookieName,
 			Value:    csrfToken,
-			Path:     "/",
+			Path:     s.cookiePath(),
 			HttpOnly: true,
 			Secure:   s.cookieSecure(r),
 			SameSite: http.SameSiteStrictMode,
@@ -906,7 +1449,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via cookieSecure(r) (COOKIE_SECURE override or HTTPS request): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
 				Name:     sessionCookieName,
 				Value:    sessionToken,
-				Path:     "/",
+				Path:     s.cookiePath(),
 				HttpOnly: true,
 				Secure:   s.cookieSecure(r),
 				MaxAge:   86400 * 7, // 1 week
@@ -927,7 +1470,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via cookieSecure(r) (COOKIE_SECURE override or HTTPS request): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
 			Name:     csrfCookieName,
 			Value:    csrfToken,
-			Path:     "/",
+			Path:     s.cookiePath(),
 			HttpOnly: true,
 			Secure:   s.cookieSecure(r),
 			SameSite: http.SameSiteStrictMode,
@@ -947,13 +1490,22 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	csrfCookie, err := r.Cookie(csrfCookieName)
+	if err != nil || subtle.ConstantTimeCompare([]byte(csrfCookie.Value), []byte(r.FormValue("csrf_token"))) != 1 {
+		http.Error(w, apperr.NewErrCSRFMismatch("invalid CSRF token", err).Error(), http.StatusForbidden)
+		return
+	}
 	if cookie, err := r.Cookie(sessionCookieName); err == nil {
 		s.deleteSession(cookie.Value)
 	}
 	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via cookieSecure(r) (COOKIE_SECURE override or HTTPS request): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
 		Name:     sessionCookieName,
 		Value:    "",
-		Path:     "/",
+		Path:     s.cookiePath(),
 		HttpOnly: true,
 		Secure:   s.cookieSecure(r),
 		MaxAge:   -1,
@@ -963,7 +1515,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via cookieSecure(r) (COOKIE_SECURE override or HTTPS request): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
 		Name:     csrfCookieName,
 		Value:    "",
-		Path:     "/",
+		Path:     s.cookiePath(),
 		HttpOnly: true,
 		Secure:   s.cookieSecure(r),
 		MaxAge:   -1,
@@ -988,19 +1540,23 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 2. Limit Total Payload Size
-	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxRequestSize)
-
-	// Item 85: Handle gzip-encoded request body
-	var bodyReader io.Reader = r.Body
-	if r.Header.Get("Content-Encoding") == "gzip" {
-		gzReader, err := gzip.NewReader(r.Body)
-		if err != nil {
-			http.Error(w, apperr.NewErrParseFailed("gzip decompress error", err).Error(), http.StatusBadRequest)
-			return
+	body, err := readRequestBody(w, r, s.cfg.MaxRequestSize)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, apperr.NewErrParseFailed("bad request", err).Error(), http.StatusBadRequest)
 		}
-		defer func() { _ = gzReader.Close() }()
-		bodyReader = gzReader
+		return
+	}
+
+	// New format: a top-level JSON array of QueryEvent (structured events
+	// from dnsserver-based slaves). Legacy format: an object with raw dnsmasq
+	// log lines parsed via internal/parser.
+	if bytes.HasPrefix(bytes.TrimSpace(body), []byte("[")) {
+		s.handleIngestEvents(w, r, body)
+		return
 	}
 
 	var payload struct {
@@ -1009,7 +1565,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		Batch  []string           `json:"batch"`
 		Health map[string]float64 `json:"health,omitempty"`
 	}
-	if err := json.NewDecoder(bodyReader).Decode(&payload); err != nil {
+	if err := json.Unmarshal(body, &payload); err != nil {
 		http.Error(w, apperr.NewErrParseFailed("payload too large or bad request", err).Error(), http.StatusBadRequest)
 		return
 	}
@@ -1063,6 +1619,83 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func readRequestBody(w http.ResponseWriter, r *http.Request, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		maxBytes = config.DefaultMaxRequestSize
+	}
+	compressed := http.MaxBytesReader(w, r.Body, maxBytes)
+	var reader io.Reader = compressed
+	var gzReader *gzip.Reader
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("Content-Encoding")), "gzip") {
+		var err error
+		gzReader, err = gzip.NewReader(compressed)
+		if err != nil {
+			return nil, fmt.Errorf("gzip reader: %w", err)
+		}
+		defer func() { _ = gzReader.Close() }()
+		reader = gzReader
+	}
+	data, err := io.ReadAll(io.LimitReader(reader, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, &http.MaxBytesError{Limit: maxBytes}
+	}
+	return data, nil
+}
+
+// handleIngestEvents processes the new ingest format: a top-level JSON array
+// of models.QueryEvent produced by dnsserver-based slaves. Node status is
+// updated from the X-Node-* headers as with legacy payloads.
+func (s *Server) handleIngestEvents(w http.ResponseWriter, r *http.Request, body []byte) {
+	var events []models.QueryEvent
+	if err := json.Unmarshal(body, &events); err != nil {
+		http.Error(w, apperr.NewErrParseFailed("invalid events payload", err).Error(), http.StatusBadRequest)
+		return
+	}
+	if len(events) > 100 {
+		http.Error(w, "Batch too large (max 100)", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	node := ""
+	now := time.Now()
+	maxUnixTime := now.Add(maxIngestFutureSkew).Unix()
+	for i := range events {
+		if events[i].UnixTime <= 0 || events[i].UnixTime > maxUnixTime {
+			events[i].UnixTime = now.Unix()
+		}
+		if node == "" {
+			node = events[i].Node
+		}
+		s.store.AddEvent(events[i])
+		s.BroadcastEvent(events[i])
+	}
+
+	// Item 88: Update node status from version headers on ingest, merging the
+	// header-derived fields into the existing status so heartbeat-provided
+	// values (MemoryMB, Goroutines, DBSizeMB, UpstreamHealth) are preserved.
+	if node != "" {
+		status := models.NodeStatus{Name: node}
+		if existing := s.store.GetNodeStatus(node); existing != nil {
+			status = *existing
+		}
+		if v := r.Header.Get("X-Node-Version"); v != "" {
+			status.Version = v
+		}
+		if v := r.Header.Get("X-Go-Version"); v != "" {
+			status.GoVersion = v
+		}
+		if v := r.Header.Get("X-Node-Build"); v != "" {
+			status.BuildInfo = v
+		}
+		s.store.SetNodeStatus(node, status)
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	nonce := ""
 	if s.nonceFromCtx != nil {
@@ -1070,12 +1703,17 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	currentEvents := s.store.GetOrderedEvents(s.cfg.ScanLimit)
+	csrfToken := ""
+	if cookie, err := r.Cookie(csrfCookieName); err == nil {
+		csrfToken = cookie.Value
+	}
 	var buf bytes.Buffer
 	if err := s.tmpl.Execute(&buf, map[string]interface{}{
-		"Events":  currentEvents,
-		"Nonce":   nonce,
-		"BaseURL": s.cfg.BaseURL,
-		"Mode":    s.cfg.Mode,
+		"Events":    currentEvents,
+		"Nonce":     nonce,
+		"BaseURL":   s.cfg.BaseURL,
+		"Mode":      s.cfg.Mode,
+		"CSRFToken": csrfToken,
 	}); err != nil {
 		log.Printf("Template execution error: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -1089,9 +1727,48 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	sinceStr := r.URL.Query().Get("since")
 	var since int64
 	if sinceStr != "" {
-		_, _ = fmt.Sscanf(sinceStr, "%d", &since)
+		var err error
+		since, err = strconv.ParseInt(sinceStr, 10, 64)
+		if err != nil || since < 0 {
+			http.Error(w, "invalid since parameter", http.StatusBadRequest)
+			return
+		}
 	}
-	result := s.store.GetRecentEvents(since)
+	cursor := r.URL.Query().Get("cursor")
+	if cursor != "" {
+		if _, err := strconv.ParseUint(cursor, 10, 64); err != nil {
+			http.Error(w, "invalid cursor parameter", http.StatusBadRequest)
+			return
+		}
+	}
+	limit := config.DefaultScanLimit
+	if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
+		parsed, err := strconv.Atoi(rawLimit)
+		if err != nil || parsed < 1 || parsed > config.DefaultScanLimit {
+			http.Error(w, fmt.Sprintf("limit must be between 1 and %d", config.DefaultScanLimit), http.StatusBadRequest)
+			return
+		}
+		limit = parsed
+	}
+	var result []models.QueryEvent
+	if cursor == "" {
+		result = s.store.GetRecentEvents(since)
+		if len(result) > limit {
+			result = result[:limit]
+		}
+	} else {
+		result = s.store.GetEventsAfter(cursor, since, limit)
+	}
+	if len(result) > 0 {
+		maxID := uint64(0)
+		for _, event := range result {
+			id, _ := strconv.ParseUint(event.ID, 10, 64)
+			if id > maxID {
+				maxID = id
+			}
+		}
+		w.Header().Set("X-Next-Cursor", strconv.FormatUint(maxID, 10))
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(result)
 }
@@ -1103,15 +1780,6 @@ func (s *Server) handleStats(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleClientStats(w http.ResponseWriter, r *http.Request) {
-	if s.cfg.IngestSecret != "" {
-		auth := r.Header.Get("Authorization")
-		expected := "Bearer " + s.cfg.IngestSecret
-		if subtle.ConstantTimeCompare([]byte(auth), []byte(expected)) != 1 {
-			http.Error(w, apperr.NewErrAuthFailed("invalid ingest secret", nil).Error(), http.StatusUnauthorized)
-			return
-		}
-	}
-
 	ip := r.URL.Query().Get("ip")
 	if ip == "" || net.ParseIP(ip) == nil {
 		http.Error(w, "Missing or invalid ip parameter", http.StatusBadRequest)
@@ -1129,32 +1797,48 @@ func (s *Server) handleSimulate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Missing domain parameter", http.StatusBadRequest)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	ips, err := (&net.Resolver{}).LookupIPAddr(ctx, domain)
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			w.WriteHeader(http.StatusGatewayTimeout)
-		} else {
-			var dnsErr *net.DNSError
-			if errors.As(err, &dnsErr) {
-				w.WriteHeader(http.StatusBadGateway)
-			} else {
-				w.WriteHeader(http.StatusInternalServerError)
-			}
-		}
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "error", "error": err.Error()})
+	if _, ok := dns.IsDomainName(domain); !ok {
+		http.Error(w, "invalid domain", http.StatusBadRequest)
 		return
 	}
-	res := make([]string, 0, len(ips))
-	for _, ip := range ips {
-		res = append(res, ip.String())
+	dnsSrv := s.getDNSServer()
+	if dnsSrv == nil {
+		http.Error(w, "DNS server unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	res := make([]string, 0, 4)
+	for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA} {
+		req := new(dns.Msg)
+		req.SetQuestion(dns.Fqdn(domain), qtype)
+		resp, drop := dnsSrv.Resolve(req, s.clientIP(r))
+		if drop || resp == nil || resp.Rcode != dns.RcodeSuccess {
+			continue
+		}
+		for _, answer := range resp.Answer {
+			switch record := answer.(type) {
+			case *dns.A:
+				res = append(res, record.A.String())
+			case *dns.AAAA:
+				res = append(res, record.AAAA.String())
+			}
+		}
+	}
+	if len(res) == 0 {
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "error", "error": "no address records"})
+		return
 	}
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "success", "ips": res})
 }
 
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
+	lastID := strings.TrimSpace(r.Header.Get("Last-Event-ID"))
+	if lastID != "" {
+		if _, err := strconv.ParseUint(lastID, 10, 64); err != nil {
+			http.Error(w, "invalid Last-Event-ID", http.StatusBadRequest)
+			return
+		}
+	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
@@ -1170,12 +1854,22 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	_, _ = fmt.Fprint(w, "retry: 3000\n\n")
 
 	ch := s.Subscribe()
 
 	defer func() {
 		s.Unsubscribe(ch)
 	}()
+
+	if lastID != "" {
+		for _, event := range s.store.GetEventsAfter(lastID, 0, config.DefaultScanLimit) {
+			data, _ := json.Marshal(event)
+			_, _ = fmt.Fprintf(w, "id: %s\ndata: %s\n\n", event.ID, data)
+			lastID = event.ID
+		}
+		flusher.Flush()
+	}
 
 	notify := r.Context().Done()
 	keepalive := s.cfg.SSEKeepaliveInterval
@@ -1193,8 +1887,16 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
+			if lastID != "" {
+				last, _ := strconv.ParseUint(lastID, 10, 64)
+				current, _ := strconv.ParseUint(ev.ID, 10, 64)
+				if current <= last {
+					continue
+				}
+			}
 			data, _ := json.Marshal(ev)
-			_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+			_, _ = fmt.Fprintf(w, "id: %s\ndata: %s\n\n", ev.ID, data)
+			lastID = ev.ID
 			flusher.Flush()
 			if !timer.Stop() {
 				select {
@@ -1228,6 +1930,408 @@ func (s *Server) handleBlocklistStatus(w http.ResponseWriter, _ *http.Request) {
 	_ = json.NewEncoder(w).Encode(bl.Status())
 }
 
+// ===== Filter Engine Endpoints =====
+
+// handleFilteringStatus reports the filter engine state: enabled/paused,
+// per-source rule counts, and last update times.
+func (s *Server) handleFilteringStatus(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	eng := s.getFilter()
+	if eng == nil {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"enabled": true,
+			"sources": []interface{}{},
+		})
+		return
+	}
+	blocked, allowed := eng.Stats()
+	resp := map[string]interface{}{
+		"enabled":              !eng.Paused(),
+		"sources":              eng.Sources(),
+		"filter_blocked_total": blocked,
+		"filter_allowed_total": allowed,
+	}
+	if until := eng.PausedUntil(); !until.IsZero() {
+		resp["paused_until"] = until.Format(time.RFC3339)
+	}
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// handleFilteringPause pauses protection for N minutes (POST {"minutes": n});
+// minutes <= 0 resumes immediately.
+func (s *Server) handleFilteringPause(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.checkCSRF(w, r) {
+		return
+	}
+	eng := s.getFilter()
+	if eng == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "filter engine is not configured",
+		})
+		return
+	}
+
+	var req struct {
+		Minutes int `json:"minutes"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	eng.Pause(req.Minutes)
+
+	resp := map[string]interface{}{"status": "ok", "enabled": !eng.Paused()}
+	if until := eng.PausedUntil(); !until.IsZero() {
+		resp["paused_until"] = until.Format(time.RFC3339)
+	}
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// ===== Typed Rewrites CRUD =====
+
+// handleRewrites dispatches GET (list), POST (add), and DELETE (?id=) for
+// typed DNS rewrites. Changes take effect live in the DNS pipeline.
+func (s *Server) handleRewrites(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	s.fieldsMu.RLock()
+	store := s.rewritesStore
+	s.fieldsMu.RUnlock()
+	if store == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "rewrites store is not configured",
+		})
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":   "ok",
+			"rewrites": store.List(),
+		})
+	case http.MethodPost:
+		if !s.checkCSRF(w, r) {
+			return
+		}
+		var req struct {
+			Domain string `json:"domain"`
+			Type   string `json:"type"`
+			Value  string `json:"value"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+		rw, err := store.Add(req.Domain, req.Type, req.Value)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid rewrite: %v", err), http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "rewrite": rw})
+	case http.MethodDelete:
+		if !s.checkCSRF(w, r) {
+			return
+		}
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			http.Error(w, "Missing id parameter", http.StatusBadRequest)
+			return
+		}
+		found, err := store.Delete(id)
+		if err != nil {
+			http.Error(w, "Failed to delete rewrite", http.StatusInternalServerError)
+			return
+		}
+		if !found {
+			http.Error(w, "Rewrite not found", http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// ===== Per-Client Registry CRUD =====
+
+// handleClients dispatches GET (list), POST (add), PUT (update), and
+// DELETE (?name=) for the per-client registry. Changes take effect live.
+func (s *Server) handleClients(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	s.fieldsMu.RLock()
+	reg := s.clientsRegistry
+	s.fieldsMu.RUnlock()
+	if reg == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "clients registry is not configured",
+		})
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "ok",
+			"clients": reg.List(),
+		})
+	case http.MethodPost, http.MethodPut:
+		if !s.checkCSRF(w, r) {
+			return
+		}
+		var c clients.Client
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256*1024)).Decode(&c); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(c.Name) == "" || len(c.IDs) == 0 {
+			http.Error(w, "Client requires a name and at least one ID (IP or CIDR)", http.StatusBadRequest)
+			return
+		}
+		var err error
+		if r.Method == http.MethodPost {
+			err = reg.Add(c)
+		} else {
+			err = reg.Update(c)
+		}
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid client: %v", err), http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+	case http.MethodDelete:
+		if !s.checkCSRF(w, r) {
+			return
+		}
+		name := r.URL.Query().Get("name")
+		if name == "" {
+			http.Error(w, "Missing name parameter", http.StatusBadRequest)
+			return
+		}
+		if !reg.Delete(name) {
+			http.Error(w, "Client not found", http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleServices returns the blocked-service catalog, global enablement, and
+// live hit counts for the settings UI.
+func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	enabled := make(map[string]bool)
+	for _, id := range strings.FieldsFunc(s.cfg.BlockedServices, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	}) {
+		enabled[strings.ToLower(id)] = true
+	}
+	hits := make(map[string]int64)
+	if dnsSrv := s.getDNSServer(); dnsSrv != nil {
+		hits = dnsSrv.ServiceStats()
+	}
+	type serviceStatus struct {
+		ID      string `json:"id"`
+		Enabled bool   `json:"enabled"`
+		Hits    int64  `json:"hits"`
+	}
+	services := make([]serviceStatus, 0, len(policy.ServiceIDs()))
+	for _, id := range policy.ServiceIDs() {
+		services = append(services, serviceStatus{ID: id, Enabled: enabled[id], Hits: hits[id]})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "services": services})
+}
+
+// ===== Query-Log Block/Unblock Actions =====
+
+// userRulesPath returns the filter user-rules file managed by the
+// query-log actions (a plain file source of the filter engine).
+func (s *Server) userRulesPath() string {
+	return filepath.Join(s.cfg.HistoryDir, "user_rules.txt")
+}
+
+// handleQuerylogAction adds a block rule (block=true) or removes it / adds
+// an exception (block=false) for a domain, then reloads the user-rules
+// source so the change takes effect immediately.
+func (s *Server) handleQuerylogAction(w http.ResponseWriter, r *http.Request, block bool) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.checkCSRF(w, r) {
+		return
+	}
+	eng := s.getFilter()
+	if eng == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": "filter engine is not configured",
+		})
+		return
+	}
+
+	var req struct {
+		Domain string `json:"domain"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	domain := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(req.Domain), "."))
+	_, validDomain := dns.IsDomainName(domain)
+	invalidCharacter := strings.IndexFunc(domain, func(r rune) bool {
+		letter := r >= 'a' && r <= 'z'
+		digit := r >= '0' && r <= '9'
+		return !letter && !digit && r != '-' && r != '.'
+	}) >= 0
+	if domain == "" || !strings.Contains(domain, ".") || !validDomain || invalidCharacter {
+		http.Error(w, "Invalid domain", http.StatusBadRequest)
+		return
+	}
+
+	path := s.userRulesPath()
+	blockRule := "||" + domain + "^"
+	exceptRule := "@@||" + domain + "^"
+
+	userRulesMu.Lock()
+	defer userRulesMu.Unlock()
+
+	var action, rule string
+	if block {
+		// Blocking: drop any stale exception and add the block rule.
+		if _, err := modifyUserRuleLocked(path, exceptRule, true); err != nil {
+			http.Error(w, "Failed to update user rules: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if _, err := modifyUserRuleLocked(path, blockRule, false); err != nil {
+			http.Error(w, "Failed to update user rules: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		action, rule = "blocked", blockRule
+	} else {
+		// Unblocking: remove the user block rule when it came from this
+		// file; otherwise add an exception rule.
+		removed, err := modifyUserRuleLocked(path, blockRule, true)
+		if err != nil {
+			http.Error(w, "Failed to update user rules: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if removed {
+			action, rule = "unblocked", blockRule
+		} else {
+			if _, err := modifyUserRuleLocked(path, exceptRule, false); err != nil {
+				http.Error(w, "Failed to update user rules: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			action, rule = "exception_added", exceptRule
+		}
+	}
+	eng.ReloadSource(path)
+
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "ok",
+		"action": action,
+		"rule":   rule,
+	})
+}
+
+// modifyUserRule adds or removes an exact rule line in the user rules file.
+// It returns whether the file changed.
+func modifyUserRule(path, ruleLine string, remove bool) (bool, error) {
+	userRulesMu.Lock()
+	defer userRulesMu.Unlock()
+	return modifyUserRuleLocked(path, ruleLine, remove)
+}
+
+func modifyUserRuleLocked(path, ruleLine string, remove bool) (bool, error) {
+	data, err := os.ReadFile(path) // #nosec G304 G703 -- path derived from trusted HistoryDir config plus a constant filename, not request input
+	if err != nil && !os.IsNotExist(err) {
+		return false, err
+	}
+
+	var out []string
+	found := false
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == ruleLine {
+			found = true
+			if remove {
+				continue
+			}
+		}
+		if trimmed == "" && len(out) == 0 {
+			continue // skip leading empties
+		}
+		out = append(out, line)
+	}
+
+	changed := false
+	switch {
+	case remove && found:
+		changed = true
+	case !remove && !found:
+		out = append(out, ruleLine)
+		changed = true
+	}
+	if !changed {
+		return false, nil
+	}
+	content := strings.Join(out, "\n")
+	if !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+	if err := writeFileAtomic(path, []byte(content), 0o600); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func writeFileAtomic(path string, data []byte, mode os.FileMode) (err error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".api-*.tmp") // #nosec G304 -- directory is trusted application configuration
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		if err != nil {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err = tmp.Chmod(mode); err != nil {
+		return err
+	}
+	if _, err = tmp.Write(data); err != nil {
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
 // ===== Item 62: Upstream Configuration Editor =====
 func (s *Server) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -1256,10 +2360,13 @@ func (s *Server) handleGetUpstreams(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handlePostUpstreams(w http.ResponseWriter, r *http.Request) {
+	if !s.checkCSRF(w, r) {
+		return
+	}
 	var req []struct {
 		Address string `json:"address"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
@@ -1271,32 +2378,12 @@ func (s *Server) handlePostUpstreams(w http.ResponseWriter, r *http.Request) {
 		if addr == "" {
 			continue
 		}
-		host, port, err := net.SplitHostPort(addr)
-		if err != nil {
+		if _, err := upstream.Parse(addr); err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"error": "Invalid upstream address format (expected ip:port)",
+				"error": "Invalid upstream specification",
 				"input": addr,
-			})
-			return
-		}
-		if net.ParseIP(host) == nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"error": "Invalid upstream IP address",
-				"input": host,
-			})
-			return
-		}
-		portNum, err := strconv.Atoi(port)
-		if err != nil || portNum < 1 || portNum > 65535 {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"error": "Invalid upstream port (must be 1-65535)",
-				"input": port,
 			})
 			return
 		}
@@ -1315,6 +2402,14 @@ func (s *Server) handlePostUpstreams(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reload the upstream pool so changes take effect immediately.
+	s.fieldsMu.RLock()
+	reload := s.upstreamReloadFn
+	s.fieldsMu.RUnlock()
+	if reload != nil {
+		reload()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":    "ok",
@@ -1323,63 +2418,28 @@ func (s *Server) handlePostUpstreams(w http.ResponseWriter, r *http.Request) {
 }
 
 // ===== Item 63: Cache Clear Endpoint =====
-func (s *Server) handleCacheClear(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleCacheClear(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-
-	// On Windows, SIGUSR1 is not supported
-	if runtime.GOOS == "windows" {
-		w.WriteHeader(http.StatusBadRequest)
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.checkCSRF(w, r) {
+		return
+	}
+	dnsSrv := s.getDNSServer()
+	if dnsSrv == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":  "error",
-			"message": "Cache clear signal (SIGUSR1) is not supported on Windows",
+			"message": "DNS server is not configured",
 		})
 		return
 	}
-
-	pidFile := s.cfg.DNSMasqPIDFile
-	data, err := os.ReadFile(pidFile) // #nosec G304 -- PID file path comes from trusted config (DNSMASQ_PID_FILE env or built-in default), not from request input
-	if err != nil {
-		w.WriteHeader(http.StatusNotFound)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  "error",
-			"message": fmt.Sprintf("PID file not found: %s", pidFile),
-		})
-		return
-	}
-
-	pidStr := strings.TrimSpace(string(data))
-	pid, err := strconv.Atoi(pidStr)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  "error",
-			"message": fmt.Sprintf("Invalid PID in file: %s", pidStr),
-		})
-		return
-	}
-
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  "error",
-			"message": fmt.Sprintf("Failed to find process %d: %v", pid, err),
-		})
-		return
-	}
-
-	if err := sendCacheClearSignal(proc); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  "error",
-			"message": fmt.Sprintf("Failed to send cache clear signal to process %d: %v", pid, err),
-		})
-		return
-	}
-
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "ok",
-		"message": "DNS cache clear signal sent",
+		"cleared": dnsSrv.ClearCache(),
 	})
 }
 
@@ -1431,10 +2491,23 @@ func (s *Server) handleGetDNSRoutes(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handlePostDNSRoutes(w http.ResponseWriter, r *http.Request) {
+	if !s.checkCSRF(w, r) {
+		return
+	}
 	var routesMap map[string]string
-	if err := json.NewDecoder(r.Body).Decode(&routesMap); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&routesMap); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
+	}
+	for pattern, raw := range routesMap {
+		if strings.TrimSpace(pattern) == "" {
+			http.Error(w, "DNS route pattern may not be empty", http.StatusBadRequest)
+			return
+		}
+		if _, err := upstream.Parse(raw); err != nil {
+			http.Error(w, "DNS route contains an invalid upstream", http.StatusBadRequest)
+			return
+		}
 	}
 
 	s.fieldsMu.RLock()
@@ -1504,23 +2577,18 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Handle gzip-encoded request body
-	var bodyReader io.Reader = r.Body
-	if r.Header.Get("Content-Encoding") == "gzip" {
-		gzReader, err := gzip.NewReader(r.Body)
-		if err != nil {
-			http.Error(w, "gzip decompress error", http.StatusBadRequest)
-			return
+	body, err := readRequestBody(w, r, s.cfg.MaxRequestSize)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, "invalid payload", http.StatusBadRequest)
 		}
-		defer func() { _ = gzReader.Close() }()
-		bodyReader = gzReader
+		return
 	}
-
-	// Limit payload size
-	limitedReader := io.LimitReader(bodyReader, s.cfg.MaxRequestSize)
-
 	var hb models.HeartbeatPayload
-	if err := json.NewDecoder(limitedReader).Decode(&hb); err != nil {
+	if err := json.Unmarshal(body, &hb); err != nil {
 		http.Error(w, "invalid payload", http.StatusBadRequest)
 		return
 	}
@@ -1700,7 +2768,7 @@ func (s *Server) Start(ctx context.Context, staticHandler http.Handler, cspMiddl
 	handler := s.cspMiddleware(s.SetupMux())
 
 	server := &http.Server{
-		Addr:              ":" + s.cfg.Port,
+		Addr:              net.JoinHostPort(s.cfg.WebListenAddr, s.cfg.Port),
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       s.cfg.HTTPReadTimeout,
@@ -1712,6 +2780,8 @@ func (s *Server) Start(ctx context.Context, staticHandler http.Handler, cspMiddl
 	if err != nil {
 		return err
 	}
+	s.webReady.Store(true)
+	defer s.webReady.Store(false)
 
 	shutdownDone := make(chan struct{})
 	go func() {

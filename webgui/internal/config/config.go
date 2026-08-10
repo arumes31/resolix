@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log"
 	"maps"
+	"net"
 	"net/url"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -18,6 +20,8 @@ import (
 const (
 	// DefaultPort is the default listening port for the web GUI.
 	DefaultPort = "35353"
+	// DefaultWebListenAddr is the default web/API bind address.
+	DefaultWebListenAddr = "0.0.0.0"
 	// DefaultHistoryDir is the default directory for JSONL history files.
 	DefaultHistoryDir = "/var/lib/tailscale-dnsrewrite"
 	// DefaultDBPath is the default database file name.
@@ -49,7 +53,36 @@ const (
 	// DefaultDNSRoutesFile is the default path to the DNS routes JSON file.
 	DefaultDNSRoutesFile = ""
 	// DefaultDNSMasqPIDFile is the default path to the dnsmasq PID file.
+	//
+	// Deprecated: dnsmasq has been replaced by the in-process DNS server.
 	DefaultDNSMasqPIDFile = "/run/dnsmasq.pid"
+	// DefaultDNSListenAddr is the default DNS server listen address.
+	DefaultDNSListenAddr = "0.0.0.0"
+	// DefaultDNSListenPort is the default DNS server listen port.
+	DefaultDNSListenPort = 53
+	// DefaultFilterUpdateInterval is the default filter subscription update interval.
+	DefaultFilterUpdateInterval = 24 * time.Hour
+	// DefaultBlockingMode is the default blocking response mode.
+	DefaultBlockingMode = "nxdomain"
+	// DefaultBlockCustomIP4 is the default A answer in custom_ip blocking mode.
+	DefaultBlockCustomIP4 = "0.0.0.0"
+	// DefaultBlockCustomIP6 is the default AAAA answer in custom_ip blocking mode.
+	DefaultBlockCustomIP6 = "::"
+	// DefaultRewritesFile is the default DNS rewrites persistence file name.
+	DefaultRewritesFile = "rewrites.json"
+	// DefaultClientsFile is the default per-client registry file name.
+	DefaultClientsFile = "clients.json"
+	// DefaultRateLimitQPS is the default per-subnet query rate limit.
+	DefaultRateLimitQPS = 20
+	// DefaultDoHPath is the default DNS-over-HTTPS endpoint path.
+	DefaultDoHPath = "/dns-query"
+	// DefaultDoTPort is the default DNS-over-TLS listen port.
+	DefaultDoTPort = 853
+
+	// minCacheTTLDefault/maxCacheTTLDefault are the default cache TTL bounds
+	// in seconds (dnsmasq local-ttl=60 / max-ttl=600).
+	minCacheTTLDefault = 60
+	maxCacheTTLDefault = 600
 	// DefaultUpstreamLatencyThreshold is the default latency alert threshold in milliseconds.
 	DefaultUpstreamLatencyThreshold = 200
 
@@ -94,6 +127,7 @@ type Config struct {
 	MasterURL        string
 	NodeName         string
 	Port             string
+	WebListenAddr    string
 	HistoryDir       string
 	DBPath           string
 	MaxEvents        int
@@ -128,8 +162,81 @@ type Config struct {
 	UpstreamsFile string
 	// DNSRoutesFile is the path to the domain-specific DNS routes JSON file.
 	DNSRoutesFile string
-	// DNSMasqPIDFile is the path to the dnsmasq PID file for cache clearing.
+	// DNSMasqPIDFile is retained only to recognize the deprecated setting.
+	//
+	// Deprecated: kept for backward compatibility; cache clear is in-process.
 	DNSMasqPIDFile string
+	// DNSListenAddr is the DNS server listen address (DNS_LISTEN_ADDR,
+	// falling back to TAILSCALE_IP, then 0.0.0.0).
+	DNSListenAddr string
+	// DNSListenPort is the DNS server listen port (DNS_LISTEN_PORT, default 53).
+	DNSListenPort int
+	// Domains holds the raw DOMAINS env value (comma-separated domain:ip
+	// static rewrites, same semantics as dnsmasq address=/).
+	Domains string
+	// BlocklistURLs holds space/comma-separated filter subscription URLs.
+	BlocklistURLs string
+	// AllowlistURLs holds space/comma-separated exception subscription URLs.
+	AllowlistURLs string
+	// AllowlistFile is a local exceptions-only filter list path.
+	AllowlistFile string
+	// FilterUpdateInterval is the subscription refresh interval.
+	FilterUpdateInterval time.Duration
+	// BlockingMode is the blocked-response mode: nxdomain|null_ip|refused|custom_ip.
+	BlockingMode string
+	// BlockCustomIP4/IP6 are the answer addresses in custom_ip mode.
+	BlockCustomIP4 string
+	BlockCustomIP6 string
+	// RewritesFile is the typed-rewrites JSON persistence file.
+	RewritesFile string
+	// SafeSearch lists enabled safe-search engines (comma-separated).
+	SafeSearch string
+	// BogusNXDOMAIN lists bogus-answer CIDRs/IPs (comma/space-separated).
+	BogusNXDOMAIN string
+	// AAAADisabled makes AAAA queries return NODATA.
+	AAAADisabled bool
+	// RefuseANY refuses QTYPE ANY queries (default true).
+	RefuseANY bool
+	// UpstreamMode selects pool behavior: load_balance (default) | parallel | strict.
+	UpstreamMode string
+	// FallbackDNS lists fallback upstreams used only when all primaries fail.
+	FallbackDNS string
+	// BootstrapDNS lists plain UDP resolvers for hostname upstreams.
+	BootstrapDNS string
+	// ECSClientSubnet is the EDNS0 client subnet attached to upstream queries.
+	ECSClientSubnet string
+	// DNS64 enables AAAA synthesis; DNS64Prefixes overrides the prefix list.
+	DNS64         bool
+	DNS64Prefixes string
+	// CacheMinTTL/CacheMaxTTL override cache TTL bounds (seconds).
+	CacheMinTTL uint32
+	CacheMaxTTL uint32
+	// CacheOptimistic serves stale entries while refreshing in background.
+	CacheOptimistic bool
+	// ClientsFile is the per-client registry JSON file.
+	ClientsFile string
+	// BlockedServices lists globally blocked service IDs (comma-separated).
+	BlockedServices string
+	// DNSAllowedClients restricts DNS service to these IPs/CIDRs when non-empty.
+	DNSAllowedClients string
+	// DNSDisallowedClients drops queries from these IPs/CIDRs silently.
+	DNSDisallowedClients string
+	// RateLimitQPS limits queries per second per subnet (0 = disabled).
+	RateLimitQPS int
+	// PrivatePTR answers PTR for known private clients locally (default true).
+	PrivatePTR bool
+	// DNSSEC enables DO-bit passthrough to upstreams (no local validation).
+	DNSSEC bool
+	// DoHEnabled serves DNS-over-HTTPS on the HTTP mux (DOH_PATH).
+	DoHEnabled   bool
+	DoHPath      string
+	DoHAuthToken string
+	// DoTEnabled serves DNS-over-TLS on DoTPort (requires TLS cert/key).
+	DoTEnabled bool
+	DoTPort    int
+	// TLSCertFile/TLSKeyFile are required for DoT.
+	TLSCertFile string
+	TLSKeyFile  string
 	// UpstreamLatencyThreshold is the latency threshold in ms for alerting.
 	UpstreamLatencyThreshold int
 
@@ -380,6 +487,20 @@ func parseIntEnv(key string, defaultVal int) int {
 	return n
 }
 
+// parseUint32Env reads a non-negative 32-bit integer environment variable.
+func parseUint32Env(key string, defaultVal uint32) uint32 {
+	val := os.Getenv(key)
+	if val == "" {
+		return defaultVal
+	}
+	n, err := strconv.ParseUint(val, 10, 32)
+	if err != nil {
+		log.Printf("[WARN] Invalid %s '%s', falling back to %d: %v", key, sanitizeForLog(val), defaultVal, err) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		return defaultVal
+	}
+	return uint32(n)
+}
+
 // resolveMode reads and validates the MODE environment variable.
 func resolveMode() string {
 	mode := strings.ToLower(os.Getenv("MODE"))
@@ -502,13 +623,84 @@ func resolveLatencyThreshold() int {
 	return DefaultUpstreamLatencyThreshold
 }
 
+// resolveDoHPath reads DOH_PATH and normalizes it to a safe, non-conflicting
+// literal path on the existing HTTP mux.
+func resolveDoHPath() string {
+	p := strings.TrimSpace(os.Getenv("DOH_PATH"))
+	if p == "" {
+		return DefaultDoHPath
+	}
+	if strings.HasPrefix(p, "//") || strings.ContainsAny(p, " \t\r\n?#{}\\") {
+		log.Printf("[WARN] Invalid DOH_PATH '%s', falling back to %s", sanitizeForLog(p), DefaultDoHPath) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		return DefaultDoHPath
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	if len(p) > 1 && (p[1] == '/' || p[1] == '\\') {
+		log.Printf("[WARN] Invalid DOH_PATH '%s', falling back to %s", sanitizeForLog(p), DefaultDoHPath) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		return DefaultDoHPath
+	}
+	p = pathpkg.Clean(p)
+	if !validDoHPath(p) {
+		log.Printf("[WARN] Conflicting DOH_PATH '%s', falling back to %s", sanitizeForLog(p), DefaultDoHPath) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		return DefaultDoHPath
+	}
+	return p
+}
+
+func validDoHPath(p string) bool {
+	if p == "" || p == "/" || strings.HasPrefix(p, "//") || strings.ContainsAny(p, " \t\r\n?#{}\\") {
+		return false
+	}
+	if p == "/healthz" || p == "/login" || p == "/logout" || p == "/metrics" {
+		return false
+	}
+	return p != "/api" && !strings.HasPrefix(p, "/api/") &&
+		p != "/static" && !strings.HasPrefix(p, "/static/")
+}
+
+// resolveBlocking reads and validates BLOCKING_MODE and BLOCK_CUSTOM_IP4/IP6.
+func resolveBlocking() (mode, ip4, ip6 string) {
+	mode = strings.ToLower(strings.TrimSpace(os.Getenv("BLOCKING_MODE")))
+	switch mode {
+	case "":
+		mode = DefaultBlockingMode
+	case "nxdomain", "null_ip", "refused", "custom_ip":
+	default:
+		log.Printf("[WARN] Invalid BLOCKING_MODE '%s', falling back to %s", sanitizeForLog(mode), DefaultBlockingMode) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		mode = DefaultBlockingMode
+	}
+	ip4 = strings.TrimSpace(os.Getenv("BLOCK_CUSTOM_IP4"))
+	if parsed := net.ParseIP(ip4); ip4 == "" || parsed == nil || parsed.To4() == nil {
+		if ip4 != "" {
+			log.Printf("[WARN] Invalid BLOCK_CUSTOM_IP4 '%s', falling back to %s", sanitizeForLog(ip4), DefaultBlockCustomIP4) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		}
+		ip4 = DefaultBlockCustomIP4
+	}
+	ip6 = strings.TrimSpace(os.Getenv("BLOCK_CUSTOM_IP6"))
+	if parsed := net.ParseIP(ip6); ip6 == "" || parsed == nil || parsed.To4() != nil {
+		if ip6 != "" {
+			log.Printf("[WARN] Invalid BLOCK_CUSTOM_IP6 '%s', falling back to %s", sanitizeForLog(ip6), DefaultBlockCustomIP6) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		}
+		ip6 = DefaultBlockCustomIP6
+	}
+	return mode, ip4, ip6
+}
+
 // LoadConfig reads configuration from environment variables.
+//
+//nolint:gocyclo // Environment mapping is intentionally centralized so defaults remain auditable in one place.
 func LoadConfig() *Config {
 	mode := resolveMode()
 
 	nodeName := resolveNodeName()
 
 	port := resolvePort()
+	webListenAddr := strings.TrimSpace(os.Getenv("WEB_LISTEN_ADDR"))
+	if webListenAddr == "" {
+		webListenAddr = DefaultWebListenAddr
+	}
 
 	historyDir := os.Getenv("HISTORY_DIR")
 	if historyDir == "" {
@@ -568,9 +760,59 @@ func LoadConfig() *Config {
 		dnsRoutesFile = DefaultDNSRoutesFile
 	}
 
+	rewritesFile := os.Getenv("REWRITES_FILE")
+	if rewritesFile == "" {
+		rewritesFile = DefaultRewritesFile
+	}
+
+	clientsFile := os.Getenv("CLIENTS_FILE")
+	if clientsFile == "" {
+		clientsFile = DefaultClientsFile
+	}
+
 	dnsmasqPIDFile := os.Getenv("DNSMASQ_PID_FILE")
 	if dnsmasqPIDFile == "" {
 		dnsmasqPIDFile = DefaultDNSMasqPIDFile
+	}
+
+	// DNS server listen settings: explicit DNS_LISTEN_ADDR wins, then the
+	// TAILSCALE_IP passed through by entrypoint.sh, then 0.0.0.0.
+	dnsListenAddr := os.Getenv("DNS_LISTEN_ADDR")
+	if dnsListenAddr == "" {
+		dnsListenAddr = os.Getenv("TAILSCALE_IP")
+	}
+	if dnsListenAddr == "" {
+		dnsListenAddr = DefaultDNSListenAddr
+	}
+	dnsListenPort := parseIntEnv("DNS_LISTEN_PORT", DefaultDNSListenPort)
+	if dnsListenPort < 1 || dnsListenPort > 65535 {
+		log.Printf("[WARN] DNS_LISTEN_PORT %d out of range, falling back to %d", dnsListenPort, DefaultDNSListenPort)
+		dnsListenPort = DefaultDNSListenPort
+	}
+	dotPort := parseIntEnv("DOT_PORT", DefaultDoTPort)
+	if dotPort < 1 || dotPort > 65535 {
+		log.Printf("[WARN] DOT_PORT %d out of range, falling back to %d", dotPort, DefaultDoTPort)
+		dotPort = DefaultDoTPort
+	}
+
+	// Filter engine blocking settings
+	blockingMode, blockCustomIP4, blockCustomIP6 := resolveBlocking()
+
+	// Upstream pool settings
+	upstreamMode := strings.ToLower(strings.TrimSpace(os.Getenv("UPSTREAM_MODE")))
+	switch upstreamMode {
+	case "":
+		upstreamMode = "load_balance"
+	case "load_balance", "parallel", "strict":
+	default:
+		log.Printf("[WARN] Invalid UPSTREAM_MODE '%s', falling back to load_balance", sanitizeForLog(upstreamMode)) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		upstreamMode = "load_balance"
+	}
+	cacheMinTTL := parseUint32Env("CACHE_MIN_TTL", minCacheTTLDefault)
+	cacheMaxTTL := parseUint32Env("CACHE_MAX_TTL", maxCacheTTLDefault)
+	if cacheMaxTTL < cacheMinTTL {
+		log.Printf("[WARN] CACHE_MAX_TTL %d < CACHE_MIN_TTL %d, using defaults %d/%d", cacheMaxTTL, cacheMinTTL, minCacheTTLDefault, maxCacheTTLDefault)
+		cacheMinTTL, cacheMaxTTL = minCacheTTLDefault, maxCacheTTLDefault
 	}
 
 	latencyThreshold := resolveLatencyThreshold()
@@ -602,12 +844,13 @@ func LoadConfig() *Config {
 		MasterURL:                  masterURL,
 		NodeName:                   nodeName,
 		Port:                       port,
+		WebListenAddr:              webListenAddr,
 		HistoryDir:                 historyDir,
 		DBPath:                     dbPath,
 		MaxEvents:                  DefaultMaxEvents,
 		HealthDomain:               healthDomain,
 		CleanupInterval:            DefaultCleanupInterval,
-		ArchiveInterval:            DefaultArchiveInterval,
+		ArchiveInterval:            batchArchive,
 		HistoryRetention:           DefaultHistoryRetention,
 		IngestSecret:               os.Getenv("INGEST_SECRET"),
 		WebUsername:                os.Getenv("WEB_USERNAME"),
@@ -627,6 +870,44 @@ func LoadConfig() *Config {
 		UpstreamsFile:              upstreamsFile,
 		DNSRoutesFile:              dnsRoutesFile,
 		DNSMasqPIDFile:             dnsmasqPIDFile,
+		DNSListenAddr:              dnsListenAddr,
+		DNSListenPort:              dnsListenPort,
+		Domains:                    os.Getenv("DOMAINS"),
+		BlocklistURLs:              os.Getenv("BLOCKLIST_URLS"),
+		AllowlistURLs:              os.Getenv("ALLOWLIST_URLS"),
+		AllowlistFile:              os.Getenv("ALLOWLIST_FILE"),
+		FilterUpdateInterval:       parseDurationEnv("FILTER_UPDATE_INTERVAL", DefaultFilterUpdateInterval),
+		BlockingMode:               blockingMode,
+		BlockCustomIP4:             blockCustomIP4,
+		BlockCustomIP6:             blockCustomIP6,
+		RewritesFile:               rewritesFile,
+		SafeSearch:                 os.Getenv("SAFE_SEARCH"),
+		BogusNXDOMAIN:              os.Getenv("BOGUS_NXDOMAIN"),
+		AAAADisabled:               strings.ToLower(os.Getenv("AAAA_DISABLED")) == "true",
+		RefuseANY:                  strings.ToLower(os.Getenv("REFUSE_ANY")) != "false",
+		UpstreamMode:               upstreamMode,
+		FallbackDNS:                os.Getenv("FALLBACK_DNS"),
+		BootstrapDNS:               os.Getenv("BOOTSTRAP_DNS"),
+		ECSClientSubnet:            os.Getenv("ECS_CLIENT_SUBNET"),
+		DNS64:                      strings.ToLower(os.Getenv("DNS64")) == "true",
+		DNS64Prefixes:              os.Getenv("DNS64_PREFIXES"),
+		CacheMinTTL:                cacheMinTTL,
+		CacheMaxTTL:                cacheMaxTTL,
+		CacheOptimistic:            strings.ToLower(os.Getenv("CACHE_OPTIMISTIC")) == "true",
+		ClientsFile:                clientsFile,
+		BlockedServices:            os.Getenv("BLOCKED_SERVICES"),
+		DNSAllowedClients:          os.Getenv("DNS_ALLOWED_CLIENTS"),
+		DNSDisallowedClients:       os.Getenv("DNS_DISALLOWED_CLIENTS"),
+		RateLimitQPS:               parseIntEnv("RATE_LIMIT_QPS", DefaultRateLimitQPS),
+		PrivatePTR:                 strings.ToLower(os.Getenv("PRIVATE_PTR")) != "false",
+		DNSSEC:                     strings.ToLower(os.Getenv("DNSSEC")) == "true",
+		DoHEnabled:                 strings.ToLower(os.Getenv("DOH_ENABLED")) == "true",
+		DoHPath:                    resolveDoHPath(),
+		DoHAuthToken:               os.Getenv("DOH_AUTH_TOKEN"),
+		DoTEnabled:                 strings.ToLower(os.Getenv("DOT_ENABLED")) == "true",
+		DoTPort:                    dotPort,
+		TLSCertFile:                os.Getenv("TLS_CERT_FILE"),
+		TLSKeyFile:                 os.Getenv("TLS_KEY_FILE"),
 		UpstreamLatencyThreshold:   latencyThreshold,
 		SSEKeepaliveInterval:       sseKeepalive,
 		BatchArchiveInterval:       batchArchive,
@@ -688,6 +969,28 @@ func (c *Config) FullDNSRoutesPath() string {
 	return filepath.Join(c.HistoryDir, c.DNSRoutesFile)
 }
 
+// FullRewritesPath returns the complete rewrites file path.
+func (c *Config) FullRewritesPath() string {
+	if c.RewritesFile == "" {
+		return ""
+	}
+	if filepath.IsAbs(c.RewritesFile) {
+		return c.RewritesFile
+	}
+	return filepath.Join(c.HistoryDir, c.RewritesFile)
+}
+
+// FullClientsPath returns the complete clients registry file path.
+func (c *Config) FullClientsPath() string {
+	if c.ClientsFile == "" {
+		return ""
+	}
+	if filepath.IsAbs(c.ClientsFile) {
+		return c.ClientsFile
+	}
+	return filepath.Join(c.HistoryDir, c.ClientsFile)
+}
+
 // FullBlocklistPath returns the complete blocklist file path.
 func (c *Config) FullBlocklistPath() string {
 	if c.BlocklistFile == "" {
@@ -701,6 +1004,8 @@ func (c *Config) FullBlocklistPath() string {
 
 // VerifyConfig checks critical configuration values before the server starts.
 // Returns a slice of error messages for critical failures and a slice of warning messages.
+//
+//nolint:gocyclo // Each independent validation is retained so all startup errors can be reported together.
 func (c *Config) VerifyConfig() ([]string, []string) {
 	var errs []string
 	var warnings []string
@@ -726,14 +1031,82 @@ func (c *Config) VerifyConfig() ([]string, []string) {
 		errs = append(errs, fmt.Sprintf("MASTER_URL must start with http:// or https:// (got: %s)", c.MasterURL))
 	}
 
-	// 3. WEB_PASSWORD check (non-critical warning)
-	if c.WebPassword == "" {
-		warnings = append(warnings, "WEB_PASSWORD is not set — the dashboard will be publicly accessible")
+	// 3. Authentication must be either fully configured or explicitly backed
+	// by an ingest secret. Internal endpoints must never silently fail open.
+	if (c.WebUsername == "") != (c.WebPassword == "") {
+		errs = append(errs, "WEB_USERNAME and WEB_PASSWORD must be configured together")
+	}
+	if c.WebUsername == "" && c.WebPassword == "" && c.IngestSecret == "" {
+		errs = append(errs, "configure WEB_USERNAME/WEB_PASSWORD or INGEST_SECRET; internal endpoints may not run without authentication")
 	}
 
 	// 4. Port number validation
 	if p, err := strconv.Atoi(c.Port); err != nil || p < 1 || p > 65535 {
 		errs = append(errs, fmt.Sprintf("Invalid PORT '%s' — must be a number between 1 and 65535", c.Port))
+	}
+	if strings.ContainsAny(c.WebListenAddr, "\r\n\x00") {
+		errs = append(errs, "WEB_LISTEN_ADDR contains invalid characters")
+	}
+
+	// 4b. DNSMASQ_PID_FILE deprecation notice (non-critical warning)
+	if os.Getenv("DNSMASQ_PID_FILE") != "" {
+		warnings = append(warnings, "DNSMASQ_PID_FILE is deprecated and ignored: cache clearing is handled by the in-process DNS server")
+	}
+
+	// 4c. DoT requires TLS certificates (critical failure)
+	if c.DoTEnabled && (c.TLSCertFile == "" || c.TLSKeyFile == "") {
+		errs = append(errs, "DOT_ENABLED requires TLS_CERT_FILE and TLS_KEY_FILE")
+	}
+	if c.DoTEnabled && (c.DoTPort < 1 || c.DoTPort > 65535) {
+		errs = append(errs, "DOT_PORT must be between 1 and 65535")
+	}
+	if c.DoHEnabled && !validDoHPath(c.DoHPath) {
+		errs = append(errs, "DOH_PATH must be a non-conflicting literal HTTP path")
+	}
+
+	for _, setting := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "DNS_ALLOWED_CLIENTS", raw: c.DNSAllowedClients},
+		{name: "DNS_DISALLOWED_CLIENTS", raw: c.DNSDisallowedClients},
+	} {
+		for _, value := range splitConfigList(setting.raw) {
+			if !validIPOrCIDR(value) {
+				errs = append(errs, fmt.Sprintf("%s contains an invalid IP or CIDR", setting.name))
+				break
+			}
+		}
+	}
+
+	if c.DNS64 {
+		for _, value := range splitConfigList(c.DNS64Prefixes) {
+			ip, network, err := net.ParseCIDR(value)
+			ones, bits := 0, 0
+			if err == nil {
+				ones, bits = network.Mask.Size()
+			}
+			if err != nil || ip.To4() != nil || bits != 128 || ones != 96 {
+				errs = append(errs, "DNS64_PREFIXES must contain only IPv6 /96 prefixes")
+				break
+			}
+		}
+	}
+
+	for _, setting := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "BLOCKLIST_URLS", raw: c.BlocklistURLs},
+		{name: "ALLOWLIST_URLS", raw: c.AllowlistURLs},
+	} {
+		for _, value := range splitConfigList(setting.raw) {
+			u, err := url.Parse(value)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+				errs = append(errs, fmt.Sprintf("%s contains an invalid URL (only http/https without embedded credentials is allowed)", setting.name))
+				break
+			}
+		}
 	}
 
 	// 5. Client aliases file check (non-critical warning)
@@ -758,4 +1131,18 @@ func (c *Config) VerifyConfig() ([]string, []string) {
 	}
 
 	return errs, warnings
+}
+
+func splitConfigList(raw string) []string {
+	return strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	})
+}
+
+func validIPOrCIDR(value string) bool {
+	if net.ParseIP(value) != nil {
+		return true
+	}
+	_, _, err := net.ParseCIDR(value)
+	return err == nil
 }

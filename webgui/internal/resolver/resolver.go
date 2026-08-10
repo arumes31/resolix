@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"container/list"
 	"context"
 	"net"
 	"sync"
@@ -10,8 +11,9 @@ import (
 )
 
 const (
-	// cacheTTL is how long a cached hostname entry is considered valid.
-	cacheTTL = 5 * time.Minute
+	positiveCacheTTL = 5 * time.Minute
+	negativeCacheTTL = time.Minute
+	maxCacheEntries  = 4096
 	// queueSize is the buffer capacity of the work queue channel.
 	queueSize = 100
 	// workerCount is the number of concurrent lookup worker goroutines.
@@ -25,11 +27,14 @@ const (
 type cacheEntry struct {
 	hostname   string
 	resolvedAt time.Time
+	order      *list.Element
 }
 
 // Resolver performs background reverse DNS lookups for client IPs.
 type Resolver struct {
-	cache   sync.Map // map[string]cacheEntry
+	cacheMu sync.Mutex
+	cache   map[string]cacheEntry
+	order   *list.List
 	pending sync.Map // map[string]struct{}
 	queue   chan string
 }
@@ -38,6 +43,8 @@ type Resolver struct {
 func New() *Resolver {
 	return &Resolver{
 		queue: make(chan string, queueSize),
+		cache: make(map[string]cacheEntry),
+		order: list.New(),
 	}
 }
 
@@ -61,10 +68,15 @@ func (r *Resolver) Start(ctx context.Context) {
 // Queue adds an IP address to the lookup work queue.
 // If the queue is full, the lookup is silently dropped.
 func (r *Resolver) Queue(ip string) {
+	if net.ParseIP(ip) == nil {
+		return
+	}
 	// Skip if already cached and not expired
-	if val, ok := r.cache.Load(ip); ok {
-		entry := val.(cacheEntry)
-		if time.Since(entry.resolvedAt) < cacheTTL {
+	r.cacheMu.Lock()
+	entry, ok := r.cache[ip]
+	r.cacheMu.Unlock()
+	if ok {
+		if time.Since(entry.resolvedAt) < entryTTL(entry) {
 			return
 		}
 	}
@@ -82,14 +94,18 @@ func (r *Resolver) Queue(ip string) {
 
 // GetHostname returns the cached hostname for an IP, or empty string if not resolved.
 func (r *Resolver) GetHostname(ip string) string {
-	val, ok := r.cache.Load(ip)
+	if net.ParseIP(ip) == nil {
+		return ""
+	}
+	r.cacheMu.Lock()
+	entry, ok := r.cache[ip]
+	r.cacheMu.Unlock()
 	if !ok {
 		// Not cached — queue for lookup
 		r.Queue(ip)
 		return ""
 	}
-	entry := val.(cacheEntry)
-	if time.Since(entry.resolvedAt) >= cacheTTL {
+	if time.Since(entry.resolvedAt) >= entryTTL(entry) {
 		// Expired — re-queue and return stale value for now
 		r.Queue(ip)
 	}
@@ -101,7 +117,7 @@ func (r *Resolver) lookup(ip string) {
 	defer r.pending.Delete(ip)
 	// Skip common non-routable addresses
 	if ip == "127.0.0.1" || ip == "::1" || ip == "0.0.0.0" {
-		r.cache.Store(ip, cacheEntry{hostname: "", resolvedAt: time.Now()})
+		r.store(ip, "")
 		return
 	}
 
@@ -112,7 +128,7 @@ func (r *Resolver) lookup(ip string) {
 	if err != nil {
 		logger.Debug("Reverse DNS lookup failed for %s: %v", ip, err)
 		// Cache empty result to avoid repeated lookups
-		r.cache.Store(ip, cacheEntry{hostname: "", resolvedAt: time.Now()})
+		r.store(ip, "")
 		return
 	}
 
@@ -125,8 +141,37 @@ func (r *Resolver) lookup(ip string) {
 		}
 	}
 
-	r.cache.Store(ip, cacheEntry{hostname: hostname, resolvedAt: time.Now()})
+	r.store(ip, hostname)
 	if hostname != "" {
 		logger.Debug("Reverse DNS: %s -> %s", ip, hostname)
 	}
+}
+
+func entryTTL(entry cacheEntry) time.Duration {
+	if entry.hostname == "" {
+		return negativeCacheTTL
+	}
+	return positiveCacheTTL
+}
+
+func (r *Resolver) store(ip, hostname string) {
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	now := time.Now()
+	if existing, ok := r.cache[ip]; ok {
+		existing.hostname = hostname
+		existing.resolvedAt = now
+		r.order.MoveToBack(existing.order)
+		r.cache[ip] = existing
+		return
+	}
+	if len(r.cache) >= maxCacheEntries {
+		oldest := r.order.Front()
+		if oldest != nil {
+			delete(r.cache, oldest.Value.(string))
+			r.order.Remove(oldest)
+		}
+	}
+	element := r.order.PushBack(ip)
+	r.cache[ip] = cacheEntry{hostname: hostname, resolvedAt: now, order: element}
 }

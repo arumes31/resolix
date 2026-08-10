@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,6 +15,8 @@ import (
 	"tailscale-dnsrewrite/webgui/internal/db"
 	"tailscale-dnsrewrite/webgui/internal/models"
 )
+
+const maxArchiveBatchSize = 10000
 
 // Store manages the in-memory ring buffer of events and SQLite disk persistence.
 type Store struct {
@@ -32,8 +35,10 @@ type Store struct {
 	idCounter uint64
 
 	// Database Batching
-	batchMu sync.Mutex
-	batch   []models.QueryEvent
+	batchMu      sync.Mutex
+	batch        []models.QueryEvent
+	batchDropped atomic.Int64
+	archiveMu    sync.Mutex
 
 	statsMu sync.RWMutex
 
@@ -63,6 +68,7 @@ type Store struct {
 	clientRPMTimes   map[string]*[60]int64
 	clientRPHBuckets map[string]*[60]int
 	clientRPHTimes   map[string]*[60]int64
+	clientLastSeen   map[string]int64
 
 	// Prepared statements for frequently-used queries (cached at init)
 	stmtInsertQuery   *sql.Stmt
@@ -103,6 +109,7 @@ func NewStore(cfg *config.Config) *Store {
 		clientRPMTimes:            make(map[string]*[60]int64),
 		clientRPHBuckets:          make(map[string]*[60]int),
 		clientRPHTimes:            make(map[string]*[60]int64),
+		clientLastSeen:            make(map[string]int64),
 		batch:                     make([]models.QueryEvent, 0, 1000),
 		vacuumInterval:            24 * time.Hour,
 		checkpointInterval:        5 * time.Minute,
@@ -158,7 +165,7 @@ func (s *Store) prepareStatements() error {
 	var err error
 
 	s.stmtInsertQuery, err = s.db.Prepare(
-		"INSERT INTO queries (unix_time, node, client_ip, domain, type, upstream, latency, dnssec, response_code, client_hostname, blocked, latency_alert) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+		"INSERT INTO queries (unix_time, node, client_ip, domain, type, upstream, latency, dnssec, response_code, client_hostname, blocked, latency_alert, matched_rule, block_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
 		return fmt.Errorf("prepare stmtInsertQuery: %w", err)
 	}
@@ -296,6 +303,7 @@ func (s *Store) AddEvent(e models.QueryEvent) {
 	} else {
 		s.clientRPHBuckets[e.ClientIP][minBucket]++
 	}
+	s.clientLastSeen[e.ClientIP] = e.UnixTime
 
 	s.statsMu.Unlock()
 
@@ -310,7 +318,16 @@ func (s *Store) AddEvent(e models.QueryEvent) {
 
 	// Add to SQLite batch
 	s.batchMu.Lock()
-	s.batch = append(s.batch, e)
+	if len(s.batch) >= maxArchiveBatchSize {
+		dropCount := len(s.batch) - maxArchiveBatchSize + 1
+		kept := append([]models.QueryEvent(nil), s.batch[dropCount:]...)
+		s.batch = kept
+		s.batch = append(s.batch, e)
+		total := s.batchDropped.Add(int64(dropCount))
+		log.Printf("[WARN] SQLite archive batch full; dropped %d oldest event(s) (%d total)", dropCount, total)
+	} else {
+		s.batch = append(s.batch, e)
+	}
 	s.batchMu.Unlock()
 }
 
@@ -450,18 +467,42 @@ func (s *Store) GetOrderedEvents(limit int) []models.QueryEvent {
 func (s *Store) GetRecentEvents(since int64) []models.QueryEvent {
 	s.eventsMu.RLock()
 	defer s.eventsMu.RUnlock()
-
-	n := s.count
-	if n > config.DefaultScanLimit {
-		n = config.DefaultScanLimit
-	}
-
+	n := min(s.count, config.DefaultScanLimit)
 	result := make([]models.QueryEvent, 0, n)
 	for i := 0; i < n; i++ {
 		idx := (s.head - 1 - i + s.cfg.MaxEvents) % s.cfg.MaxEvents
+		if event := s.events[idx]; event.UnixTime > since {
+			result = append(result, event)
+		}
+	}
+	for left, right := 0, len(result)-1; left < right; left, right = left+1, right-1 {
+		result[left], result[right] = result[right], result[left]
+	}
+	return result
+}
+
+// GetEventsAfter returns events newer than cursor, or newer than since when
+// no cursor is supplied. Results are oldest-first and bounded by limit.
+func (s *Store) GetEventsAfter(cursor string, since int64, limit int) []models.QueryEvent {
+	s.eventsMu.RLock()
+	defer s.eventsMu.RUnlock()
+
+	n := s.count
+	if limit <= 0 || limit > config.DefaultScanLimit {
+		limit = config.DefaultScanLimit
+	}
+
+	cursorID, _ := strconv.ParseUint(cursor, 10, 64)
+	result := make([]models.QueryEvent, 0, min(n, limit))
+	for i := 0; i < n; i++ {
+		idx := (s.head - n + i + s.cfg.MaxEvents) % s.cfg.MaxEvents
 		e := s.events[idx]
-		if e.UnixTime > since {
+		eventID, _ := strconv.ParseUint(e.ID, 10, 64)
+		if (cursorID > 0 && eventID > cursorID) || (cursorID == 0 && e.UnixTime > since) {
 			result = append(result, e)
+			if len(result) == limit {
+				break
+			}
 		}
 	}
 	return result
@@ -471,6 +512,11 @@ func (s *Store) GetRecentEvents(since int64) []models.QueryEvent {
 //
 //nolint:gocyclo
 func (s *Store) GetStats() map[string]interface{} {
+	s.archiveMu.Lock()
+	s.batchMu.Lock()
+	pending := append([]models.QueryEvent(nil), s.batch...)
+	s.batchMu.Unlock()
+	s.archiveMu.Unlock()
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
@@ -522,12 +568,15 @@ func (s *Store) GetStats() map[string]interface{} {
 	// Query SQLite for long-term aggregates
 	var totalEvents int64
 	var rpd int
+	var queryErrors []string
 	if s.db != nil {
 		if err := s.db.QueryRow("SELECT COUNT(*) FROM queries").Scan(&totalEvents); err != nil && err != sql.ErrNoRows {
 			log.Printf("Error getting totalEvents: %v", err)
+			queryErrors = append(queryErrors, "total")
 		}
 		if err := s.db.QueryRow("SELECT COUNT(*) FROM queries WHERE unix_time >= ?", cutoff24h).Scan(&rpd); err != nil && err != sql.ErrNoRows {
 			log.Printf("Error getting rpd: %v", err)
+			queryErrors = append(queryErrors, "rpd")
 		}
 	}
 
@@ -535,9 +584,25 @@ func (s *Store) GetStats() map[string]interface{} {
 	if s.db != nil {
 		if err := s.db.QueryRow("SELECT COUNT(*) FROM queries WHERE upstream = 'System Cache' AND unix_time >= ?", cutoff24h).Scan(&cacheHits); err != nil && err != sql.ErrNoRows {
 			log.Printf("Error getting cacheHits: %v", err)
+			queryErrors = append(queryErrors, "cache_hits")
 		}
 		if err := s.db.QueryRow("SELECT COUNT(*) FROM queries WHERE upstream != '' AND unix_time >= ?", cutoff24h).Scan(&totalReplies); err != nil && err != sql.ErrNoRows {
 			log.Printf("Error getting totalReplies: %v", err)
+			queryErrors = append(queryErrors, "total_replies")
+		}
+	}
+
+	totalEvents += int64(len(pending))
+	for _, event := range pending {
+		if event.UnixTime < cutoff24h {
+			continue
+		}
+		rpd++
+		if event.Upstream != "" {
+			totalReplies++
+		}
+		if event.Upstream == "System Cache" {
+			cacheHits++
 		}
 	}
 
@@ -647,6 +712,8 @@ func (s *Store) GetStats() map[string]interface{} {
 		"heatmap":          heatmap,
 		"type_counts":      typeCounts,
 		"bandwidth_saved":  bandwidthSaved,
+		"degraded":         len(queryErrors) > 0,
+		"errors":           queryErrors,
 	}
 }
 
@@ -755,6 +822,20 @@ func (s *Store) CleanupPending(now time.Time) {
 			delete(s.pendingQueries, node)
 		}
 	}
+
+	s.statsMu.Lock()
+	clientCutoff := now.Add(-time.Hour).Unix()
+	for client, lastSeen := range s.clientLastSeen {
+		if lastSeen >= clientCutoff {
+			continue
+		}
+		delete(s.clientLastSeen, client)
+		delete(s.clientRPMBuckets, client)
+		delete(s.clientRPMTimes, client)
+		delete(s.clientRPHBuckets, client)
+		delete(s.clientRPHTimes, client)
+	}
+	s.statsMu.Unlock()
 }
 
 // SetPending records the start time of a DNS query.
@@ -832,6 +913,8 @@ func (s *Store) SetDNSSEC(node, domain, result string) {
 
 // ArchiveStep performs a batch insert of recent queries into SQLite and deletes old ones.
 func (s *Store) ArchiveStep(now time.Time) int {
+	s.archiveMu.Lock()
+	defer s.archiveMu.Unlock()
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 	if s.closed || s.db == nil {
@@ -839,17 +922,16 @@ func (s *Store) ArchiveStep(now time.Time) int {
 	}
 
 	s.batchMu.Lock()
-	if len(s.batch) == 0 {
-		s.batchMu.Unlock()
+	toInsert := append([]models.QueryEvent(nil), s.batch...)
+	s.batchMu.Unlock()
+	if len(toInsert) == 0 {
+		s.pruneOldEvents(now)
 		return 0
 	}
-	toInsert := s.batch
-	s.batch = make([]models.QueryEvent, 0, 1000)
-	s.batchMu.Unlock()
 
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(context.Background(), nil)
 	if err != nil {
-		log.Printf("Failed to begin SQLite transaction: %v", err)
+		log.Printf("Failed to begin SQLite transaction; retaining %d events for retry: %v", len(toInsert), err)
 		return 0
 	}
 
@@ -858,10 +940,10 @@ func (s *Store) ArchiveStep(now time.Time) int {
 	if s.stmtInsertQuery != nil {
 		stmt = tx.Stmt(s.stmtInsertQuery)
 	} else {
-		stmt, err = tx.Prepare("INSERT INTO queries (unix_time, node, client_ip, domain, type, upstream, latency, dnssec, response_code, client_hostname, blocked, latency_alert) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+		stmt, err = tx.Prepare("INSERT INTO queries (unix_time, node, client_ip, domain, type, upstream, latency, dnssec, response_code, client_hostname, blocked, latency_alert, matched_rule, block_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
 		if err != nil {
 			_ = tx.Rollback()
-			log.Printf("Failed to prepare SQLite statement: %v", err)
+			log.Printf("Failed to prepare SQLite statement; retaining %d events for retry: %v", len(toInsert), err)
 			return 0
 		}
 	}
@@ -876,19 +958,40 @@ func (s *Store) ArchiveStep(now time.Time) int {
 		if e.LatencyAlert {
 			latencyAlertInt = 1
 		}
-		_, err = stmt.Exec(e.UnixTime, e.Node, e.ClientIP, e.Domain, e.Type, e.Upstream, e.Latency, e.DNSSEC, e.ResponseCode, e.ClientHostname, blockedInt, latencyAlertInt)
+		_, err = stmt.Exec(e.UnixTime, e.Node, e.ClientIP, e.Domain, e.Type, e.Upstream, e.Latency, e.DNSSEC, e.ResponseCode, e.ClientHostname, blockedInt, latencyAlertInt, e.MatchedRule, e.BlockReason)
 		if err != nil {
-			log.Printf("Error inserting event into SQLite: %v", err)
+			_ = tx.Rollback()
+			log.Printf("Failed to insert SQLite batch; retaining %d events for retry: %v", len(toInsert), err)
+			return 0
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		log.Printf("Failed to commit SQLite transaction: %v", err)
+		log.Printf("Failed to commit SQLite transaction; retaining %d events for retry: %v", len(toInsert), err)
 		return 0
 	}
 
-	// Delete old data based on retention policy using cached prepared statement
+	s.batchMu.Lock()
+	committed := make(map[string]struct{}, len(toInsert))
+	for _, event := range toInsert {
+		committed[event.ID] = struct{}{}
+	}
+	remaining := make([]models.QueryEvent, 0, len(s.batch))
+	for _, event := range s.batch {
+		if _, ok := committed[event.ID]; !ok {
+			remaining = append(remaining, event)
+		}
+	}
+	s.batch = remaining
+	s.batchMu.Unlock()
+
+	s.pruneOldEvents(now)
+	return len(toInsert)
+}
+
+func (s *Store) pruneOldEvents(now time.Time) {
 	cutoff := now.Add(-s.cfg.HistoryRetention).Unix()
+	var err error
 	if s.stmtCleanup != nil {
 		_, err = s.stmtCleanup.Exec(cutoff)
 	} else {
@@ -897,8 +1000,6 @@ func (s *Store) ArchiveStep(now time.Time) int {
 	if err != nil {
 		log.Printf("Failed to prune old SQLite data: %v", err)
 	}
-
-	return len(toInsert)
 }
 
 // SetUpstreamHealth updates the latency mapping and history for upstream DNS servers for a specific node.

@@ -83,6 +83,43 @@ func TestAddEvent_EmptyBuffer(t *testing.T) {
 	}
 }
 
+func TestArchiveStepRetainsBatchOnDatabaseFailure(t *testing.T) {
+	s, cleanup := newTestStore(t)
+	defer cleanup()
+	s.AddEvent(models.QueryEvent{UnixTime: time.Now().Unix(), Domain: "retry.test", Type: "A"})
+	if _, err := s.db.Exec("DROP TABLE queries"); err != nil {
+		t.Fatal(err)
+	}
+	if archived := s.ArchiveStep(time.Now()); archived != 0 {
+		t.Fatalf("archived = %d, want 0", archived)
+	}
+	s.batchMu.Lock()
+	pending := len(s.batch)
+	s.batchMu.Unlock()
+	if pending != 1 {
+		t.Fatalf("pending batch = %d, want 1", pending)
+	}
+}
+
+func TestArchiveStepPrunesWithoutPendingBatch(t *testing.T) {
+	s, cleanup := newTestStore(t)
+	defer cleanup()
+	old := time.Now().Add(-7 * 24 * time.Hour).Unix()
+	if _, err := s.db.Exec("INSERT INTO queries (unix_time, node, client_ip, domain, type, upstream, latency, dnssec, response_code, client_hostname, blocked, latency_alert, matched_rule, block_reason) VALUES (?, '', '', 'old.test', 'A', '', NULL, '', '', '', 0, 0, '', '')", old); err != nil {
+		t.Fatal(err)
+	}
+	if archived := s.ArchiveStep(time.Now()); archived != 0 {
+		t.Fatalf("archived = %d, want 0", archived)
+	}
+	var count int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM queries WHERE domain = 'old.test'").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("old rows remaining = %d", count)
+	}
+}
+
 func TestAddEvent_SingleEvent(t *testing.T) {
 	s, cleanup := newTestStore(t)
 	defer cleanup()
@@ -376,6 +413,28 @@ func TestGetRecentEvents(t *testing.T) {
 	recent := s.GetRecentEvents(now - 50)
 	if len(recent) != 2 {
 		t.Errorf("expected 2 recent events, got %d", len(recent))
+	}
+	if recent[0].Domain != "recent.com" || recent[1].Domain != "newest.com" {
+		t.Fatalf("recent events are not oldest-first: %+v", recent)
+	}
+}
+
+func TestArchiveBatchDropsOldestWhenBounded(t *testing.T) {
+	cfg := &config.Config{MaxEvents: 10}
+	s := NewStore(cfg)
+	for i := 0; i <= maxArchiveBatchSize; i++ {
+		s.AddEvent(models.QueryEvent{UnixTime: int64(i + 1), Domain: fmt.Sprintf("event-%d.test", i)})
+	}
+	s.batchMu.Lock()
+	defer s.batchMu.Unlock()
+	if len(s.batch) != maxArchiveBatchSize {
+		t.Fatalf("batch length = %d, want %d", len(s.batch), maxArchiveBatchSize)
+	}
+	if s.batch[0].Domain != "event-1.test" {
+		t.Fatalf("oldest retained event = %q, want event-1.test", s.batch[0].Domain)
+	}
+	if got := s.batchDropped.Load(); got != 1 {
+		t.Fatalf("dropped count = %d, want 1", got)
 	}
 }
 

@@ -52,7 +52,7 @@ func TestSyncDNSConfigAppliesOnlyValidNewRevision(t *testing.T) {
 		}))
 		defer master.Close()
 
-		forwarder := NewForwarder(&config.Config{Mode: "slave", MasterURL: master.URL, MaxRequestSize: 1 << 20})
+		forwarder := NewForwarder(&config.Config{Mode: "slave", ControllerURL: master.URL, MaxRequestSize: 1 << 20})
 		var calls atomic.Int32
 		forwarder.SetDNSConfigFn(func(got configsync.Snapshot) error {
 			if got.Revision != snapshot.Revision {
@@ -76,7 +76,7 @@ func TestSyncDNSConfigAppliesOnlyValidNewRevision(t *testing.T) {
 		}))
 		defer master.Close()
 
-		forwarder := NewForwarder(&config.Config{Mode: "slave", MasterURL: master.URL, MaxRequestSize: 1 << 20})
+		forwarder := NewForwarder(&config.Config{Mode: "slave", ControllerURL: master.URL, MaxRequestSize: 1 << 20})
 		var calls atomic.Int32
 		forwarder.SetDNSConfigFn(func(configsync.Snapshot) error {
 			calls.Add(1)
@@ -94,7 +94,7 @@ func TestSyncDNSConfigAppliesOnlyValidNewRevision(t *testing.T) {
 		}))
 		defer master.Close()
 
-		forwarder := NewForwarder(&config.Config{Mode: "slave", MasterURL: master.URL, MaxRequestSize: 1 << 20})
+		forwarder := NewForwarder(&config.Config{Mode: "slave", ControllerURL: master.URL, MaxRequestSize: 1 << 20})
 		var calls atomic.Int32
 		forwarder.SetDNSConfigFn(func(configsync.Snapshot) error {
 			calls.Add(1)
@@ -112,7 +112,7 @@ func TestSyncDNSConfigAppliesOnlyValidNewRevision(t *testing.T) {
 		}))
 		defer master.Close()
 
-		forwarder := NewForwarder(&config.Config{Mode: "slave", MasterURL: master.URL, MaxRequestSize: 1 << 20})
+		forwarder := NewForwarder(&config.Config{Mode: "slave", ControllerURL: master.URL, MaxRequestSize: 1 << 20})
 		var calls atomic.Int32
 		forwarder.SetDNSConfigFn(func(configsync.Snapshot) error {
 			calls.Add(1)
@@ -139,7 +139,7 @@ func TestSyncDNSConfigAppliesOnlyValidNewRevision(t *testing.T) {
 		}))
 		defer master.Close()
 
-		forwarder := NewForwarder(&config.Config{Mode: "slave", MasterURL: master.URL, MaxRequestSize: 1 << 20})
+		forwarder := NewForwarder(&config.Config{Mode: "slave", ControllerURL: master.URL, MaxRequestSize: 1 << 20})
 		var calls atomic.Int32
 		forwarder.SetDNSConfigFn(func(configsync.Snapshot) error {
 			calls.Add(1)
@@ -167,7 +167,7 @@ func decodeJSONBody(r *http.Request, v interface{}) error {
 }
 
 func TestNewForwarder(t *testing.T) {
-	cfg := &config.Config{Mode: "slave", MasterURL: "https://localhost:12345", NodeName: "test-node"}
+	cfg := &config.Config{Mode: "slave", ControllerURL: "https://localhost:12345", NodeName: "test-node"}
 	fwd := NewForwarder(cfg)
 	if fwd == nil {
 		t.Fatal("NewForwarder returned nil")
@@ -175,7 +175,7 @@ func TestNewForwarder(t *testing.T) {
 }
 
 func TestEnqueue_SlaveMode(t *testing.T) {
-	cfg := &config.Config{Mode: "slave", MasterURL: "http://localhost:12345", NodeName: "test-node"}
+	cfg := &config.Config{Mode: "slave", ControllerURL: "http://localhost:12345", NodeName: "test-node"}
 	fwd := NewForwarder(cfg)
 
 	fwd.EnqueueEvent(models.QueryEvent{Domain: "line1.example.com", Node: "test-node"})
@@ -206,7 +206,7 @@ func TestEnqueue_MasterMode(t *testing.T) {
 }
 
 func TestEnqueue_NoMasterURL(t *testing.T) {
-	cfg := &config.Config{Mode: "slave", MasterURL: "", NodeName: "test-node"}
+	cfg := &config.Config{Mode: "slave", ControllerURL: "", NodeName: "test-node"}
 	fwd := NewForwarder(cfg)
 
 	fwd.EnqueueEvent(models.QueryEvent{Domain: "line1.example.com", Node: "test-node"})
@@ -223,7 +223,7 @@ func TestEnqueue_NoMasterURL(t *testing.T) {
 func TestEnqueue_MaxBacklogSize(t *testing.T) {
 	cfg := &config.Config{
 		Mode:           "slave",
-		MasterURL:      "http://localhost:12345",
+		ControllerURL:  "http://localhost:12345",
 		NodeName:       "test-node",
 		MaxBacklogSize: 2048, // Small limit (a few events)
 	}
@@ -269,10 +269,10 @@ func TestSendBatch_Success(t *testing.T) {
 	defer server.Close()
 
 	cfg := &config.Config{
-		Mode:      "slave",
-		MasterURL: server.URL,
-		NodeName:  "test-node",
-		BaseURL:   "",
+		Mode:          "slave",
+		ControllerURL: server.URL,
+		NodeName:      "test-node",
+		BaseURL:       "",
 	}
 	fwd := NewForwarder(cfg)
 
@@ -306,11 +306,11 @@ func TestSendBatch_WithIngestSecret(t *testing.T) {
 	defer server.Close()
 
 	cfg := &config.Config{
-		Mode:         "slave",
-		MasterURL:    server.URL,
-		NodeName:     "test-node",
-		IngestSecret: "my-secret-token",
-		BaseURL:      "",
+		Mode:          "slave",
+		ControllerURL: server.URL,
+		NodeName:      "test-node",
+		IngestSecret:  "my-secret-token",
+		BaseURL:       "",
 	}
 	fwd := NewForwarder(cfg)
 
@@ -333,10 +333,10 @@ func TestSendBatch_ServerError(t *testing.T) {
 	defer server.Close()
 
 	cfg := &config.Config{
-		Mode:      "slave",
-		MasterURL: server.URL,
-		NodeName:  "test-node",
-		BaseURL:   "",
+		Mode:          "slave",
+		ControllerURL: server.URL,
+		NodeName:      "test-node",
+		BaseURL:       "",
 	}
 	fwd := NewForwarder(cfg)
 
@@ -349,10 +349,10 @@ func TestSendBatch_ServerError(t *testing.T) {
 
 func TestSendBatch_ConnectionRefused(t *testing.T) {
 	cfg := &config.Config{
-		Mode:      "slave",
-		MasterURL: "http://localhost:0", // Port 0 is invalid/unreachable
-		NodeName:  "test-node",
-		BaseURL:   "",
+		Mode:          "slave",
+		ControllerURL: "http://localhost:0", // Port 0 is invalid/unreachable
+		NodeName:      "test-node",
+		BaseURL:       "",
 	}
 	fwd := NewForwarder(cfg)
 
@@ -382,10 +382,10 @@ func TestSendBatch_WithHealth(t *testing.T) {
 	defer server.Close()
 
 	cfg := &config.Config{
-		Mode:      "slave",
-		MasterURL: server.URL,
-		NodeName:  "test-node",
-		BaseURL:   "",
+		Mode:          "slave",
+		ControllerURL: server.URL,
+		NodeName:      "test-node",
+		BaseURL:       "",
 	}
 	fwd := NewForwarder(cfg)
 
@@ -405,7 +405,7 @@ func TestSendBatch_WithHealth(t *testing.T) {
 }
 
 func TestStop(_ *testing.T) {
-	cfg := &config.Config{Mode: "slave", MasterURL: "http://localhost:12345", NodeName: "test-node"}
+	cfg := &config.Config{Mode: "slave", ControllerURL: "http://localhost:12345", NodeName: "test-node"}
 	fwd := NewForwarder(cfg)
 
 	// Stop should not panic
@@ -442,7 +442,7 @@ func TestStart_StopDrain(t *testing.T) {
 
 	cfg := &config.Config{
 		Mode:                       "slave",
-		MasterURL:                  server.URL,
+		ControllerURL:              server.URL,
 		NodeName:                   "test-node",
 		BaseURL:                    "",
 		HeartbeatInterval:          1 * time.Hour,
@@ -508,7 +508,7 @@ func TestRetryMechanism(t *testing.T) {
 
 	cfg := &config.Config{
 		Mode:                       "slave",
-		MasterURL:                  server.URL,
+		ControllerURL:              server.URL,
 		NodeName:                   "test-node",
 		BaseURL:                    "",
 		HeartbeatInterval:          1 * time.Hour,
@@ -575,7 +575,7 @@ func TestBatchSizeLimit(t *testing.T) {
 
 	cfg := &config.Config{
 		Mode:                       "slave",
-		MasterURL:                  server.URL,
+		ControllerURL:              server.URL,
 		NodeName:                   "test-node",
 		BaseURL:                    "",
 		HeartbeatInterval:          1 * time.Hour,
@@ -650,10 +650,10 @@ func TestReportHealth_SlaveMode(t *testing.T) {
 	defer server.Close()
 
 	cfg := &config.Config{
-		Mode:      "slave",
-		MasterURL: server.URL,
-		NodeName:  "test-node",
-		BaseURL:   "",
+		Mode:          "slave",
+		ControllerURL: server.URL,
+		NodeName:      "test-node",
+		BaseURL:       "",
 	}
 	fwd := NewForwarder(cfg)
 	fwd.httpClient = server.Client()
@@ -720,8 +720,8 @@ func TestSyncFromMasterRejectsOversizedGzipResponse(t *testing.T) {
 		_ = writer.Close()
 	}))
 	defer server.Close()
-	fwd := NewForwarder(&config.Config{MasterURL: server.URL, MaxRequestSize: 4})
-	if _, err := fwd.syncFromMaster(server.Client(), "/sync"); err == nil {
+	fwd := NewForwarder(&config.Config{ControllerURL: server.URL, MaxRequestSize: 4})
+	if _, err := fwd.syncFromController(server.Client(), "/sync"); err == nil {
 		t.Fatal("expected oversized response error")
 	}
 }
@@ -774,10 +774,10 @@ func TestVersionHeaders(t *testing.T) {
 	defer server.Close()
 
 	cfg := &config.Config{
-		Mode:      "slave",
-		MasterURL: server.URL,
-		NodeName:  "test-node",
-		BaseURL:   "",
+		Mode:          "slave",
+		ControllerURL: server.URL,
+		NodeName:      "test-node",
+		BaseURL:       "",
 	}
 	fwd := NewForwarder(cfg)
 

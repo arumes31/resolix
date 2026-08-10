@@ -448,7 +448,7 @@ func TestArchiveStep(t *testing.T) {
 
 func TestForwarder_NoPanic(t *testing.T) {
 	_ = t // Ignore unused param warning
-	cfg := &config.Config{Mode: "slave", MasterURL: "http://localhost:12345", NodeName: "slave-1"}
+	cfg := &config.Config{Mode: "slave", ControllerURL: "http://localhost:12345", NodeName: "slave-1"}
 	fwd := forwarder.NewForwarder(cfg)
 
 	// Test EnqueueEvent adds to backlog

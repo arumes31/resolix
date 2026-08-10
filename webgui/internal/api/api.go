@@ -2035,7 +2035,7 @@ func (s *Server) handleFilteringPause(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !s.requireMaster(w) {
+	if !s.requireController(w) {
 		return
 	}
 	if !s.checkCSRF(w, r) {
@@ -2073,7 +2073,7 @@ func (s *Server) handleFilteringPause(w http.ResponseWriter, r *http.Request) {
 // typed DNS rewrites. Changes take effect live in the DNS pipeline.
 func (s *Server) handleRewrites(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	if r.Method != http.MethodGet && !s.requireMaster(w) {
+	if r.Method != http.MethodGet && !s.requireController(w) {
 		return
 	}
 	s.fieldsMu.RLock()
@@ -2143,7 +2143,7 @@ func (s *Server) handleRewrites(w http.ResponseWriter, r *http.Request) {
 // DELETE (?name=) for the per-client registry. Changes take effect live.
 func (s *Server) handleClients(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	if r.Method != http.MethodGet && !s.requireMaster(w) {
+	if r.Method != http.MethodGet && !s.requireController(w) {
 		return
 	}
 	s.fieldsMu.RLock()
@@ -2255,7 +2255,7 @@ func (s *Server) handleQuerylogAction(w http.ResponseWriter, r *http.Request, bl
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !s.requireMaster(w) {
+	if !s.requireController(w) {
 		return
 	}
 	if !s.checkCSRF(w, r) {
@@ -2432,7 +2432,7 @@ func (s *Server) handleGetUpstreams(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handlePostUpstreams(w http.ResponseWriter, r *http.Request) {
-	if !s.requireMaster(w) {
+	if !s.requireController(w) {
 		return
 	}
 	if !s.checkCSRF(w, r) {
@@ -2570,7 +2570,7 @@ func (s *Server) handleGetDNSRoutes(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handlePostDNSRoutes(w http.ResponseWriter, r *http.Request) {
-	if !s.requireMaster(w) {
+	if !s.requireController(w) {
 		return
 	}
 	if !s.checkCSRF(w, r) {

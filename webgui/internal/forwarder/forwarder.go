@@ -74,33 +74,33 @@ func NewForwarder(cfg *config.Config) *Forwarder {
 		syncedRoutes:  make(map[string]string),
 		syncedHealth:  make(map[string]map[string]float64),
 	}
-	if cfg.Mode == "slave" && cfg.MasterURL != "" {
-		_, f.transportErr = masterEndpoint(cfg, "/api/sync/dns-config")
+	if cfg.Mode == "slave" && cfg.ControllerURL != "" {
+		_, f.transportErr = controllerEndpoint(cfg, "/api/sync/dns-config")
 	}
 	if f.transportErr == nil {
 		f.httpClient = &http.Client{
 			Timeout:       10 * time.Second,
-			CheckRedirect: rejectMasterRedirect,
+			CheckRedirect: rejectControllerRedirect,
 		}
 	}
 	return f
 }
 
-func rejectMasterRedirect(_ *http.Request, _ []*http.Request) error {
+func rejectControllerRedirect(_ *http.Request, _ []*http.Request) error {
 	return http.ErrUseLastResponse
 }
 
-func doMasterRequest(client *http.Client, req *http.Request) (*http.Response, error) {
+func doControllerRequest(client *http.Client, req *http.Request) (*http.Response, error) {
 	if client == nil {
 		return nil, errors.New("master HTTP client is not configured")
 	}
 	secureClient := *client
-	secureClient.CheckRedirect = rejectMasterRedirect
+	secureClient.CheckRedirect = rejectControllerRedirect
 	return secureClient.Do(req)
 }
 
-func masterEndpoint(cfg *config.Config, endpoint string) (string, error) {
-	master, err := url.ParseRequestURI(cfg.MasterURL)
+func controllerEndpoint(cfg *config.Config, endpoint string) (string, error) {
+	master, err := url.ParseRequestURI(cfg.ControllerURL)
 	if err != nil {
 		return "", fmt.Errorf("parse MASTER_URL: %w", err)
 	}
@@ -113,7 +113,7 @@ func masterEndpoint(cfg *config.Config, endpoint string) (string, error) {
 	if cfg.BaseURL != "" && (!strings.HasPrefix(cfg.BaseURL, "/") || strings.ContainsAny(cfg.BaseURL, "?#")) {
 		return "", errors.New("BASE_URL must be an absolute path without a query or fragment")
 	}
-	target := strings.TrimRight(cfg.MasterURL, "/") + strings.TrimRight(cfg.BaseURL, "/") + endpoint
+	target := strings.TrimRight(cfg.ControllerURL, "/") + strings.TrimRight(cfg.BaseURL, "/") + endpoint
 	parsedTarget, err := url.ParseRequestURI(target)
 	if err != nil {
 		return "", fmt.Errorf("parse master endpoint: %w", err)
@@ -125,7 +125,7 @@ func masterEndpoint(cfg *config.Config, endpoint string) (string, error) {
 }
 
 func (f *Forwarder) enabled() bool {
-	return f.cfg.Mode == "slave" && f.cfg.MasterURL != ""
+	return f.cfg.Mode == "slave" && f.cfg.ControllerURL != ""
 }
 
 // SetDNSRoutesFn sets the callback for applying synced DNS routes (Item 91).
@@ -201,7 +201,7 @@ func (f *Forwarder) GetSyncedUpstreamHealth() map[string]map[string]float64 {
 
 // EnqueueEvent adds a query event to the forwarding queue.
 func (f *Forwarder) EnqueueEvent(ev models.QueryEvent) {
-	if f.cfg.Mode != "slave" || f.cfg.MasterURL == "" {
+	if f.cfg.Mode != "slave" || f.cfg.ControllerURL == "" {
 		return
 	}
 	if ev.Node == "" {
@@ -316,7 +316,7 @@ func (f *Forwarder) sendBatch(client *http.Client, events []models.QueryEvent, h
 		bodyReader = bytes.NewBuffer(compressed)
 	}
 
-	req, err := http.NewRequest("POST", f.cfg.MasterURL+f.cfg.BaseURL+"/api/ingest", bodyReader)
+	req, err := http.NewRequest("POST", f.cfg.ControllerURL+f.cfg.BaseURL+"/api/ingest", bodyReader)
 	if err != nil {
 		return err
 	}
@@ -334,7 +334,7 @@ func (f *Forwarder) sendBatch(client *http.Client, events []models.QueryEvent, h
 		req.Header.Set("Authorization", "Bearer "+f.cfg.IngestSecret)
 	}
 
-	resp, err := doMasterRequest(client, req)
+	resp, err := doControllerRequest(client, req)
 	if err != nil {
 		return err
 	}
@@ -375,7 +375,7 @@ func (f *Forwarder) sendHeartbeat(client *http.Client, health map[string]float64
 		bodyReader = bytes.NewBuffer(compressed)
 	}
 
-	req, err := http.NewRequest("POST", f.cfg.MasterURL+f.cfg.BaseURL+"/api/heartbeat", bodyReader)
+	req, err := http.NewRequest("POST", f.cfg.ControllerURL+f.cfg.BaseURL+"/api/heartbeat", bodyReader)
 	if err != nil {
 		return err
 	}
@@ -391,7 +391,7 @@ func (f *Forwarder) sendHeartbeat(client *http.Client, health map[string]float64
 		req.Header.Set("Authorization", "Bearer "+f.cfg.IngestSecret)
 	}
 
-	resp, err := doMasterRequest(client, req)
+	resp, err := doControllerRequest(client, req)
 	if err != nil {
 		return err
 	}
@@ -403,9 +403,9 @@ func (f *Forwarder) sendHeartbeat(client *http.Client, health map[string]float64
 	return nil
 }
 
-// syncFromMaster fetches configuration data from the master (Items 90, 91, 94).
-func (f *Forwarder) syncFromMaster(client *http.Client, endpoint string) ([]byte, error) {
-	requestURL, err := masterEndpoint(f.cfg, endpoint)
+// syncFromController fetches configuration data from the master (Items 90, 91, 94).
+func (f *Forwarder) syncFromController(client *http.Client, endpoint string) ([]byte, error) {
+	requestURL, err := controllerEndpoint(f.cfg, endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -422,7 +422,7 @@ func (f *Forwarder) syncFromMaster(client *http.Client, endpoint string) ([]byte
 	}
 	req.Header.Set("Accept-Encoding", "gzip")
 
-	resp, err := doMasterRequest(client, req)
+	resp, err := doControllerRequest(client, req)
 	if err != nil {
 		return nil, err
 	}
@@ -458,7 +458,7 @@ func (f *Forwarder) syncFromMaster(client *http.Client, endpoint string) ([]byte
 
 // syncAliases fetches and applies client aliases from master (Item 90).
 func (f *Forwarder) syncAliases(client *http.Client) {
-	data, err := f.syncFromMaster(client, "/api/sync/aliases")
+	data, err := f.syncFromController(client, "/api/sync/aliases")
 	if err != nil {
 		log.Printf("[WARN] Failed to sync aliases from master: %v", err)
 		return
@@ -484,7 +484,7 @@ func (f *Forwarder) syncAliases(client *http.Client) {
 
 // syncDNSRoutes fetches and applies DNS routes from master (Item 91).
 func (f *Forwarder) syncDNSRoutes(client *http.Client) {
-	data, err := f.syncFromMaster(client, "/api/sync/dns-routes")
+	data, err := f.syncFromController(client, "/api/sync/dns-routes")
 	if err != nil {
 		log.Printf("[WARN] Failed to sync DNS routes from master: %v", err)
 		return
@@ -512,7 +512,7 @@ func (f *Forwarder) syncDNSRoutes(client *http.Client) {
 
 // syncUpstreamHealth fetches and applies upstream health from master (Item 94).
 func (f *Forwarder) syncUpstreamHealth(client *http.Client) {
-	data, err := f.syncFromMaster(client, "/api/sync/upstream-health")
+	data, err := f.syncFromController(client, "/api/sync/upstream-health")
 	if err != nil {
 		log.Printf("[WARN] Failed to sync upstream health from master: %v", err)
 		return
@@ -543,7 +543,7 @@ func (f *Forwarder) syncUpstreamHealth(client *http.Client) {
 }
 
 func (f *Forwarder) syncDNSConfig(client *http.Client) {
-	data, err := f.syncFromMaster(client, "/api/sync/dns-config")
+	data, err := f.syncFromController(client, "/api/sync/dns-config")
 	if err != nil {
 		log.Printf("[WARN] Failed to sync DNS configuration from master: %v", err)
 		return

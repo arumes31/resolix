@@ -130,7 +130,7 @@ const (
 // Config holds the application configuration.
 type Config struct {
 	Mode             string
-	MasterURL        string
+	ControllerURL    string
 	NodeName         string
 	Port             string
 	WebListenAddr    string
@@ -576,12 +576,12 @@ func resolvePort() string {
 	return port
 }
 
-// validateMasterURL exits fatally when masterURL is set but invalid.
-func validateMasterURL(masterURL string) {
+// validateControllerURL exits fatally when masterURL is set but invalid.
+func validateControllerURL(masterURL string) {
 	if masterURL == "" {
 		return
 	}
-	if !isValidMasterURL(masterURL) {
+	if !isValidControllerURL(masterURL) {
 		log.Fatalf("[FATAL] Invalid MASTER_URL: must start with https:// (got: %s)", sanitizeForLog(masterURL)) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
 	}
 	if _, err := url.ParseRequestURI(masterURL); err != nil {
@@ -753,7 +753,7 @@ func LoadConfig() *Config {
 	}
 
 	masterURL := strings.TrimSuffix(os.Getenv("MASTER_URL"), "/")
-	validateMasterURL(masterURL)
+	validateControllerURL(masterURL)
 
 	// Load client aliases from env var
 	aliases := loadEnvAliases()
@@ -877,7 +877,7 @@ func LoadConfig() *Config {
 
 	cfg := &Config{
 		Mode:                       mode,
-		MasterURL:                  masterURL,
+		ControllerURL:              masterURL,
 		NodeName:                   nodeName,
 		Port:                       port,
 		WebListenAddr:              webListenAddr,
@@ -965,15 +965,15 @@ func LoadConfig() *Config {
 		NodeOfflineThreshold:       nodeOfflineThreshold,
 	}
 
-	if cfg.Mode == "slave" && cfg.MasterURL == "" {
+	if cfg.Mode == "slave" && cfg.ControllerURL == "" {
 		log.Fatal("[FATAL] MASTER_URL is required when MODE is slave")
 	}
 
 	return cfg
 }
 
-// isValidMasterURL checks that the URL uses protected HTTPS transport.
-func isValidMasterURL(rawURL string) bool {
+// isValidControllerURL checks that the URL uses protected HTTPS transport.
+func isValidControllerURL(rawURL string) bool {
 	return strings.HasPrefix(rawURL, "https://")
 }
 
@@ -1066,8 +1066,8 @@ func (c *Config) VerifyConfig() ([]string, []string) {
 	}
 
 	// 2. MASTER_URL schema validation (if set)
-	if c.MasterURL != "" && !isValidMasterURL(c.MasterURL) {
-		errs = append(errs, fmt.Sprintf("MASTER_URL must start with https:// (got: %s)", c.MasterURL))
+	if c.ControllerURL != "" && !isValidControllerURL(c.ControllerURL) {
+		errs = append(errs, fmt.Sprintf("MASTER_URL must start with https:// (got: %s)", c.ControllerURL))
 	}
 
 	// 3. Authentication must be either fully configured or explicitly backed

@@ -113,6 +113,34 @@ func TestResolveDoHPath(t *testing.T) {
 	}
 }
 
+func TestNormalizeBaseURL(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "default", want: DefaultBaseURL},
+		{name: "leading slash", value: "dns", want: "/dns"},
+		{name: "clean path", value: "/dns//admin/", want: "/dns/admin"},
+		{name: "protocol relative", value: "//evil.example", want: DefaultBaseURL},
+		{name: "absolute URL", value: "https://evil.example", want: DefaultBaseURL},
+		{name: "query", value: "/dns?next=//evil.example", want: DefaultBaseURL},
+		{name: "fragment", value: "/dns#fragment", want: DefaultBaseURL},
+		{name: "backslash", value: `\evil.example`, want: DefaultBaseURL},
+		{name: "slash backslash", value: `/\evil.example`, want: DefaultBaseURL},
+		{name: "escaped protocol relative", value: "/%2f%2fevil.example", want: DefaultBaseURL},
+		{name: "escaped backslash", value: "/%5cevil.example", want: DefaultBaseURL},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("BASE_URL", tt.value)
+			if got := normalizeBaseURL(); got != tt.want {
+				t.Fatalf("normalizeBaseURL() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestResolveBlockingTrimsAndValidatesAddressFamilies(t *testing.T) {
 	t.Setenv("BLOCK_CUSTOM_IP4", " 192.0.2.10 ")
 	t.Setenv("BLOCK_CUSTOM_IP6", " 2001:db8::10 ")

@@ -148,18 +148,15 @@ type Config struct {
 	IngestSecret     string
 	WebUsername      string
 	WebPassword      string
-	// CookieSecure forces the Secure attribute on session/CSRF cookies
-	// (COOKIE_SECURE override for TLS-terminating proxies).
-	CookieSecure    bool
-	ScanLimit       int
-	MaxBacklogSize  int64
-	UpstreamDNS     string
-	clientAliases   map[string]string
-	clientAliasesMu sync.RWMutex
-	TrustedProxies  []string
-	Debug           bool
-	LogLevel        string
-	BaseURL         string
+	ScanLimit        int
+	MaxBacklogSize   int64
+	UpstreamDNS      string
+	clientAliases    map[string]string
+	clientAliasesMu  sync.RWMutex
+	TrustedProxies   []string
+	Debug            bool
+	LogLevel         string
+	BaseURL          string
 
 	// ClientAliasesFile is the path to a file with IP=Alias entries.
 	ClientAliasesFile string
@@ -646,27 +643,41 @@ func parseTrustedProxies() []string {
 	return trustedProxies
 }
 
-// normalizeBaseURL reads BASE_URL and ensures it starts with / and has no
-// trailing /. Values that would become protocol-relative redirect targets
-// ("//host") or contain a leading backslash are rejected.
+// normalizeBaseURL reads BASE_URL and reduces it to a local, absolute path.
 func normalizeBaseURL() string {
-	baseURL := os.Getenv("BASE_URL")
-	if baseURL == "" {
-		baseURL = DefaultBaseURL
+	raw := strings.TrimSpace(os.Getenv("BASE_URL"))
+	if raw == "" {
+		return DefaultBaseURL
 	}
-	if strings.HasPrefix(baseURL, "//") || strings.HasPrefix(baseURL, "\\") {
-		log.Printf("[WARN] Invalid BASE_URL '%s', falling back to %s", sanitizeForLog(baseURL), DefaultBaseURL) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-		baseURL = DefaultBaseURL
+	candidate, err := url.Parse(raw)
+	if err != nil || candidate.IsAbs() || candidate.Host != "" || candidate.RawQuery != "" ||
+		candidate.Fragment != "" || strings.ContainsAny(raw, "\\\r\n") {
+		log.Printf("[WARN] Invalid BASE_URL '%s', falling back to %s", sanitizeForLog(raw), DefaultBaseURL) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		return DefaultBaseURL
 	}
-	// Ensure base URL starts with / and ends without /
-	if !strings.HasPrefix(baseURL, "/") {
-		baseURL = "/" + baseURL
+	if !strings.HasPrefix(raw, "/") {
+		raw = "/" + raw
 	}
-	baseURL = strings.TrimSuffix(baseURL, "/")
-	if baseURL == "" {
-		baseURL = "/"
+	if len(raw) > 1 && raw[0] == '/' && (raw[1] == '/' || raw[1] == '\\') {
+		log.Printf("[WARN] Invalid BASE_URL '%s', falling back to %s", sanitizeForLog(raw), DefaultBaseURL) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		return DefaultBaseURL
 	}
-	return baseURL
+	parsed, err := url.ParseRequestURI(raw)
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || parsed.RawQuery != "" ||
+		parsed.Fragment != "" {
+		log.Printf("[WARN] Invalid BASE_URL '%s', falling back to %s", sanitizeForLog(raw), DefaultBaseURL) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		return DefaultBaseURL
+	}
+	decodedPath, err := url.PathUnescape(parsed.EscapedPath())
+	if err != nil || strings.HasPrefix(decodedPath, "//") || strings.Contains(decodedPath, "\\") {
+		log.Printf("[WARN] Invalid BASE_URL '%s', falling back to %s", sanitizeForLog(raw), DefaultBaseURL) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		return DefaultBaseURL
+	}
+	cleaned := pathpkg.Clean("/" + strings.TrimLeft(parsed.Path, "/"))
+	if cleaned == "." || cleaned == "" {
+		return DefaultBaseURL
+	}
+	return cleaned
 }
 
 // resolveLatencyThreshold reads and validates UPSTREAM_LATENCY_THRESHOLD.
@@ -913,7 +924,6 @@ func LoadConfig() *Config {
 		IngestSecret:               os.Getenv("INGEST_SECRET"),
 		WebUsername:                os.Getenv("WEB_USERNAME"),
 		WebPassword:                os.Getenv("WEB_PASSWORD"),
-		CookieSecure:               strings.ToLower(os.Getenv("COOKIE_SECURE")) == "true",
 		ScanLimit:                  DefaultScanLimit,
 		MaxBacklogSize:             DefaultMaxBacklogSize,
 		UpstreamDNS:                os.Getenv("UPSTREAM_DNS"),

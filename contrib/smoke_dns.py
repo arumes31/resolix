@@ -43,9 +43,10 @@ def exchange(args: argparse.Namespace, wire: bytes) -> bytes:
 
     raw = socket.create_connection((args.host, args.port), timeout=5)
     if args.protocol == "dot":
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
+        if not args.ca_file:
+            raise RuntimeError("DoT requires --ca-file")
+        context = ssl.create_default_context(cafile=args.ca_file)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         raw = context.wrap_socket(raw, server_hostname="localhost")
     with raw:
         raw.sendall(struct.pack("!H", len(wire)) + wire)
@@ -60,6 +61,7 @@ def main() -> None:
     parser.add_argument("port", type=int)
     parser.add_argument("domain")
     parser.add_argument("expected_rcode", type=int)
+    parser.add_argument("--ca-file")
     args = parser.parse_args()
     response = exchange(args, query(args.domain))
     if len(response) < 12:

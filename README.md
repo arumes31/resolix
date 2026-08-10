@@ -19,7 +19,7 @@ Resolix is a self-hosted DNS control plane for Tailscale networks. One Go servic
 - SQLite history with bounded asynchronous batching, live SSE updates, metrics, health checks, and node status.
 - A dedicated `/config` control plane for upstreams, routes, filter subscriptions, custom rules, rewrites, clients, services, and cache management.
 - Controller/Agent clusters with content-addressed configuration snapshots and visible revision drift.
-- Reverse-proxy and subpath support through `WEB_LISTEN_ADDR`, `BASE_URL`, `TRUSTED_PROXIES`, and secure-cookie controls.
+- Reverse-proxy TLS termination and subpath support through `WEB_LISTEN_ADDR`, `BASE_URL`, and `TRUSTED_PROXIES`.
 
 ## Quick start
 
@@ -40,9 +40,9 @@ Set at least these values in `.env`:
 ```dotenv
 TS_AUTHKEY=tskey-auth-REPLACE_ME
 INGEST_SECRET=replace-with-a-long-random-secret
-WEB_USERNAME=admin
-WEB_PASSWORD=replace-with-a-strong-password
 NODE_NAME=resolix-1
+# Configure WEB_USERNAME and WEB_PASSWORD after placing an HTTPS reverse proxy
+# in front of Resolix.
 ```
 
 Then start the published image:
@@ -146,7 +146,6 @@ Environment variables are the bootstrap layer. Settings that can be changed safe
 | `WEB_LISTEN_ADDR` | Web/API bind address | `0.0.0.0` |
 | `BASE_URL` | Reverse-proxy subpath such as `/dns` | `/` |
 | `TRUSTED_PROXIES` | Proxy IPs/CIDRs allowed to provide forwarded headers | unset |
-| `COOKIE_SECURE` | Force `Secure` on session and CSRF cookies | `false` |
 | `MAX_REQUEST_SIZE` | Maximum HTTP request body size in bytes | `1048576` |
 | `HTTP_READ_TIMEOUT` | HTTP read timeout | `10s` |
 | `HTTP_WRITE_TIMEOUT` | HTTP write timeout | `30s` |
@@ -243,18 +242,21 @@ DoH shares the web listener and appears at `DOH_PATH`. Terminate HTTPS at a reve
 
 DoT listens directly on `DOT_PORT`. When `DOT_ENABLED=true`, startup fails unless `TLS_CERT_FILE` and `TLS_KEY_FILE` point to a readable, valid keypair.
 
-## Reverse proxy
+## Reverse proxy and web TLS
 
-Bind Resolix to loopback when the proxy runs on the same host. Trust only the proxy address and force secure cookies:
+The web listener intentionally serves HTTP behind a TLS-terminating reverse proxy. When dashboard authentication is configured, Resolix accepts it only over HTTPS observed directly or through an explicitly trusted proxy. Session and CSRF cookies are always `Secure`, `HttpOnly`, and `SameSite=Strict`.
+
+Bind Resolix to loopback when the proxy runs on the same host and trust only the proxy address:
 
 ```dotenv
 WEB_LISTEN_ADDR=127.0.0.1
 BASE_URL=/dns
 TRUSTED_PROXIES=127.0.0.1
-COOKIE_SECURE=true
+WEB_USERNAME=admin
+WEB_PASSWORD=replace-with-a-strong-password
 ```
 
-Resolix honors `Forwarded`, `X-Forwarded-For`, and `X-Forwarded-Proto` only from `TRUSTED_PROXIES`. Keep the configured `BASE_URL` in the upstream request path and disable response buffering for SSE.
+Resolix honors `Forwarded`, `X-Forwarded-For`, and `X-Forwarded-Proto` only from `TRUSTED_PROXIES`. The proxy must overwrite or safely append these headers, redirect public HTTP to HTTPS, and manage certificates and HSTS. A direct HTTP request to an authenticated dashboard is rejected with `426 Upgrade Required`. Keep the configured `BASE_URL` in the upstream request path and disable response buffering for SSE. When the proxy is another container, trust only its fixed address or the smallest dedicated container-network CIDR.
 
 ### Nginx
 

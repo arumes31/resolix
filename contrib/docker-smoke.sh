@@ -29,6 +29,7 @@ if [[ "${OSTYPE:-}" == msys* || "${OSTYPE:-}" == cygwin* ]]; then
   smoke_mount="$(cygpath -w "${smoke_dir}")"
 fi
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "${openssl_subject}" \
+  -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' \
   -keyout "${smoke_dir}/tls.key" -out "${smoke_dir}/tls.crt" >/dev/null 2>&1
 
 docker build \
@@ -98,5 +99,5 @@ python3 contrib/smoke_dns.py tcp 127.0.0.1 "${dns_tcp_port}" smoke.test 0
 python3 contrib/smoke_dns.py tcp 127.0.0.1 "${dns_tcp_port}" blocked.test 3
 python3 contrib/smoke_dns.py doh 127.0.0.1 "${web_port}" smoke.test 0
 python3 contrib/smoke_dns.py doh 127.0.0.1 "${web_port}" blocked.test 3
-python3 contrib/smoke_dns.py dot 127.0.0.1 "${dot_port}" smoke.test 0
-python3 contrib/smoke_dns.py dot 127.0.0.1 "${dot_port}" blocked.test 3
+python3 contrib/smoke_dns.py dot 127.0.0.1 "${dot_port}" smoke.test 0 --ca-file "${smoke_dir}/tls.crt"
+python3 contrib/smoke_dns.py dot 127.0.0.1 "${dot_port}" blocked.test 3 --ca-file "${smoke_dir}/tls.crt"

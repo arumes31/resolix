@@ -444,15 +444,25 @@ func (s *Server) isHTTPS(r *http.Request) bool {
 			}
 		}
 	}
-	proto, _, _ := strings.Cut(r.Header.Get("X-Forwarded-Proto"), ",")
-	return strings.EqualFold(strings.TrimSpace(proto), "https")
+	protos := strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")
+	for i := len(protos) - 1; i >= 0; i-- {
+		if proto := strings.TrimSpace(protos[i]); proto != "" {
+			return strings.EqualFold(proto, "https")
+		}
+	}
+	return false
 }
 
-// cookieSecure reports whether cookies must be marked Secure: either forced
-// via the COOKIE_SECURE configuration override, or the request came in over
-// HTTPS (isHTTPS).
-func (s *Server) cookieSecure(r *http.Request) bool {
-	return s.cfg.CookieSecure || s.isHTTPS(r)
+func (s *Server) newSecureCookie(name, value string, maxAge int) *http.Cookie {
+	return &http.Cookie{
+		Name:     name,
+		Value:    value,
+		Path:     s.cookiePath(),
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   maxAge,
+	}
 }
 
 // sanitizeLogValue strips CR/LF characters from an untrusted value before it
@@ -1396,6 +1406,10 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			http.Error(w, "Web authentication is misconfigured", http.StatusServiceUnavailable)
 			return
 		}
+		if !s.isHTTPS(r) {
+			http.Error(w, "HTTPS is required for web authentication", http.StatusUpgradeRequired)
+			return
+		}
 
 		// Check for session cookie
 		cookie, err := r.Cookie(sessionCookieName)
@@ -1415,6 +1429,11 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if !s.isHTTPS(r) {
+		http.Error(w, "HTTPS is required for web authentication", http.StatusUpgradeRequired)
+		return
+	}
+
 	nonce := ""
 	if s.nonceFromCtx != nil {
 		nonce = s.nonceFromCtx(r.Context())
@@ -1429,16 +1448,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Set CSRF cookie (HttpOnly, Secure if HTTPS, SameSite=Strict)
-		http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via cookieSecure(r) (COOKIE_SECURE override or HTTPS request): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
-			Name:     csrfCookieName,
-			Value:    csrfToken,
-			Path:     s.cookiePath(),
-			HttpOnly: true,
-			Secure:   s.cookieSecure(r),
-			SameSite: http.SameSiteStrictMode,
-			MaxAge:   86400 * 7, // 1 week, matches session cookie
-		})
+		http.SetCookie(w, s.newSecureCookie(csrfCookieName, csrfToken, int(sessionLifetime.Seconds())))
 
 		if err := s.tmpl.ExecuteTemplate(w, "login.html", map[string]interface{}{
 			"Nonce":     nonce,
@@ -1489,15 +1499,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			// Successful login — reset rate limiter for this IP
 			s.resetRateLimit(ip)
 
-			http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via cookieSecure(r) (COOKIE_SECURE override or HTTPS request): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
-				Name:     sessionCookieName,
-				Value:    sessionToken,
-				Path:     s.cookiePath(),
-				HttpOnly: true,
-				Secure:   s.cookieSecure(r),
-				MaxAge:   86400 * 7, // 1 week
-				SameSite: http.SameSiteStrictMode,
-			})
+			http.SetCookie(w, s.newSecureCookie(sessionCookieName, sessionToken, int(sessionLifetime.Seconds())))
 			http.Redirect(w, r, s.cfg.BaseURL+"/", http.StatusSeeOther)
 			return
 		}
@@ -1510,15 +1512,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
-		http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via cookieSecure(r) (COOKIE_SECURE override or HTTPS request): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
-			Name:     csrfCookieName,
-			Value:    csrfToken,
-			Path:     s.cookiePath(),
-			HttpOnly: true,
-			Secure:   s.cookieSecure(r),
-			SameSite: http.SameSiteStrictMode,
-			MaxAge:   int(sessionLifetime.Seconds()),
-		})
+		http.SetCookie(w, s.newSecureCookie(csrfCookieName, csrfToken, int(sessionLifetime.Seconds())))
 
 		if err := s.tmpl.ExecuteTemplate(w, "login.html", map[string]interface{}{
 			"Error":     "Invalid username or password",
@@ -1545,25 +1539,9 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if cookie, err := r.Cookie(sessionCookieName); err == nil {
 		s.deleteSession(cookie.Value)
 	}
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via cookieSecure(r) (COOKIE_SECURE override or HTTPS request): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
-		Name:     sessionCookieName,
-		Value:    "",
-		Path:     s.cookiePath(),
-		HttpOnly: true,
-		Secure:   s.cookieSecure(r),
-		MaxAge:   -1,
-		SameSite: http.SameSiteStrictMode,
-	})
+	http.SetCookie(w, s.newSecureCookie(sessionCookieName, "", -1))
 	// Also clear the CSRF cookie
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure is set dynamically via cookieSecure(r) (COOKIE_SECURE override or HTTPS request): the service commonly runs plain HTTP on a tailnet where forcing Secure would break login; HttpOnly and SameSite=Strict are always set
-		Name:     csrfCookieName,
-		Value:    "",
-		Path:     s.cookiePath(),
-		HttpOnly: true,
-		Secure:   s.cookieSecure(r),
-		MaxAge:   -1,
-		SameSite: http.SameSiteStrictMode,
-	})
+	http.SetCookie(w, s.newSecureCookie(csrfCookieName, "", -1))
 	http.Redirect(w, r, s.cfg.BaseURL+"/login", http.StatusSeeOther)
 }
 

@@ -210,7 +210,6 @@ LOG_LEVEL=INFO
 BASE_URL=/
 # Comma-separated proxy IPs/CIDRs allowed to supply Forwarded/X-Forwarded-*.
 # TRUSTED_PROXIES=127.0.0.1,10.0.0.0/8
-# COOKIE_SECURE=true
 
 # Database file name or absolute path (default: dns.db)
 # If relative, it is placed inside HISTORY_DIR

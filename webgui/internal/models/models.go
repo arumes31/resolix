@@ -100,6 +100,7 @@ type NodeStatus struct {
 	Goroutines     int                `json:"goroutines,omitempty"`
 	DBSizeMB       float64            `json:"db_size_mb,omitempty"`
 	UpstreamHealth map[string]float64 `json:"upstream_health,omitempty"`
+	ConfigRevision string             `json:"config_revision,omitempty"`
 }
 
 // IsOnline returns whether the node is considered online based on the offline threshold.
@@ -109,12 +110,13 @@ func (n *NodeStatus) IsOnline(threshold time.Duration) bool {
 
 // HeartbeatPayload represents the heartbeat data sent from slave to master (Item 92).
 type HeartbeatPayload struct {
-	Node       string             `json:"node"`
-	Version    string             `json:"version,omitempty"`
-	GoVersion  string             `json:"go_version,omitempty"`
-	BuildInfo  string             `json:"build_info,omitempty"`
-	MemoryMB   float64            `json:"memory_mb,omitempty"`
-	Goroutines int                `json:"goroutines,omitempty"`
-	DBSizeMB   float64            `json:"db_size_mb,omitempty"`
-	Health     map[string]float64 `json:"health,omitempty"`
+	Node           string             `json:"node"`
+	Version        string             `json:"version,omitempty"`
+	GoVersion      string             `json:"go_version,omitempty"`
+	BuildInfo      string             `json:"build_info,omitempty"`
+	MemoryMB       float64            `json:"memory_mb,omitempty"`
+	Goroutines     int                `json:"goroutines,omitempty"`
+	DBSizeMB       float64            `json:"db_size_mb,omitempty"`
+	Health         map[string]float64 `json:"health,omitempty"`
+	ConfigRevision string             `json:"config_revision,omitempty"`
 }

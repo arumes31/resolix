@@ -11,13 +11,16 @@ import (
 	"log"
 	"math/big"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"tailscale-dnsrewrite/webgui/internal/config"
+	"tailscale-dnsrewrite/webgui/internal/configsync"
 	"tailscale-dnsrewrite/webgui/internal/models"
 )
 
@@ -41,6 +44,7 @@ type Forwarder struct {
 	wakeChan         chan struct{}
 	healthReports    chan map[string]float64
 	httpClient       *http.Client
+	transportErr     error
 	retries          atomic.Int64
 	dropped          atomic.Int64
 	sent             atomic.Int64
@@ -55,20 +59,73 @@ type Forwarder struct {
 	setDNSRoutesFn      func(routes map[string]string)
 	setAliasesFn        func(aliases map[string]string)
 	setUpstreamHealthFn func(node string, health map[string]float64)
+	setDNSConfigFn      func(snapshot configsync.Snapshot) error
+	configRevision      string
 }
 
 // NewForwarder creates a new log forwarder for slave nodes.
 func NewForwarder(cfg *config.Config) *Forwarder {
-	return &Forwarder{
+	f := &Forwarder{
 		stopChan:      make(chan struct{}),
 		wakeChan:      make(chan struct{}, 1),
 		healthReports: make(chan map[string]float64, 1),
-		httpClient:    &http.Client{Timeout: 10 * time.Second},
 		cfg:           cfg,
 		syncedAliases: make(map[string]string),
 		syncedRoutes:  make(map[string]string),
 		syncedHealth:  make(map[string]map[string]float64),
 	}
+	if cfg.Mode == "slave" && cfg.MasterURL != "" {
+		_, f.transportErr = masterEndpoint(cfg, "/api/sync/dns-config")
+	}
+	if f.transportErr == nil {
+		f.httpClient = &http.Client{
+			Timeout:       10 * time.Second,
+			CheckRedirect: rejectMasterRedirect,
+		}
+	}
+	return f
+}
+
+func rejectMasterRedirect(_ *http.Request, _ []*http.Request) error {
+	return http.ErrUseLastResponse
+}
+
+func doMasterRequest(client *http.Client, req *http.Request) (*http.Response, error) {
+	if client == nil {
+		return nil, errors.New("master HTTP client is not configured")
+	}
+	secureClient := *client
+	secureClient.CheckRedirect = rejectMasterRedirect
+	return secureClient.Do(req)
+}
+
+func masterEndpoint(cfg *config.Config, endpoint string) (string, error) {
+	master, err := url.ParseRequestURI(cfg.MasterURL)
+	if err != nil {
+		return "", fmt.Errorf("parse MASTER_URL: %w", err)
+	}
+	if !strings.EqualFold(master.Scheme, "https") || master.Host == "" {
+		return "", errors.New("MASTER_URL must use HTTPS")
+	}
+	if master.User != nil || master.RawQuery != "" || master.Fragment != "" {
+		return "", errors.New("MASTER_URL must not contain credentials, a query, or a fragment")
+	}
+	if cfg.BaseURL != "" && (!strings.HasPrefix(cfg.BaseURL, "/") || strings.ContainsAny(cfg.BaseURL, "?#")) {
+		return "", errors.New("BASE_URL must be an absolute path without a query or fragment")
+	}
+	target := strings.TrimRight(cfg.MasterURL, "/") + strings.TrimRight(cfg.BaseURL, "/") + endpoint
+	parsedTarget, err := url.ParseRequestURI(target)
+	if err != nil {
+		return "", fmt.Errorf("parse master endpoint: %w", err)
+	}
+	if !strings.EqualFold(parsedTarget.Scheme, "https") || parsedTarget.Host != master.Host {
+		return "", errors.New("master endpoint must remain on the HTTPS master origin")
+	}
+	return target, nil
+}
+
+func (f *Forwarder) enabled() bool {
+	return f.cfg.Mode == "slave" && f.cfg.MasterURL != ""
 }
 
 // SetDNSRoutesFn sets the callback for applying synced DNS routes (Item 91).
@@ -90,6 +147,20 @@ func (f *Forwarder) SetUpstreamHealthFn(fn func(node string, health map[string]f
 	f.syncMu.Lock()
 	defer f.syncMu.Unlock()
 	f.setUpstreamHealthFn = fn
+}
+
+// SetDNSConfigFn sets the callback that validates and applies a master snapshot.
+func (f *Forwarder) SetDNSConfigFn(fn func(snapshot configsync.Snapshot) error) {
+	f.syncMu.Lock()
+	defer f.syncMu.Unlock()
+	f.setDNSConfigFn = fn
+}
+
+// ConfigRevision returns the last successfully applied master revision.
+func (f *Forwarder) ConfigRevision() string {
+	f.syncMu.RLock()
+	defer f.syncMu.RUnlock()
+	return f.configRevision
 }
 
 // GetSyncedAliases returns the latest aliases synced from master (Item 90).
@@ -263,7 +334,7 @@ func (f *Forwarder) sendBatch(client *http.Client, events []models.QueryEvent, h
 		req.Header.Set("Authorization", "Bearer "+f.cfg.IngestSecret)
 	}
 
-	resp, err := client.Do(req)
+	resp, err := doMasterRequest(client, req)
 	if err != nil {
 		return err
 	}
@@ -281,14 +352,15 @@ func (f *Forwarder) sendHeartbeat(client *http.Client, health map[string]float64
 	dbSizeMB := getDBSizeMB(f.cfg)
 
 	hb := models.HeartbeatPayload{
-		Node:       f.cfg.NodeName,
-		Version:    Version,
-		GoVersion:  runtime.Version(),
-		BuildInfo:  fmt.Sprintf("%s/%s", Version, runtime.Version()),
-		MemoryMB:   memoryMB,
-		Goroutines: goroutines,
-		DBSizeMB:   dbSizeMB,
-		Health:     health,
+		Node:           f.cfg.NodeName,
+		Version:        Version,
+		GoVersion:      runtime.Version(),
+		BuildInfo:      fmt.Sprintf("%s/%s", Version, runtime.Version()),
+		MemoryMB:       memoryMB,
+		Goroutines:     goroutines,
+		DBSizeMB:       dbSizeMB,
+		Health:         health,
+		ConfigRevision: f.ConfigRevision(),
 	}
 
 	data, err := json.Marshal(hb)
@@ -319,7 +391,7 @@ func (f *Forwarder) sendHeartbeat(client *http.Client, health map[string]float64
 		req.Header.Set("Authorization", "Bearer "+f.cfg.IngestSecret)
 	}
 
-	resp, err := client.Do(req)
+	resp, err := doMasterRequest(client, req)
 	if err != nil {
 		return err
 	}
@@ -333,7 +405,11 @@ func (f *Forwarder) sendHeartbeat(client *http.Client, health map[string]float64
 
 // syncFromMaster fetches configuration data from the master (Items 90, 91, 94).
 func (f *Forwarder) syncFromMaster(client *http.Client, endpoint string) ([]byte, error) {
-	req, err := http.NewRequest("GET", f.cfg.MasterURL+f.cfg.BaseURL+endpoint, nil)
+	requestURL, err := masterEndpoint(f.cfg, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest("GET", requestURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -346,7 +422,7 @@ func (f *Forwarder) syncFromMaster(client *http.Client, endpoint string) ([]byte
 	}
 	req.Header.Set("Accept-Encoding", "gzip")
 
-	resp, err := client.Do(req)
+	resp, err := doMasterRequest(client, req)
 	if err != nil {
 		return nil, err
 	}
@@ -466,6 +542,47 @@ func (f *Forwarder) syncUpstreamHealth(client *http.Client) {
 	log.Printf("[INFO] Synced upstream health for %d nodes (%d upstreams) from master", len(result), totalUpstreams)
 }
 
+func (f *Forwarder) syncDNSConfig(client *http.Client) {
+	data, err := f.syncFromMaster(client, "/api/sync/dns-config")
+	if err != nil {
+		log.Printf("[WARN] Failed to sync DNS configuration from master: %v", err)
+		return
+	}
+	var snapshot configsync.Snapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		log.Printf("[WARN] Failed to parse DNS configuration snapshot: %v", err)
+		return
+	}
+	validRevision, err := snapshot.ValidRevision()
+	if err != nil {
+		log.Printf("[WARN] Failed to validate DNS configuration snapshot revision: %v", err)
+		return
+	}
+	if !validRevision {
+		log.Printf("[WARN] Rejected DNS configuration snapshot with invalid revision")
+		return
+	}
+	f.syncMu.RLock()
+	currentRevision := f.configRevision
+	apply := f.setDNSConfigFn
+	f.syncMu.RUnlock()
+	if snapshot.Revision == currentRevision {
+		return
+	}
+	if apply == nil {
+		log.Printf("[WARN] DNS configuration sync callback is not configured")
+		return
+	}
+	if err := apply(snapshot); err != nil {
+		log.Printf("[WARN] Failed to apply DNS configuration revision: %v", err)
+		return
+	}
+	f.syncMu.Lock()
+	f.configRevision = snapshot.Revision
+	f.syncMu.Unlock()
+	log.Printf("[INFO] Applied DNS configuration revision %.12s", snapshot.Revision)
+}
+
 // calculateBackoff computes the backoff duration with exponential growth and jitter (Item 86).
 // Sequence: initial, 2x, 4x, 8x, 16x, 30s (capped) with 0-500ms random jitter.
 // A non-positive initial interval falls back to 1s, preserving the original progression.
@@ -501,8 +618,11 @@ func safeInterval(d, fallback time.Duration) time.Duration {
 
 // Start begins the forwarding worker loop with heartbeat and sync goroutines.
 func (f *Forwarder) Start() error {
-	if f.cfg.Mode != "slave" || f.cfg.MasterURL == "" {
+	if !f.enabled() {
 		return nil
+	}
+	if f.transportErr != nil {
+		return fmt.Errorf("configure master transport: %w", f.transportErr)
 	}
 	client := f.httpClient
 	backoffAttempt := 0
@@ -653,13 +773,14 @@ func (f *Forwarder) startHeartbeat(client *http.Client) {
 	memoryMB, goroutines := getResourceStats()
 	dbSizeMB := getDBSizeMB(f.cfg)
 	hb := models.HeartbeatPayload{
-		Node:       f.cfg.NodeName,
-		Version:    Version,
-		GoVersion:  runtime.Version(),
-		BuildInfo:  fmt.Sprintf("%s/%s", Version, runtime.Version()),
-		MemoryMB:   memoryMB,
-		Goroutines: goroutines,
-		DBSizeMB:   dbSizeMB,
+		Node:           f.cfg.NodeName,
+		Version:        Version,
+		GoVersion:      runtime.Version(),
+		BuildInfo:      fmt.Sprintf("%s/%s", Version, runtime.Version()),
+		MemoryMB:       memoryMB,
+		Goroutines:     goroutines,
+		DBSizeMB:       dbSizeMB,
+		ConfigRevision: f.ConfigRevision(),
 	}
 	if err := f.sendHeartbeat(client, hb.Health); err != nil {
 		log.Printf("[WARN] Initial heartbeat failed: %v", err)
@@ -679,7 +800,8 @@ func (f *Forwarder) startHeartbeat(client *http.Client) {
 	}
 }
 
-// startSyncLoops runs periodic sync operations for aliases, DNS routes, and upstream health.
+// startSyncLoops runs periodic sync operations for aliases, DNS routes,
+// master-owned DNS configuration, and upstream health.
 func (f *Forwarder) startSyncLoops(client *http.Client) {
 	// Item 90: Sync client aliases
 	aliasesInterval := safeInterval(f.cfg.SyncAliasesInterval, config.DefaultSyncAliasesInterval)
@@ -700,6 +822,7 @@ func (f *Forwarder) startSyncLoops(client *http.Client) {
 	f.syncAliases(client)
 	f.syncDNSRoutes(client)
 	f.syncUpstreamHealth(client)
+	f.syncDNSConfig(client)
 
 	for {
 		select {
@@ -709,6 +832,7 @@ func (f *Forwarder) startSyncLoops(client *http.Client) {
 			f.syncAliases(client)
 		case <-routesTicker.C:
 			f.syncDNSRoutes(client)
+			f.syncDNSConfig(client)
 		case <-healthTicker.C:
 			f.syncUpstreamHealth(client)
 		}
@@ -717,7 +841,7 @@ func (f *Forwarder) startSyncLoops(client *http.Client) {
 
 // ReportHealth sends a health update to the master.
 func (f *Forwarder) ReportHealth(health map[string]float64) {
-	if f.cfg.Mode != "slave" || f.cfg.MasterURL == "" {
+	if !f.enabled() || f.transportErr != nil {
 		return
 	}
 	f.ensureHealthReporter(f.httpClient)

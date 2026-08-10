@@ -301,6 +301,33 @@ func (s *Store) List() []Rewrite {
 	return out
 }
 
+// Replace validates and atomically persists a complete rewrite set.
+func (s *Store) Replace(items []Rewrite) error {
+	validated := make([]Rewrite, len(items))
+	for i, item := range items {
+		item.Domain = NormalizeDomain(item.Domain)
+		item.Type = strings.ToUpper(strings.TrimSpace(item.Type))
+		item.Value = strings.TrimSpace(item.Value)
+		if err := Validate(item.Domain, item.Type, item.Value); err != nil {
+			return fmt.Errorf("rewrite %d: %w", i+1, err)
+		}
+		if item.ID == "" {
+			item.ID = newID()
+		}
+		validated[i] = item
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.saveItems(validated); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.items = validated
+	s.mu.Unlock()
+	return nil
+}
+
 // Add validates and stores a new rewrite, persisting the store.
 func (s *Store) Add(domain, typ, value string) (Rewrite, error) {
 	domain = NormalizeDomain(domain)
@@ -364,12 +391,17 @@ func (s *Store) Delete(id string) (found bool, err error) {
 // save persists the store atomically (temp file + rename). No-op for
 // in-memory stores (empty path).
 func (s *Store) save() error {
+	s.mu.RLock()
+	items := append([]Rewrite(nil), s.items...)
+	s.mu.RUnlock()
+	return s.saveItems(items)
+}
+
+func (s *Store) saveItems(items []Rewrite) error {
 	if s.path == "" {
 		return nil
 	}
-	s.mu.RLock()
-	data, err := json.MarshalIndent(s.items, "", "  ")
-	s.mu.RUnlock()
+	data, err := json.MarshalIndent(items, "", "  ")
 	if err != nil {
 		return err
 	}

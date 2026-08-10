@@ -582,7 +582,7 @@ func validateMasterURL(masterURL string) {
 		return
 	}
 	if !isValidMasterURL(masterURL) {
-		log.Fatalf("[FATAL] Invalid MASTER_URL: must start with http:// or https:// (got: %s)", sanitizeForLog(masterURL)) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		log.Fatalf("[FATAL] Invalid MASTER_URL: must start with https:// (got: %s)", sanitizeForLog(masterURL)) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
 	}
 	if _, err := url.ParseRequestURI(masterURL); err != nil {
 		log.Fatalf("[FATAL] Invalid MASTER_URL: %v", err)
@@ -972,9 +972,9 @@ func LoadConfig() *Config {
 	return cfg
 }
 
-// isValidMasterURL checks that the URL starts with http:// or https://.
+// isValidMasterURL checks that the URL uses protected HTTPS transport.
 func isValidMasterURL(rawURL string) bool {
-	return strings.HasPrefix(rawURL, "http://") || strings.HasPrefix(rawURL, "https://")
+	return strings.HasPrefix(rawURL, "https://")
 }
 
 // FullDBPath returns the complete database path by joining HistoryDir and DBPath.
@@ -1067,7 +1067,7 @@ func (c *Config) VerifyConfig() ([]string, []string) {
 
 	// 2. MASTER_URL schema validation (if set)
 	if c.MasterURL != "" && !isValidMasterURL(c.MasterURL) {
-		errs = append(errs, fmt.Sprintf("MASTER_URL must start with http:// or https:// (got: %s)", c.MasterURL))
+		errs = append(errs, fmt.Sprintf("MASTER_URL must start with https:// (got: %s)", c.MasterURL))
 	}
 
 	// 3. Authentication must be either fully configured or explicitly backed

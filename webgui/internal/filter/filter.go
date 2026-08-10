@@ -30,8 +30,11 @@ const (
 
 // Source describes a rule source (local file or remote URL) and its status.
 type Source struct {
+	ID             string    `json:"id,omitempty"`
+	Title          string    `json:"title,omitempty"`
 	Name           string    `json:"name"`
 	Kind           string    `json:"kind"` // "file" or "url"
+	Enabled        bool      `json:"enabled"`
 	AllowOnly      bool      `json:"allow_only"`
 	RuleCount      int       `json:"rule_count"`
 	AllowRuleCount int       `json:"allow_rule_count"`
@@ -59,10 +62,11 @@ type Engine struct {
 	blockRegexRules  []indexedRule
 	allowRegexRules  []indexedRule
 
-	pausedUntil  atomic.Int64 // unix seconds; 0 = protection enabled
-	blockedTotal atomic.Int64
-	allowedTotal atomic.Int64
-	httpClient   *http.Client
+	pausedUntil    atomic.Int64 // unix seconds; 0 = protection enabled
+	blockedTotal   atomic.Int64
+	allowedTotal   atomic.Int64
+	httpClient     *http.Client
+	updateRequests chan struct{}
 }
 
 type indexedRule struct {
@@ -79,6 +83,7 @@ func New() *Engine {
 		blockDomainIndex: make(map[string][]indexedRule),
 		allowDomainIndex: make(map[string][]indexedRule),
 		httpClient:       &http.Client{Timeout: fetchTimeout},
+		updateRequests:   make(chan struct{}, 1),
 	}
 }
 
@@ -168,6 +173,33 @@ func (e *Engine) Sources() []Source {
 	return out
 }
 
+// ReplaceURLSources atomically replaces managed URL subscriptions while
+// preserving local file sources. Call UpdateAll after replacement to fetch
+// the newly configured subscriptions.
+func (e *Engine) ReplaceURLSources(subscriptions []Subscription) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	kept := make([]*Source, 0, len(e.sources)+len(subscriptions))
+	for _, src := range e.sources {
+		if src.Kind == "url" {
+			delete(e.blockRules, src)
+			delete(e.allowRules, src)
+			continue
+		}
+		kept = append(kept, src)
+	}
+	for _, subscription := range subscriptions {
+		if !subscription.Enabled {
+			continue
+		}
+		src := newURLSource(subscription)
+		kept = append(kept, src)
+	}
+	e.sources = kept
+	e.rebuildIndexesLocked()
+}
+
 // setRules atomically swaps the parsed rules of a source and refreshes its
 // status (keep-last-good: callers only invoke this on successful loads).
 func (e *Engine) setRules(src *Source, block, allow []Rule, loadErr string) {
@@ -177,6 +209,16 @@ func (e *Engine) setRules(src *Source, block, allow []Rule, loadErr string) {
 func (e *Engine) setRulesStatus(src *Source, block, allow []Rule, loadErr string, ignored int, truncated bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	active := false
+	for _, current := range e.sources {
+		if current == src {
+			active = true
+			break
+		}
+	}
+	if !active {
+		return
+	}
 	src.LastChecked = time.Now()
 	if loadErr == "" {
 		changed := !rulesEqual(e.blockRules[src], block) || !rulesEqual(e.allowRules[src], allow)

@@ -26,7 +26,7 @@ const (
 // AddFileSource registers a local file source and loads it immediately.
 // allowOnly sources contribute exceptions only (ALLOWLIST_FILE).
 func (e *Engine) AddFileSource(path string, allowOnly bool) *Source {
-	src := &Source{Name: path, Kind: "file", AllowOnly: allowOnly}
+	src := &Source{Name: path, Kind: "file", AllowOnly: allowOnly, Enabled: true}
 	e.mu.Lock()
 	e.sources = append(e.sources, src)
 	e.mu.Unlock()
@@ -38,15 +38,29 @@ func (e *Engine) AddFileSource(path string, allowOnly bool) *Source {
 // happens on the first UpdateAll/StartUpdateLoop pass.
 // allowOnly sources contribute exceptions only (ALLOWLIST_URLS).
 func (e *Engine) AddURLSource(rawurl string, allowOnly bool) *Source {
-	src := &Source{Name: rawurl, Kind: "url", AllowOnly: allowOnly, validURL: true}
+	src := newURLSource(Subscription{URL: rawurl, AllowOnly: allowOnly, Enabled: true})
+	e.mu.Lock()
+	e.sources = append(e.sources, src)
+	e.mu.Unlock()
+	return src
+}
+
+func newURLSource(subscription Subscription) *Source {
+	src := &Source{
+		ID:        subscription.ID,
+		Title:     subscription.Name,
+		Name:      subscription.URL,
+		Kind:      "url",
+		AllowOnly: subscription.AllowOnly,
+		Enabled:   subscription.Enabled,
+		validURL:  true,
+	}
+	rawurl := subscription.URL
 	u, err := url.Parse(rawurl)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
 		src.validURL = false
 		src.LastError = "invalid URL: only http/https without embedded credentials is allowed"
 	}
-	e.mu.Lock()
-	e.sources = append(e.sources, src)
-	e.mu.Unlock()
 	return src
 }
 
@@ -124,6 +138,15 @@ func (e *Engine) UpdateAll(ctx context.Context) {
 		}(src)
 	}
 	wg.Wait()
+}
+
+// RequestUpdate asks the owned update loop to refresh URL subscriptions. It
+// coalesces bursts so configuration changes do not wait on remote servers.
+func (e *Engine) RequestUpdate() {
+	select {
+	case e.updateRequests <- struct{}{}:
+	default:
+	}
 }
 
 // fetchSource downloads a subscription with ETag/Last-Modified conditional
@@ -235,6 +258,8 @@ func (e *Engine) StartUpdateLoop(ctx context.Context, interval time.Duration) {
 			select {
 			case <-ctx.Done():
 				return
+			case <-e.updateRequests:
+				e.UpdateAll(ctx)
 			case <-ticker.C:
 				e.LoadLocal()
 				e.UpdateAll(ctx)

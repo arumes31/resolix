@@ -1,7 +1,9 @@
+ARG VERSION=2.4.0
+
 # Stage 1: Build
 FROM golang:1.26.5-alpine AS builder
 
-ARG VERSION=dev
+ARG VERSION
 ARG BUILD_INFO=local
 
 WORKDIR /app
@@ -23,7 +25,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
 # Stage 2: Final Image
 FROM alpine:3.24
 
-ARG VERSION=dev
+ARG VERSION
 ARG BUILD_INFO=local
 ARG BUILD_DATE
 LABEL org.opencontainers.image.title="Resolix" \

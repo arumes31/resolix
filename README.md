@@ -57,8 +57,8 @@ The dashboard is available at `http://127.0.0.1:35353/`. Persistent data remains
 For production, pin an immutable release instead of relying on `latest`:
 
 ```bash
-IMAGE_VERSION=v2.3.6 docker compose -f docker-compose.example.yaml pull
-IMAGE_VERSION=v2.3.6 docker compose -f docker-compose.example.yaml up -d
+IMAGE_VERSION=v2.3.7 docker compose -f docker-compose.example.yaml pull
+IMAGE_VERSION=v2.3.7 docker compose -f docker-compose.example.yaml up -d
 ```
 
 To build locally, use `docker compose up -d --build`.
@@ -301,7 +301,17 @@ Restore both directories while the container is stopped, retain ownership and pe
 - Native installs should use [`contrib/resolix.service`](contrib/resolix.service). It still reads the legacy environment and state locations as fallbacks.
 - Replace `MODE=master` with `MODE=controller`, `MODE=slave` with `MODE=agent`, and `MASTER_URL` with `CONTROLLER_URL`. Legacy values remain accepted during migration.
 
-Every code-changing push to `main` creates the next `v2.3.x` patch release and dispatches a tagged multi-platform image build. Release images receive version, revision, build-date, semver, `latest`, and SHA metadata/tags.
+### Versions and releases
+
+[`webgui/VERSION`](webgui/VERSION) is the canonical application version. The binary, API, node status, and container metadata report that version; CI rejects a mismatched Dockerfile default.
+
+Merging code into `main` does not create a tag or release. When a version is ready to ship:
+
+1. Update `webgui/VERSION` and the matching `ARG VERSION` default in `Dockerfile`.
+2. Merge the tested change into `main`.
+3. Run the **Create Release** workflow manually in GitHub Actions.
+
+The workflow tags the current `main` commit with `v<version>`, dispatches the multi-platform GHCR build for that tag, and creates the GitHub release. The image receives version, revision, build-date, semver, `latest`, and SHA metadata/tags. The release and image workflows reject tags that do not exactly match `webgui/VERSION`.
 
 ## Operations
 

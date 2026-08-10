@@ -22,6 +22,15 @@ import (
 	"github.com/arumes31/resolix/webgui/internal/storage"
 )
 
+func TestEmbeddedVersion(t *testing.T) {
+	if strings.TrimSpace(embeddedVersion) == "" {
+		t.Fatal("embedded version is empty")
+	}
+	if Version == "" {
+		t.Fatal("Version is empty")
+	}
+}
+
 func setupTest() (*config.Config, *storage.Store, *parser.Parser, *api.Server) {
 	cfg := config.LoadConfig()
 	cfg.MaxEvents = 1000

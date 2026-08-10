@@ -83,6 +83,15 @@ for _ in $(seq 1 60); do
 done
 curl --fail --silent "http://127.0.0.1:${web_port}/readyz" >/dev/null
 
+api_version="$(curl --fail --silent "http://127.0.0.1:${web_port}/api/version" \
+  | python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])')"
+image_version="$(docker image inspect resolix:smoke \
+  --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')"
+if [[ "${api_version}" != "smoke" || "${image_version}" != "smoke" ]]; then
+  echo "Version metadata mismatch: API=${api_version}, image=${image_version}" >&2
+  exit 1
+fi
+
 python3 contrib/smoke_dns.py udp 127.0.0.1 "${dns_udp_port}" smoke.test 0
 python3 contrib/smoke_dns.py udp 127.0.0.1 "${dns_udp_port}" blocked.test 3
 python3 contrib/smoke_dns.py tcp 127.0.0.1 "${dns_tcp_port}" smoke.test 0

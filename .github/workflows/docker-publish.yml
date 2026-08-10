@@ -72,11 +72,22 @@ jobs:
         id: build
         shell: bash
         run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            echo "version=${GITHUB_REF_NAME}" >> "${GITHUB_OUTPUT}"
-          else
-            echo "version=dev-${GITHUB_SHA::7}" >> "${GITHUB_OUTPUT}"
+          app_version="$(tr -d '[:space:]' < webgui/VERSION)"
+          if [[ ! "${app_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "webgui/VERSION must contain a stable semantic version (X.Y.Z)" >&2
+            exit 1
           fi
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            expected_tag="v${app_version}"
+            if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
+              echo "Tag ${GITHUB_REF_NAME} does not match webgui/VERSION (${expected_tag})" >&2
+              exit 1
+            fi
+            version="${app_version}"
+          else
+            version="${app_version}-dev+${GITHUB_SHA::7}"
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
           echo "date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "${GITHUB_OUTPUT}"
 
       - name: Set up QEMU
@@ -92,7 +103,9 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.version=${{ steps.build.outputs.version }}
           build-args: |
             VERSION=${{ steps.build.outputs.version }}
             BUILD_INFO=${{ github.sha }}

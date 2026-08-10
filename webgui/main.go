@@ -42,11 +42,21 @@ import (
 	"github.com/arumes31/resolix/webgui/internal/upstream"
 )
 
-// Version represents the current application version.
+// Version is injected for packaged builds and otherwise loaded from VERSION.
+// BuildInfo identifies the source revision used for the build.
 var (
-	Version   = "dev"
+	Version   string
 	BuildInfo = "local"
 )
+
+//go:embed VERSION
+var embeddedVersion string
+
+func init() {
+	if Version == "" {
+		Version = strings.TrimSpace(embeddedVersion)
+	}
+}
 
 //go:embed templates static
 var embedFS embed.FS

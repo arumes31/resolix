@@ -1,25 +1,15 @@
-name: Automatic Patch Release
+name: Create Release
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "webgui/**"
-      - "Dockerfile"
-      - "entrypoint.sh"
-      - "docker-compose*.yaml"
-      - ".github/workflows/**"
+  workflow_dispatch:
 
 concurrency:
-  group: automatic-patch-release
+  group: manual-release
   cancel-in-progress: false
 
 permissions:
   actions: write
   contents: write
-
-env:
-  RELEASE_SERIES: v2.3
 
 jobs:
   release:
@@ -29,32 +19,41 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: main
 
-      - name: Compute next patch version
+      - name: Validate release version
         id: version
         shell: bash
         run: |
-          latest="$(git tag --list | grep -E "^${RELEASE_SERIES//./\\.}\\.[0-9]+$" | sort -V | tail -n 1 || true)"
-          if [[ -z "${latest}" ]]; then
-            latest="${RELEASE_SERIES}.0"
+          version="$(tr -d '[:space:]' < webgui/VERSION)"
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "webgui/VERSION must contain a stable semantic version (X.Y.Z)" >&2
+            exit 1
           fi
-          IFS=. read -r major minor patch <<< "${latest#v}"
-          next="v${major}.${minor}.$((patch + 1))"
-          echo "version=${next}" >> "${GITHUB_OUTPUT}"
+          tag="v${version}"
+          if git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
+            echo "Tag ${tag} already exists" >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
 
-      - name: Tag code-changing push
+      - name: Tag main
         env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "${VERSION}" -m "Automated release ${VERSION}"
-          git push origin "${VERSION}"
-          gh workflow run docker-publish.yml --ref "${VERSION}"
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin "${TAG}"
+
+      - name: Build release image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: gh workflow run docker-publish.yml --ref "${TAG}"
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
-        run: gh release create "${VERSION}" --generate-notes --verify-tag
+          TAG: ${{ steps.version.outputs.tag }}
+        run: gh release create "${TAG}" --generate-notes --verify-tag

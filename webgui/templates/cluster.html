@@ -66,8 +66,14 @@
         <main class="app-content container cluster-container">
             <div class="config-intro">
                 <div><span class="page-kicker">Fleet visibility</span><h2>Controller and agent state</h2></div>
-                <p>Review connectivity, runtime resources, versions, and the last report received from each resolver node.</p>
+                <p>Review connectivity, configuration revisions, storage health, versions, and the last report received from each resolver node.</p>
             </div>
+            <section class="metric-grid storage-metric-grid" aria-label="Controller storage status">
+                <article class="metric-card"><span>Database</span><strong id="storageDatabaseSize">—</strong><small>Main history file</small></article>
+                <article class="metric-card"><span>Write-ahead log</span><strong id="storageWALSize">—</strong><small id="storageCheckpointAge">Checkpoint not reported</small></article>
+                <article class="metric-card"><span>Archive queue</span><strong id="storageQueueDepth">—</strong><small id="storageQueueCapacity">Pending events</small></article>
+                <article class="metric-card"><span>Dropped events</span><strong id="storageDroppedEvents">—</strong><small id="storageVacuumState">Maintenance state loading</small></article>
+            </section>
             <section class="node-status-panel console-section">
                 <div class="section-heading"><div><span class="page-kicker">Resolver fleet</span><h2>Reporting nodes</h2></div><span class="section-chip healthy"><i class="metric-dot green"></i>Auto refresh</span></div>
                 <div id="nodeCards" class="node-status-grid"><p class="empty-state">No agent nodes connected</p></div>

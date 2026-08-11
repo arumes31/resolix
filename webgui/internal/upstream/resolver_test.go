@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -305,6 +306,118 @@ func TestDoHResolver(t *testing.T) {
 	}
 	if len(resp.Answer) != 1 || resp.Answer[0].(*dns.A).A.String() != testAnswerIP {
 		t.Fatalf("DoH answer = %v", resp.Answer)
+	}
+}
+
+func TestDoHResolverRejectsInvalidResponseMetadata(t *testing.T) {
+	tests := []struct {
+		name        string
+		contentType string
+		changeID    bool
+		wantError   string
+	}{
+		{name: "content type", contentType: "text/plain", wantError: "invalid content type"},
+		{name: "message ID", contentType: "application/dns-message", changeID: true, wantError: "message ID mismatch"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				wire, err := io.ReadAll(request.Body)
+				if err != nil {
+					t.Errorf("read body: %v", err)
+					return
+				}
+				query := new(dns.Msg)
+				if err := query.Unpack(wire); err != nil {
+					t.Errorf("unpack query: %v", err)
+					return
+				}
+				response := new(dns.Msg)
+				response.SetReply(query)
+				if test.changeID {
+					response.Id++
+				}
+				packed, err := response.Pack()
+				if err != nil {
+					t.Errorf("pack response: %v", err)
+					return
+				}
+				w.Header().Set("Content-Type", test.contentType)
+				_, _ = w.Write(packed)
+			}))
+			defer server.Close()
+
+			testHTTPClient = server.Client()
+			defer func() { testHTTPClient = nil }()
+			spec, err := Parse(server.URL + "/dns-query")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = (&dohResolver{spec: spec}).Exchange(queryA())
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("Exchange error = %v, want %q", err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestDoHResolverRejectsInvalidHTTPAndDNSResponses(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		wire, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+			return
+		}
+		query := new(dns.Msg)
+		if err := query.Unpack(wire); err != nil {
+			t.Errorf("unpack query: %v", err)
+			return
+		}
+		response := new(dns.Msg)
+		response.SetReply(query)
+		switch request.URL.Path {
+		case "/status":
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		case "/content-type":
+			w.Header().Set("Content-Type", "text/plain")
+		case "/message-id":
+			response.Id++
+			w.Header().Set("Content-Type", "application/dns-message")
+		case "/not-response":
+			response.Response = false
+			w.Header().Set("Content-Type", "application/dns-message")
+		}
+		packed, err := response.Pack()
+		if err != nil {
+			t.Errorf("pack response: %v", err)
+			return
+		}
+		_, _ = w.Write(packed)
+	}))
+	t.Cleanup(server.Close)
+
+	testHTTPClient = server.Client()
+	t.Cleanup(func() { testHTTPClient = nil })
+	for _, test := range []struct {
+		path string
+		want string
+	}{
+		{path: "/status", want: "status 503"},
+		{path: "/content-type", want: "invalid content type"},
+		{path: "/message-id", want: "message ID mismatch"},
+		{path: "/not-response", want: "not a DNS response"},
+	} {
+		t.Run(test.path, func(t *testing.T) {
+			spec, err := Parse(server.URL + test.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = (&dohResolver{spec: spec}).Exchange(queryA())
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Exchange() error = %v, want substring %q", err, test.want)
+			}
+		})
 	}
 }
 

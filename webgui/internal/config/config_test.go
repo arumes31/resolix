@@ -2,10 +2,17 @@ package config
 
 import (
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestDefaultFilterUpdateIntervalIsDaily(t *testing.T) {
+	if DefaultFilterUpdateInterval != 24*time.Hour {
+		t.Fatalf("DefaultFilterUpdateInterval = %s, want 24h", DefaultFilterUpdateInterval)
+	}
+}
 
 func TestResolveModeCanonicalizesLegacyNames(t *testing.T) {
 	tests := []struct {
@@ -82,10 +89,14 @@ func TestLoadConfigOperationalLimits(t *testing.T) {
 	t.Setenv("MASTER_URL", "")
 	t.Setenv("RATE_LIMIT_QPS", "")
 	t.Setenv("RATE_LIMIT_INTERNAL_QPS", "")
+	t.Setenv("RATE_LIMIT_EDE", "")
 	t.Setenv("MAX_REQUEST_SIZE", "")
 	cfg := LoadConfig()
 	if cfg.RateLimitQPS != 80 || cfg.InternalRateLimitQPS != 1000 {
 		t.Fatalf("default rate limits = %d/%d, want 80/1000", cfg.RateLimitQPS, cfg.InternalRateLimitQPS)
+	}
+	if cfg.RateLimitEDE {
+		t.Fatal("RATE_LIMIT_EDE enabled by default")
 	}
 	if cfg.MaxRequestSize != 1<<20 {
 		t.Fatalf("default MAX_REQUEST_SIZE = %d, want %d", cfg.MaxRequestSize, 1<<20)
@@ -93,9 +104,13 @@ func TestLoadConfigOperationalLimits(t *testing.T) {
 
 	t.Setenv("RATE_LIMIT_QPS", "250")
 	t.Setenv("RATE_LIMIT_INTERNAL_QPS", "500")
+	t.Setenv("RATE_LIMIT_EDE", "true")
 	cfg = LoadConfig()
 	if cfg.RateLimitQPS != 250 || cfg.InternalRateLimitQPS != 500 {
 		t.Fatalf("configured rate limits = %d/%d, want 250/500", cfg.RateLimitQPS, cfg.InternalRateLimitQPS)
+	}
+	if !cfg.RateLimitEDE {
+		t.Fatal("RATE_LIMIT_EDE was not loaded")
 	}
 }
 
@@ -250,6 +265,17 @@ func TestVerifyConfigRejectsAuthenticationAndNetworkMisconfiguration(t *testing.
 	errList, _ := cfg.VerifyConfig()
 	if len(errList) == 0 {
 		t.Fatal("partial web authentication passed verification")
+	}
+
+	cfg = base()
+	cfg.Mode = ModeAgent
+	cfg.ControllerURL = "https://100.64.0.1:35353"
+	cfg.IngestSecret = ""
+	cfg.WebUsername = "admin"
+	cfg.WebPassword = "web-secret"
+	errList, _ = cfg.VerifyConfig()
+	if !slices.Contains(errList, "INGEST_SECRET is required in agent mode for authenticated controller communication") {
+		t.Fatalf("agent without INGEST_SECRET errors = %v", errList)
 	}
 
 	cfg = base()

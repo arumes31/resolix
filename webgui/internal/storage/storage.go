@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -41,16 +42,18 @@ type Store struct {
 	idCounter uint64
 
 	// Database Batching
-	batchMu       sync.Mutex
-	batch         []models.QueryEvent
-	batchStart    int
-	batchDropped  atomic.Int64
-	batchInFlight atomic.Int64
-	archiveMu     sync.Mutex
-	archiveReady  chan struct{}
-	archiveMark   int
-	archiveLimit  int
-	archiveBatch  int
+	batchMu          sync.Mutex
+	batch            []models.QueryEvent
+	batchStart       int
+	batchBytes       int64
+	batchDropped     atomic.Int64
+	batchInFlight    atomic.Int64
+	batchFlightBytes atomic.Int64
+	archiveMu        sync.Mutex
+	archiveReady     chan struct{}
+	archiveMark      int
+	archiveLimit     int
+	archiveBatch     int
 
 	// Protected by batchMu.
 	batchDropLogAt      time.Time
@@ -75,8 +78,9 @@ type Store struct {
 	lastTopStats              map[string][]models.StatEntry
 
 	// Node status tracking (Items 89, 92, 93)
-	nodeStatuses map[string]*models.NodeStatus // node name -> status
-	nodeStatusMu sync.RWMutex
+	nodeStatuses   map[string]*models.NodeStatus // stable node ID -> status
+	nodeTombstones map[string]time.Time          // stable node ID -> decommission time
+	nodeStatusMu   sync.RWMutex
 
 	// UX Addons
 	typeCounts       map[string]int
@@ -89,7 +93,6 @@ type Store struct {
 	// Prepared statements for frequently-used queries (cached at init)
 	stmtGetTopDomains *sql.Stmt
 	stmtGetTopClients *sql.Stmt
-	stmtCleanup       *sql.Stmt
 
 	// Background maintenance context
 	ctx    context.Context
@@ -98,6 +101,11 @@ type Store struct {
 	// Configurable intervals for background maintenance
 	vacuumInterval     time.Duration
 	checkpointInterval time.Duration
+	maintenanceMu      sync.RWMutex
+	checkpointState    checkpointState
+	vacuumState        vacuumState
+	optimizeState      optimizeState
+	dbBusyErrors       atomic.Int64
 
 	// archiveInsert is overridden by tests that need to hold an archive write
 	// in flight. Production always uses insertArchiveBatch.
@@ -111,11 +119,12 @@ type pendingInfo struct {
 
 // ArchiveQueueMetrics describes current SQLite archive queue pressure and limits.
 type ArchiveQueueMetrics struct {
-	Pending    int
-	Dropped    int64
-	Capacity   int
-	Trigger    int
-	WriteBatch int
+	Pending      int
+	PendingBytes int64
+	Dropped      int64
+	Capacity     int
+	Trigger      int
+	WriteBatch   int
 }
 
 func archiveLimits(cfg *config.Config) (capacity, trigger, writeBatch int) {
@@ -149,6 +158,7 @@ func NewStore(cfg *config.Config) *Store {
 		nodeUpstreamHealthHistory: make(map[string]map[string][]float64),
 		lastTopStats:              make(map[string][]models.StatEntry),
 		nodeStatuses:              make(map[string]*models.NodeStatus),
+		nodeTombstones:            make(map[string]time.Time),
 		typeCounts:                make(map[string]int),
 		clientRPMBuckets:          make(map[string]*[60]int),
 		clientRPMTimes:            make(map[string]*[60]int64),
@@ -195,6 +205,7 @@ func (s *Store) Init() {
 		log.Fatalf("Failed to initialize SQLite DB: %v", err)
 	}
 	s.db = database
+	s.loadNodeTombstones()
 
 	// Prepare frequently-used SQL statements for caching (Task 20)
 	if err := s.prepareStatements(); err != nil {
@@ -203,6 +214,7 @@ func (s *Store) Init() {
 
 	// Create background maintenance context
 	s.ctx, s.cancel = context.WithCancel(context.Background())
+	s.optimizeDatabase(s.ctx)
 
 	// Start background maintenance goroutines
 	s.startVacuum(s.ctx)
@@ -232,21 +244,15 @@ func (s *Store) prepareStatements() error {
 	var err error
 
 	s.stmtGetTopDomains, err = s.db.Prepare(
-		"SELECT domain, COUNT(*) as c FROM queries WHERE unix_time >= ? GROUP BY domain")
+		"SELECT domain, SUM(count) AS c FROM query_hourly_domains WHERE hour >= ? GROUP BY domain ORDER BY c DESC LIMIT 50")
 	if err != nil {
 		return fmt.Errorf("prepare stmtGetTopDomains: %w", err)
 	}
 
 	s.stmtGetTopClients, err = s.db.Prepare(
-		"SELECT client_ip, COUNT(*) as c FROM queries WHERE unix_time >= ? GROUP BY client_ip")
+		"SELECT client_ip, SUM(count) AS c FROM query_hourly_clients WHERE hour >= ? GROUP BY client_ip ORDER BY c DESC LIMIT 50")
 	if err != nil {
 		return fmt.Errorf("prepare stmtGetTopClients: %w", err)
-	}
-
-	s.stmtCleanup, err = s.db.Prepare(
-		"DELETE FROM queries WHERE unix_time < ?")
-	if err != nil {
-		return fmt.Errorf("prepare stmtCleanup: %w", err)
 	}
 
 	log.Printf("Prepared SQL statements cached successfully")
@@ -276,11 +282,6 @@ func (s *Store) Close() {
 		_ = s.stmtGetTopClients.Close()
 		s.stmtGetTopClients = nil
 	}
-	if s.stmtCleanup != nil {
-		_ = s.stmtCleanup.Close()
-		s.stmtCleanup = nil
-	}
-
 	// Close database connection
 	if s.db != nil {
 		_ = s.db.Close()
@@ -378,6 +379,7 @@ func (s *Store) AddEvent(e models.QueryEvent) {
 	var droppedSinceWarning, droppedTotal int64
 	s.batchMu.Lock()
 	if s.pendingBatchLenLocked() >= s.archiveLimit {
+		s.batchBytes -= eventApproxBytes(s.batch[s.batchStart])
 		s.batch[s.batchStart] = models.QueryEvent{}
 		s.batchStart++
 		if s.batchStart >= max(1, s.archiveLimit/4) {
@@ -393,6 +395,7 @@ func (s *Store) AddEvent(e models.QueryEvent) {
 		}
 	}
 	s.batch = append(s.batch, e)
+	s.batchBytes += eventApproxBytes(e)
 	if s.pendingBatchLenLocked() >= s.archiveMark {
 		select {
 		case s.archiveReady <- struct{}{}:
@@ -434,6 +437,7 @@ func (s *Store) UpdateEvent(node, domain string, latency float64, upstream strin
 			s.batchMu.Lock()
 			for b := len(s.batch) - 1; b >= s.batchStart; b-- {
 				if s.batch[b].Domain == domain && s.batch[b].Node == node && !s.batch[b].Latency.Valid {
+					beforeBytes := eventApproxBytes(s.batch[b])
 					s.batch[b].Latency = sql.NullFloat64{Float64: latency, Valid: true}
 					s.batch[b].Upstream = upstream
 					// Propagate DNSSEC and ResponseCode from the in-memory event to the batch
@@ -442,6 +446,7 @@ func (s *Store) UpdateEvent(node, domain string, latency float64, upstream strin
 					s.batch[b].LatencyAlert = s.events[idx].LatencyAlert
 					s.batch[b].ClientHostname = s.events[idx].ClientHostname
 					s.batch[b].Blocked = s.events[idx].Blocked
+					s.batchBytes += eventApproxBytes(s.batch[b]) - beforeBytes
 					break
 				}
 			}
@@ -475,7 +480,9 @@ func (s *Store) SetBlocked(node, domain string) bool {
 			for b := len(s.batch) - 1; b >= s.batchStart; b-- {
 				if s.batch[b].Domain == domain && s.batch[b].Node == node {
 					if !s.batch[b].Blocked {
+						beforeBytes := eventApproxBytes(s.batch[b])
 						s.batch[b].Blocked = true
+						s.batchBytes += eventApproxBytes(s.batch[b]) - beforeBytes
 					}
 					break
 				}
@@ -508,7 +515,9 @@ func (s *Store) SetClientHostname(node, clientIP, hostname string) bool {
 			s.batchMu.Lock()
 			for b := len(s.batch) - 1; b >= s.batchStart; b-- {
 				if s.batch[b].ClientIP == clientIP && s.batch[b].Node == node {
+					beforeBytes := eventApproxBytes(s.batch[b])
 					s.batch[b].ClientHostname = hostname
+					s.batchBytes += eventApproxBytes(s.batch[b]) - beforeBytes
 					break
 				}
 			}
@@ -586,6 +595,15 @@ func (s *Store) GetEventsAfter(cursor string, since int64, limit int) []models.Q
 //
 //nolint:gocyclo
 func (s *Store) GetStats() map[string]interface{} {
+	return s.getStatsAt(time.Now())
+}
+
+// getStatsAt is the deterministic implementation behind GetStats. Complete
+// UTC hours use incremental aggregates; the partial cutoff hour is read from
+// SQLite exactly so the rolling 24-hour window never includes older rows.
+//
+//nolint:gocyclo
+func (s *Store) getStatsAt(nowTime time.Time) map[string]interface{} {
 	s.archiveMu.Lock()
 	defer s.archiveMu.Unlock()
 	s.batchMu.Lock()
@@ -594,8 +612,10 @@ func (s *Store) GetStats() map[string]interface{} {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
-	now := time.Now().Unix()
+	now := nowTime.Unix()
 	cutoff24h := now - 86400
+	cutoffHour := (cutoff24h / 3600) * 3600
+	completeHourStart := cutoffHour + 3600
 
 	rpm := 0
 	rph := 0
@@ -634,9 +654,6 @@ func (s *Store) GetStats() map[string]interface{} {
 	}
 
 	typeCounts := make(map[string]int)
-	for k, v := range s.typeCounts {
-		typeCounts[k] = v
-	}
 	s.statsMu.RUnlock()
 
 	// Query SQLite for long-term aggregates
@@ -647,18 +664,79 @@ func (s *Store) GetStats() map[string]interface{} {
 	domainCounts := make(map[string]int)
 	clientCounts := make(map[string]int)
 	heatmap := make(map[string]int)
+	mergeWindowEvent := func(event models.QueryEvent) {
+		rpd++
+		if event.Upstream != "" {
+			totalReplies++
+		}
+		if isCacheHit(event) {
+			cacheHits++
+		}
+		typeCounts[event.Type]++
+		domainCounts[event.Domain]++
+		clientCounts[event.ClientIP]++
+		hour := time.Unix(event.UnixTime, 0).UTC().Format("15:00")
+		heatmap[hour]++
+	}
 	if s.db != nil {
-		if err := s.db.QueryRow("SELECT COUNT(*) FROM queries").Scan(&totalEvents); err != nil && err != sql.ErrNoRows {
+		if err := s.db.QueryRow("SELECT COALESCE(SUM(total), 0) FROM query_hourly_totals").Scan(&totalEvents); err != nil && err != sql.ErrNoRows {
 			log.Printf("Error getting totalEvents: %v", err)
+			s.recordDBError(err)
 			queryErrors = append(queryErrors, "total")
 		}
-		err := s.db.QueryRow(`SELECT COUNT(*),
-			COALESCE(SUM(CASE WHEN upstream = 'System Cache' THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN upstream != '' THEN 1 ELSE 0 END), 0)
-			FROM queries WHERE unix_time >= ?`, cutoff24h).Scan(&rpd, &cacheHits, &totalReplies)
+		err := s.db.QueryRow(`SELECT COALESCE(SUM(total), 0),
+			COALESCE(SUM(cache_hits), 0), COALESCE(SUM(replies), 0)
+			FROM query_hourly_totals WHERE hour >= ?`, completeHourStart).Scan(&rpd, &cacheHits, &totalReplies)
 		if err != nil && err != sql.ErrNoRows {
 			log.Printf("Error getting daily aggregates: %v", err)
+			s.recordDBError(err)
 			queryErrors = append(queryErrors, "rpd", "cache_hits", "total_replies")
+		}
+		rows, err := s.db.Query("SELECT type, SUM(count) FROM query_hourly_types WHERE hour >= ? GROUP BY type", completeHourStart)
+		if err != nil {
+			s.recordDBError(err)
+			queryErrors = append(queryErrors, "type_counts")
+		} else {
+			for rows.Next() {
+				var queryType string
+				var count int
+				if err := rows.Scan(&queryType, &count); err == nil {
+					typeCounts[queryType] = count
+				}
+			}
+			if err := rows.Err(); err != nil {
+				s.recordDBError(err)
+				queryErrors = append(queryErrors, "type_counts")
+			}
+			_ = rows.Close()
+		}
+
+		rows, err = s.db.Query(`SELECT unix_time, domain, client_ip, type, upstream, cache_status
+			FROM queries WHERE unix_time >= ? AND unix_time < ?`, cutoff24h, completeHourStart)
+		if err != nil {
+			s.recordDBError(err)
+			queryErrors = append(queryErrors, "cutoff_hour")
+		} else {
+			for rows.Next() {
+				var event models.QueryEvent
+				var upstream, cacheStatus sql.NullString
+				if err := rows.Scan(
+					&event.UnixTime, &event.Domain, &event.ClientIP, &event.Type,
+					&upstream, &cacheStatus,
+				); err != nil {
+					s.recordDBError(err)
+					queryErrors = append(queryErrors, "cutoff_hour")
+					continue
+				}
+				event.Upstream = upstream.String
+				event.CacheStatus = cacheStatus.String
+				mergeWindowEvent(event)
+			}
+			if err := rows.Err(); err != nil {
+				s.recordDBError(err)
+				queryErrors = append(queryErrors, "cutoff_hour")
+			}
+			_ = rows.Close()
 		}
 	}
 
@@ -667,17 +745,7 @@ func (s *Store) GetStats() map[string]interface{} {
 		if event.UnixTime < cutoff24h {
 			continue
 		}
-		rpd++
-		if event.Upstream != "" {
-			totalReplies++
-		}
-		if event.Upstream == "System Cache" {
-			cacheHits++
-		}
-		domainCounts[event.Domain]++
-		clientCounts[event.ClientIP]++
-		hour := time.Unix(event.UnixTime, 0).Format("15:00")
-		heatmap[hour]++
+		mergeWindowEvent(event)
 	}
 
 	cacheHitRatio := 0.0
@@ -691,7 +759,7 @@ func (s *Store) GetStats() map[string]interface{} {
 	if s.db != nil {
 		// Domain candidates (the Top 10 are selected after pending counts are merged).
 		if s.stmtGetTopDomains != nil {
-			rowsDomains, err := s.stmtGetTopDomains.Query(cutoff24h)
+			rowsDomains, err := s.stmtGetTopDomains.Query(completeHourStart)
 			if err == nil {
 				for rowsDomains.Next() {
 					var d string
@@ -709,7 +777,7 @@ func (s *Store) GetStats() map[string]interface{} {
 
 		// Client candidates (the Top 10 are selected after pending counts are merged).
 		if s.stmtGetTopClients != nil {
-			rowsClients, err := s.stmtGetTopClients.Query(cutoff24h)
+			rowsClients, err := s.stmtGetTopClients.Query(completeHourStart)
 			if err == nil {
 				for rowsClients.Next() {
 					var ip string
@@ -727,13 +795,13 @@ func (s *Store) GetStats() map[string]interface{} {
 
 		// Hourly heatmap
 		currentHour := now / 3600
-		rowsHeatmap, err := s.db.Query("SELECT unix_time / 3600 as hr, COUNT(*) FROM queries WHERE unix_time >= ? GROUP BY hr", cutoff24h)
+		rowsHeatmap, err := s.db.Query("SELECT hour, total FROM query_hourly_totals WHERE hour >= ?", completeHourStart)
 		if err == nil {
 			for rowsHeatmap.Next() {
 				var hr int64
 				var c int
 				if rowsHeatmap.Scan(&hr, &c) == nil {
-					t := time.Unix(hr*3600, 0)
+					t := time.Unix(hr, 0).UTC()
 					heatmap[t.Format("15:00")] += c
 				}
 			}
@@ -745,7 +813,7 @@ func (s *Store) GetStats() map[string]interface{} {
 
 		// Fill missing hours in heatmap
 		for h := currentHour - 23; h <= currentHour; h++ {
-			t := time.Unix(h*3600, 0)
+			t := time.Unix(h*3600, 0).UTC()
 			k := t.Format("15:00")
 			if _, exists := heatmap[k]; !exists {
 				heatmap[k] = 0
@@ -971,7 +1039,9 @@ func (s *Store) SetDNSSEC(node, domain, result string) {
 			s.batchMu.Lock()
 			for b := len(s.batch) - 1; b >= s.batchStart; b-- {
 				if s.batch[b].Domain == domain && s.batch[b].Node == node {
+					beforeBytes := eventApproxBytes(s.batch[b])
 					s.batch[b].DNSSEC = result
+					s.batchBytes += eventApproxBytes(s.batch[b]) - beforeBytes
 					break
 				}
 			}
@@ -1059,6 +1129,7 @@ func (s *Store) archiveStep(ctx context.Context, now time.Time) (int, error) {
 			return archived, err
 		}
 		s.batchInFlight.Add(-int64(len(toInsert)))
+		s.batchFlightBytes.Add(-eventsApproxBytes(toInsert))
 		archived += len(toInsert)
 	}
 
@@ -1077,9 +1148,12 @@ func (s *Store) claimArchiveBatch() []models.QueryEvent {
 		return nil
 	}
 	claimed := append([]models.QueryEvent(nil), pending[:chunkSize]...)
+	claimedBytes := eventsApproxBytes(claimed)
 	clear(s.batch[s.batchStart : s.batchStart+chunkSize])
 	s.batchStart += chunkSize
+	s.batchBytes -= claimedBytes
 	s.batchInFlight.Add(int64(chunkSize))
+	s.batchFlightBytes.Add(claimedBytes)
 	if s.pendingBatchLenLocked() == 0 || s.batchStart >= max(1, s.archiveLimit/4) {
 		s.compactBatchLocked()
 	}
@@ -1097,7 +1171,9 @@ func (s *Store) restoreArchiveBatch(claimed []models.QueryEvent) {
 	clear(s.batch)
 	s.batch = append(s.batch[:0], combined[dropped:]...)
 	s.batchStart = 0
+	s.batchBytes = eventsApproxBytes(s.batch)
 	s.batchInFlight.Add(-int64(len(claimed)))
+	s.batchFlightBytes.Add(-eventsApproxBytes(claimed))
 	if dropped > 0 {
 		s.batchDropped.Add(int64(dropped))
 		s.batchDropUnreported += int64(dropped)
@@ -1115,14 +1191,14 @@ func (s *Store) insertArchiveBatch(ctx context.Context, events []models.QueryEve
 		return fmt.Errorf("begin transaction for %d events: %w", len(events), err)
 	}
 
-	const insertPrefix = "INSERT INTO queries (unix_time, node, client_ip, domain, type, upstream, latency, dnssec, response_code, client_hostname, blocked, latency_alert, matched_rule, block_reason) VALUES "
-	const rowPlaceholders = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+	const insertPrefix = "INSERT INTO queries (unix_time, node, client_ip, domain, type, upstream, latency, dnssec, response_code, client_hostname, blocked, latency_alert, matched_rule, block_reason, cache_status, cache_ttl, negative_soa) VALUES "
+	const rowPlaceholders = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 	for start := 0; start < len(events); start += archiveInsertRows {
 		end := min(start+archiveInsertRows, len(events))
 		var query strings.Builder
 		query.Grow(len(insertPrefix) + (end-start)*(len(rowPlaceholders)+1))
 		query.WriteString(insertPrefix)
-		args := make([]any, 0, (end-start)*14)
+		args := make([]any, 0, (end-start)*17)
 		for index, event := range events[start:end] {
 			if index > 0 {
 				query.WriteByte(',')
@@ -1136,14 +1212,21 @@ func (s *Store) insertArchiveBatch(ctx context.Context, events []models.QueryEve
 			if event.LatencyAlert {
 				latencyAlert = 1
 			}
-			args = append(args, event.UnixTime, event.Node, event.ClientIP, event.Domain, event.Type, event.Upstream, event.Latency, event.DNSSEC, event.ResponseCode, event.ClientHostname, blocked, latencyAlert, event.MatchedRule, event.BlockReason)
+			args = append(args, event.UnixTime, event.Node, event.ClientIP, event.Domain, event.Type, event.Upstream, event.Latency, event.DNSSEC, event.ResponseCode, event.ClientHostname, blocked, latencyAlert, event.MatchedRule, event.BlockReason, event.CacheStatus, event.CacheTTL, event.NegativeSOA)
 		}
 		if _, err = tx.ExecContext(ctx, query.String(), args...); err != nil {
 			_ = tx.Rollback()
+			s.recordDBError(err)
 			return fmt.Errorf("insert batch of %d events: %w", len(events), err)
 		}
 	}
+	if err := upsertHourlyAggregates(ctx, tx, events); err != nil {
+		_ = tx.Rollback()
+		s.recordDBError(err)
+		return fmt.Errorf("update hourly aggregates for %d events: %w", len(events), err)
+	}
 	if err := tx.Commit(); err != nil {
+		s.recordDBError(err)
 		return fmt.Errorf("commit batch of %d events: %w", len(events), err)
 	}
 	return nil
@@ -1154,13 +1237,15 @@ func (s *Store) insertArchiveBatch(ctx context.Context, events []models.QueryEve
 func (s *Store) ArchiveMetrics() ArchiveQueueMetrics {
 	s.batchMu.Lock()
 	pending := s.pendingBatchLenLocked() + int(s.batchInFlight.Load())
+	pendingBytes := s.batchBytes + s.batchFlightBytes.Load()
 	s.batchMu.Unlock()
 	return ArchiveQueueMetrics{
-		Pending:    pending,
-		Dropped:    s.batchDropped.Load(),
-		Capacity:   s.archiveLimit,
-		Trigger:    s.archiveMark,
-		WriteBatch: s.archiveBatch,
+		Pending:      pending,
+		PendingBytes: pendingBytes,
+		Dropped:      s.batchDropped.Load(),
+		Capacity:     s.archiveLimit,
+		Trigger:      s.archiveMark,
+		WriteBatch:   s.archiveBatch,
 	}
 }
 
@@ -1180,14 +1265,12 @@ func (s *Store) flushArchiveDropWarning() {
 
 func (s *Store) pruneOldEvents(ctx context.Context, now time.Time) {
 	cutoff := now.Add(-s.cfg.HistoryRetention).Unix()
-	var err error
-	if s.stmtCleanup != nil {
-		_, err = s.stmtCleanup.ExecContext(ctx, cutoff)
-	} else {
-		_, err = s.db.ExecContext(ctx, "DELETE FROM queries WHERE unix_time < ?", cutoff)
-	}
+	deleted, err := pruneRetentionBatch(ctx, s.db, cutoff)
 	if err != nil {
+		s.recordDBError(err)
 		log.Printf("Failed to prune old SQLite data: %v", err)
+	} else if deleted == retentionDeleteBatch {
+		log.Printf("SQLite retention deleted a bounded batch of %d rows; remaining expired rows will be pruned on a later archive pass", deleted)
 	}
 }
 
@@ -1196,6 +1279,12 @@ func (s *Store) SetUpstreamHealth(node string, health map[string]float64) {
 	if node == "" {
 		node = "local"
 	}
+	s.nodeStatusMu.RLock()
+	if _, tombstoned := s.nodeTombstones[node]; tombstoned {
+		s.nodeStatusMu.RUnlock()
+		return
+	}
+	defer s.nodeStatusMu.RUnlock()
 	s.healthMu.Lock()
 	defer s.healthMu.Unlock()
 
@@ -1231,18 +1320,39 @@ func (s *Store) GetUpstreamHealth() map[string]map[string]float64 {
 	return result
 }
 
-// SetNodeStatus updates the status of a node (Items 89, 92, 93).
-// This is called when a heartbeat is received from a agent node.
+// SetNodeStatus updates a legacy name-addressed status. New cluster traffic
+// should use SetNodeStatusIdentity so equal display names cannot overwrite one
+// another.
 func (s *Store) SetNodeStatus(name string, status models.NodeStatus) {
+	_ = s.SetNodeStatusIdentity(status.ID, name, status)
+}
+
+// SetNodeStatusIdentity updates a node keyed by its stable identity. It returns
+// false for a tombstoned identity, requiring an explicit restore before a
+// decommissioned node can silently rejoin.
+func (s *Store) SetNodeStatusIdentity(identity, name string, status models.NodeStatus) bool {
 	if name == "" {
 		name = "unknown"
 	}
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		identity = name
+	}
 	s.nodeStatusMu.Lock()
 	defer s.nodeStatusMu.Unlock()
+	if _, tombstoned := s.nodeTombstones[identity]; tombstoned {
+		return false
+	}
 
+	status.ID = identity
+	status.Name = name
 	status.Online = true
 	status.LastSeen = time.Now()
-	s.nodeStatuses[name] = &status
+	status.UpstreamHealth = cloneFloatMap(status.UpstreamHealth)
+	status.ForwarderEndpointErrors = cloneStringMap(status.ForwarderEndpointErrors)
+	s.nodeStatuses[identity] = &status
+	s.refreshDuplicateNameWarningsLocked(name)
+	return true
 }
 
 // GetNodeStatus returns the status of a single node by name.
@@ -1251,12 +1361,25 @@ func (s *Store) GetNodeStatus(name string) *models.NodeStatus {
 	defer s.nodeStatusMu.RUnlock()
 
 	if ns, ok := s.nodeStatuses[name]; ok {
-		// Return a copy
-		result := *ns
-		result.Online = ns.IsOnline(s.cfg.NodeOfflineThreshold)
-		return &result
+		return s.cloneNodeStatus(ns)
+	}
+	for _, ns := range s.nodeStatuses {
+		if ns.Name == name {
+			return s.cloneNodeStatus(ns)
+		}
 	}
 	return nil
+}
+
+// GetNodeStatusByID returns a node only when its stable identity matches.
+func (s *Store) GetNodeStatusByID(identity string) *models.NodeStatus {
+	s.nodeStatusMu.RLock()
+	defer s.nodeStatusMu.RUnlock()
+	status := s.nodeStatuses[strings.TrimSpace(identity)]
+	if status == nil {
+		return nil
+	}
+	return s.cloneNodeStatus(status)
 }
 
 // GetNodeStatuses returns a copy of all node statuses with online state computed.
@@ -1266,11 +1389,152 @@ func (s *Store) GetNodeStatuses() []models.NodeStatus {
 
 	result := make([]models.NodeStatus, 0, len(s.nodeStatuses))
 	for _, ns := range s.nodeStatuses {
-		copy := *ns
-		copy.Online = ns.IsOnline(s.cfg.NodeOfflineThreshold)
-		result = append(result, copy)
+		result = append(result, *s.cloneNodeStatus(ns))
 	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Name == result[j].Name {
+			return result[i].ID < result[j].ID
+		}
+		return result[i].Name < result[j].Name
+	})
 	return result
+}
+
+// DecommissionNode tombstones a stable identity and removes volatile status
+// and health without deleting archived query history.
+func (s *Store) DecommissionNode(identity string) (bool, error) {
+	identity = strings.TrimSpace(identity)
+	s.nodeStatusMu.Lock()
+	status := s.nodeStatuses[identity]
+	if status == nil {
+		s.nodeStatusMu.Unlock()
+		return false, nil
+	}
+	decommissionedAt := time.Now()
+	s.dbMu.RLock()
+	if s.closed || s.db == nil {
+		s.dbMu.RUnlock()
+		s.nodeStatusMu.Unlock()
+		return false, errors.New("persist node tombstone: database is not available")
+	}
+	_, err := s.db.Exec(`INSERT INTO node_tombstones(node_id, node_name, decommissioned_at)
+		VALUES (?, ?, ?) ON CONFLICT(node_id) DO UPDATE SET
+		node_name = excluded.node_name, decommissioned_at = excluded.decommissioned_at`,
+		identity, status.Name, decommissionedAt.Unix())
+	s.dbMu.RUnlock()
+	if err != nil {
+		s.recordDBError(err)
+		s.nodeStatusMu.Unlock()
+		return false, fmt.Errorf("persist node tombstone: %w", err)
+	}
+	delete(s.nodeStatuses, identity)
+	s.nodeTombstones[identity] = decommissionedAt
+	s.refreshDuplicateNameWarningsLocked(status.Name)
+	s.nodeStatusMu.Unlock()
+
+	s.healthMu.Lock()
+	delete(s.nodeUpstreamHealth, identity)
+	delete(s.nodeUpstreamHealthHistory, identity)
+	s.healthMu.Unlock()
+	return true, nil
+}
+
+// RestoreNode removes a stable tombstone. The node remains absent until its
+// next authenticated heartbeat.
+func (s *Store) RestoreNode(identity string) (bool, error) {
+	identity = strings.TrimSpace(identity)
+	s.nodeStatusMu.Lock()
+	_, existed := s.nodeTombstones[identity]
+	if !existed {
+		s.nodeStatusMu.Unlock()
+		return false, nil
+	}
+	s.dbMu.RLock()
+	if s.closed || s.db == nil {
+		s.dbMu.RUnlock()
+		s.nodeStatusMu.Unlock()
+		return false, errors.New("remove node tombstone: database is not available")
+	}
+	_, err := s.db.Exec("DELETE FROM node_tombstones WHERE node_id = ?", identity)
+	s.dbMu.RUnlock()
+	if err != nil {
+		s.recordDBError(err)
+		s.nodeStatusMu.Unlock()
+		return false, fmt.Errorf("remove node tombstone: %w", err)
+	}
+	delete(s.nodeTombstones, identity)
+	s.nodeStatusMu.Unlock()
+	return true, nil
+}
+
+// IsNodeTombstoned reports whether an identity requires explicit restoration.
+func (s *Store) IsNodeTombstoned(identity string) bool {
+	s.nodeStatusMu.RLock()
+	_, ok := s.nodeTombstones[strings.TrimSpace(identity)]
+	s.nodeStatusMu.RUnlock()
+	return ok
+}
+
+func (s *Store) loadNodeTombstones() {
+	rows, err := s.db.Query("SELECT node_id, decommissioned_at FROM node_tombstones")
+	if err != nil {
+		log.Printf("[WARN] Load node tombstones: %v", err)
+		return
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var identity string
+		var unixTime int64
+		if err := rows.Scan(&identity, &unixTime); err != nil {
+			log.Printf("[WARN] Read node tombstone: %v", err)
+			continue
+		}
+		s.nodeTombstones[identity] = time.Unix(unixTime, 0)
+	}
+}
+
+func (s *Store) refreshDuplicateNameWarningsLocked(name string) {
+	count := 0
+	for _, status := range s.nodeStatuses {
+		if status.Name == name {
+			count++
+		}
+	}
+	for _, status := range s.nodeStatuses {
+		if status.Name == name {
+			status.DuplicateNameWarning = count > 1
+		}
+	}
+}
+
+func (s *Store) cloneNodeStatus(status *models.NodeStatus) *models.NodeStatus {
+	result := *status
+	result.Online = status.IsOnline(s.cfg.NodeOfflineThreshold)
+	result.UpstreamHealth = cloneFloatMap(status.UpstreamHealth)
+	result.ForwarderEndpointErrors = cloneStringMap(status.ForwarderEndpointErrors)
+	return &result
+}
+
+func cloneFloatMap(source map[string]float64) map[string]float64 {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string]float64, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 // GetAlias returns the friendly name for a client IP if configured.
@@ -1304,8 +1568,9 @@ func (s *Store) updateTrends() {
 	s.statsMu.Unlock()
 }
 
-// startVacuum runs a background goroutine that periodically executes VACUUM
-// to reclaim disk space from deleted rows. Default interval: 24 hours.
+// startVacuum runs bounded incremental vacuum work when the database supports
+// it. Existing databases that require a blocking one-time VACUUM migration are
+// reported through DBMetrics and never migrated automatically.
 func (s *Store) startVacuum(ctx context.Context) {
 	go func() {
 		ticker := time.NewTicker(s.vacuumInterval)
@@ -1320,19 +1585,37 @@ func (s *Store) startVacuum(ctx context.Context) {
 					s.dbMu.RUnlock()
 					return
 				}
-				log.Printf("Database VACUUM started")
 				start := time.Now()
-				_, err := s.db.ExecContext(ctx, "VACUUM;")
+				var mode int
+				err := s.db.QueryRowContext(ctx, "PRAGMA auto_vacuum").Scan(&mode)
+				pagesRequested := 0
+				if err == nil && mode == 2 {
+					pagesRequested = incrementalVacuumPages
+					_, err = s.db.ExecContext(ctx, "PRAGMA incremental_vacuum(200)")
+				}
+				duration := time.Since(start)
+				s.maintenanceMu.Lock()
+				s.vacuumState = vacuumState{
+					At: start, Duration: duration, PagesRequested: pagesRequested,
+				}
 				if err != nil {
-					log.Printf("Database VACUUM failed: %v", err)
-				} else {
-					log.Printf("Database VACUUM completed in %s", time.Since(start).Round(time.Millisecond))
+					s.vacuumState.Error = err.Error()
+				}
+				s.maintenanceMu.Unlock()
+				switch {
+				case err != nil:
+					s.recordDBError(err)
+					log.Printf("Incremental database vacuum failed: %v", err)
+				case mode == 2:
+					log.Printf("Incremental database vacuum completed in %s", duration.Round(time.Millisecond))
+				default:
+					log.Printf("Database auto_vacuum is not incremental; skipping blocking VACUUM and exposing a maintenance recommendation")
 				}
 				s.dbMu.RUnlock()
 			}
 		}
 	}()
-	log.Printf("Periodic VACUUM started (interval: %s)", s.vacuumInterval)
+	log.Printf("Periodic incremental vacuum check started (interval: %s)", s.vacuumInterval)
 }
 
 // startWALCheckpoint runs a background goroutine that periodically executes
@@ -1353,8 +1636,21 @@ func (s *Store) startWALCheckpoint(ctx context.Context) {
 					return
 				}
 				var busy, logFrames, checkpointed int
+				started := time.Now()
 				row := s.db.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE);")
-				if err := row.Scan(&busy, &logFrames, &checkpointed); err != nil {
+				err := row.Scan(&busy, &logFrames, &checkpointed)
+				duration := time.Since(started)
+				s.maintenanceMu.Lock()
+				s.checkpointState = checkpointState{
+					At: started, Duration: duration, Busy: busy,
+					LogFrames: logFrames, Checkpointed: checkpointed,
+				}
+				if err != nil {
+					s.checkpointState.Error = err.Error()
+				}
+				s.maintenanceMu.Unlock()
+				if err != nil {
+					s.recordDBError(err)
 					log.Printf("WAL checkpoint failed: %v", err)
 				} else {
 					log.Printf("WAL checkpoint completed: busy=%d, logFrames=%d, checkpointed=%d", busy, logFrames, checkpointed)

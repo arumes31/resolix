@@ -1,6 +1,8 @@
 package dnsserver
 
 import (
+	"container/list"
+	"fmt"
 	"log"
 	"net"
 	"strings"
@@ -65,8 +67,9 @@ func (s *Server) aclAllowlistDrop(clientIP string) bool {
 
 // rateBucket is a per-client-IP token bucket.
 type rateBucket struct {
-	tokens float64
-	last   time.Time
+	tokens  float64
+	last    time.Time
+	element *list.Element
 }
 
 // rateLimiter is a bounded per-client-IP token-bucket limiter.
@@ -75,6 +78,7 @@ type rateLimiter struct {
 	qps        float64
 	maxBuckets int
 	buckets    map[string]*rateBucket
+	order      *list.List
 }
 
 func newRateLimiter(qps int) *rateLimiter {
@@ -82,19 +86,33 @@ func newRateLimiter(qps int) *rateLimiter {
 		qps:        float64(qps),
 		maxBuckets: maxRateLimitBuckets,
 		buckets:    make(map[string]*rateBucket),
+		order:      list.New(),
 	}
 }
 
 // clientKey returns a canonical per-IP rate-limit bucket key.
-func clientKey(ipStr string) string {
+func clientKey(ipStr string, prefixes ...int) string {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		return ""
 	}
-	if v4 := ip.To4(); v4 != nil {
-		return v4.String()
+	ipv4Prefix, ipv6Prefix := 32, 128
+	if len(prefixes) > 0 && prefixes[0] >= 1 && prefixes[0] <= 32 {
+		ipv4Prefix = prefixes[0]
 	}
-	return ip.String()
+	if len(prefixes) > 1 && prefixes[1] >= 1 && prefixes[1] <= 128 {
+		ipv6Prefix = prefixes[1]
+	}
+	if v4 := ip.To4(); v4 != nil {
+		if ipv4Prefix == 32 {
+			return v4.String()
+		}
+		return v4.Mask(net.CIDRMask(ipv4Prefix, 32)).String() + fmt.Sprintf("/%d", ipv4Prefix)
+	}
+	if ipv6Prefix == 128 {
+		return ip.String()
+	}
+	return ip.Mask(net.CIDRMask(ipv6Prefix, 128)).String() + fmt.Sprintf("/%d", ipv6Prefix)
 }
 
 // allow consumes one token for the client using the default rate.
@@ -104,11 +122,11 @@ func (rl *rateLimiter) allow(ipStr string) bool {
 
 // allowAtRate consumes one token for the client using qps as the refill rate
 // and one-second burst capacity. A non-positive rate disables limiting.
-func (rl *rateLimiter) allowAtRate(ipStr string, qps int) bool {
+func (rl *rateLimiter) allowAtRate(ipStr string, qps int, prefixes ...int) bool {
 	if qps <= 0 {
 		return true
 	}
-	key := clientKey(ipStr)
+	key := clientKey(ipStr, prefixes...)
 	if key == "" {
 		return true
 	}
@@ -120,18 +138,17 @@ func (rl *rateLimiter) allowAtRate(ipStr string, qps int) bool {
 	b, ok := rl.buckets[key]
 	if !ok {
 		if len(rl.buckets) >= rl.maxBuckets {
-			oldestKey := ""
-			var oldest time.Time
-			for candidate, bucket := range rl.buckets {
-				if oldestKey == "" || bucket.last.Before(oldest) {
-					oldestKey = candidate
-					oldest = bucket.last
-				}
+			oldest := rl.order.Front()
+			if oldest != nil {
+				delete(rl.buckets, oldest.Value.(string))
+				rl.order.Remove(oldest)
 			}
-			delete(rl.buckets, oldestKey)
 		}
 		b = &rateBucket{tokens: limit, last: now}
+		b.element = rl.order.PushBack(key)
 		rl.buckets[key] = b
+	} else if b.element != nil {
+		rl.order.MoveToBack(b.element)
 	}
 	// Refill (burst capacity = one second of qps).
 	elapsed := now.Sub(b.last).Seconds()
@@ -169,6 +186,9 @@ func (rl *rateLimiter) cleanup(maxIdle time.Duration) {
 	cutoff := time.Now().Add(-maxIdle)
 	for key, b := range rl.buckets {
 		if b.last.Before(cutoff) {
+			if b.element != nil {
+				rl.order.Remove(b.element)
+			}
 			delete(rl.buckets, key)
 		}
 	}

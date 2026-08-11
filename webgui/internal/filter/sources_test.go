@@ -114,6 +114,52 @@ func TestSubscriptionUpdate(t *testing.T) {
 	}
 }
 
+func TestManagedSubscriptionBlocksPrivateTargetsByDefault(t *testing.T) {
+	var hits atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_, _ = fmt.Fprintln(w, "||private.example^")
+	}))
+	t.Cleanup(server.Close)
+
+	engine := New()
+	engine.AddURLSourceWithOptions(Subscription{ID: "private", URL: server.URL, Enabled: true})
+	engine.UpdateAll(context.Background())
+	source := engine.Sources()[0]
+	if source.LastError != "blocked by private-network download protection" || hits.Load() != 0 {
+		t.Fatalf("private target status = error %q, hits %d", source.LastError, hits.Load())
+	}
+}
+
+func TestManagedSubscriptionReportsRedirectAndContentMetadata(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/start" {
+			http.Redirect(w, r, server.URL+"/list", http.StatusFound)
+			return
+		}
+		_, _ = fmt.Fprintln(w, "! comment\n||metadata.example^\nunsupported option##selector")
+	}))
+	t.Cleanup(server.Close)
+
+	engine := New()
+	engine.AddURLSourceWithOptions(Subscription{
+		ID: "metadata", URL: server.URL + "/start", Enabled: true, AllowPrivate: true,
+		TimeoutSeconds: 2, RedirectLimit: 2,
+	})
+	engine.UpdateAll(context.Background())
+	source := engine.Sources()[0]
+	if source.LastError != "" || source.RuleCount != 1 || source.RuleCountDelta != 1 {
+		t.Fatalf("metadata source status = %+v", source)
+	}
+	if source.RedirectCount != 1 || source.FinalHostname != "127.0.0.1" || source.DownloadedBytes == 0 {
+		t.Fatalf("download metadata = %+v", source)
+	}
+	if source.IgnoredCount != 2 || len(source.Checksum) != 64 || source.LastChecked.IsZero() || source.LastUpdate.IsZero() {
+		t.Fatalf("rule metadata = %+v", source)
+	}
+}
+
 func TestSubscriptionFailureKeepsLastGood(t *testing.T) {
 	var fail atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -196,5 +242,79 @@ func TestStartUpdateLoopInitialLoad(t *testing.T) {
 			t.Fatal("initial subscription load did not happen")
 		}
 		<-ticker.C
+	}
+}
+
+func TestStartUpdateLoopHandlesRequestedUpdate(t *testing.T) {
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		_, _ = fmt.Fprintln(w, "||requested.example.com^")
+	}))
+	defer server.Close()
+
+	e := New()
+	e.AddURLSource(server.URL, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	e.StartUpdateLoop(ctx, time.Hour)
+
+	waitForRequests := func(want int64) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for requests.Load() < want {
+			if time.Now().After(deadline) {
+				t.Fatalf("subscription requests = %d, want at least %d", requests.Load(), want)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	waitForRequests(1)
+	e.RequestUpdate()
+	waitForRequests(2)
+}
+
+func TestRefreshGenerationUpdatesOnlyRequestedSubscription(t *testing.T) {
+	var firstHits, secondHits atomic.Int64
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		firstHits.Add(1)
+		_, _ = fmt.Fprintln(w, "||first.example^")
+	}))
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		secondHits.Add(1)
+		_, _ = fmt.Fprintln(w, "||second.example^")
+	}))
+	t.Cleanup(first.Close)
+	t.Cleanup(second.Close)
+
+	engine := New()
+	subscriptions := []Subscription{
+		{ID: "first", URL: first.URL, Enabled: true, AllowPrivate: true},
+		{ID: "second", URL: second.URL, Enabled: true, AllowPrivate: true},
+	}
+	engine.ReplaceURLSources(subscriptions)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	engine.StartUpdateLoop(ctx, time.Hour)
+	waitForHitCount(t, &firstHits, 1)
+	waitForHitCount(t, &secondHits, 1)
+
+	subscriptions[1].RefreshGeneration = "next"
+	engine.ReplaceURLSources(subscriptions)
+	waitForHitCount(t, &secondHits, 2)
+	time.Sleep(50 * time.Millisecond)
+	if firstHits.Load() != 1 {
+		t.Fatalf("unrequested subscription fetched %d times", firstHits.Load())
+	}
+}
+
+func waitForHitCount(t *testing.T, counter *atomic.Int64, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for counter.Load() < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("subscription requests = %d, want at least %d", counter.Load(), want)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

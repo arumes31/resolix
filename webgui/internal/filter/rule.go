@@ -5,11 +5,76 @@
 package filter
 
 import (
+	"bufio"
+	"fmt"
 	"log"
 	"net"
 	"regexp"
 	"strings"
 )
+
+// RuleDiagnostic identifies a custom-rule line that will not become an
+// active DNS rule.
+type RuleDiagnostic struct {
+	Line     int    `json:"line"`
+	Severity string `json:"severity"`
+	Message  string `json:"message"`
+}
+
+// MaxRuleDiagnostics bounds validation responses for large invalid rule sets.
+const MaxRuleDiagnostics = 100
+
+// ValidateRuleText reports actionable syntax diagnostics with stable line
+// numbers while accepting comments, headers, and blank lines.
+func ValidateRuleText(text string) (accepted int, diagnostics []RuleDiagnostic) {
+	appendDiagnostic := func(diagnostic RuleDiagnostic) {
+		if len(diagnostics) < MaxRuleDiagnostics {
+			diagnostics = append(diagnostics, diagnostic)
+		}
+	}
+	scanner := bufio.NewScanner(strings.NewReader(text))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	lineNumber := 0
+	for scanner.Scan() {
+		lineNumber++
+		raw := strings.TrimSpace(scanner.Text())
+		if raw == "" || strings.HasPrefix(raw, "#") || strings.HasPrefix(raw, "!") ||
+			(strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]")) {
+			continue
+		}
+		if strings.Contains(raw, "##") || strings.Contains(raw, "#?#") || strings.Contains(raw, "#@#") {
+			appendDiagnostic(RuleDiagnostic{Line: lineNumber, Severity: "warning", Message: "cosmetic rules do not affect DNS and will be ignored"})
+			continue
+		}
+		body := strings.TrimPrefix(raw, "@@")
+		if strings.HasPrefix(body, "/") && strings.HasSuffix(body, "/") {
+			pattern := body[1 : len(body)-1]
+			if pattern == "" {
+				appendDiagnostic(RuleDiagnostic{Line: lineNumber, Severity: "error", Message: "regular expression may not be empty"})
+				continue
+			}
+			if _, err := regexp.Compile(pattern); err != nil {
+				appendDiagnostic(RuleDiagnostic{Line: lineNumber, Severity: "error", Message: fmt.Sprintf("invalid RE2 expression: %v", err)})
+				continue
+			}
+			accepted++
+			continue
+		}
+		if strings.Contains(body, "*") {
+			appendDiagnostic(RuleDiagnostic{Line: lineNumber, Severity: "error", Message: "wildcards are unsupported; use a domain suffix or /RE2/ expression"})
+			continue
+		}
+		if _, _, ok := parseLine(raw); !ok {
+			appendDiagnostic(RuleDiagnostic{Line: lineNumber, Severity: "error", Message: "unsupported or invalid DNS filter rule"})
+			continue
+		}
+		accepted++
+	}
+	if err := scanner.Err(); err != nil {
+		appendDiagnostic(RuleDiagnostic{Line: lineNumber + 1, Severity: "error", Message: fmt.Sprintf("read rules: %v", err)})
+	}
+	return accepted, diagnostics
+}
 
 // ruleKind distinguishes domain-suffix rules from regex rules.
 type ruleKind int

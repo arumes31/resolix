@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"html/template"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"github.com/arumes31/resolix/webgui/internal/config"
 	"github.com/arumes31/resolix/webgui/internal/configsync"
 	"github.com/arumes31/resolix/webgui/internal/dnsroutes"
+	"github.com/arumes31/resolix/webgui/internal/dnssettings"
 	"github.com/arumes31/resolix/webgui/internal/filter"
 	"github.com/arumes31/resolix/webgui/internal/rewrites"
 )
@@ -37,10 +39,13 @@ func TestDedicatedPagesAndRootRejectsUnknownPaths(t *testing.T) {
 	body := recorder.Body.String()
 	if recorder.Code != http.StatusOK ||
 		!strings.Contains(body, `class="app-page config-page compact"`) ||
+		!strings.Contains(body, `data-page="config"`) ||
 		!strings.Contains(body, `id="configAuthority"`) ||
 		!strings.Contains(body, `id="bootstrapList"`) ||
 		!strings.Contains(body, `id="allowlistForm"`) ||
 		!strings.Contains(body, `id="allowlistList"`) ||
+		!strings.Contains(body, `id="dnsSettingsForm"`) ||
+		!strings.Contains(body, `id="syncAllNodesBtn"`) ||
 		!strings.Contains(body, `id="rewriteDeleteDialog"`) {
 		t.Fatalf("config response = %d %q", recorder.Code, recorder.Body.String())
 	}
@@ -84,6 +89,35 @@ func TestDedicatedPagesAndRootRejectsUnknownPaths(t *testing.T) {
 	}
 }
 
+func TestFrontendAssetsRespectStyleCSP(t *testing.T) {
+	for _, path := range []string{
+		"../../static/js/index.js",
+		"../../static/js/config.js",
+		"../../static/js/shell.js",
+		"../../templates/index.html",
+		"../../templates/querylog.html",
+		"../../templates/cluster.html",
+		"../../templates/config.html",
+	} {
+		content, err := os.ReadFile(path) // #nosec G304 -- paths are fixed test fixtures listed above
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(content, []byte("style=")) || bytes.Contains(content, []byte(".style.")) {
+			t.Fatalf("%s contains an inline style that style-src blocks", path)
+		}
+	}
+	for _, path := range []string{"../../static/css/style.css", "../../static/css/login.css"} {
+		content, err := os.ReadFile(path) // #nosec G304 -- paths are fixed test fixtures listed above
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(content, []byte("'Inter'")) || bytes.Contains(content, []byte("'Outfit'")) {
+			t.Fatalf("%s references the repository's incomplete webfont bundle", path)
+		}
+	}
+}
+
 func TestAgentRejectsConfigurationMutation(t *testing.T) {
 	server := testServer(&config.Config{Mode: config.ModeAgent})
 	recorder := httptest.NewRecorder()
@@ -104,6 +138,68 @@ func TestControllerRejectsEmptyUpstreamList(t *testing.T) {
 	server.handlePostUpstreams(recorder, request)
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("response = %d %q", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestDNSSettingsAPIValidatesPersistsAndApplies(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{Mode: config.ModeController, HistoryDir: dir, ConfigDir: dir}
+	server := testServer(cfg)
+	defaults := dnssettings.Settings{
+		UpstreamMode: "load_balance", BlockingMode: "nxdomain", BlockCustomIPv4: "0.0.0.0",
+		BlockCustomIPv6: "::", RefuseANY: true, PrivatePTR: true,
+	}.Normalize()
+	store, err := dnssettings.Load(cfg.FullDNSSettingsPath(), defaults)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.SetDNSSettingsStore(store)
+	applied := 0
+	server.SetDNSSettingsApplyFunc(func(settings dnssettings.Settings) {
+		applied++
+		if settings.UpstreamMode != "parallel" || !settings.DNSSEC {
+			t.Errorf("applied settings = %+v", settings)
+		}
+	})
+
+	body := `{
+		"upstream_mode":"parallel","fallback_dns":["9.9.9.9"],"ecs_client_subnet":"",
+		"blocking_mode":"nxdomain","block_custom_ipv4":"0.0.0.0","block_custom_ipv6":"::",
+		"blocked_response_ttl":60,"safe_search":["google"],"bogus_nxdomain":[],
+		"aaaa_disabled":false,"refuse_any":true,"dnssec":true,"private_ptr":true,
+		"allowed_clients":["100.64.0.0/10"],"disallowed_clients":[],
+		"rate_limit_qps":80,"internal_rate_limit_qps":1000,"rate_limit_ede":false,
+		"cache_size":25000,"cache_min_ttl":60,"cache_max_ttl":600,
+		"cache_optimistic":true,"cache_prefetch":true,"cache_prefetch_window_ms":30000,
+		"cache_prefetch_hits":3,"cache_servfail_ttl_ms":500
+	}`
+	request := httptest.NewRequest(http.MethodPut, "/api/config/dns-settings", strings.NewReader(body))
+	request.AddCookie(&http.Cookie{
+		Name: csrfCookieName, Value: "token", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
+	})
+	request.Header.Set("X-CSRF-Token", "token")
+	recorder := httptest.NewRecorder()
+	server.handleDNSSettings(recorder, request)
+	if recorder.Code != http.StatusOK || applied != 1 {
+		t.Fatalf("response = %d %q, applied=%d", recorder.Code, recorder.Body.String(), applied)
+	}
+	reloaded, err := dnssettings.Load(cfg.FullDNSSettingsPath(), defaults)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.Get(); got.UpstreamMode != "parallel" || !got.DNSSEC || got.CacheSERVFAILTTLMS != 500 {
+		t.Fatalf("persisted settings = %+v", got)
+	}
+
+	request = httptest.NewRequest(http.MethodPut, "/api/config/dns-settings", strings.NewReader(`{"upstream_mode":"fastest"}`))
+	request.AddCookie(&http.Cookie{
+		Name: csrfCookieName, Value: "token", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
+	})
+	request.Header.Set("X-CSRF-Token", "token")
+	recorder = httptest.NewRecorder()
+	server.handleDNSSettings(recorder, request)
+	if recorder.Code != http.StatusBadRequest || applied != 1 {
+		t.Fatalf("invalid response = %d %q, applied=%d", recorder.Code, recorder.Body.String(), applied)
 	}
 }
 
@@ -239,6 +335,7 @@ func TestUpstreamSettingsPersistBootstrapResolvers(t *testing.T) {
 	}
 }
 
+//nolint:gocyclo // This integration-style test intentionally verifies one complete atomic snapshot workflow.
 func TestApplyConfigSnapshotPersistsAllManagedSettings(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{Mode: config.ModeAgent, HistoryDir: dir, UpstreamsFile: "upstreams.json"}
@@ -267,8 +364,23 @@ func TestApplyConfigSnapshotPersistsAllManagedSettings(t *testing.T) {
 	server.SetClients(clientRegistry)
 	dnsRoutes := dnsroutes.New(filepath.Join(dir, "dns-routes.json"))
 	server.SetDNSRoutes(dnsRoutes)
+	managedDefaults := dnssettings.Settings{
+		UpstreamMode: "load_balance", BlockingMode: "nxdomain", BlockCustomIPv4: "0.0.0.0",
+		BlockCustomIPv6: "::", RefuseANY: true, PrivatePTR: true,
+	}.Normalize()
+	dnsSettingsStore, err := dnssettings.Load(filepath.Join(dir, "dns-settings.json"), managedDefaults)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.SetDNSSettingsStore(dnsSettingsStore)
+	var appliedSettings dnssettings.Settings
+	server.SetDNSSettingsApplyFunc(func(settings dnssettings.Settings) { appliedSettings = settings })
+	managed := managedDefaults
+	managed.UpstreamMode = "parallel"
+	managed.DNSSEC = true
+	managed.AllowedClients = []string{"100.64.0.0/10"}
 
-	snapshot, err := configsync.NewSnapshot(
+	snapshot, err := configsync.NewSnapshotWithDNSSettings(
 		[]string{"1.1.1.1"}, []string{"8.8.8.8"}, map[string]string{"internal": "9.9.9.9"},
 		[]filter.Subscription{{
 			ID: "trusted-domains", Name: "Trusted domains", URL: "https://allow.example/list.txt", AllowOnly: true, Enabled: true,
@@ -282,6 +394,7 @@ func TestApplyConfigSnapshotPersistsAllManagedSettings(t *testing.T) {
 			SourceCIDRs: []string{"100.64.0.0/10"},
 		}},
 		[]clients.Client{{Name: "office", IDs: []string{"192.0.2.0/24"}, UseGlobalSettings: true}},
+		&managed,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -308,7 +421,60 @@ func TestApplyConfigSnapshotPersistsAllManagedSettings(t *testing.T) {
 	if got := subscriptions.List(); len(got) != 1 || !got[0].AllowOnly || got[0].ID != "trusted-domains" {
 		t.Fatalf("subscriptions = %+v", got)
 	}
+	if got := dnsSettingsStore.Get(); got.UpstreamMode != "parallel" || !got.DNSSEC ||
+		len(got.AllowedClients) != 1 || appliedSettings.UpstreamMode != "parallel" {
+		t.Fatalf("DNS settings not persisted/applied: stored=%+v applied=%+v", got, appliedSettings)
+	}
 	if result := engine.Match("blocked.example"); !result.Blocked {
 		t.Fatalf("synced user rule did not block: %+v", result)
+	}
+
+	candidate := snapshot.Clone()
+	candidate.Revision = ""
+	candidate.Routes = map[string]string{"preview.internal": "8.8.4.4"}
+	body, err := json.Marshal(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	server.handleConfigDiff(recorder, httptest.NewRequest(http.MethodPost, "/api/config/diff", strings.NewReader(string(body))))
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"field":"routes"`) {
+		t.Fatalf("diff preview = %d %q", recorder.Code, recorder.Body.String())
+	}
+	if got := dnsRoutes.GetRoutesMap(); got["internal"] != "9.9.9.9" || got["preview.internal"] != "" {
+		t.Fatalf("diff preview mutated routes: %v", got)
+	}
+
+	before, err := server.currentConfigSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousBefore, err := os.ReadFile(server.previousConfigSnapshotPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid, err := configsync.NewSnapshot(
+		before.Upstreams, before.BootstrapServers, before.Routes, before.Subscriptions,
+		"*unsupported-wildcard*\n", before.Rewrites, before.Clients,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.ApplyConfigSnapshot(invalid); err == nil || !strings.Contains(err.Error(), "user rule line 1") {
+		t.Fatalf("invalid user-rule apply error = %v", err)
+	}
+	after, err := server.currentConfigSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Revision != before.Revision {
+		t.Fatalf("revision changed after rejected rules: before=%q after=%q", before.Revision, after.Revision)
+	}
+	previousAfter, err := os.ReadFile(server.previousConfigSnapshotPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(previousAfter, previousBefore) {
+		t.Fatal("previous snapshot changed after rejected rules")
 	}
 }

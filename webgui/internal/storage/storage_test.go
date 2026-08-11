@@ -18,6 +18,92 @@ import (
 	"github.com/arumes31/resolix/webgui/internal/models"
 )
 
+func TestStableNodeIdentityPreventsDuplicateNameOverwriteAndTombstones(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+	if !store.SetNodeStatusIdentity("node-a", "resolver", models.NodeStatus{SourceAddress: "100.64.0.1"}) ||
+		!store.SetNodeStatusIdentity("node-b", "resolver", models.NodeStatus{SourceAddress: "100.64.0.2"}) {
+		t.Fatal("initial identities were rejected")
+	}
+	nodes := store.GetNodeStatuses()
+	if len(nodes) != 2 || !nodes[0].DuplicateNameWarning || !nodes[1].DuplicateNameWarning {
+		t.Fatalf("duplicate-name statuses = %+v", nodes)
+	}
+	decommissioned, err := store.DecommissionNode("node-a")
+	if err != nil || !decommissioned || !store.IsNodeTombstoned("node-a") {
+		t.Fatal("node-a was not tombstoned")
+	}
+	if store.SetNodeStatusIdentity("node-a", "resolver", models.NodeStatus{}) {
+		t.Fatal("tombstoned identity silently rejoined")
+	}
+	restored, err := store.RestoreNode("node-a")
+	if err != nil || !restored || !store.SetNodeStatusIdentity("node-a", "resolver", models.NodeStatus{}) {
+		t.Fatal("restored identity could not rejoin")
+	}
+}
+
+func TestDecommissionRequiresStableIDAndPersistsBeforeMutation(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+	store.SetNodeStatusIdentity("stable-a", "shared-name", models.NodeStatus{})
+	store.SetNodeStatusIdentity("stable-b", "shared-name", models.NodeStatus{})
+	store.SetUpstreamHealth("stable-a", map[string]float64{"1.1.1.1": 5})
+
+	if removed, err := store.DecommissionNode("shared-name"); err != nil || removed {
+		t.Fatalf("name-addressed decommission = %v, %v", removed, err)
+	}
+	removed, err := store.DecommissionNode("stable-a")
+	if err != nil || !removed {
+		t.Fatalf("stable-id decommission = %v, %v", removed, err)
+	}
+	if store.GetNodeStatusByID("stable-a") != nil || store.GetNodeStatusByID("stable-b") == nil {
+		t.Fatal("decommission removed the wrong identity")
+	}
+	if _, exists := store.GetUpstreamHealth()["stable-a"]; exists {
+		t.Fatal("decommission retained stable-id health")
+	}
+	var tombstones int
+	if err := store.db.QueryRow("SELECT COUNT(*) FROM node_tombstones WHERE node_id = ?", "stable-a").Scan(&tombstones); err != nil || tombstones != 1 {
+		t.Fatalf("persisted tombstones = %d, err = %v", tombstones, err)
+	}
+}
+
+func TestDecommissionDatabaseFailureLeavesNodePublished(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+	store.SetNodeStatusIdentity("stable-a", "resolver", models.NodeStatus{})
+	if _, err := store.db.Exec("DROP TABLE node_tombstones"); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := store.DecommissionNode("stable-a")
+	if err == nil || removed {
+		t.Fatalf("decommission after persistence failure = %v, %v", removed, err)
+	}
+	if store.GetNodeStatusByID("stable-a") == nil || store.IsNodeTombstoned("stable-a") {
+		t.Fatal("failed persistence mutated published node state")
+	}
+}
+
+func TestRestoreDatabaseFailureLeavesTombstonePublished(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+	store.SetNodeStatusIdentity("stable-a", "resolver", models.NodeStatus{})
+	removed, err := store.DecommissionNode("stable-a")
+	if err != nil || !removed {
+		t.Fatalf("decommission = %v, %v", removed, err)
+	}
+	if _, err := store.db.Exec("DROP TABLE node_tombstones"); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := store.RestoreNode("stable-a")
+	if err == nil || restored {
+		t.Fatalf("restore after persistence failure = %v, %v", restored, err)
+	}
+	if !store.IsNodeTombstoned("stable-a") {
+		t.Fatal("failed restoration removed published tombstone")
+	}
+}
+
 // newTestStore creates a Store with an on-disk SQLite database in a temporary
 // directory for testing.
 func newTestStore(t *testing.T) (*Store, func()) {
@@ -563,9 +649,42 @@ func TestGetStatsMergesArchivedAndPendingHeatmapCounts(t *testing.T) {
 
 	stats := s.GetStats()
 	heatmap := stats["heatmap"].(map[string]int)
-	hour := now.Format("15:00")
+	hour := now.UTC().Format("15:00")
 	if heatmap[hour] != 2 {
 		t.Fatalf("heatmap[%q] = %d, want combined count 2", hour, heatmap[hour])
+	}
+}
+
+func TestGetStatsUsesExactRollingDayAtNonHourBoundary(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+	now := time.Now().UTC().Truncate(time.Hour).Add(37 * time.Minute)
+	cutoff := now.Add(-24 * time.Hour)
+	store.AddEvent(models.QueryEvent{
+		UnixTime: cutoff.Add(-time.Second).Unix(), Domain: "expired-boundary.example",
+		ClientIP: "192.0.2.1", Type: "AAAA", Upstream: "System Cache", CacheStatus: "fresh",
+	})
+	store.AddEvent(models.QueryEvent{
+		UnixTime: cutoff.Add(time.Second).Unix(), Domain: "valid-boundary.example",
+		ClientIP: "192.0.2.2", Type: "A", Upstream: "1.1.1.1",
+	})
+	if archived := store.ArchiveStep(time.Now()); archived != 2 {
+		t.Fatalf("archived = %d", archived)
+	}
+	stats := store.getStatsAt(now)
+	if rpd := stats["rpd"].(int); rpd != 1 {
+		t.Fatalf("rolling-day queries = %d, want 1", rpd)
+	}
+	types := stats["type_counts"].(map[string]int)
+	if types["A"] != 1 || types["AAAA"] != 0 {
+		t.Fatalf("rolling-day types = %+v", types)
+	}
+	top := stats["top_domains"].([]models.StatEntry)
+	if len(top) != 1 || top[0].Key != "valid-boundary.example" {
+		t.Fatalf("rolling-day domains = %+v", top)
+	}
+	if ratio := stats["cache_hit_ratio"].(float64); ratio != 0 {
+		t.Fatalf("rolling-day cache ratio = %v, want 0", ratio)
 	}
 }
 

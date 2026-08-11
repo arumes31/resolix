@@ -16,6 +16,7 @@ func TestMigrateLegacyStateCopiesManagedFilesWithoutReplacingDestinations(t *tes
 	files := []string{
 		"filter-subscriptions.json",
 		"user_rules.txt",
+		"dns-settings.json",
 		"upstreams.json",
 		"dns-routes.json",
 		"rewrites.json",
@@ -102,6 +103,7 @@ func TestConfigPathsUseDedicatedDirectory(t *testing.T) {
 		{name: "clients", got: cfg.FullClientsPath(), want: filepath.Join(configDir, "clients.json")},
 		{name: "custom rules", got: cfg.FullUserRulesPath(), want: filepath.Join(configDir, "user_rules.txt")},
 		{name: "subscriptions", got: cfg.FullFilterSubscriptionsPath(), want: filepath.Join(configDir, "filter-subscriptions.json")},
+		{name: "DNS settings", got: cfg.FullDNSSettingsPath(), want: filepath.Join(configDir, "dns-settings.json")},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

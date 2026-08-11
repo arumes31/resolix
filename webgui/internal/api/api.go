@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,6 +41,7 @@ import (
 	"github.com/arumes31/resolix/webgui/internal/controllertls"
 	"github.com/arumes31/resolix/webgui/internal/dnsroutes"
 	"github.com/arumes31/resolix/webgui/internal/dnsserver"
+	"github.com/arumes31/resolix/webgui/internal/dnssettings"
 	apperr "github.com/arumes31/resolix/webgui/internal/errors"
 	"github.com/arumes31/resolix/webgui/internal/filter"
 	"github.com/arumes31/resolix/webgui/internal/forwarder"
@@ -188,9 +190,19 @@ type Server struct {
 
 	// DNS routes (Item 66)
 	dnsRoutes *dnsroutes.DNSRoutes
+	// dnsSettings contains controller-managed behavior that is safe to update
+	// without rebinding DNS or HTTP listeners.
+	dnsSettings        *dnssettings.Store
+	dnsSettingsApplyFn func(dnssettings.Settings)
 
 	// Mutex protecting resolver, blocklist, and dnsRoutes fields
 	fieldsMu sync.RWMutex
+	// configApplyMu serializes multi-store snapshot application and rollback.
+	configApplyMu sync.Mutex
+	// syncRequestMu protects controller-issued cluster and per-node sync epochs.
+	syncRequestMu         sync.RWMutex
+	clusterSyncGeneration uint64
+	nodeSyncGenerations   map[string]uint64
 
 	// DNS loop detection (Item 65)
 	dnsLoopDetected bool
@@ -227,14 +239,15 @@ func (s *Server) buildMetadata() (version, buildInfo string) {
 // NewServer initializes a new API server.
 func NewServer(cfg *config.Config, store *storage.Store, prs *parser.Parser, tmpl *template.Template) *Server {
 	s := &Server{
-		cfg:         cfg,
-		store:       store,
-		parser:      prs,
-		tmpl:        tmpl,
-		subscribers: make(map[chan models.QueryEvent]int),
-		rateLimits:  make(map[string]*rateLimitEntry),
-		sessions:    make(map[string]time.Time),
-		metrics:     &Metrics{StartTime: time.Now()},
+		cfg:                 cfg,
+		store:               store,
+		parser:              prs,
+		tmpl:                tmpl,
+		subscribers:         make(map[chan models.QueryEvent]int),
+		rateLimits:          make(map[string]*rateLimitEntry),
+		sessions:            make(map[string]time.Time),
+		metrics:             &Metrics{StartTime: time.Now()},
+		nodeSyncGenerations: make(map[string]uint64),
 	}
 
 	// Hash the configured password at startup if auth is enabled
@@ -281,15 +294,26 @@ func (s *Server) SetDNSRoutes(dr *dnsroutes.DNSRoutes) {
 // SetFilter configures the filter engine for status/pause endpoints and metrics.
 func (s *Server) SetFilter(eng *filter.Engine) {
 	s.fieldsMu.Lock()
-	defer s.fieldsMu.Unlock()
 	s.filterEngine = eng
+	store := s.subscriptionStore
+	s.fieldsMu.Unlock()
+	if eng != nil {
+		eng.SetRulesChangedCallback(s.clearDNSCache)
+		if store != nil {
+			eng.SetHistoryDir(store.HistoryDir())
+		}
+	}
 }
 
 // SetSubscriptionStore configures persistent URL filter subscriptions.
 func (s *Server) SetSubscriptionStore(store *filter.SubscriptionStore) {
 	s.fieldsMu.Lock()
-	defer s.fieldsMu.Unlock()
 	s.subscriptionStore = store
+	engine := s.filterEngine
+	s.fieldsMu.Unlock()
+	if store != nil && engine != nil {
+		engine.SetHistoryDir(store.HistoryDir())
+	}
 }
 
 // SetRewritesStore configures the typed-rewrites store for the CRUD API.
@@ -304,6 +328,27 @@ func (s *Server) SetDNSServer(srv *dnsserver.Server) {
 	s.fieldsMu.Lock()
 	defer s.fieldsMu.Unlock()
 	s.dnsServer = srv
+}
+
+// SetDNSSettingsStore configures persistent controller-managed DNS policy.
+func (s *Server) SetDNSSettingsStore(store *dnssettings.Store) {
+	s.fieldsMu.Lock()
+	s.dnsSettings = store
+	s.fieldsMu.Unlock()
+}
+
+// SetDNSSettingsApplyFunc configures live application after a settings file
+// has been durably replaced.
+func (s *Server) SetDNSSettingsApplyFunc(fn func(dnssettings.Settings)) {
+	s.fieldsMu.Lock()
+	s.dnsSettingsApplyFn = fn
+	s.fieldsMu.Unlock()
+}
+
+func (s *Server) clearDNSCache() {
+	if dnsSrv := s.getDNSServer(); dnsSrv != nil {
+		dnsSrv.ClearCache()
+	}
 }
 
 // SetClients configures the per-client registry for the clients API.
@@ -473,6 +518,28 @@ func (s *Server) newSecureCookie(name, value string, maxAge int) *http.Cookie {
 // is written to the logs, preventing log injection (gosec G706).
 func sanitizeLogValue(s string) string {
 	return strings.NewReplacer("\r", "", "\n", "").Replace(s)
+}
+
+func requestNodeIdentity(r *http.Request, fallbackName string) string {
+	return normalizeNodeIdentity(r.Header.Get("X-Node-ID"), fallbackName)
+}
+
+func normalizeNodeIdentity(value, fallbackName string) string {
+	identity := strings.TrimSpace(value)
+	if identity == "" || len(identity) > 128 {
+		return fallbackName
+	}
+	for _, char := range identity {
+		if !isAllowedNodeIdentityRune(char) {
+			return fallbackName
+		}
+	}
+	return identity
+}
+
+func isAllowedNodeIdentityRune(char rune) bool {
+	return char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' ||
+		char >= '0' && char <= '9' || strings.ContainsRune("._:-", char)
 }
 
 // clientIP extracts the client IP from the request. Forwarded headers are
@@ -909,7 +976,9 @@ func (s *Server) SetupMux() http.Handler {
 	mux.Handle("/cluster", s.authMiddleware(http.HandlerFunc(s.handleClusterPage)))
 	mux.Handle("/config", s.authMiddleware(http.HandlerFunc(s.handleConfigPage)))
 	mux.Handle("/api/events", s.authMiddleware(http.HandlerFunc(s.handleEvents)))
+	mux.Handle("/api/history", s.authMiddleware(http.HandlerFunc(s.handleHistory)))
 	mux.Handle("/api/stats", s.authMiddleware(http.HandlerFunc(s.handleStats)))
+	mux.Handle("/api/storage/status", s.authMiddleware(http.HandlerFunc(s.handleStorageStatus)))
 	mux.Handle("/api/client_stats", s.authMiddleware(http.HandlerFunc(s.handleClientStats)))
 	mux.Handle("/api/simulate", s.authMiddleware(http.HandlerFunc(s.handleSimulate)))
 
@@ -920,8 +989,18 @@ func (s *Server) SetupMux() http.Handler {
 	mux.Handle("/api/filtering/pause", s.authMiddleware(http.HandlerFunc(s.handleFilteringPause)))
 	mux.Handle("/api/filtering/status", s.authMiddleware(http.HandlerFunc(s.handleFilteringStatus)))
 	mux.Handle("/api/filtering/update", s.authMiddleware(http.HandlerFunc(s.handleFilteringUpdate)))
+	mux.Handle("/api/filtering/test", s.authMiddleware(http.HandlerFunc(s.handleFilteringTest)))
+	mux.Handle("/api/filtering/validate", s.authMiddleware(http.HandlerFunc(s.handleFilteringValidate)))
+	mux.Handle("/api/filtering/rollback", s.authMiddleware(http.HandlerFunc(s.handleFilteringRollback)))
 	mux.Handle("/api/config/status", s.authMiddleware(http.HandlerFunc(s.handleConfigStatus)))
+	mux.Handle("/api/config/dns-settings", s.authMiddleware(http.HandlerFunc(s.handleDNSSettings)))
+	mux.Handle("/api/config/snapshot", s.authMiddleware(http.HandlerFunc(s.handleConfigSnapshot)))
+	mux.Handle("/api/config/diff", s.authMiddleware(http.HandlerFunc(s.handleConfigDiff)))
+	mux.Handle("/api/config/sync-now", s.authMiddleware(http.HandlerFunc(s.handleConfigSyncNow)))
 	mux.Handle("/api/config/subscriptions", s.authMiddleware(http.HandlerFunc(s.handleFilterSubscriptions)))
+	mux.Handle("/api/config/subscriptions/export", s.authMiddleware(http.HandlerFunc(s.handleFilterSubscriptionsExport)))
+	mux.Handle("/api/config/subscriptions/import", s.authMiddleware(http.HandlerFunc(s.handleFilterSubscriptionsImport)))
+	mux.Handle("/api/config/subscriptions/bulk", s.authMiddleware(http.HandlerFunc(s.handleFilterSubscriptionsBulk)))
 	mux.Handle("/api/config/user-rules", s.authMiddleware(http.HandlerFunc(s.handleUserRules)))
 
 	// Typed DNS rewrites CRUD
@@ -941,15 +1020,18 @@ func (s *Server) SetupMux() http.Handler {
 	// Item 62: Upstream configuration editor
 	mux.Handle("/api/upstreams", s.authMiddleware(http.HandlerFunc(s.handleUpstreams)))
 	mux.Handle("/api/upstream-settings", s.authMiddleware(http.HandlerFunc(s.handleUpstreamSettings)))
+	mux.Handle("/api/upstreams/test", s.authMiddleware(http.HandlerFunc(s.handleUpstreamTest)))
 
 	// Item 63: Cache clear endpoint
 	mux.Handle("/api/cache/clear", s.authMiddleware(http.HandlerFunc(s.handleCacheClear)))
+	mux.Handle("/api/cache/status", s.authMiddleware(http.HandlerFunc(s.handleCacheStatus)))
 
 	// Item 65: DNS loop detection endpoint
 	mux.Handle("/api/dns/loop-status", s.authMiddleware(http.HandlerFunc(s.handleDNSLoopStatus)))
 
 	// Item 66: Domain-specific routing rules
 	mux.Handle("/api/dns/routes", s.authMiddleware(http.HandlerFunc(s.handleDNSRoutes)))
+	mux.Handle("/api/dns/routes/test", s.authMiddleware(http.HandlerFunc(s.handleDNSRouteTest)))
 
 	// Item 68: Upstream latency alerts
 	mux.Handle("/api/upstreams/latency", s.authMiddleware(http.HandlerFunc(s.handleUpstreamLatency)))
@@ -1184,7 +1266,7 @@ func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
 
 // handleMetrics exposes Prometheus-format metrics on the /metrics endpoint.
 // The route is protected by authMiddleware (see SetupMux).
-func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 
 	var buf bytes.Buffer
@@ -1247,7 +1329,8 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(&buf, "# TYPE sse_subscriber_drops_total counter\n")
 	fmt.Fprintf(&buf, "sse_subscriber_drops_total %d\n", s.subDropCnt.Load())
 	if s.store != nil {
-		archiveMetrics := s.store.ArchiveMetrics()
+		databaseMetrics := s.store.DBMetrics(r.Context())
+		archiveMetrics := databaseMetrics.Archive
 		fmt.Fprintf(&buf, "# HELP sqlite_archive_pending_events Events waiting to be archived to SQLite\n")
 		fmt.Fprintf(&buf, "# TYPE sqlite_archive_pending_events gauge\n")
 		fmt.Fprintf(&buf, "sqlite_archive_pending_events %d\n", archiveMetrics.Pending)
@@ -1263,6 +1346,40 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(&buf, "# HELP sqlite_archive_dropped_events_total Events dropped after the SQLite archive queue reached its hard limit\n")
 		fmt.Fprintf(&buf, "# TYPE sqlite_archive_dropped_events_total counter\n")
 		fmt.Fprintf(&buf, "sqlite_archive_dropped_events_total %d\n", archiveMetrics.Dropped)
+		fmt.Fprintf(&buf, "# HELP sqlite_archive_pending_bytes Approximate bytes waiting for SQLite archival\n")
+		fmt.Fprintf(&buf, "# TYPE sqlite_archive_pending_bytes gauge\n")
+		fmt.Fprintf(&buf, "sqlite_archive_pending_bytes %d\n", archiveMetrics.PendingBytes)
+		fmt.Fprintf(&buf, "# HELP sqlite_database_bytes Main SQLite database file size\n")
+		fmt.Fprintf(&buf, "# TYPE sqlite_database_bytes gauge\n")
+		fmt.Fprintf(&buf, "sqlite_database_bytes %d\n", databaseMetrics.DatabaseBytes)
+		fmt.Fprintf(&buf, "# HELP sqlite_wal_bytes SQLite write-ahead log file size\n")
+		fmt.Fprintf(&buf, "# TYPE sqlite_wal_bytes gauge\n")
+		fmt.Fprintf(&buf, "sqlite_wal_bytes %d\n", databaseMetrics.WALBytes)
+		fmt.Fprintf(&buf, "# HELP sqlite_busy_errors_total SQLite operations that failed with BUSY or LOCKED\n")
+		fmt.Fprintf(&buf, "# TYPE sqlite_busy_errors_total counter\n")
+		fmt.Fprintf(&buf, "sqlite_busy_errors_total %d\n", databaseMetrics.BusyErrors)
+		fmt.Fprintf(&buf, "# HELP sqlite_freelist_pages Currently unused SQLite pages\n")
+		fmt.Fprintf(&buf, "# TYPE sqlite_freelist_pages gauge\n")
+		fmt.Fprintf(&buf, "sqlite_freelist_pages %d\n", databaseMetrics.FreeListPages)
+		fmt.Fprintf(&buf, "# HELP sqlite_checkpoint_age_seconds Seconds since the last scheduled WAL checkpoint; -1 before the first checkpoint\n")
+		fmt.Fprintf(&buf, "# TYPE sqlite_checkpoint_age_seconds gauge\n")
+		fmt.Fprintf(&buf, "sqlite_checkpoint_age_seconds %.3f\n", databaseMetrics.CheckpointAgeSeconds)
+		fmt.Fprintf(&buf, "# HELP sqlite_checkpoint_busy Whether the last WAL checkpoint was blocked by another connection\n")
+		fmt.Fprintf(&buf, "# TYPE sqlite_checkpoint_busy gauge\n")
+		fmt.Fprintf(&buf, "sqlite_checkpoint_busy %d\n", databaseMetrics.LastCheckpointBusy)
+		fmt.Fprintf(&buf, "# HELP sqlite_checkpoint_log_frames WAL frames observed by the last checkpoint\n")
+		fmt.Fprintf(&buf, "# TYPE sqlite_checkpoint_log_frames gauge\n")
+		fmt.Fprintf(&buf, "sqlite_checkpoint_log_frames %d\n", databaseMetrics.LastCheckpointLogFrames)
+		fmt.Fprintf(&buf, "# HELP sqlite_checkpointed_frames WAL frames checkpointed by the last checkpoint\n")
+		fmt.Fprintf(&buf, "# TYPE sqlite_checkpointed_frames gauge\n")
+		fmt.Fprintf(&buf, "sqlite_checkpointed_frames %d\n", databaseMetrics.LastCheckpointedFrames)
+		vacuumRecommended := 0
+		if databaseMetrics.VacuumRecommended {
+			vacuumRecommended = 1
+		}
+		fmt.Fprintf(&buf, "# HELP sqlite_vacuum_recommended Whether a maintenance-window migration to incremental vacuum is recommended\n")
+		fmt.Fprintf(&buf, "# TYPE sqlite_vacuum_recommended gauge\n")
+		fmt.Fprintf(&buf, "sqlite_vacuum_recommended %d\n", vacuumRecommended)
 	}
 
 	fmt.Fprintf(&buf, "# HELP http_requests_total HTTP requests by method and status\n")
@@ -1343,10 +1460,38 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		cacheStats := dnsSrv.CacheStats()
 		fmt.Fprintf(&buf, "# HELP dns_cache_entries Current cache entries\n# TYPE dns_cache_entries gauge\ndns_cache_entries %d\n", cacheStats.Entries)
 		fmt.Fprintf(&buf, "# HELP dns_cache_capacity Maximum cache entries\n# TYPE dns_cache_capacity gauge\ndns_cache_capacity %d\n", cacheStats.Capacity)
+		fmt.Fprintf(&buf, "# HELP dns_cache_utilization Cache capacity utilization ratio\n# TYPE dns_cache_utilization gauge\ndns_cache_utilization %f\n", cacheStats.Utilization)
+		fmt.Fprintf(&buf, "# HELP dns_cache_negative_entries Current negative cache entries\n# TYPE dns_cache_negative_entries gauge\ndns_cache_negative_entries %d\n", cacheStats.NegativeEntries)
+		fmt.Fprintf(&buf, "# HELP dns_cache_in_flight Current coalesced upstream cache misses\n# TYPE dns_cache_in_flight gauge\ndns_cache_in_flight %d\n", cacheStats.InFlight)
+		fmt.Fprintf(&buf, "# HELP dns_cache_fresh_hits_total Fresh positive cache responses served\n# TYPE dns_cache_fresh_hits_total counter\ndns_cache_fresh_hits_total %d\n", cacheStats.FreshHits)
+		fmt.Fprintf(&buf, "# HELP dns_cache_negative_hits_total Negative cache responses served\n# TYPE dns_cache_negative_hits_total counter\ndns_cache_negative_hits_total %d\n", cacheStats.NegativeHits)
+		fmt.Fprintf(&buf, "# HELP dns_cache_prefetched_hits_total Prefetched cache responses served\n# TYPE dns_cache_prefetched_hits_total counter\ndns_cache_prefetched_hits_total %d\n", cacheStats.PrefetchedHits)
+		fmt.Fprintf(&buf, "# HELP dns_cache_servfail_hits_total SERVFAIL micro-cache responses served\n# TYPE dns_cache_servfail_hits_total counter\ndns_cache_servfail_hits_total %d\n", cacheStats.SERVFAILHits)
 		fmt.Fprintf(&buf, "# HELP dns_cache_stale_hits_total Optimistic stale responses served\n# TYPE dns_cache_stale_hits_total counter\ndns_cache_stale_hits_total %d\n", cacheStats.StaleHits)
 		fmt.Fprintf(&buf, "# HELP dns_cache_evictions_total LRU cache evictions\n# TYPE dns_cache_evictions_total counter\ndns_cache_evictions_total %d\n", cacheStats.Evictions)
+		fmt.Fprintf(&buf, "# HELP dns_cache_expirations_total Expired cache entries removed\n# TYPE dns_cache_expirations_total counter\ndns_cache_expirations_total %d\n", cacheStats.Expirations)
 		fmt.Fprintf(&buf, "# HELP dns_cache_cleared_entries_total Entries removed by cache clears\n# TYPE dns_cache_cleared_entries_total counter\ndns_cache_cleared_entries_total %d\n", cacheStats.Cleared)
+		fmt.Fprintf(&buf, "# HELP dns_cache_invalidated_entries_total Entries removed by targeted invalidation\n# TYPE dns_cache_invalidated_entries_total counter\ndns_cache_invalidated_entries_total %d\n", cacheStats.Invalidated)
 		fmt.Fprintf(&buf, "# HELP dns_cache_refreshes_total Successful optimistic cache refreshes\n# TYPE dns_cache_refreshes_total counter\ndns_cache_refreshes_total %d\n", cacheStats.Refreshes)
+		fmt.Fprintf(&buf, "# HELP dns_cache_prefetches_total Successful proactive cache refreshes\n# TYPE dns_cache_prefetches_total counter\ndns_cache_prefetches_total %d\n", cacheStats.Prefetches)
+		fmt.Fprintf(&buf, "# HELP dns_cache_coalesced_total Cache misses joined to an in-flight request\n# TYPE dns_cache_coalesced_total counter\ndns_cache_coalesced_total %d\n", cacheStats.Coalesced)
+		fmt.Fprintf(&buf, "# HELP dns_cache_qtype_hits_total Cache hits by DNS record type\n# TYPE dns_cache_qtype_hits_total counter\n")
+		fmt.Fprintf(&buf, "# HELP dns_cache_qtype_misses_total Cache misses by DNS record type\n# TYPE dns_cache_qtype_misses_total counter\n")
+		fmt.Fprintf(&buf, "# HELP dns_cache_qtype_evictions_total Cache evictions by DNS record type\n# TYPE dns_cache_qtype_evictions_total counter\n")
+		fmt.Fprintf(&buf, "# HELP dns_cache_qtype_expirations_total Cache expirations by DNS record type\n# TYPE dns_cache_qtype_expirations_total counter\n")
+		qtypes := make([]string, 0, len(cacheStats.ByQType))
+		for qtype := range cacheStats.ByQType {
+			qtypes = append(qtypes, qtype)
+		}
+		sort.Strings(qtypes)
+		for _, qtype := range qtypes {
+			stats := cacheStats.ByQType[qtype]
+			label := escapePrometheusLabel(qtype)
+			fmt.Fprintf(&buf, "dns_cache_qtype_hits_total{qtype=\"%s\"} %d\n", label, stats.Hits)
+			fmt.Fprintf(&buf, "dns_cache_qtype_misses_total{qtype=\"%s\"} %d\n", label, stats.Misses)
+			fmt.Fprintf(&buf, "dns_cache_qtype_evictions_total{qtype=\"%s\"} %d\n", label, stats.Evictions)
+			fmt.Fprintf(&buf, "dns_cache_qtype_expirations_total{qtype=\"%s\"} %d\n", label, stats.Expirations)
+		}
 
 	}
 
@@ -1595,6 +1740,11 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, apperr.NewErrParseFailed("payload too large or bad request", err).Error(), http.StatusBadRequest)
 		return
 	}
+	identity := requestNodeIdentity(r, payload.Node)
+	if payload.Node != "" && s.store.IsNodeTombstoned(identity) {
+		http.Error(w, "node is decommissioned", http.StatusGone)
+		return
+	}
 
 	// 3. Strict Input Validation
 	if len(payload.Batch) > 100 {
@@ -1619,15 +1769,15 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		processLine(l)
 	}
 	if len(payload.Health) > 0 {
-		s.store.SetUpstreamHealth(payload.Node, payload.Health)
+		s.store.SetUpstreamHealth(identity, payload.Health)
 	}
 
 	// Item 88: Update node status from version headers on ingest, merging the
 	// header-derived fields into the existing status so heartbeat-provided
 	// values (MemoryMB, Goroutines, DBSizeMB, UpstreamHealth) are preserved.
 	if payload.Node != "" {
-		status := models.NodeStatus{Name: payload.Node}
-		if existing := s.store.GetNodeStatus(payload.Node); existing != nil {
+		status := models.NodeStatus{ID: identity, Name: payload.Node}
+		if existing := s.store.GetNodeStatus(identity); existing != nil {
 			status = *existing
 		}
 		if v := r.Header.Get("X-Node-Version"); v != "" {
@@ -1639,7 +1789,10 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		if v := r.Header.Get("X-Node-Build"); v != "" {
 			status.BuildInfo = v
 		}
-		s.store.SetNodeStatus(payload.Node, status)
+		if !s.store.SetNodeStatusIdentity(identity, payload.Node, status) {
+			http.Error(w, "node is decommissioned", http.StatusGone)
+			return
+		}
 	}
 
 	w.WriteHeader(http.StatusNoContent)
@@ -1686,14 +1839,25 @@ func (s *Server) handleIngestEvents(w http.ResponseWriter, r *http.Request, body
 	}
 
 	node := ""
+	if len(events) > 0 {
+		node = events[0].Node
+		for i := 1; i < len(events); i++ {
+			if events[i].Node != node {
+				http.Error(w, "events must belong to one node", http.StatusBadRequest)
+				return
+			}
+		}
+	}
+	identity := requestNodeIdentity(r, node)
+	if node != "" && s.store.IsNodeTombstoned(identity) {
+		http.Error(w, "node is decommissioned", http.StatusGone)
+		return
+	}
 	now := time.Now()
 	maxUnixTime := now.Add(maxIngestFutureSkew).Unix()
 	for i := range events {
 		if events[i].UnixTime <= 0 || events[i].UnixTime > maxUnixTime {
 			events[i].UnixTime = now.Unix()
-		}
-		if node == "" {
-			node = events[i].Node
 		}
 		s.store.AddEvent(events[i])
 		s.BroadcastEvent(events[i])
@@ -1703,8 +1867,8 @@ func (s *Server) handleIngestEvents(w http.ResponseWriter, r *http.Request, body
 	// header-derived fields into the existing status so heartbeat-provided
 	// values (MemoryMB, Goroutines, DBSizeMB, UpstreamHealth) are preserved.
 	if node != "" {
-		status := models.NodeStatus{Name: node}
-		if existing := s.store.GetNodeStatus(node); existing != nil {
+		status := models.NodeStatus{ID: identity, Name: node}
+		if existing := s.store.GetNodeStatus(identity); existing != nil {
 			status = *existing
 		}
 		if v := r.Header.Get("X-Node-Version"); v != "" {
@@ -1716,7 +1880,10 @@ func (s *Server) handleIngestEvents(w http.ResponseWriter, r *http.Request, body
 		if v := r.Header.Get("X-Node-Build"); v != "" {
 			status.BuildInfo = v
 		}
-		s.store.SetNodeStatus(node, status)
+		if !s.store.SetNodeStatusIdentity(identity, node, status) {
+			http.Error(w, "node is decommissioned", http.StatusGone)
+			return
+		}
 	}
 
 	w.WriteHeader(http.StatusNoContent)
@@ -2005,10 +2172,12 @@ func (s *Server) handleFilteringStatus(w http.ResponseWriter, _ *http.Request) {
 	}
 	blocked, allowed := eng.Stats()
 	resp := map[string]interface{}{
-		"enabled":              !eng.Paused(),
-		"sources":              eng.Sources(),
-		"filter_blocked_total": blocked,
-		"filter_allowed_total": allowed,
+		"enabled":                 !eng.Paused(),
+		"sources":                 eng.Sources(),
+		"update_interval_seconds": int64(s.cfg.FilterUpdateInterval.Seconds()),
+		"allowlist_overrides":     eng.AllowlistOverrides(100),
+		"filter_blocked_total":    blocked,
+		"filter_allowed_total":    allowed,
 	}
 	if until := eng.PausedUntil(); !until.IsZero() {
 		resp["paused_until"] = until.Format(time.RFC3339)
@@ -2103,6 +2272,7 @@ func (s *Server) handleRewrites(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("Invalid rewrite: %v", err), http.StatusBadRequest)
 			return
 		}
+		s.clearDNSCache()
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "rewrite": rw})
 	case http.MethodPut:
 		if !s.checkCSRF(w, r) {
@@ -2132,6 +2302,7 @@ func (s *Server) handleRewrites(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Rewrite not found", http.StatusNotFound)
 			return
 		}
+		s.clearDNSCache()
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "rewrite": rw})
 	case http.MethodDelete:
 		if !s.checkCSRF(w, r) {
@@ -2151,6 +2322,7 @@ func (s *Server) handleRewrites(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Rewrite not found", http.StatusNotFound)
 			return
 		}
+		s.clearDNSCache()
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -2207,6 +2379,7 @@ func (s *Server) handleClients(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("Invalid client: %v", err), http.StatusBadRequest)
 			return
 		}
+		s.clearDNSCache()
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
 	case http.MethodDelete:
 		if !s.checkCSRF(w, r) {
@@ -2221,6 +2394,7 @@ func (s *Server) handleClients(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Client not found", http.StatusNotFound)
 			return
 		}
+		s.clearDNSCache()
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -2317,6 +2491,7 @@ func (s *Server) handleQuerylogAction(w http.ResponseWriter, r *http.Request, bl
 		}
 	}
 	eng.ReloadSource(path)
+	s.clearDNSCache()
 
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"status": "ok",
@@ -2423,10 +2598,36 @@ func (s *Server) handleGetUpstreams(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleUpstreamSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		upstreams := s.configuredUpstreams()
+		details := make([]map[string]interface{}, 0, len(upstreams))
+		for _, raw := range upstreams {
+			spec, err := upstream.Parse(raw)
+			if err != nil {
+				continue
+			}
+			details = append(details, map[string]interface{}{
+				"spec": raw, "normalized_spec": spec.NormalizedKey(), "scheme": spec.Scheme,
+				"host": spec.Host, "port": spec.Port, "path": spec.Path,
+				"timeout_ms": float64(spec.TimeoutDuration().Microseconds()) / 1000,
+				"weight":     spec.SelectionWeight(),
+			})
+		}
+		s.fieldsMu.RLock()
+		pool := s.upstreamPool
+		s.fieldsMu.RUnlock()
+		var upstreamRuntime []upstream.StatSnapshot
+		var bootstrapStatus []upstream.BootstrapStatus
+		if pool != nil {
+			upstreamRuntime = pool.StatsSnapshot()
+			bootstrapStatus = pool.BootstrapStatus()
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"upstreams":         s.configuredUpstreams(),
+			"upstreams":         upstreams,
 			"bootstrap_servers": s.configuredBootstrapServers(),
+			"details":           details,
+			"runtime":           upstreamRuntime,
+			"bootstrap_status":  bootstrapStatus,
 		})
 	case http.MethodPost:
 		if !s.requireController(w) || !s.checkCSRF(w, r) {
@@ -2462,6 +2663,49 @@ func (s *Server) handleUpstreamSettings(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
+func (s *Server) handleUpstreamTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.checkCSRF(w, r) {
+		return
+	}
+	var request struct {
+		Spec             string   `json:"spec"`
+		Domain           string   `json:"domain"`
+		BootstrapServers []string `json:"bootstrap_servers"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&request); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+	request.Spec = strings.TrimSpace(request.Spec)
+	request.Domain = strings.TrimSuffix(strings.TrimSpace(request.Domain), ".")
+	if request.Domain == "" {
+		request.Domain = s.cfg.HealthDomain
+	}
+	if _, ok := dns.IsDomainName(request.Domain); !ok {
+		http.Error(w, "A valid test domain is required", http.StatusBadRequest)
+		return
+	}
+	if len(request.BootstrapServers) == 0 {
+		request.BootstrapServers = s.configuredBootstrapServers()
+	}
+	if err := upstream.ValidateBootstrapServers(request.BootstrapServers); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	report, err := upstream.ProbeDetailed(r.Context(), request.Spec, request.Domain, request.BootstrapServers)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(report)
+}
+
 func compactStrings(values []string) []string {
 	result := make([]string, 0, len(values))
 	for _, value := range values {
@@ -2490,6 +2734,7 @@ func (s *Server) saveUpstreamSettings(upstreams, bootstrapServers []string) erro
 	if reload != nil {
 		reload()
 	}
+	s.clearDNSCache()
 	return nil
 }
 
@@ -2550,6 +2795,7 @@ func (s *Server) handlePostUpstreams(w http.ResponseWriter, r *http.Request) {
 	if reload != nil {
 		reload()
 	}
+	s.clearDNSCache()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -2582,6 +2828,54 @@ func (s *Server) handleCacheClear(w http.ResponseWriter, r *http.Request) {
 		"status":  "ok",
 		"cleared": dnsSrv.ClearCache(),
 	})
+}
+
+func (s *Server) handleCacheStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	dnsSrv := s.getDNSServer()
+	if dnsSrv == nil {
+		http.Error(w, "DNS server is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	mode := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("entries")))
+	if mode != "" && mode != "negative" && mode != "all" {
+		http.Error(w, "entries must be negative or all", http.StatusBadRequest)
+		return
+	}
+	limit := 100
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 1000 {
+			http.Error(w, "limit must be between 1 and 1000", http.StatusBadRequest)
+			return
+		}
+		limit = parsed
+	}
+
+	response := struct {
+		Stats     dnsserver.CacheStats         `json:"stats"`
+		Entries   []dnsserver.CacheEntryStatus `json:"entries,omitempty"`
+		Truncated bool                         `json:"truncated,omitempty"`
+	}{Stats: dnsSrv.CacheStats()}
+	if mode != "" {
+		for _, entry := range dnsSrv.CacheEntries() {
+			if mode == "negative" && !entry.Negative {
+				continue
+			}
+			if len(response.Entries) == limit {
+				response.Truncated = true
+				break
+			}
+			response.Entries = append(response.Entries, entry)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
 }
 
 // ===== Item 65: DNS Loop Detection Endpoint =====
@@ -2631,6 +2925,64 @@ func (s *Server) handleGetDNSRoutes(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+func (s *Server) handleDNSRouteTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	domain := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(r.URL.Query().Get("domain")), "."))
+	if _, ok := dns.IsDomainName(domain); !ok || domain == "" {
+		http.Error(w, "A valid domain is required", http.StatusBadRequest)
+		return
+	}
+	s.fieldsMu.RLock()
+	dr := s.dnsRoutes
+	s.fieldsMu.RUnlock()
+	routes := map[string]string{}
+	if dr != nil {
+		routes = dr.GetRoutesMap()
+	}
+	type candidate struct {
+		Pattern        string `json:"pattern"`
+		Upstream       string `json:"upstream"`
+		NormalizedSpec string `json:"normalized_spec"`
+		Exact          bool   `json:"exact"`
+	}
+	candidates := make([]candidate, 0)
+	for pattern, raw := range routes {
+		pattern = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(pattern), "."))
+		exact := pattern == domain
+		matches := exact
+		if strings.HasPrefix(pattern, "*.") {
+			suffix := strings.TrimPrefix(pattern, "*.")
+			matches = domain == suffix || strings.HasSuffix(domain, "."+suffix)
+		}
+		if !matches {
+			continue
+		}
+		normalized, _ := upstream.Normalize(raw)
+		candidates = append(candidates, candidate{Pattern: pattern, Upstream: raw, NormalizedSpec: normalized, Exact: exact})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].Exact != candidates[j].Exact {
+			return candidates[i].Exact
+		}
+		if len(candidates[i].Pattern) != len(candidates[j].Pattern) {
+			return len(candidates[i].Pattern) > len(candidates[j].Pattern)
+		}
+		return candidates[i].Pattern < candidates[j].Pattern
+	})
+	var selected interface{}
+	if len(candidates) > 0 {
+		selected = candidates[0]
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"domain": domain, "matched": len(candidates) > 0, "selected": selected, "precedence": candidates,
+	})
+}
+
 func (s *Server) handlePostDNSRoutes(w http.ResponseWriter, r *http.Request) {
 	if !s.requireController(w) {
 		return
@@ -2666,6 +3018,7 @@ func (s *Server) handlePostDNSRoutes(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Failed to save routes: %v", err), http.StatusInternalServerError)
 		return
 	}
+	s.clearDNSCache()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -2741,6 +3094,19 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing node name", http.StatusBadRequest)
 		return
 	}
+	identity := normalizeNodeIdentity(hb.NodeID, hb.Node)
+	if headerIdentity := strings.TrimSpace(r.Header.Get("X-Node-ID")); headerIdentity != "" {
+		normalizedHeader := normalizeNodeIdentity(headerIdentity, "")
+		if normalizedHeader == "" || (hb.NodeID != "" && normalizedHeader != identity) {
+			http.Error(w, "node identity mismatch", http.StatusBadRequest)
+			return
+		}
+		identity = normalizedHeader
+	}
+	if s.store.IsNodeTombstoned(identity) {
+		http.Error(w, "node is decommissioned", http.StatusGone)
+		return
+	}
 
 	// Extract version info from headers (Item 88)
 	nodeVersion := r.Header.Get("X-Node-Version")
@@ -2758,28 +3124,57 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		hb.BuildInfo = buildInfo
 	}
 
-	// Update node status in storage
-	status := models.NodeStatus{
-		Name:           hb.Node,
-		Version:        hb.Version,
-		GoVersion:      hb.GoVersion,
-		BuildInfo:      hb.BuildInfo,
-		MemoryMB:       hb.MemoryMB,
-		Goroutines:     hb.Goroutines,
-		DBSizeMB:       hb.DBSizeMB,
-		UpstreamHealth: hb.Health,
-		ConfigRevision: hb.ConfigRevision,
+	clockSkewMS := int64(0)
+	if !hb.SentAt.IsZero() {
+		clockSkewMS = time.Since(hb.SentAt).Milliseconds()
 	}
-	s.store.SetNodeStatus(hb.Node, status)
+	sourceAddress := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		sourceAddress = host
+	}
+
+	// Update node status in storage.
+	status := models.NodeStatus{
+		ID:                      identity,
+		Name:                    hb.Node,
+		Version:                 hb.Version,
+		GoVersion:               hb.GoVersion,
+		BuildInfo:               hb.BuildInfo,
+		MemoryMB:                hb.MemoryMB,
+		Goroutines:              hb.Goroutines,
+		DBSizeMB:                hb.DBSizeMB,
+		UpstreamHealth:          hb.Health,
+		ConfigRevision:          hb.ConfigRevision,
+		DesiredConfigRevision:   hb.DesiredConfigRevision,
+		PreviousConfigRevision:  hb.PreviousConfigRevision,
+		ConfigSchemaVersion:     hb.ConfigSchemaVersion,
+		ConfigSchemaCompatible:  hb.ConfigSchemaCompatible,
+		ConfigApplyError:        hb.ConfigApplyError,
+		ConfigApplyDurationMS:   hb.ConfigApplyDurationMS,
+		ClockSkewMS:             clockSkewMS,
+		ForwarderBacklogDepth:   hb.ForwarderBacklogDepth,
+		ForwarderBacklogBytes:   hb.ForwarderBacklogBytes,
+		ForwarderBacklogOldestS: hb.ForwarderBacklogOldestS,
+		ForwarderEndpointErrors: hb.ForwarderEndpointErrors,
+		LastIngestError:         hb.LastIngestError,
+		LastHeartbeatError:      hb.LastHeartbeatError,
+		LastConfigSyncError:     hb.LastConfigSyncError,
+		SourceAddress:           sourceAddress,
+	}
+	if !s.store.SetNodeStatusIdentity(identity, hb.Node, status) {
+		http.Error(w, "node is decommissioned", http.StatusGone)
+		return
+	}
 
 	// Also store upstream health if provided
 	if len(hb.Health) > 0 {
-		s.store.SetUpstreamHealth(hb.Node, hb.Health)
+		s.store.SetUpstreamHealth(identity, hb.Health)
 	}
 
 	log.Printf("[INFO] Heartbeat received from node %s (v%s, %d goroutines, %.1fMB mem)", // #nosec G706 -- CR/LF stripped by sanitizeLogValue; gosec taint analysis cannot see through the helper
 		sanitizeLogValue(hb.Node), sanitizeLogValue(hb.Version), hb.Goroutines, hb.MemoryMB)
 
+	w.Header().Set("X-Config-Sync-Generation", s.syncGenerationFor(identity))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -2867,19 +3262,75 @@ func (s *Server) handleSyncUpstreamHealth(w http.ResponseWriter, r *http.Request
 }
 
 // ===== Item 89: Node Discovery and Status Endpoint =====
-// handleNodes returns the status of all known nodes in the cluster.
+// handleNodes returns node status or safely decommissions an offline node.
 func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+	switch r.Method {
+	case http.MethodGet:
+		nodes := s.store.GetNodeStatuses()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"nodes": nodes})
+	case http.MethodDelete:
+		if !s.requireController(w) || !s.checkCSRF(w, r) {
+			return
+		}
+		identifier := strings.TrimSpace(r.URL.Query().Get("id"))
+		if identifier == "" || len(identifier) > 255 {
+			http.Error(w, "A stable node id is required", http.StatusBadRequest)
+			return
+		}
+		status := s.store.GetNodeStatusByID(identifier)
+		if status == nil {
+			http.Error(w, "Node not found", http.StatusNotFound)
+			return
+		}
+		if status.Online && r.URL.Query().Get("force") != "true" {
+			http.Error(w, "Node is online; retry with force=true only after stopping it", http.StatusConflict)
+			return
+		}
+		decommissioned, err := s.store.DecommissionNode(status.ID)
+		if err != nil {
+			http.Error(w, "Failed to persist node decommission", http.StatusInternalServerError)
+			return
+		}
+		if !decommissioned {
+			http.Error(w, "Node not found", http.StatusNotFound)
+			return
+		}
+		s.syncRequestMu.Lock()
+		delete(s.nodeSyncGenerations, status.ID)
+		s.syncRequestMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status": "decommissioned", "node": status.Name, "id": status.ID,
+		})
+	case http.MethodPost:
+		if !s.requireController(w) || !s.checkCSRF(w, r) {
+			return
+		}
+		if r.URL.Query().Get("action") != "restore" {
+			http.Error(w, "Unsupported node action", http.StatusBadRequest)
+			return
+		}
+		identity := strings.TrimSpace(r.URL.Query().Get("id"))
+		if identity == "" || len(identity) > 128 {
+			http.Error(w, "A stable node identity is required", http.StatusBadRequest)
+			return
+		}
+		restored, err := s.store.RestoreNode(identity)
+		if err != nil {
+			http.Error(w, "Failed to persist node restoration", http.StatusInternalServerError)
+			return
+		}
+		if !restored {
+			http.Error(w, "Node tombstone not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "restored", "id": identity})
+	default:
+		w.Header().Set("Allow", "GET, POST, DELETE")
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
 	}
-
-	nodes := s.store.GetNodeStatuses()
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"nodes": nodes,
-	})
 }
 
 func (s *Server) gzipMiddleware(next http.Handler) http.Handler {

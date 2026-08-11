@@ -25,6 +25,9 @@ type QueryEvent struct {
 	LatencyAlert   bool            `json:"latency_alert,omitempty"`   // True if latency exceeds threshold
 	MatchedRule    string          `json:"matched_rule,omitempty"`    // Filter rule that matched (when blocked/allowed)
 	BlockReason    string          `json:"block_reason,omitempty"`    // Machine-readable block reason (e.g. FilteredByBlocklist)
+	CacheStatus    string          `json:"cache_status,omitempty"`    // fresh, stale, prefetched, or negative
+	CacheTTL       uint32          `json:"cache_ttl,omitempty"`       // remaining cache TTL returned to the client
+	NegativeSOA    string          `json:"negative_soa,omitempty"`    // SOA owner used for negative-cache TTL
 }
 
 // TimestampFormatted returns a human-readable time string for the template.
@@ -90,17 +93,34 @@ type StatEntry struct {
 
 // NodeStatus represents the current status of a node in the distributed cluster (Items 85-94).
 type NodeStatus struct {
-	Name           string             `json:"name"`
-	LastSeen       time.Time          `json:"last_seen"`
-	Online         bool               `json:"online"`
-	Version        string             `json:"version,omitempty"`
-	GoVersion      string             `json:"go_version,omitempty"`
-	BuildInfo      string             `json:"build_info,omitempty"`
-	MemoryMB       float64            `json:"memory_mb,omitempty"`
-	Goroutines     int                `json:"goroutines,omitempty"`
-	DBSizeMB       float64            `json:"db_size_mb,omitempty"`
-	UpstreamHealth map[string]float64 `json:"upstream_health,omitempty"`
-	ConfigRevision string             `json:"config_revision,omitempty"`
+	ID                      string             `json:"id,omitempty"`
+	Name                    string             `json:"name"`
+	LastSeen                time.Time          `json:"last_seen"`
+	Online                  bool               `json:"online"`
+	Version                 string             `json:"version,omitempty"`
+	GoVersion               string             `json:"go_version,omitempty"`
+	BuildInfo               string             `json:"build_info,omitempty"`
+	MemoryMB                float64            `json:"memory_mb,omitempty"`
+	Goroutines              int                `json:"goroutines,omitempty"`
+	DBSizeMB                float64            `json:"db_size_mb,omitempty"`
+	UpstreamHealth          map[string]float64 `json:"upstream_health,omitempty"`
+	ConfigRevision          string             `json:"config_revision,omitempty"`
+	DesiredConfigRevision   string             `json:"desired_config_revision,omitempty"`
+	PreviousConfigRevision  string             `json:"previous_config_revision,omitempty"`
+	ConfigSchemaVersion     int                `json:"config_schema_version,omitempty"`
+	ConfigSchemaCompatible  bool               `json:"config_schema_compatible"`
+	ConfigApplyError        string             `json:"config_apply_error,omitempty"`
+	ConfigApplyDurationMS   int64              `json:"config_apply_duration_ms"`
+	ClockSkewMS             int64              `json:"clock_skew_ms"`
+	ForwarderBacklogDepth   int                `json:"forwarder_backlog_depth"`
+	ForwarderBacklogBytes   int64              `json:"forwarder_backlog_bytes"`
+	ForwarderBacklogOldestS float64            `json:"forwarder_backlog_oldest_seconds"`
+	ForwarderEndpointErrors map[string]string  `json:"forwarder_endpoint_errors,omitempty"`
+	LastIngestError         string             `json:"last_ingest_error,omitempty"`
+	LastHeartbeatError      string             `json:"last_heartbeat_error,omitempty"`
+	LastConfigSyncError     string             `json:"last_config_sync_error,omitempty"`
+	SourceAddress           string             `json:"source_address,omitempty"`
+	DuplicateNameWarning    bool               `json:"duplicate_name_warning,omitempty"`
 }
 
 // IsOnline returns whether the node is considered online based on the offline threshold.
@@ -110,13 +130,28 @@ func (n *NodeStatus) IsOnline(threshold time.Duration) bool {
 
 // HeartbeatPayload represents the heartbeat data sent from agent to controller (Item 92).
 type HeartbeatPayload struct {
-	Node           string             `json:"node"`
-	Version        string             `json:"version,omitempty"`
-	GoVersion      string             `json:"go_version,omitempty"`
-	BuildInfo      string             `json:"build_info,omitempty"`
-	MemoryMB       float64            `json:"memory_mb,omitempty"`
-	Goroutines     int                `json:"goroutines,omitempty"`
-	DBSizeMB       float64            `json:"db_size_mb,omitempty"`
-	Health         map[string]float64 `json:"health,omitempty"`
-	ConfigRevision string             `json:"config_revision,omitempty"`
+	NodeID                  string             `json:"node_id,omitempty"`
+	Node                    string             `json:"node"`
+	SentAt                  time.Time          `json:"sent_at,omitempty"`
+	Version                 string             `json:"version,omitempty"`
+	GoVersion               string             `json:"go_version,omitempty"`
+	BuildInfo               string             `json:"build_info,omitempty"`
+	MemoryMB                float64            `json:"memory_mb,omitempty"`
+	Goroutines              int                `json:"goroutines,omitempty"`
+	DBSizeMB                float64            `json:"db_size_mb,omitempty"`
+	Health                  map[string]float64 `json:"health,omitempty"`
+	ConfigRevision          string             `json:"config_revision,omitempty"`
+	DesiredConfigRevision   string             `json:"desired_config_revision,omitempty"`
+	PreviousConfigRevision  string             `json:"previous_config_revision,omitempty"`
+	ConfigSchemaVersion     int                `json:"config_schema_version,omitempty"`
+	ConfigSchemaCompatible  bool               `json:"config_schema_compatible"`
+	ConfigApplyError        string             `json:"config_apply_error,omitempty"`
+	ConfigApplyDurationMS   int64              `json:"config_apply_duration_ms"`
+	ForwarderBacklogDepth   int                `json:"forwarder_backlog_depth"`
+	ForwarderBacklogBytes   int64              `json:"forwarder_backlog_bytes"`
+	ForwarderBacklogOldestS float64            `json:"forwarder_backlog_oldest_seconds"`
+	ForwarderEndpointErrors map[string]string  `json:"forwarder_endpoint_errors,omitempty"`
+	LastIngestError         string             `json:"last_ingest_error,omitempty"`
+	LastHeartbeatError      string             `json:"last_heartbeat_error,omitempty"`
+	LastConfigSyncError     string             `json:"last_config_sync_error,omitempty"`
 }

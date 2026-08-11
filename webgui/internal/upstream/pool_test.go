@@ -73,6 +73,62 @@ func TestPoolStrictOrder(t *testing.T) {
 	}
 }
 
+func TestPoolChaosFailover(t *testing.T) {
+	const timeout = 250 * time.Millisecond
+	withTimeout := func(address string) string {
+		return "udp://" + address + "?timeout=" + timeout.String()
+	}
+	assertFailover := func(t *testing.T, primary string, primaryHits *atomic.Int32) {
+		t.Helper()
+		var fallbackHits atomic.Int32
+		fallback := startUDPUpstreamHandler(t, ipAnswerHandler(t, "9.9.9.9", 0, &fallbackHits))
+		pool := NewPool(PoolConfig{
+			Mode: ModeStrict, PrimarySpecs: []string{withTimeout(primary), fallback},
+		})
+
+		started := time.Now()
+		response, used, err := pool.Exchange(queryA())
+		if err != nil {
+			t.Fatalf("failover exchange: %v", err)
+		}
+		if elapsed := time.Since(started); elapsed > 2*time.Second {
+			t.Fatalf("failover exceeded bounded timeout: %s", elapsed)
+		}
+		if got := answerIP(t, response); got != "9.9.9.9" || used != fallback {
+			t.Fatalf("failover answer=%s used=%q, want fallback %q", got, used, fallback)
+		}
+		if primaryHits.Load() != 1 || fallbackHits.Load() != 1 {
+			t.Fatalf("upstream hits primary=%d fallback=%d, want 1/1", primaryHits.Load(), fallbackHits.Load())
+		}
+	}
+
+	t.Run("packet loss", func(t *testing.T) {
+		var hits atomic.Int32
+		primary := startUDPUpstreamHandler(t, func(dns.ResponseWriter, *dns.Msg) {
+			hits.Add(1) // Deliberately drop the datagram without replying.
+		})
+		assertFailover(t, primary, &hits)
+	})
+
+	t.Run("response delay", func(t *testing.T) {
+		var hits atomic.Int32
+		primary := startUDPUpstreamHandler(t, ipAnswerHandler(t, "1.1.1.1", 2*timeout, &hits))
+		assertFailover(t, primary, &hits)
+	})
+
+	t.Run("resolver protocol failure", func(t *testing.T) {
+		var hits atomic.Int32
+		primary := startUDPUpstreamHandler(t, func(w dns.ResponseWriter, request *dns.Msg) {
+			hits.Add(1)
+			response := new(dns.Msg)
+			response.SetReply(request)
+			response.Id++ // A mismatched transaction ID must be rejected.
+			_ = w.WriteMsg(response)
+		})
+		assertFailover(t, primary, &hits)
+	})
+}
+
 func TestPoolParallelFastestWins(t *testing.T) {
 	var slowHits, fastHits atomic.Int32
 	slow := startUDPUpstreamHandler(t, ipAnswerHandler(t, "1.1.1.1", 300*time.Millisecond, &slowHits))

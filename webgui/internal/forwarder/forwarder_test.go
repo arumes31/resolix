@@ -11,7 +11,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -21,6 +25,57 @@ import (
 	"github.com/arumes31/resolix/webgui/internal/configsync"
 	"github.com/arumes31/resolix/webgui/internal/models"
 )
+
+func TestStableNodeIdentityPersistsWithPrivatePermissions(t *testing.T) {
+	dir := t.TempDir()
+	first := &config.Config{HistoryDir: dir}
+	ensureNodeIdentity(first)
+	if !validNodeIdentity(first.NodeID) {
+		t.Fatalf("generated node identity = %q", first.NodeID)
+	}
+	second := &config.Config{HistoryDir: dir}
+	ensureNodeIdentity(second)
+	if second.NodeID != first.NodeID {
+		t.Fatalf("restored identity = %q, want %q", second.NodeID, first.NodeID)
+	}
+	info, err := os.Stat(filepath.Join(dir, nodeIdentityFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("node identity permissions = %o, want private", info.Mode().Perm())
+	}
+}
+
+func TestSanitizeDiagnosticRedactsStateAndControls(t *testing.T) {
+	cfg := &config.Config{IngestSecret: "secret-value", HistoryDir: "/private/history"}
+	got := sanitizeDiagnostic("failed\nsecret-value at /private/history", cfg)
+	if strings.Contains(got, "secret-value") || strings.Contains(got, "/private/history") || strings.ContainsAny(got, "\r\n") {
+		t.Fatalf("diagnostic was not sanitized: %q", got)
+	}
+}
+
+func TestDecodePersistedBacklogSupportsVersionedAndLegacyState(t *testing.T) {
+	item := persistedBacklogItem{Event: models.QueryEvent{Domain: "example.test"}, QueuedAt: time.Now()}
+	for name, value := range map[string]any{
+		"versioned": persistedBacklog{Version: backlogStateVersion, Items: []persistedBacklogItem{item}},
+		"legacy":    []persistedBacklogItem{item},
+	} {
+		t.Run(name, func(t *testing.T) {
+			data, err := json.Marshal(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			items, err := decodePersistedBacklog(data)
+			if err != nil || len(items) != 1 || items[0].Event.Domain != "example.test" {
+				t.Fatalf("decode = %+v, %v", items, err)
+			}
+		})
+	}
+	if _, err := decodePersistedBacklog([]byte(`{"version":99,"items":[]}`)); err == nil {
+		t.Fatal("unsupported backlog version was accepted")
+	}
+}
 
 // testEvents builds query events with the given domains for "test-node".
 func testEvents(domains ...string) []models.QueryEvent {

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/arumes31/resolix/webgui/internal/clients"
 	"github.com/arumes31/resolix/webgui/internal/dnsroutes"
+	"github.com/arumes31/resolix/webgui/internal/dnssettings"
 	"github.com/arumes31/resolix/webgui/internal/filter"
 	"github.com/arumes31/resolix/webgui/internal/models"
 	"github.com/arumes31/resolix/webgui/internal/policy"
@@ -47,6 +49,16 @@ const (
 	staticTTL = 60
 	// maxChainDepth caps CNAME/safe-search chase chains to avoid loops.
 	maxChainDepth = 8
+	// defaultEDNSUDPSize is the fragmentation-safe DNS payload size recommended
+	// by DNS Flag Day 2020. Larger client advertisements are clamped to it.
+	defaultEDNSUDPSize = 1232
+	// maxMissFlights bounds distinct concurrent cache-miss work so random-name
+	// floods cannot grow the coalescing map without limit.
+	maxMissFlights           = 1024
+	maxBackgroundRefreshes   = 64
+	defaultTCPIdleTimeout    = 8 * time.Second
+	defaultTCPMaxQueries     = 128
+	defaultTCPMaxConnections = 256
 )
 
 // Config holds the DNS server configuration.
@@ -72,6 +84,8 @@ type Config struct {
 	// BlockCustomIP4/IP6 are the answer addresses in custom_ip mode.
 	BlockCustomIP4 string
 	BlockCustomIP6 string
+	// BlockedResponseTTL is used for synthetic blocked A/AAAA answers.
+	BlockedResponseTTL uint32
 	// Rewrites is the typed-rewrite store (nil = fall back to StaticHosts).
 	Rewrites *rewrites.Store
 	// Policy holds safe-search / bogus-NXDOMAIN / AAAA / ANY policy (nil = off).
@@ -89,6 +103,13 @@ type Config struct {
 	CacheMinTTL     uint32
 	CacheMaxTTL     uint32
 	CacheOptimistic bool
+	// CachePrefetch refreshes frequently used entries shortly before expiry.
+	CachePrefetch       bool
+	CachePrefetchWindow time.Duration
+	CachePrefetchHits   uint32
+	// CacheSERVFAILTTL enables a bounded SERVFAIL micro-cache. Values above one
+	// second are clamped to one second; zero disables it.
+	CacheSERVFAILTTL time.Duration
 
 	// AllowedClients restricts service to these IPs/CIDRs when non-empty.
 	AllowedClients string
@@ -98,8 +119,20 @@ type Config struct {
 	RateLimitQPS int
 	// InternalRateLimitQPS limits LAN and Tailscale clients per IP (0 = disabled).
 	InternalRateLimitQPS int
+	// RateLimitEDE opts EDNS-capable clients into a small REFUSED response with
+	// EDE Prohibited. The default remains a silent drop to resist amplification.
+	RateLimitEDE bool
+	// RateLimitIPv4Prefix/IPv6Prefix aggregate clients into subnet buckets.
+	RateLimitIPv4Prefix int
+	RateLimitIPv6Prefix int
+	// RateLimitAllowlist bypasses query rate limiting for trusted IPs/CIDRs.
+	RateLimitAllowlist string
 	// PrivatePTR answers PTR for known private clients locally.
 	PrivatePTR bool
+	// PrivatePTRUpstreams route unknown private PTR queries to dedicated resolvers.
+	PrivatePTRUpstreams []string
+	// ResolveClientHostnames enriches events and local PTR answers from reverse DNS.
+	ResolveClientHostnames bool
 	// DNSSEC enables DO-bit passthrough to upstreams (no local validation).
 	DNSSEC bool
 	// Resolver is the reverse-DNS resolver used for private PTR fallback.
@@ -110,6 +143,11 @@ type Config struct {
 	DoTPort     int
 	TLSCertFile string
 	TLSKeyFile  string
+	// TCPIdleTimeout and TCPMaxQueries tune persistent DNS TCP/DoT sessions.
+	// TCPMaxConnections bounds active TCP and DoT connections across listeners.
+	TCPIdleTimeout    time.Duration
+	TCPMaxQueries     int
+	TCPMaxConnections int
 }
 
 // Server is the embedded DNS server.
@@ -127,6 +165,7 @@ type Server struct {
 	allowed             []*net.IPNet
 	allowedConfigured   bool
 	disallowed          []*net.IPNet
+	rateLimitAllowlist  []*net.IPNet
 	rateLimiter         *rateLimiter
 	rateLimitDropped    atomic.Int64
 	aclDropped          atomic.Int64
@@ -140,20 +179,76 @@ type Server struct {
 	// refreshInFlight tracks optimistic-cache background refreshes (single-flight).
 	refreshMu       sync.Mutex
 	refreshInFlight map[cacheKey]bool
+	refreshSlots    chan struct{}
+
+	missMu          sync.Mutex
+	missInFlight    map[cacheKey]*missFlight
+	cacheMutationMu sync.Mutex
+	cacheGeneration atomic.Uint64
+	tcpSlots        chan struct{}
+	// runtimeMu prevents live policy replacement from racing active queries.
+	// Listener and dependency fields in cfg remain immutable after startup.
+	runtimeMu sync.RWMutex
+}
+
+type missFlight struct {
+	done    chan struct{}
+	result  upstreamResult
+	waiters int
+}
+
+type upstreamResult struct {
+	upstream    string
+	msg         *dns.Msg
+	matchedRule string
+	blockReason string
 }
 
 // New creates a DNS server. emit is invoked synchronously for every answered
 // query with the event and whether the client is stats-excluded (typically
 // Store.AddEvent + Server.BroadcastEvent wiring from main).
 func New(cfg Config, emit func(models.QueryEvent, bool)) *Server {
+	if cfg.TCPIdleTimeout <= 0 {
+		cfg.TCPIdleTimeout = defaultTCPIdleTimeout
+	}
+	if cfg.TCPMaxQueries <= 0 {
+		cfg.TCPMaxQueries = defaultTCPMaxQueries
+	}
+	if cfg.TCPMaxConnections <= 0 {
+		cfg.TCPMaxConnections = defaultTCPMaxConnections
+	}
+	if cfg.RateLimitIPv4Prefix <= 0 {
+		cfg.RateLimitIPv4Prefix = 32
+	}
+	if cfg.RateLimitIPv6Prefix <= 0 {
+		cfg.RateLimitIPv6Prefix = 128
+	}
 	s := &Server{
 		cfg:             cfg,
 		cache:           newCache(cfg.CacheSize, cfg.CacheMinTTL, cfg.CacheMaxTTL),
 		emit:            emit,
 		refreshInFlight: make(map[cacheKey]bool),
+		refreshSlots:    make(chan struct{}, maxBackgroundRefreshes),
+		missInFlight:    make(map[cacheKey]*missFlight),
 		client: &dns.Client{
 			Timeout: upstreamTimeout,
+			UDPSize: defaultEDNSUDPSize,
 		},
+	}
+	if s.cfg.CachePrefetchWindow <= 0 {
+		s.cfg.CachePrefetchWindow = 30 * time.Second
+	}
+	if s.cfg.CachePrefetchHits == 0 {
+		s.cfg.CachePrefetchHits = 3
+	}
+	if s.cfg.CacheSERVFAILTTL > time.Second {
+		s.cfg.CacheSERVFAILTTL = time.Second
+	}
+	if s.cfg.CacheSERVFAILTTL < 0 {
+		s.cfg.CacheSERVFAILTTL = 0
+	}
+	if cfg.TCPMaxConnections > 0 {
+		s.tcpSlots = make(chan struct{}, cfg.TCPMaxConnections)
 	}
 	s.cache.optimistic = cfg.CacheOptimistic
 	for _, raw := range cfg.Upstreams {
@@ -169,13 +264,21 @@ func New(cfg Config, emit func(models.QueryEvent, bool)) *Server {
 	s.allowed = parseCIDRList(cfg.AllowedClients)
 	s.allowedConfigured = strings.TrimSpace(cfg.AllowedClients) != ""
 	s.disallowed = parseCIDRList(cfg.DisallowedClients)
-	if cfg.RateLimitQPS > 0 || cfg.InternalRateLimitQPS > 0 {
-		s.rateLimiter = newRateLimiter(cfg.RateLimitQPS)
-	}
+	s.rateLimitAllowlist = parseCIDRList(cfg.RateLimitAllowlist)
+	s.rateLimiter = newRateLimiter(cfg.RateLimitQPS)
 	handler := dns.HandlerFunc(s.ServeDNS)
-	s.udp = &dns.Server{Net: "udp", Handler: handler}
-	s.tcp = &dns.Server{Net: "tcp", Handler: handler}
+	s.udp = &dns.Server{Net: "udp", Handler: handler, UDPSize: defaultEDNSUDPSize}
+	s.tcp = newTCPServer("tcp", handler, cfg)
 	return s
+}
+
+func newTCPServer(network string, handler dns.Handler, cfg Config) *dns.Server {
+	server := &dns.Server{Net: network, Handler: handler, MaxTCPQueries: cfg.TCPMaxQueries}
+	if cfg.TCPIdleTimeout > 0 {
+		idleTimeout := cfg.TCPIdleTimeout
+		server.IdleTimeout = func() time.Duration { return idleTimeout }
+	}
+	return server
 }
 
 // ListenAddr returns the host:port the server binds to.
@@ -201,6 +304,47 @@ func (c resetTolerantConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		}
 		return n, addr, err
 	}
+}
+
+// connectionLimitListener rejects connections above a shared fixed limit.
+// The slot is released exactly once when the accepted connection closes.
+type connectionLimitListener struct {
+	net.Listener
+	slots chan struct{}
+}
+
+func (l connectionLimitListener) Accept() (net.Conn, error) {
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		select {
+		case l.slots <- struct{}{}:
+			return &slotConn{Conn: conn, release: func() { <-l.slots }}, nil
+		default:
+			_ = conn.Close()
+		}
+	}
+}
+
+type slotConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *slotConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
+}
+
+func (s *Server) limitTCPListener(listener net.Listener) net.Listener {
+	if listener == nil || s.tcpSlots == nil {
+		return listener
+	}
+	return connectionLimitListener{Listener: listener, slots: s.tcpSlots}
 }
 
 // Start binds the configured address and runs the listeners until ctx is
@@ -261,10 +405,11 @@ func (s *Server) startOn(ctx context.Context, udpConn net.PacketConn, tcpLn, dot
 	defer cancel()
 
 	s.udp.PacketConn = resetTolerantConn{udpConn}
-	s.tcp.Listener = tcpLn
+	s.tcp.Listener = s.limitTCPListener(tcpLn)
 	servers := []*dns.Server{s.udp, s.tcp}
 	if dotLn != nil {
-		s.dot = &dns.Server{Net: "tcp-tls", Listener: dotLn, Handler: dns.HandlerFunc(s.ServeDNS)}
+		s.dot = newTCPServer("tcp-tls", dns.HandlerFunc(s.ServeDNS), s.cfg)
+		s.dot.Listener = s.limitTCPListener(dotLn)
 		servers = append(servers, s.dot)
 	}
 
@@ -298,16 +443,31 @@ func (s *Server) startOn(ctx context.Context, udpConn net.PacketConn, tcpLn, dot
 type resolution struct {
 	upstream    string
 	cacheHit    bool
+	cacheState  string
 	blocked     bool
 	matchedRule string
 	blockReason string
+	cacheTTL    uint32
+	negativeSOA string
+	ede         *dns.EDNS0_EDE
 }
+
+const (
+	cacheStateFresh      = "fresh"
+	cacheStateStale      = "stale"
+	cacheStatePrefetched = "prefetched"
+	cacheStateNegative   = "negative"
+	cacheStateCoalesced  = "coalesced"
+	cacheStateSERVFAIL   = "servfail"
+)
 
 // Resolve answers a query message through the full pipeline and emits the
 // query event. It returns drop=true for deny-list matches, allow-list misses,
 // and rate-limit excess so DNS listeners emit no response. Shared by the
 // UDP/TCP/DoT listeners and the DoH endpoint.
 func (s *Server) Resolve(r *dns.Msg, clientIP string) (resp *dns.Msg, drop bool) {
+	s.runtimeMu.RLock()
+	defer s.runtimeMu.RUnlock()
 	start := time.Now()
 
 	resp = new(dns.Msg)
@@ -330,8 +490,20 @@ func (s *Server) Resolve(r *dns.Msg, clientIP string) (resp *dns.Msg, drop bool)
 	if isInternalClientIP(clientIP) {
 		rateLimitQPS = s.cfg.InternalRateLimitQPS
 	}
-	if s.rateLimiter != nil && !s.rateLimiter.allowAtRate(clientIP, rateLimitQPS) {
+	if s.rateLimiter != nil && !cidrListContains(s.rateLimitAllowlist, clientIP) &&
+		!s.rateLimiter.allowAtRate(
+			clientIP,
+			rateLimitQPS,
+			s.cfg.RateLimitIPv4Prefix,
+			s.cfg.RateLimitIPv6Prefix,
+		) {
 		s.rateLimitDropped.Add(1)
+		if s.cfg.RateLimitEDE && r.IsEdns0() != nil {
+			resp.Rcode = dns.RcodeRefused
+			resp.Extra = responseExtra(r, nil)
+			addExtendedError(resp, r, dns.ExtendedErrorCodeProhibited, "rate limit exceeded")
+			return resp, false
+		}
 		return nil, true
 	}
 
@@ -341,7 +513,10 @@ func (s *Server) Resolve(r *dns.Msg, clientIP string) (resp *dns.Msg, drop bool)
 		cl = s.cfg.Clients.Find(clientIP)
 	}
 
-	res := s.resolve(r, resp, 0, cl, clientIP)
+	res := s.resolve(r, resp, 0, cl, clientIP, make(map[string]struct{}))
+	if res.ede != nil {
+		addExtendedError(resp, r, res.ede.InfoCode, res.ede.ExtraText)
+	}
 	if s.cfg.Policy != nil && s.cfg.Policy.AAAADisabled && len(r.Question) > 0 &&
 		(r.Question[0].Qtype == dns.TypeHTTPS || r.Question[0].Qtype == dns.TypeSVCB) {
 		stripIPv6Hints(resp.Answer)
@@ -386,7 +561,15 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	if drop || resp == nil {
 		return
 	}
+	if isUDPNetwork(w.LocalAddr()) {
+		resp = resp.Copy()
+		resp.Truncate(int(clientUDPSize(r)))
+	}
 	_ = w.WriteMsg(resp)
+}
+
+func isUDPNetwork(addr net.Addr) bool {
+	return addr != nil && strings.HasPrefix(strings.ToLower(addr.Network()), "udp")
 }
 
 // resolve runs the request pipeline and fills resp.
@@ -396,18 +579,35 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 // filtering) → cache →
 // forward (client upstreams → per-domain route → global pool) →
 // bogus-NXDOMAIN conversion → cache store. depth bounds chase chains.
-func (s *Server) resolve(r *dns.Msg, resp *dns.Msg, depth int, cl *clients.Client, clientIP string) resolution {
-	if len(r.Question) == 0 {
+func (s *Server) resolve(
+	r *dns.Msg,
+	resp *dns.Msg,
+	depth int,
+	cl *clients.Client,
+	clientIP string,
+	cnamePath map[string]struct{},
+) resolution {
+	if r.Response || r.Opcode != dns.OpcodeQuery || len(r.Question) != 1 {
 		resp.Rcode = dns.RcodeFormatError
+		resp.Extra = responseExtra(r, nil)
+		addExtendedError(resp, r, dns.ExtendedErrorCodeInvalidData, "expected one standard DNS query question")
 		return resolution{}
 	}
 	q := r.Question[0]
+	if _, valid := dns.IsDomainName(q.Name); !valid {
+		resp.Rcode = dns.RcodeFormatError
+		resp.Extra = responseExtra(r, nil)
+		addExtendedError(resp, r, dns.ExtendedErrorCodeInvalidData, "invalid question name")
+		return resolution{}
+	}
 	domain := normalizeName(q.Name)
 
 	// Early policy short-circuits (before rewrites).
 	if s.cfg.Policy != nil {
 		if s.cfg.Policy.RefuseANY && q.Qtype == dns.TypeANY {
 			resp.Rcode = dns.RcodeRefused
+			resp.Extra = responseExtra(r, nil)
+			addExtendedError(resp, r, dns.ExtendedErrorCodeProhibited, "ANY queries are disabled")
 			return resolution{upstream: "Policy", matchedRule: "REFUSE_ANY", blockReason: policy.ReasonRefusedANY}
 		}
 		if s.cfg.Policy.AAAADisabled && q.Qtype == dns.TypeAAAA {
@@ -417,7 +617,7 @@ func (s *Server) resolve(r *dns.Msg, resp *dns.Msg, depth int, cl *clients.Clien
 	}
 
 	// Stage 1: typed rewrites (short-circuit, pre-cache).
-	if res, handled := s.stageRewrites(r, q, resp, depth, cl, clientIP); handled {
+	if res, handled := s.stageRewrites(r, q, resp, depth, cl, clientIP, cnamePath); handled {
 		return res
 	}
 
@@ -427,7 +627,7 @@ func (s *Server) resolve(r *dns.Msg, resp *dns.Msg, depth int, cl *clients.Clien
 	}
 
 	// Stage 2: safe search (global engines or per-client override).
-	if res, handled := s.stageSafeSearch(r, q, resp, depth, cl, clientIP); handled {
+	if res, handled := s.stageSafeSearch(r, q, resp, depth, cl, clientIP, cnamePath); handled {
 		return res
 	}
 
@@ -439,6 +639,8 @@ func (s *Server) resolve(r *dns.Msg, resp *dns.Msg, depth int, cl *clients.Clien
 			blockedResp := s.blockedResponse(r, q)
 			resp.Rcode = blockedResp.Rcode
 			resp.Answer = blockedResp.Answer
+			resp.Extra = responseExtra(r, nil)
+			addExtendedError(resp, r, dns.ExtendedErrorCodeFiltered, "blocked by filtering policy")
 			return resolution{upstream: "Filtered", blocked: true, matchedRule: f.Rule, blockReason: f.Reason}
 		}
 	}
@@ -447,7 +649,13 @@ func (s *Server) resolve(r *dns.Msg, resp *dns.Msg, depth int, cl *clients.Clien
 	// custom upstreams get a distinct cache group so their answers never
 	// pollute the shared global cache.
 	group, specs := clientUpstreamGroup(cl)
-	key := cacheKey{name: domain, qtype: q.Qtype, qclass: q.Qclass, group: group}
+	if q.Qtype == dns.TypePTR {
+		if ip := arpaToIP(q.Name); ip != nil && isPrivateIP(ip) && len(s.cfg.PrivatePTRUpstreams) > 0 {
+			specs = s.cfg.PrivatePTRUpstreams
+			group = "private-ptr:" + strings.Join(specs, ",")
+		}
+	}
+	key := s.makeCacheKey(r, q, domain, group, cl)
 	return s.resolveViaCacheOrUpstream(r, resp, key, specs)
 }
 
@@ -465,15 +673,70 @@ func clientUpstreamGroup(cl *clients.Client) (group string, specs []string) {
 	return "up:" + strings.Join(cl.Upstreams, ","), cl.Upstreams
 }
 
+// makeCacheKey includes every request dimension that can change an upstream
+// response. Configuration swaps should additionally call the targeted
+// invalidation methods so unreachable generations do not consume capacity.
+func (s *Server) makeCacheKey(r *dns.Msg, q dns.Question, domain, group string, cl *clients.Client) cacheKey {
+	key := cacheKey{
+		name: domain, qtype: q.Qtype, qclass: q.Qclass, group: group,
+		cd: r.CheckingDisabled, policy: clientPolicyScope(cl),
+	}
+	if opt := r.IsEdns0(); opt != nil {
+		key.do = opt.Do()
+		key.ecs = ecsScope(opt)
+	}
+	if group == "" && s.cfg.Routes != nil {
+		key.route = s.cfg.Routes.GetUpstreamForDomain(domain)
+	}
+	return key
+}
+
+func clientPolicyScope(cl *clients.Client) string {
+	if cl == nil || cl.UseGlobalSettings {
+		return "global"
+	}
+	return strings.Join([]string{
+		"custom",
+		strconv.FormatBool(cl.FilteringEnabled),
+		strconv.FormatBool(cl.SafeSearchEnabled),
+		strings.Join(cl.SafeSearchEngines, ","),
+		strings.Join(cl.Upstreams, ","),
+	}, "|")
+}
+
+func ecsScope(opt *dns.OPT) string {
+	var scopes []string
+	for _, option := range opt.Option {
+		subnet, ok := option.(*dns.EDNS0_SUBNET)
+		if !ok {
+			continue
+		}
+		address := subnet.Address
+		bits := 128
+		if subnet.Family == 1 {
+			address = address.To4()
+			bits = 32
+		}
+		if address == nil || int(subnet.SourceNetmask) > bits {
+			scopes = append(scopes, fmt.Sprintf("%d/%d/%d/invalid", subnet.Family, subnet.SourceNetmask, subnet.SourceScope))
+			continue
+		}
+		masked := address.Mask(net.CIDRMask(int(subnet.SourceNetmask), bits))
+		scopes = append(scopes, fmt.Sprintf("%d/%d/%d/%s", subnet.Family, subnet.SourceNetmask, subnet.SourceScope, masked))
+	}
+	return strings.Join(scopes, ";")
+}
+
 // stageRewrites applies typed rewrites from the store (or the legacy
 // StaticHosts fallback). handled is true when a rewrite answered the query.
 func (s *Server) stageRewrites(
-	_ *dns.Msg,
+	request *dns.Msg,
 	q dns.Question,
 	resp *dns.Msg,
 	depth int,
 	cl *clients.Client,
 	clientIP string,
+	cnamePath map[string]struct{},
 ) (resolution, bool) {
 	domain := normalizeName(q.Name)
 
@@ -535,7 +798,7 @@ func (s *Server) stageRewrites(
 			if e.Type != rewrites.TypeCNAME {
 				continue
 			}
-			return s.chaseCNAME(q, resp, e.Value, e.String(), "Rewrite", "Rewrite", depth, cl, clientIP), true
+			return s.chaseCNAME(request, q, resp, e.Value, e.String(), "Rewrite", "Rewrite", depth, cl, clientIP, cnamePath), true
 		}
 	}
 
@@ -547,12 +810,13 @@ func (s *Server) stageRewrites(
 // restricted variants (pre-cache, like rewrites). Clients with global
 // settings disabled use their own engine list (or inherit the global set).
 func (s *Server) stageSafeSearch(
-	_ *dns.Msg,
+	request *dns.Msg,
 	q dns.Question,
 	resp *dns.Msg,
 	depth int,
 	cl *clients.Client,
 	clientIP string,
+	cnamePath map[string]struct{},
 ) (resolution, bool) {
 	target := ""
 	switch {
@@ -576,6 +840,7 @@ func (s *Server) stageSafeSearch(
 	// the pipeline and return both the CNAME and the target's records.
 	if q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA || q.Qtype == dns.TypeCNAME {
 		return s.chaseCNAME(
+			request,
 			q,
 			resp,
 			target,
@@ -585,6 +850,7 @@ func (s *Server) stageSafeSearch(
 			depth,
 			cl,
 			clientIP,
+			cnamePath,
 		), true
 	}
 	// Other types get just the CNAME record.
@@ -598,6 +864,7 @@ func (s *Server) stageSafeSearch(
 // chaseCNAME appends the CNAME record and resolves the target through the
 // rest of the pipeline (filter/cache/forward), merging the answers.
 func (s *Server) chaseCNAME(
+	request *dns.Msg,
 	q dns.Question,
 	resp *dns.Msg,
 	target string,
@@ -607,40 +874,62 @@ func (s *Server) chaseCNAME(
 	depth int,
 	cl *clients.Client,
 	clientIP string,
+	cnamePath map[string]struct{},
 ) resolution {
-	if depth >= maxChainDepth {
+	source := normalizeName(q.Name)
+	normalizedTarget := normalizeName(target)
+	if _, seen := cnamePath[normalizedTarget]; seen || normalizedTarget == source || depth >= maxChainDepth {
 		resp.Rcode = dns.RcodeServerFailure
-		return resolution{upstream: label, matchedRule: rule + " (chain depth exceeded)", blockReason: reason}
+		return resolution{
+			upstream:    label,
+			matchedRule: fmt.Sprintf("%s (CNAME loop at %s -> %s)", rule, source, normalizedTarget),
+			blockReason: "CNAME_LOOP",
+			ede: &dns.EDNS0_EDE{
+				InfoCode:  dns.ExtendedErrorCodeOther,
+				ExtraText: "CNAME loop detected",
+			},
+		}
 	}
+	cnamePath[source] = struct{}{}
 	fqdn := dns.Fqdn(target)
 	cname := &dns.CNAME{
 		Hdr:    dns.RR_Header{Name: q.Name, Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: staticTTL},
 		Target: fqdn,
 	}
-	sub := new(dns.Msg)
-	sub.SetQuestion(fqdn, q.Qtype)
+	sub := request.Copy()
+	sub.Response = false
+	sub.Question = []dns.Question{{Name: fqdn, Qtype: q.Qtype, Qclass: q.Qclass}}
+	sub.Answer = nil
+	sub.Ns = nil
 	subResp := new(dns.Msg)
 	subResp.SetReply(sub)
 	subResp.RecursionAvailable = true
-	subResolution := s.resolve(sub, subResp, depth+1, cl, clientIP)
+	subResolution := s.resolve(sub, subResp, depth+1, cl, clientIP, cnamePath)
 
 	resp.Rcode = subResp.Rcode
 	resp.Answer = append([]dns.RR{cname}, subResp.Answer...)
 	resp.Ns = subResp.Ns
+	if subResolution.blockReason == "CNAME_LOOP" {
+		return subResolution
+	}
 	return resolution{upstream: label, blocked: subResolution.blocked, matchedRule: rule, blockReason: reason}
 }
 
 // blockedResponse builds the response for a filtered query according to the
-// configured blocking mode, with TTL 60 per existing conventions.
+// configured blocking mode and response TTL.
 func (s *Server) blockedResponse(r *dns.Msg, question dns.Question) *dns.Msg {
 	resp := new(dns.Msg)
 	resp.SetReply(r)
 	resp.RecursionAvailable = true
 
+	ttl := s.cfg.BlockedResponseTTL
+	if ttl == 0 {
+		ttl = staticTTL
+	}
 	hdr := dns.RR_Header{
 		Name:   question.Name,
 		Class:  dns.ClassINET,
-		Ttl:    staticTTL,
+		Ttl:    ttl,
 		Rrtype: question.Qtype,
 	}
 	switch s.cfg.BlockingMode {
@@ -691,52 +980,174 @@ func (s *Server) staticHosts() map[string]net.IP {
 func (s *Server) resolveViaCacheOrUpstream(r *dns.Msg, resp *dns.Msg, key cacheKey, specs []string) resolution {
 	// Stage: cache lookup.
 	if ent, remaining, ok := s.cache.get(key); ok {
-		resp.Rcode = ent.rcode
-		resp.AuthenticatedData = ent.authenticatedData
-		resp.Answer = withTTL(ent.answers, remaining)
-		resp.Ns = withTTL(ent.authority, remaining)
-		resp.Extra = responseExtra(r, nil)
-		return resolution{upstream: "System Cache", cacheHit: true}
+		applyCacheEntry(resp, r, ent, remaining)
+		state, label := cacheEntryState(ent)
+		if s.shouldPrefetch(ent, remaining) {
+			s.refreshAsync(key, r.Copy(), specs, true)
+		}
+		return resolution{
+			upstream: label, cacheHit: true, cacheState: state,
+			cacheTTL: remaining, negativeSOA: ent.negativeSOA,
+		}
 	}
 
 	// Optimistic caching: serve the stale entry with TTL 1 and refresh in
 	// the background (single-flight per key).
 	if s.cfg.CacheOptimistic {
 		if ent, ok := s.cache.getStale(key); ok {
-			resp.Rcode = ent.rcode
-			resp.AuthenticatedData = ent.authenticatedData
-			resp.Answer = withTTL(ent.answers, 1)
-			resp.Ns = withTTL(ent.authority, 1)
-			resp.Extra = responseExtra(r, nil)
-			s.refreshAsync(key, r, specs)
-			return resolution{upstream: "System Cache (stale)", cacheHit: true}
+			applyCacheEntry(resp, r, ent, 1)
+			code := dns.ExtendedErrorCodeStaleAnswer
+			label := "System Cache (stale)"
+			if ent.negative {
+				code = dns.ExtendedErrorCodeStaleNXDOMAINAnswer
+				label = "System Cache (stale negative)"
+			}
+			addExtendedError(resp, r, code, "stale answer served while refreshing")
+			s.refreshAsync(key, r.Copy(), specs, false)
+			return resolution{
+				upstream: label, cacheHit: true, cacheState: cacheStateStale,
+				cacheTTL: 1, negativeSOA: ent.negativeSOA,
+			}
 		}
 	}
 
-	// Stage: forward (client upstreams → route → global pool).
-	usedUpstream, m := s.forward(r, specs)
-	if m == nil {
+	// Coalesce concurrent misses for the same complete cache key. If the
+	// bounded flight table is full, the caller proceeds independently.
+	generation := s.cacheGeneration.Load()
+	flight, leader := s.beginMissFlight(key)
+	if flight == nil {
 		resp.Rcode = dns.RcodeServerFailure
-		return resolution{upstream: usedUpstream}
+		resp.Extra = responseExtra(r, nil)
+		addExtendedError(resp, r, dns.ExtendedErrorCodeNetworkError, "upstream concurrency limit reached")
+		return resolution{upstream: "Overloaded", blockReason: "UPSTREAM_CAPACITY"}
+	}
+	if !leader {
+		<-flight.done
+		s.cache.coalesced.Add(1)
+		result := cloneUpstreamResult(flight.result)
+		s.applyUpstreamResult(resp, r, result)
+		return resolution{
+			upstream: result.upstream, cacheState: cacheStateCoalesced,
+			matchedRule: result.matchedRule, blockReason: result.blockReason,
+		}
 	}
 
-	// Stage: bogus-NXDOMAIN conversion (anti-poisoning) — runs before the
-	// cache store so converted answers never poison the cache.
-	if s.cfg.Policy != nil && s.cfg.Policy.IsBogusAnswer(m.Answer) {
+	result := s.fetchUpstreamResult(r, specs)
+	if result.msg != nil {
+		s.storeInCacheIfGeneration(key, result.msg, false, generation)
+	}
+	s.completeMissFlight(key, flight, result)
+	s.applyUpstreamResult(resp, r, result)
+	return resolution{
+		upstream:    result.upstream,
+		matchedRule: result.matchedRule,
+		blockReason: result.blockReason,
+	}
+}
+
+func applyCacheEntry(resp, request *dns.Msg, ent *cacheEntry, ttl uint32) {
+	resp.Rcode = ent.rcode
+	resp.AuthenticatedData = ent.authenticatedData
+	resp.Answer = withTTL(ent.answers, ttl)
+	resp.Ns = withTTL(ent.authority, ttl)
+	resp.Extra = responseExtra(request, nil)
+	if ent.servfail {
+		addExtendedError(resp, request, dns.ExtendedErrorCodeCachedError, "cached upstream failure")
+	}
+}
+
+func cacheEntryState(ent *cacheEntry) (state, label string) {
+	switch {
+	case ent.prefetched && ent.negative:
+		return cacheStatePrefetched, "System Cache (prefetched negative)"
+	case ent.prefetched:
+		return cacheStatePrefetched, "System Cache (prefetched)"
+	case ent.negative:
+		return cacheStateNegative, "System Cache (negative)"
+	case ent.servfail:
+		return cacheStateSERVFAIL, "System Cache (servfail)"
+	default:
+		return cacheStateFresh, "System Cache"
+	}
+}
+
+func (s *Server) shouldPrefetch(ent *cacheEntry, remaining uint32) bool {
+	return s.cfg.CachePrefetch && ent.hits >= s.cfg.CachePrefetchHits &&
+		time.Duration(remaining)*time.Second <= s.cfg.CachePrefetchWindow
+}
+
+func (s *Server) fetchUpstreamResult(r *dns.Msg, specs []string) upstreamResult {
+	usedUpstream, message := s.forward(r, specs)
+	if message == nil {
+		message = new(dns.Msg)
+		message.SetReply(r)
+		message.Rcode = dns.RcodeServerFailure
+		return upstreamResult{upstream: usedUpstream, msg: message}
+	}
+
+	// Bogus-NXDOMAIN conversion runs before cache storage. The converted
+	// response is intentionally not cacheable because it has no authority SOA.
+	if s.cfg.Policy != nil && s.cfg.Policy.IsBogusAnswer(message.Answer) {
 		s.bogusNXHits.Add(1)
-		resp.Rcode = dns.RcodeNameError
-		return resolution{upstream: usedUpstream, matchedRule: "BOGUS_NXDOMAIN", blockReason: policy.ReasonBogusNX}
+		converted := new(dns.Msg)
+		converted.SetReply(r)
+		converted.Rcode = dns.RcodeNameError
+		return upstreamResult{
+			upstream: usedUpstream, msg: converted,
+			matchedRule: "BOGUS_NXDOMAIN", blockReason: policy.ReasonBogusNX,
+		}
 	}
+	return upstreamResult{upstream: usedUpstream, msg: message}
+}
 
-	resp.Rcode = m.Rcode
-	resp.AuthenticatedData = m.AuthenticatedData
-	resp.Answer = m.Answer
-	resp.Ns = m.Ns
-	resp.Extra = responseExtra(r, m.Extra)
+func (s *Server) applyUpstreamResult(resp, request *dns.Msg, result upstreamResult) {
+	if result.msg == nil {
+		resp.Rcode = dns.RcodeServerFailure
+		resp.Extra = responseExtra(request, nil)
+		addExtendedError(resp, request, dns.ExtendedErrorCodeNetworkError, "no reachable upstream")
+		return
+	}
+	resp.Rcode = result.msg.Rcode
+	resp.AuthenticatedData = result.msg.AuthenticatedData
+	resp.Answer = copyRRs(result.msg.Answer)
+	resp.Ns = copyRRs(result.msg.Ns)
+	resp.Extra = responseExtra(request, result.msg.Extra)
+	if result.msg.Rcode == dns.RcodeServerFailure {
+		addExtendedError(resp, request, dns.ExtendedErrorCodeNetworkError, "no reachable upstream")
+	}
+}
 
-	// Stage: cache store.
-	s.storeInCache(key, m)
-	return resolution{upstream: usedUpstream}
+func cloneUpstreamResult(result upstreamResult) upstreamResult {
+	if result.msg != nil {
+		result.msg = result.msg.Copy()
+	}
+	return result
+}
+
+func (s *Server) beginMissFlight(key cacheKey) (*missFlight, bool) {
+	s.missMu.Lock()
+	defer s.missMu.Unlock()
+	if flight, ok := s.missInFlight[key]; ok {
+		flight.waiters++
+		return flight, false
+	}
+	if len(s.missInFlight) >= maxMissFlights {
+		return nil, false
+	}
+	flight := &missFlight{done: make(chan struct{})}
+	s.missInFlight[key] = flight
+	return flight, true
+}
+
+func (s *Server) completeMissFlight(key cacheKey, flight *missFlight, result upstreamResult) {
+	if flight == nil {
+		return
+	}
+	s.missMu.Lock()
+	flight.result = cloneUpstreamResult(result)
+	delete(s.missInFlight, key)
+	close(flight.done)
+	s.missMu.Unlock()
 }
 
 // responseExtra preserves non-OPT additional records from upstream and
@@ -756,34 +1167,126 @@ func responseExtra(request *dns.Msg, upstreamExtra []dns.RR) []dns.RR {
 	opt := new(dns.OPT)
 	opt.Hdr.Name = "."
 	opt.Hdr.Rrtype = dns.TypeOPT
-	opt.SetUDPSize(requestOPT.UDPSize())
+	opt.SetUDPSize(clientUDPSize(request))
 	opt.SetVersion(requestOPT.Version())
 	opt.SetDo(requestOPT.Do())
 	return append(extra, opt)
 }
 
+func clientUDPSize(request *dns.Msg) uint16 {
+	if request == nil {
+		return dns.MinMsgSize
+	}
+	requestOPT := request.IsEdns0()
+	if requestOPT == nil {
+		return dns.MinMsgSize
+	}
+	size := requestOPT.UDPSize()
+	if size < dns.MinMsgSize {
+		return dns.MinMsgSize
+	}
+	if size > defaultEDNSUDPSize {
+		return defaultEDNSUDPSize
+	}
+	return size
+}
+
+func addExtendedError(resp, request *dns.Msg, code uint16, text string) {
+	if request == nil || request.IsEdns0() == nil {
+		return
+	}
+	opt := resp.IsEdns0()
+	if opt == nil {
+		resp.Extra = responseExtra(request, resp.Extra)
+		opt = resp.IsEdns0()
+	}
+	if opt == nil {
+		return
+	}
+	opt.Option = append(opt.Option, &dns.EDNS0_EDE{InfoCode: code, ExtraText: text})
+}
+
 // refreshAsync repopulates a stale cache entry in the background,
 // single-flight per key. No event is emitted (not a client query).
-func (s *Server) refreshAsync(key cacheKey, r *dns.Msg, specs []string) {
+func (s *Server) refreshAsync(key cacheKey, r *dns.Msg, specs []string, prefetch bool) {
+	generation := s.cacheGeneration.Load()
+	select {
+	case s.refreshSlots <- struct{}{}:
+	default:
+		return
+	}
 	s.refreshMu.Lock()
 	if s.refreshInFlight[key] {
 		s.refreshMu.Unlock()
+		<-s.refreshSlots
 		return
 	}
 	s.refreshInFlight[key] = true
 	s.refreshMu.Unlock()
 
 	go func() {
+		s.runtimeMu.RLock()
+		defer s.runtimeMu.RUnlock()
 		defer func() {
+			<-s.refreshSlots
 			s.refreshMu.Lock()
 			delete(s.refreshInFlight, key)
 			s.refreshMu.Unlock()
 		}()
-		if _, m := s.forward(r, specs); m != nil {
-			s.storeInCache(key, m)
+		result := s.fetchUpstreamResult(r, specs)
+		if result.msg != nil && result.msg.Rcode != dns.RcodeServerFailure &&
+			s.storeInCacheIfGeneration(key, result.msg, prefetch, generation) {
 			s.cache.refreshes.Add(1)
+			if prefetch {
+				s.cache.prefetches.Add(1)
+			}
 		}
 	}()
+}
+
+// ApplySettings replaces live-safe DNS behavior. Active requests finish with
+// one coherent policy while new requests observe the replacement.
+func (s *Server) ApplySettings(settings dnssettings.Settings) {
+	settings = settings.Normalize()
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
+	s.cfg.BlockingMode = settings.BlockingMode
+	s.cfg.BlockCustomIP4 = settings.BlockCustomIPv4
+	s.cfg.BlockCustomIP6 = settings.BlockCustomIPv6
+	s.cfg.BlockedResponseTTL = settings.BlockedResponseTTL
+	s.cfg.Policy = policy.New(policy.Config{
+		SafeSearch:   settings.SafeSearch,
+		BogusNets:    settings.BogusNXDOMAIN,
+		AAAADisabled: settings.AAAADisabled,
+		RefuseANY:    settings.RefuseANY,
+	})
+	s.cfg.AllowedClients = strings.Join(settings.AllowedClients, " ")
+	s.cfg.DisallowedClients = strings.Join(settings.DisallowedClients, " ")
+	s.allowed = parseCIDRList(s.cfg.AllowedClients)
+	s.allowedConfigured = len(settings.AllowedClients) > 0
+	s.disallowed = parseCIDRList(s.cfg.DisallowedClients)
+	s.cfg.RateLimitQPS = settings.RateLimitQPS
+	s.cfg.InternalRateLimitQPS = settings.InternalRateLimitQPS
+	s.cfg.RateLimitEDE = settings.RateLimitEDE
+	s.cfg.RateLimitIPv4Prefix = settings.RateLimitIPv4Prefix
+	s.cfg.RateLimitIPv6Prefix = settings.RateLimitIPv6Prefix
+	s.cfg.RateLimitAllowlist = strings.Join(settings.RateLimitAllowlist, " ")
+	s.rateLimitAllowlist = parseCIDRList(s.cfg.RateLimitAllowlist)
+	s.cfg.PrivatePTR = settings.PrivatePTR
+	s.cfg.PrivatePTRUpstreams = append([]string(nil), settings.PrivatePTRUpstreams...)
+	s.cfg.ResolveClientHostnames = settings.ResolveClientHostnames
+	s.cfg.DNSSEC = settings.DNSSEC
+	s.cfg.CacheOptimistic = settings.CacheOptimistic
+	s.cfg.CachePrefetch = settings.CachePrefetch
+	s.cfg.CachePrefetchWindow = time.Duration(settings.CachePrefetchWindowMS) * time.Millisecond
+	s.cfg.CachePrefetchHits = settings.CachePrefetchHits
+	s.cfg.CacheSERVFAILTTL = time.Duration(settings.CacheSERVFAILTTLMS) * time.Millisecond
+	s.cache.reconfigure(
+		settings.CacheSize,
+		settings.CacheMinTTL,
+		settings.CacheMaxTTL,
+		settings.CacheOptimistic,
+	)
 }
 
 // forward resolves r through the upstream pool. Per-client custom upstreams
@@ -796,9 +1299,10 @@ func (s *Server) forward(r *dns.Msg, specs []string) (string, *dns.Msg) {
 	// toggle applies even when the client supplied its own OPT record.
 	r = r.Copy()
 	if opt := r.IsEdns0(); opt != nil {
+		opt.SetUDPSize(defaultEDNSUDPSize)
 		opt.SetDo(s.cfg.DNSSEC)
-	} else if s.cfg.DNSSEC {
-		r.SetEdns0(1232, true)
+	} else {
+		r.SetEdns0(defaultEDNSUDPSize, s.cfg.DNSSEC)
 	}
 	if s.cfg.Pool != nil {
 		if len(specs) > 0 {
@@ -848,12 +1352,42 @@ func (s *Server) forward(r *dns.Msg, specs []string) (string, *dns.Msg) {
 // storeInCache caches a forwarded response with clamped TTLs, including
 // negative answers (NXDOMAIN/NODATA) keyed off the SOA TTL (max 600s).
 func (s *Server) storeInCache(key cacheKey, m *dns.Msg) {
+	s.cacheMutationMu.Lock()
+	defer s.cacheMutationMu.Unlock()
+	s.storeInCacheWithSource(key, m, false)
+}
+
+// storeInCacheIfGeneration publishes a fetched response only when no cache
+// invalidation has completed since the fetch started. The generation check and
+// cache mutation share the same lock as invalidation, making the operation
+// linearizable: either the store precedes an invalidation and is removed by it,
+// or it follows the invalidation and is rejected as stale.
+func (s *Server) storeInCacheIfGeneration(
+	key cacheKey,
+	m *dns.Msg,
+	prefetched bool,
+	generation uint64,
+) bool {
+	s.cacheMutationMu.Lock()
+	defer s.cacheMutationMu.Unlock()
+	if generation != s.cacheGeneration.Load() {
+		return false
+	}
+	s.storeInCacheWithSource(key, m, prefetched)
+	return true
+}
+
+func (s *Server) storeInCacheWithSource(key cacheKey, m *dns.Msg, prefetched bool) {
+	if m == nil || m.Truncated {
+		return
+	}
 	ent := &cacheEntry{
 		answers:           copyRRs(m.Answer),
 		authority:         copyRRs(m.Ns),
 		rcode:             m.Rcode,
 		authenticatedData: m.AuthenticatedData,
 		storedAt:          time.Now(),
+		prefetched:        prefetched,
 	}
 
 	switch {
@@ -862,7 +1396,7 @@ func (s *Server) storeInCache(key cacheKey, m *dns.Msg) {
 		ent.ttl = s.cache.clamp(minAnswerTTL(m.Answer))
 	case m.Rcode == dns.RcodeNameError || (m.Rcode == dns.RcodeSuccess && len(m.Answer) == 0):
 		// Negative answer (NXDOMAIN/NODATA): SOA TTL clamped to the max.
-		ttl, ok := soaTTL(m.Ns)
+		ttl, origin, ok := soaMetadata(m.Ns)
 		if !ok {
 			return
 		}
@@ -873,6 +1407,11 @@ func (s *Server) storeInCache(key cacheKey, m *dns.Msg) {
 			return
 		}
 		ent.ttl = ttl
+		ent.negative = true
+		ent.negativeSOA = origin
+	case m.Rcode == dns.RcodeServerFailure && s.cfg.CacheSERVFAILTTL > 0:
+		ent.ttl = 1
+		ent.servfail = true
 	default:
 		// SERVFAIL and other rcodes are not cached.
 		return
@@ -905,6 +1444,9 @@ func (s *Server) buildEvent(r, resp *dns.Msg, clientIP string, cl *clients.Clien
 		Blocked:     res.blocked,
 		MatchedRule: res.matchedRule,
 		BlockReason: res.blockReason,
+		CacheStatus: res.cacheState,
+		CacheTTL:    res.cacheTTL,
+		NegativeSOA: res.negativeSOA,
 	}
 	if len(r.Question) > 0 {
 		ev.Type = dns.TypeToString[r.Question[0].Qtype]
@@ -912,6 +1454,9 @@ func (s *Server) buildEvent(r, resp *dns.Msg, clientIP string, cl *clients.Clien
 	}
 	ev.ClientIP = clientIP
 	ev.ResponseCode = dns.RcodeToString[resp.Rcode]
+	if s.cfg.ResolveClientHostnames && s.cfg.Resolver != nil {
+		ev.ClientHostname = s.cfg.Resolver.GetHostname(clientIP)
+	}
 
 	// DNSSEC passthrough status (no local validation): only an upstream AD bit
 	// proves a secure response; all other responses remain indeterminate.
@@ -965,13 +1510,93 @@ func (s *Server) ACLStats() (deniedDropped, allowlistDropped int64, buckets int)
 
 // CacheStats returns a snapshot of the in-process response cache.
 func (s *Server) CacheStats() CacheStats {
-	return s.cache.stats()
+	stats := s.cache.stats()
+	s.missMu.Lock()
+	stats.InFlight = len(s.missInFlight)
+	s.missMu.Unlock()
+	return stats
+}
+
+// CacheEntries returns a stable diagnostic snapshot. Negative entries include
+// their remaining TTL and SOA; answer data is not exposed.
+func (s *Server) CacheEntries() []CacheEntryStatus {
+	return s.cache.entryStatuses()
 }
 
 // ClearCache removes all in-process DNS response cache entries and returns
 // the number removed.
 func (s *Server) ClearCache() int {
+	s.cacheMutationMu.Lock()
+	defer s.cacheMutationMu.Unlock()
+	s.cacheGeneration.Add(1)
 	return s.cache.clear()
+}
+
+// InvalidateCacheDomains removes cache entries at or below the supplied
+// domain suffixes. It is intended for rewrite, filter, and DNS-route updates.
+func (s *Server) InvalidateCacheDomains(domains ...string) int {
+	normalized := make([]string, 0, len(domains))
+	for _, domain := range domains {
+		domain = normalizeName(strings.TrimPrefix(strings.TrimSpace(domain), "*."))
+		if domain != "" {
+			normalized = append(normalized, domain)
+		}
+	}
+	if len(normalized) == 0 {
+		return 0
+	}
+	s.cacheMutationMu.Lock()
+	defer s.cacheMutationMu.Unlock()
+	s.cacheGeneration.Add(1)
+	return s.cache.invalidate(func(key cacheKey) bool {
+		for _, domain := range normalized {
+			if key.name == domain || strings.HasSuffix(key.name, "."+domain) {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// InvalidateCacheRoutes removes entries resolved through any supplied route
+// upstream spec. Callers should pass both old and new specs when a route is
+// changed.
+func (s *Server) InvalidateCacheRoutes(routeSpecs ...string) int {
+	routes := make(map[string]struct{}, len(routeSpecs))
+	for _, spec := range routeSpecs {
+		if spec = strings.TrimSpace(spec); spec != "" {
+			routes[spec] = struct{}{}
+		}
+	}
+	if len(routes) == 0 {
+		return 0
+	}
+	s.cacheMutationMu.Lock()
+	defer s.cacheMutationMu.Unlock()
+	s.cacheGeneration.Add(1)
+	return s.cache.invalidate(func(key cacheKey) bool {
+		_, match := routes[key.route]
+		return match
+	})
+}
+
+// InvalidateCacheGroups removes entries for exact per-client upstream group
+// discriminators. An empty group represents the global upstream pool.
+func (s *Server) InvalidateCacheGroups(groups ...string) int {
+	selected := make(map[string]struct{}, len(groups))
+	for _, group := range groups {
+		selected[group] = struct{}{}
+	}
+	if len(selected) == 0 {
+		return 0
+	}
+	s.cacheMutationMu.Lock()
+	defer s.cacheMutationMu.Unlock()
+	s.cacheGeneration.Add(1)
+	return s.cache.invalidate(func(key cacheKey) bool {
+		_, match := selected[key.group]
+		return match
+	})
 }
 
 // clientIPFromRemote extracts the IP part of a DNS client address.

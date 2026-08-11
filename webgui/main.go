@@ -30,6 +30,7 @@ import (
 	"github.com/arumes31/resolix/webgui/internal/controllertls"
 	"github.com/arumes31/resolix/webgui/internal/dnsroutes"
 	"github.com/arumes31/resolix/webgui/internal/dnsserver"
+	"github.com/arumes31/resolix/webgui/internal/dnssettings"
 	"github.com/arumes31/resolix/webgui/internal/filter"
 	"github.com/arumes31/resolix/webgui/internal/forwarder"
 	"github.com/arumes31/resolix/webgui/internal/health"
@@ -233,6 +234,8 @@ MODE=controller
 
 # Unique identifier for this node
 NODE_NAME=resolix-1
+# Optional stable cluster identity. Nodes generate HISTORY_DIR/node-id when unset.
+# NODE_ID=resolver-vienna-01
 
 # Secret token to authenticate logs from agent nodes
 # INGEST_SECRET=your-secret-token
@@ -299,7 +302,7 @@ DB_PATH=dns.db
 # Policy features
 # SAFE_SEARCH=google,bing,ddg,youtube
 # BOGUS_NXDOMAIN=10.0.0.0/8,192.0.2.33 (answers fully inside these become NXDOMAIN)
-# AAAA_DISABLED=true (AAAA queries get NOERROR-empty answers)
+# AAAA_DISABLED=false (set true so AAAA queries get NOERROR-empty answers)
 # REFUSE_ANY=true (default; QTYPE ANY is refused)
 
 # Upstream pool (Step 4): schemes udp:// tcp:// tls:// https:// (DoT/DoH)
@@ -307,11 +310,18 @@ DB_PATH=dns.db
 # FALLBACK_DNS=9.9.9.9 (used only when all primary upstreams fail)
 # BOOTSTRAP_DNS="9.9.9.9 1.1.1.1" (initial plain UDP IP resolvers for hostname DoT/DoH; /config overrides)
 # ECS_CLIENT_SUBNET=192.0.2.0/24 (EDNS0 client subnet sent to upstreams)
-# DNS64=true (synthesize AAAA from A on empty AAAA answers)
+# DNS64=false (set true to synthesize AAAA from A on empty AAAA answers)
 # DNS64_PREFIXES=64:ff9b::/96
-# CACHE_OPTIMISTIC=true (serve stale entries while refreshing in background)
+# CACHE_OPTIMISTIC=false (set true to serve stale entries while refreshing in background)
 # CACHE_MIN_TTL=60
 # CACHE_MAX_TTL=600
+# CACHE_PREFETCH=false
+# CACHE_PREFETCH_WINDOW=30s
+# CACHE_PREFETCH_HITS=3
+# CACHE_SERVFAIL_TTL=0s (optional; maximum 1s)
+# DNS_TCP_IDLE_TIMEOUT=8s
+# DNS_TCP_MAX_QUERIES=128
+# DNS_TCP_MAX_CONNECTIONS=256
 
 # Per-client policies (Step 5)
 # CLIENTS_FILE=clients.json (per-client registry: filtering, safe search,
@@ -324,6 +334,7 @@ DB_PATH=dns.db
 # DNS_DISALLOWED_CLIENTS=100.64.0.5
 # RATE_LIMIT_QPS=80 (public clients, per IP; 0 disables)
 # RATE_LIMIT_INTERNAL_QPS=1000 (LAN/Tailscale clients, per IP; 0 disables)
+# RATE_LIMIT_EDE=false (opt-in REFUSED+EDE; default silently drops excess queries)
 # PRIVATE_PTR=true (answer known RFC1918/CGNAT/ULA client PTRs as <name>.lan)
 # DNSSEC=false (pass the DNSSEC DO bit upstream; no local validation)
 # DOH_ENABLED=false
@@ -353,6 +364,7 @@ DB_PATH=dns.db
 
 # Optional log file for file-based logging (default: empty = stderr only)
 # LOG_FILE=/var/log/resolix.log
+# DEBUG=false
 
 # ===== Distributed Architecture (Items 85-94) =====
 # Maximum retry attempts for forwarding with exponential backoff (default: 6)
@@ -416,6 +428,12 @@ func main() {
 	prs := parser.NewParser(store, cfg.Debug)
 	srv := api.NewServer(cfg, store, prs, tmpl)
 	srv.SetBuildInfo(Version, BuildInfo)
+	dnsSettingsStore, err := dnssettings.Load(cfg.FullDNSSettingsPath(), defaultDNSSettings(cfg))
+	if err != nil {
+		logger.Fatal("Failed to load managed DNS settings: %v", err)
+	}
+	srv.SetDNSSettingsStore(dnsSettingsStore)
+	managedDNS := dnsSettingsStore.Get()
 
 	// Item 59: Initialize and start reverse DNS resolver
 	res := resolver.New()
@@ -526,14 +544,24 @@ func main() {
 
 	// Policy (Step 3): safe search, bogus NXDOMAIN, AAAA disable, refuse ANY.
 	pol := policy.New(policy.Config{
-		SafeSearch:   splitListEnv(cfg.SafeSearch),
-		BogusNets:    splitListEnv(cfg.BogusNXDOMAIN),
-		AAAADisabled: cfg.AAAADisabled,
-		RefuseANY:    cfg.RefuseANY,
+		SafeSearch:   managedDNS.SafeSearch,
+		BogusNets:    managedDNS.BogusNXDOMAIN,
+		AAAADisabled: managedDNS.AAAADisabled,
+		RefuseANY:    managedDNS.RefuseANY,
 	})
 
 	// Upstream pool (Step 4): modes, fallback, bootstrap, ECS, DNS64.
-	pool := setupUpstreamPool(ctx, cfg, store, srv, checker, loadResolverSettings, upstreamSpecs, bootstrapServers)
+	pool := setupUpstreamPool(
+		ctx,
+		cfg,
+		managedDNS,
+		store,
+		srv,
+		checker,
+		loadResolverSettings,
+		upstreamSpecs,
+		bootstrapServers,
+	)
 	checker.SetProbeFunc(pool.Probe)
 	go checker.Start(ctx, func(_ []string, latencies map[string]float64) {
 		store.SetUpstreamHealth(cfg.NodeName, latencies)
@@ -542,49 +570,59 @@ func main() {
 		}
 		logger.Debug("Health status updated for node %s. Latencies: %v", cfg.NodeName, latencies)
 	})
-	dr.SetOnChange(pool.ClearRouteCache)
 	fwd.SetDNSConfigFn(func(snapshot configsync.Snapshot) error {
 		return srv.ApplyConfigSnapshot(snapshot)
 	})
 
 	// Start forwarding only after every config-sync target is initialized, so
 	// the initial agent sync cannot race application startup.
-	go func() {
-		if err := fwd.Start(); err != nil {
-			errChan <- err
-		}
-	}()
+	forwarderDone := make(chan error, 1)
 
 	dnsSrv := dnsserver.New(dnsserver.Config{
-		Addr:            cfg.DNSListenAddr,
-		Port:            cfg.DNSListenPort,
-		Upstreams:       upstreamSpecs,
-		Rewrites:        rwStore,
-		Policy:          pol,
-		Pool:            pool,
-		Routes:          dr,
-		Clients:         clientReg,
-		AliasFunc:       store.GetAlias,
-		CacheMinTTL:     cfg.CacheMinTTL,
-		CacheMaxTTL:     cfg.CacheMaxTTL,
-		CacheOptimistic: cfg.CacheOptimistic,
+		Addr:                cfg.DNSListenAddr,
+		Port:                cfg.DNSListenPort,
+		Upstreams:           upstreamSpecs,
+		Rewrites:            rwStore,
+		Policy:              pol,
+		Pool:                pool,
+		Routes:              dr,
+		Clients:             clientReg,
+		AliasFunc:           store.GetAlias,
+		CacheSize:           managedDNS.CacheSize,
+		CacheMinTTL:         managedDNS.CacheMinTTL,
+		CacheMaxTTL:         managedDNS.CacheMaxTTL,
+		CacheOptimistic:     managedDNS.CacheOptimistic,
+		CachePrefetch:       managedDNS.CachePrefetch,
+		CachePrefetchWindow: time.Duration(managedDNS.CachePrefetchWindowMS) * time.Millisecond,
+		CachePrefetchHits:   managedDNS.CachePrefetchHits,
+		CacheSERVFAILTTL:    time.Duration(managedDNS.CacheSERVFAILTTLMS) * time.Millisecond,
 		// Step 6: ACL, rate limit, private PTR, DNSSEC, DoT.
-		AllowedClients:       cfg.DNSAllowedClients,
-		DisallowedClients:    cfg.DNSDisallowedClients,
-		RateLimitQPS:         cfg.RateLimitQPS,
-		InternalRateLimitQPS: cfg.InternalRateLimitQPS,
-		PrivatePTR:           cfg.PrivatePTR,
-		DNSSEC:               cfg.DNSSEC,
-		Resolver:             res,
-		DoTEnabled:           cfg.DoTEnabled,
-		DoTPort:              cfg.DoTPort,
-		TLSCertFile:          cfg.TLSCertFile,
-		TLSKeyFile:           cfg.TLSKeyFile,
-		NodeName:             cfg.NodeName,
-		Filter:               filterEng,
-		BlockingMode:         cfg.BlockingMode,
-		BlockCustomIP4:       cfg.BlockCustomIP4,
-		BlockCustomIP6:       cfg.BlockCustomIP6,
+		AllowedClients:         strings.Join(managedDNS.AllowedClients, " "),
+		DisallowedClients:      strings.Join(managedDNS.DisallowedClients, " "),
+		RateLimitQPS:           managedDNS.RateLimitQPS,
+		InternalRateLimitQPS:   managedDNS.InternalRateLimitQPS,
+		RateLimitEDE:           managedDNS.RateLimitEDE,
+		RateLimitIPv4Prefix:    managedDNS.RateLimitIPv4Prefix,
+		RateLimitIPv6Prefix:    managedDNS.RateLimitIPv6Prefix,
+		RateLimitAllowlist:     strings.Join(managedDNS.RateLimitAllowlist, " "),
+		PrivatePTR:             managedDNS.PrivatePTR,
+		PrivatePTRUpstreams:    managedDNS.PrivatePTRUpstreams,
+		ResolveClientHostnames: managedDNS.ResolveClientHostnames,
+		DNSSEC:                 managedDNS.DNSSEC,
+		Resolver:               res,
+		DoTEnabled:             cfg.DoTEnabled,
+		DoTPort:                cfg.DoTPort,
+		TLSCertFile:            cfg.TLSCertFile,
+		TLSKeyFile:             cfg.TLSKeyFile,
+		TCPIdleTimeout:         cfg.DNSTCPIdleTimeout,
+		TCPMaxQueries:          cfg.DNSTCPMaxQueries,
+		TCPMaxConnections:      cfg.DNSTCPMaxConnections,
+		NodeName:               cfg.NodeName,
+		Filter:                 filterEng,
+		BlockingMode:           managedDNS.BlockingMode,
+		BlockCustomIP4:         managedDNS.BlockCustomIPv4,
+		BlockCustomIP6:         managedDNS.BlockCustomIPv6,
+		BlockedResponseTTL:     managedDNS.BlockedResponseTTL,
 	}, func(ev models.QueryEvent, excludeFromStats bool) {
 		// exclude_from_stats clients emit to SSE only (no store/forwarder).
 		if !excludeFromStats {
@@ -597,6 +635,21 @@ func main() {
 	})
 	dnsDone := make(chan struct{})
 	srv.SetDNSServer(dnsSrv)
+	srv.SetDNSSettingsApplyFunc(func(settings dnssettings.Settings) {
+		pool.SetRuntimeSettings(settings.UpstreamMode, settings.FallbackDNS, settings.ECSClientSubnet)
+		dnsSrv.ApplySettings(settings)
+	})
+	go func() {
+		err := fwd.Start()
+		forwarderDone <- err
+		if err != nil {
+			errChan <- err
+		}
+	}()
+	dr.SetOnChange(func() {
+		pool.ClearRouteCache()
+		dnsSrv.ClearCache()
+	})
 	go func() {
 		defer close(dnsDone)
 		protocols := "UDP+TCP"
@@ -640,6 +693,7 @@ func main() {
 	// Step 2: Stop the log forwarder
 	logger.Info("Shutdown step 2: Stopping log forwarder...")
 	fwd.Stop()
+	waitForForwarder(cfg, forwarderDone)
 
 	// Step 3: Stop DNS routes reload
 	logger.Info("Shutdown step 3: Stopping DNS routes reload...")
@@ -773,6 +827,7 @@ func loadRewritesStore(cfg *config.Config) *rewrites.Store {
 func setupUpstreamPool(
 	ctx context.Context,
 	cfg *config.Config,
+	dnsSettings dnssettings.Settings,
 	store *storage.Store,
 	srv *api.Server,
 	checker *health.Checker,
@@ -781,11 +836,11 @@ func setupUpstreamPool(
 	currentBootstrap []string,
 ) *upstream.Pool {
 	pool := upstream.NewPool(upstream.PoolConfig{
-		Mode:             cfg.UpstreamMode,
+		Mode:             dnsSettings.UpstreamMode,
 		PrimarySpecs:     currentSpecs,
-		FallbackSpecs:    strings.Fields(cfg.FallbackDNS),
+		FallbackSpecs:    dnsSettings.FallbackDNS,
 		BootstrapServers: currentBootstrap,
-		ECSClientSubnet:  cfg.ECSClientSubnet,
+		ECSClientSubnet:  dnsSettings.ECSClientSubnet,
 		DNS64:            cfg.DNS64,
 		DNS64Prefixes:    strings.Fields(cfg.DNS64Prefixes),
 		CacheMinTTL:      cfg.CacheMinTTL,
@@ -835,6 +890,40 @@ func setupUpstreamPool(
 		}
 	}()
 	return pool
+}
+
+func defaultDNSSettings(cfg *config.Config) dnssettings.Settings {
+	return dnssettings.Settings{
+		UpstreamMode:           cfg.UpstreamMode,
+		FallbackDNS:            splitListEnv(cfg.FallbackDNS),
+		ECSClientSubnet:        cfg.ECSClientSubnet,
+		BlockingMode:           cfg.BlockingMode,
+		BlockCustomIPv4:        cfg.BlockCustomIP4,
+		BlockCustomIPv6:        cfg.BlockCustomIP6,
+		BlockedResponseTTL:     60,
+		SafeSearch:             splitListEnv(cfg.SafeSearch),
+		BogusNXDOMAIN:          splitListEnv(cfg.BogusNXDOMAIN),
+		AAAADisabled:           cfg.AAAADisabled,
+		RefuseANY:              cfg.RefuseANY,
+		DNSSEC:                 cfg.DNSSEC,
+		PrivatePTR:             cfg.PrivatePTR,
+		ResolveClientHostnames: true,
+		AllowedClients:         splitListEnv(cfg.DNSAllowedClients),
+		DisallowedClients:      splitListEnv(cfg.DNSDisallowedClients),
+		RateLimitQPS:           cfg.RateLimitQPS,
+		InternalRateLimitQPS:   cfg.InternalRateLimitQPS,
+		RateLimitEDE:           cfg.RateLimitEDE,
+		RateLimitIPv4Prefix:    32,
+		RateLimitIPv6Prefix:    128,
+		CacheSize:              25000,
+		CacheMinTTL:            cfg.CacheMinTTL,
+		CacheMaxTTL:            cfg.CacheMaxTTL,
+		CacheOptimistic:        cfg.CacheOptimistic,
+		CachePrefetch:          cfg.CachePrefetch,
+		CachePrefetchWindowMS:  cfg.CachePrefetchWindow.Milliseconds(),
+		CachePrefetchHits:      cfg.CachePrefetchHits,
+		CacheSERVFAILTTLMS:     cfg.CacheSERVFAILTTL.Milliseconds(),
+	}.Normalize()
 }
 
 // splitListEnv splits a space/comma-separated env list into trimmed entries.
@@ -889,6 +978,21 @@ func waitForDNSServer(cfg *config.Config, dnsDone <-chan struct{}) {
 		case <-timer.C:
 		default:
 		}
+	}
+}
+
+// waitForForwarder ensures Start has returned after its final durable backlog
+// flush before shutdown can proceed to close shared resources.
+func waitForForwarder(cfg *config.Config, forwarderDone <-chan error) {
+	timer := time.NewTimer(cfg.HTTPShutdownTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-forwarderDone:
+		if err != nil {
+			logger.Warning("Forwarder shutdown error: %v", err)
+		}
+	case <-timer.C:
+		logger.Warning("Forwarder did not stop within %s", cfg.HTTPShutdownTimeout)
 	}
 }
 

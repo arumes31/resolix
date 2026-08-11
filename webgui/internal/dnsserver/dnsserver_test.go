@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -11,7 +12,11 @@ import (
 
 	"github.com/miekg/dns"
 
+	"github.com/arumes31/resolix/webgui/internal/clients"
+	"github.com/arumes31/resolix/webgui/internal/dnsroutes"
+	"github.com/arumes31/resolix/webgui/internal/dnssettings"
 	"github.com/arumes31/resolix/webgui/internal/models"
+	"github.com/arumes31/resolix/webgui/internal/rewrites"
 )
 
 type scriptedResetConn struct {
@@ -40,6 +45,32 @@ func TestResetTolerantConnRetriesWrappedResetsWithLimit(t *testing.T) {
 	alwaysReset := &scriptedResetConn{resets: -1}
 	if _, _, err := (resetTolerantConn{alwaysReset}).ReadFrom(buffer); err == nil {
 		t.Fatal("permanently resetting connection did not return an error")
+	}
+}
+
+func TestApplySettingsUpdatesLivePolicyAndCache(t *testing.T) {
+	t.Parallel()
+	server := New(Config{}, nil)
+	settings := dnssettings.Settings{
+		UpstreamMode: "load_balance", BlockingMode: "nxdomain", BlockCustomIPv4: "0.0.0.0",
+		BlockCustomIPv6: "::", RefuseANY: true, PrivatePTR: true,
+		AllowedClients: []string{"100.64.0.0/10"}, AAAADisabled: true,
+		CacheSize: 64, CacheMinTTL: 10, CacheMaxTTL: 120,
+	}.Normalize()
+	server.ApplySettings(settings)
+
+	query := new(dns.Msg)
+	query.SetQuestion("example.test.", dns.TypeAAAA)
+	if response, dropped := server.Resolve(query, "192.168.1.2"); !dropped || response != nil {
+		t.Fatalf("outside allowlist response=%v dropped=%v", response, dropped)
+	}
+	response, dropped := server.Resolve(query, "100.64.0.2")
+	if dropped || response == nil || response.Rcode != dns.RcodeSuccess || len(response.Answer) != 0 {
+		t.Fatalf("managed AAAA policy response=%v dropped=%v", response, dropped)
+	}
+	stats := server.CacheStats()
+	if stats.Capacity != 64 {
+		t.Fatalf("cache capacity = %d, want 64", stats.Capacity)
 	}
 }
 
@@ -211,8 +242,13 @@ func TestUpstreamOPTIsRebuiltPerClientAcrossCache(t *testing.T) {
 	}
 	second := query(512, false)
 	assertOPT(second, 512, false)
-	if hits.Load() != 1 {
-		t.Fatalf("upstream hits = %d, want cache hit on second query", hits.Load())
+	if hits.Load() != 2 {
+		t.Fatalf("upstream hits = %d, want separate DO-bit cache entries", hits.Load())
+	}
+	third := query(512, false)
+	assertOPT(third, 512, false)
+	if hits.Load() != 2 {
+		t.Fatalf("upstream hits = %d, want third query served from matching cache entry", hits.Load())
 	}
 }
 
@@ -230,6 +266,201 @@ func TestStaticHostAndUpstreamNormalization(t *testing.T) {
 			t.Errorf("normalizeUpstream(%q) = %q, want invalid", input, got)
 		}
 	}
+}
+
+func TestCacheKeyIncludesResponseVaryDimensions(t *testing.T) {
+	routes := dnsroutes.New("")
+	if err := routes.SetRoutes(map[string]string{"example.test": "tls://route.test:853"}); err != nil {
+		t.Fatal(err)
+	}
+	server := New(Config{Routes: routes}, nil)
+	base := new(dns.Msg)
+	base.SetQuestion("example.test.", dns.TypeA)
+	baseKey := server.makeCacheKey(base, base.Question[0], "example.test", "", nil)
+	if baseKey.route != "tls://route.test:853" || baseKey.policy != "global" {
+		t.Fatalf("base cache key = %+v", baseKey)
+	}
+
+	doQuery := base.Copy()
+	doQuery.SetEdns0(1232, true)
+	if got := server.makeCacheKey(doQuery, doQuery.Question[0], "example.test", "", nil); got == baseKey || !got.do {
+		t.Fatalf("DO cache key did not vary: %+v", got)
+	}
+	cdQuery := base.Copy()
+	cdQuery.CheckingDisabled = true
+	if got := server.makeCacheKey(cdQuery, cdQuery.Question[0], "example.test", "", nil); got == baseKey || !got.cd {
+		t.Fatalf("CD cache key did not vary: %+v", got)
+	}
+	ecsQuery := base.Copy()
+	ecsQuery.SetEdns0(1232, false)
+	ecsQuery.IsEdns0().Option = append(ecsQuery.IsEdns0().Option, &dns.EDNS0_SUBNET{
+		Code: dns.EDNS0SUBNET, Family: 1, SourceNetmask: 24,
+		Address: net.ParseIP("192.0.2.77").To4(),
+	})
+	if got := server.makeCacheKey(ecsQuery, ecsQuery.Question[0], "example.test", "", nil); got.ecs == "" || got == baseKey {
+		t.Fatalf("ECS cache key did not vary: %+v", got)
+	}
+
+	client := &clients.Client{
+		UseGlobalSettings: false, FilteringEnabled: true,
+		SafeSearchEnabled: true, SafeSearchEngines: []string{"google"},
+		Upstreams: []string{"9.9.9.9"},
+	}
+	clientKey := server.makeCacheKey(base, base.Question[0], "example.test", "up:9.9.9.9", client)
+	if clientKey.policy == baseKey.policy || clientKey.group == baseKey.group {
+		t.Fatalf("client-policy cache key did not vary: %+v", clientKey)
+	}
+}
+
+func TestEDNSDefaultAndClientSizeClamp(t *testing.T) {
+	var observedSize atomic.Uint32
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		if opt := r.IsEdns0(); opt != nil {
+			observedSize.Store(uint32(opt.UDPSize()))
+		}
+		response := new(dns.Msg)
+		response.SetReply(r)
+		response.Answer = []dns.RR{aRecord(r.Question[0].Name, "192.0.2.1", 60)}
+		_ = w.WriteMsg(response)
+	})}
+	go func() { _ = fake.ActivateAndServe() }()
+	t.Cleanup(func() { _ = fake.Shutdown() })
+
+	server := New(Config{Upstreams: []string{pc.LocalAddr().String()}}, nil)
+	query := new(dns.Msg)
+	query.SetQuestion("edns.test.", dns.TypeA)
+	response, drop := server.Resolve(query, "192.0.2.1")
+	if drop || response == nil || observedSize.Load() != defaultEDNSUDPSize {
+		t.Fatalf("default EDNS exchange: response=%v drop=%t size=%d", response, drop, observedSize.Load())
+	}
+
+	large := new(dns.Msg)
+	large.SetQuestion("large-edns.test.", dns.TypeA)
+	large.SetEdns0(4096, false)
+	extra := responseExtra(large, nil)
+	if len(extra) != 1 || extra[0].(*dns.OPT).UDPSize() != defaultEDNSUDPSize {
+		t.Fatalf("clamped response OPT = %v", extra)
+	}
+}
+
+func TestServeDNSTruncatesToClientUDPSize(t *testing.T) {
+	store, err := rewrites.Load("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 40; i++ {
+		if _, err := store.Add("large.test", rewrites.TypeTXT, fmt.Sprintf("%02d-%s", i, strings.Repeat("x", 38))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	server := New(Config{Rewrites: store}, nil)
+	query := new(dns.Msg)
+	query.SetQuestion("large.test.", dns.TypeTXT)
+	query.SetEdns0(512, false)
+	writer := &fakeResponseWriter{remote: &net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 53000}}
+	server.ServeDNS(writer, query)
+	if writer.last == nil || !writer.last.Truncated {
+		t.Fatalf("UDP response was not truncated: %+v", writer.last)
+	}
+	wire, err := writer.last.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wire) > 512 {
+		t.Fatalf("truncated wire length = %d, want <= 512", len(wire))
+	}
+}
+
+func TestMalformedAndEmptyQuestionsReturnFORMERR(t *testing.T) {
+	var upstreamHits atomic.Int32
+	server := New(Config{Upstreams: []string{startFakeUpstream(t, &upstreamHits)}}, nil)
+	responseMessage := new(dns.Msg)
+	responseMessage.SetQuestion("response.test.", dns.TypeA)
+	responseMessage.Response = true
+	updateMessage := new(dns.Msg)
+	updateMessage.SetQuestion("update.test.", dns.TypeSOA)
+	updateMessage.Opcode = dns.OpcodeUpdate
+	multipleQuestions := new(dns.Msg)
+	multipleQuestions.SetQuestion("first.test.", dns.TypeA)
+	multipleQuestions.Question = append(multipleQuestions.Question, dns.Question{
+		Name: "second.test.", Qtype: dns.TypeAAAA, Qclass: dns.ClassINET,
+	})
+	tests := []struct {
+		name    string
+		message *dns.Msg
+	}{
+		{name: "empty question", message: &dns.Msg{MsgHdr: dns.MsgHdr{Id: 1}}},
+		{name: "response bit", message: responseMessage},
+		{name: "update opcode", message: updateMessage},
+		{name: "multiple questions", message: multipleQuestions},
+		{name: "overlong label", message: &dns.Msg{
+			MsgHdr:   dns.MsgHdr{Id: 2},
+			Question: []dns.Question{{Name: strings.Repeat("a", 64) + ".test.", Qtype: dns.TypeA, Qclass: dns.ClassINET}},
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.message.SetEdns0(1232, false)
+			response, drop := server.Resolve(tt.message, "192.0.2.1")
+			if drop || response == nil || response.Rcode != dns.RcodeFormatError {
+				t.Fatalf("FORMERR response=%v drop=%t", response, drop)
+			}
+			if code, ok := extendedErrorCode(response); !ok || code != dns.ExtendedErrorCodeInvalidData {
+				t.Fatalf("EDE code = %d/%t, want Invalid Data", code, ok)
+			}
+		})
+	}
+	if got := upstreamHits.Load(); got != 0 {
+		t.Fatalf("malformed requests reached upstream %d times", got)
+	}
+}
+
+func TestStripIPv6Hints(t *testing.T) {
+	record := &dns.HTTPS{SVCB: dns.SVCB{
+		Hdr:      dns.RR_Header{Name: "example.test.", Rrtype: dns.TypeHTTPS, Class: dns.ClassINET},
+		Priority: 1,
+		Target:   ".",
+		Value: []dns.SVCBKeyValue{
+			&dns.SVCBIPv4Hint{Hint: []net.IP{net.ParseIP("192.0.2.1").To4()}},
+			&dns.SVCBIPv6Hint{Hint: []net.IP{net.ParseIP("2001:db8::1")}},
+		},
+	}}
+	stripIPv6Hints([]dns.RR{record})
+	if len(record.Value) != 1 {
+		t.Fatalf("HTTPS values after strip = %v", record.Value)
+	}
+	if _, ok := record.Value[0].(*dns.SVCBIPv4Hint); !ok {
+		t.Fatalf("remaining HTTPS value = %T, want IPv4 hint", record.Value[0])
+	}
+}
+
+func TestTCPServerLimitsAreConfigured(t *testing.T) {
+	const idle = 250 * time.Millisecond
+	server := New(Config{TCPIdleTimeout: idle, TCPMaxQueries: 7, TCPMaxConnections: 2}, nil)
+	if server.tcp.MaxTCPQueries != 7 || server.tcp.IdleTimeout == nil || server.tcp.IdleTimeout() != idle {
+		t.Fatalf("TCP server configuration = %+v", server.tcp)
+	}
+	if cap(server.tcpSlots) != 2 {
+		t.Fatalf("TCP connection slots = %d, want 2", cap(server.tcpSlots))
+	}
+}
+
+func extendedErrorCode(message *dns.Msg) (uint16, bool) {
+	opt := message.IsEdns0()
+	if opt == nil {
+		return 0, false
+	}
+	for _, option := range opt.Option {
+		if ede, ok := option.(*dns.EDNS0_EDE); ok {
+			return ede.InfoCode, true
+		}
+	}
+	return 0, false
 }
 
 // assertStaticRewritePhase verifies that a subdomain of a static host is

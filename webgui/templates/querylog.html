@@ -76,6 +76,30 @@
                 <p>Newest queries stay at the top. Filter the stream, inspect clients, or test a domain through the active policy path.</p>
             </div>
             <div id="settingsNotice" class="settings-notice is-hidden" role="status" aria-live="polite"></div>
+            <section class="query-filter-panel" aria-label="Query log filters">
+                <div id="queryFilterChips" class="filter-chips" aria-live="polite"></div>
+                <div class="query-filter-actions">
+                    <label>Record type
+                        <select id="queryTypeFilter" aria-label="Filter by record type">
+                            <option value="">All types</option>
+                            <option>A</option><option>AAAA</option><option>CNAME</option><option>HTTPS</option><option>MX</option><option>PTR</option><option>SRV</option><option>TXT</option>
+                        </select>
+                    </label>
+                    <label>Decision
+                        <select id="queryStatusFilter" aria-label="Filter by decision">
+                            <option value="">All decisions</option>
+                            <option value="allowed">Allowed</option>
+                            <option value="blocked">Blocked</option>
+                            <option value="cached">Cached</option>
+                            <option value="failed">Failed</option>
+                        </select>
+                    </label>
+                    <details id="columnChooser" class="column-chooser">
+                        <summary>Columns</summary>
+                        <div id="columnChooserList" class="column-chooser-list" role="group" aria-label="Visible query log columns"></div>
+                    </details>
+                </div>
+            </section>
             <section class="command-bar" aria-label="DNS lookup test">
                 <div class="command-copy"><span class="command-prompt" aria-hidden="true">›_</span><div><strong>Resolution probe</strong><span>Test the active policy path from this node</span></div></div>
                 <div class="simulator-box simulator-compact">
@@ -86,11 +110,11 @@
             <div id="simulatorResult"></div>
 
             <section class="console-section query-log-section">
-                <div class="section-heading"><div><span class="page-kicker">Live stream</span><h2>DNS queries</h2></div><span class="section-chip healthy"><i class="metric-dot green"></i>Newest first</span></div>
-                <div class="table-container">
+                <div class="section-heading"><div><span class="page-kicker">Live stream</span><h2>DNS queries</h2></div><span id="queryResultCount" class="section-chip healthy"><i class="metric-dot green"></i>Newest first</span></div>
+                <div id="queryScroll" class="table-container query-virtual-scroll" tabindex="0" aria-label="Virtualized DNS query log">
                     <div id="viewClearedBanner" class="view-cleared-banner is-hidden">View cleared — new events will appear as they arrive</div>
                     <table>
-                        <thead><tr><th>Time</th><th>Node</th><th>Type</th><th>Domain</th><th>Client</th><th>Upstream</th><th>Latency</th><th>Action</th></tr></thead>
+                        <thead><tr id="queryTableHead"></tr></thead>
                         <tbody id="eventTable"></tbody>
                     </table>
                 </div>
@@ -108,6 +132,18 @@
             </div>
             <button id="modalCloseBtn" class="btn btn-primary modal-close">Close</button>
         </div>
+    </div>
+    <aside id="queryDetailDrawer" class="query-detail-drawer" role="dialog" aria-modal="true" aria-labelledby="queryDetailTitle" aria-hidden="true" tabindex="-1">
+        <div class="query-detail-header">
+            <div><span class="page-kicker">Resolution trace</span><h2 id="queryDetailTitle">Query decision</h2></div>
+            <button id="queryDetailClose" type="button" class="btn-icon" aria-label="Close query details">×</button>
+        </div>
+        <div id="queryDetailBody" class="query-detail-body"></div>
+    </aside>
+    <div id="queryDrawerScrim" class="query-drawer-scrim" aria-hidden="true"></div>
+    <div id="queryUndoToast" class="query-undo-toast" role="status" aria-live="polite" aria-hidden="true">
+        <span id="queryUndoMessage"></span>
+        <button id="queryUndoBtn" type="button" class="mini-action">Undo</button>
     </div>
     <script nonce="{{.Nonce}}" src="static/js/shell.js"></script>
     <script nonce="{{.Nonce}}" src="static/js/index.js"></script>

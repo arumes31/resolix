@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,10 +17,13 @@ import (
 
 // Pool modes (UPSTREAM_MODE).
 const (
-	ModeLoadBalance   = "load_balance"
-	ModeParallel      = "parallel"
-	ModeStrict        = "strict"
-	maxResolverGroups = 256
+	ModeLoadBalance         = "load_balance"
+	ModeParallel            = "parallel"
+	ModeStrict              = "strict"
+	maxResolverGroups       = 256
+	circuitFailureThreshold = 3
+	circuitCooldown         = 30 * time.Second
+	latencySampleLimit      = 256
 )
 
 // PoolConfig configures the upstream pool.
@@ -44,19 +48,41 @@ type PoolConfig struct {
 
 // stat tracks per-upstream performance.
 type stat struct {
-	ewmaMS         float64 // exponentially weighted moving average latency
-	failures       atomic.Int64
-	failurePenalty atomic.Int64
-	successes      atomic.Int64
+	ewmaMS               float64 // exponentially weighted moving average latency
+	failures             atomic.Int64
+	failurePenalty       atomic.Int64
+	successes            atomic.Int64
+	consecutiveFailures  atomic.Int64
+	consecutiveSuccesses atomic.Int64
+	circuitUntil         atomic.Int64
+	lastFailure          string
+	latencySamples       [latencySampleLimit]float64
+	latencyCount         int
+	latencyIndex         int
 }
 
 // StatSnapshot reports per-upstream stats for metrics.
 type StatSnapshot struct {
-	Spec      string  `json:"spec"`
-	EWMAms    float64 `json:"ewma_ms"`
-	Failures  int64   `json:"failures"`
-	Successes int64   `json:"successes"`
-	Healthy   bool    `json:"healthy"`
+	Spec                 string    `json:"spec"`
+	NormalizedSpec       string    `json:"normalized_spec"`
+	EWMAms               float64   `json:"ewma_ms"`
+	P50ms                float64   `json:"p50_ms"`
+	P95ms                float64   `json:"p95_ms"`
+	P99ms                float64   `json:"p99_ms"`
+	Failures             int64     `json:"failures"`
+	Successes            int64     `json:"successes"`
+	ConsecutiveFailures  int64     `json:"consecutive_failures"`
+	ConsecutiveSuccesses int64     `json:"consecutive_successes"`
+	Healthy              bool      `json:"healthy"`
+	LastFailure          string    `json:"last_failure,omitempty"`
+	CircuitOpenUntil     time.Time `json:"circuit_open_until,omitempty"`
+	TimeoutMS            float64   `json:"timeout_ms"`
+	Weight               int       `json:"weight"`
+	ResolvedEndpoint     string    `json:"resolved_endpoint,omitempty"`
+	ConnectionsReused    int64     `json:"connections_reused"`
+	ConnectionsFresh     int64     `json:"connections_fresh"`
+	TLSIssuer            string    `json:"tls_issuer,omitempty"`
+	TLSExpiresAt         time.Time `json:"tls_expires_at,omitempty"`
 }
 
 // Pool resolves queries against a set of upstreams with a configurable
@@ -155,6 +181,7 @@ func (p *Pool) warnHostnameUpstreams() {
 // buildResolvers parses specs into resolvers, skipping invalid entries.
 func (p *Pool) buildResolvers(specs []string) []Resolver {
 	var out []Resolver
+	seen := make(map[string]struct{}, len(specs))
 	for _, raw := range specs {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
@@ -165,6 +192,11 @@ func (p *Pool) buildResolvers(specs []string) []Resolver {
 			log.Printf("[WARN] Ignoring invalid upstream spec %q: %v", raw, err)
 			continue
 		}
+		if _, exists := seen[spec.NormalizedKey()]; exists {
+			log.Printf("[WARN] Ignoring duplicate normalized upstream spec %q", raw)
+			continue
+		}
+		seen[spec.NormalizedKey()] = struct{}{}
 		out = append(out, p.newResolver(spec))
 	}
 	return out
@@ -199,6 +231,31 @@ func (p *Pool) SetBootstrapServers(servers []string) {
 	p.boot = boot
 	p.primary = p.buildResolvers(p.cfg.PrimarySpecs)
 	p.fallback = p.buildResolvers(p.cfg.FallbackSpecs)
+	p.routes = make(map[string]Resolver)
+	p.groups = make(map[string][]Resolver)
+	p.mu.Unlock()
+	p.warnHostnameUpstreams()
+}
+
+// SetRuntimeSettings replaces the live-safe selection, fallback, and ECS
+// policy while retaining primary resolver statistics and bootstrap state.
+func (p *Pool) SetRuntimeSettings(mode string, fallbackSpecs []string, ecsClientSubnet string) {
+	if mode == "" {
+		mode = ModeLoadBalance
+	}
+	p.mu.Lock()
+	p.cfg.Mode = mode
+	p.cfg.FallbackSpecs = append([]string(nil), fallbackSpecs...)
+	p.fallback = p.buildResolvers(fallbackSpecs)
+	p.cfg.ECSClientSubnet = strings.TrimSpace(ecsClientSubnet)
+	p.ecsIP = nil
+	p.ecsBits = 0
+	p.ecsFamily = 0
+	if p.cfg.ECSClientSubnet != "" {
+		if err := p.parseECS(p.cfg.ECSClientSubnet); err != nil {
+			log.Printf("[WARN] Ignoring invalid live ECS client subnet")
+		}
+	}
 	p.routes = make(map[string]Resolver)
 	p.groups = make(map[string][]Resolver)
 	p.mu.Unlock()
@@ -250,12 +307,15 @@ func (p *Pool) Probe(ctx context.Context, raw, domain string) error {
 // considered healthy.
 func (p *Pool) healthy(rs []Resolver) []Resolver {
 	fn, _ := p.healthFn.Load().(func() map[string]float64)
-	if fn == nil {
-		return rs
+	var health map[string]float64
+	if fn != nil {
+		health = fn()
 	}
-	health := fn()
 	out := make([]Resolver, 0, len(rs))
 	for _, r := range rs {
+		if until := p.statFor(r.String()).circuitUntil.Load(); until > time.Now().UnixNano() {
+			continue
+		}
 		lat, known := health[r.String()]
 		if known && lat < 0 {
 			continue
@@ -365,7 +425,10 @@ func (p *Pool) exchangeByMode(candidates []Resolver, m *dns.Msg) (*dns.Msg, stri
 	if len(candidates) == 0 {
 		return nil, "", fmt.Errorf("no upstreams available")
 	}
-	switch p.cfg.Mode {
+	p.mu.RLock()
+	mode := p.cfg.Mode
+	p.mu.RUnlock()
+	switch mode {
 	case ModeParallel:
 		return p.exchangeParallel(candidates, m)
 	case ModeLoadBalance:
@@ -395,7 +458,13 @@ func (p *Pool) exchangeParallel(candidates []Resolver, m *dns.Msg) (*dns.Msg, st
 		spec string
 		err  error
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), exchangeTimeout+time.Second)
+	maxTimeout := exchangeTimeout
+	for _, candidate := range candidates {
+		if timeout := resolverSpec(candidate).TimeoutDuration(); timeout > maxTimeout {
+			maxTimeout = timeout
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), maxTimeout+time.Second)
 	defer cancel()
 	results := make(chan result, len(candidates))
 	for _, r := range candidates {
@@ -438,7 +507,7 @@ func (p *Pool) weightedOrder(candidates []Resolver) []Resolver {
 		p.statsMu.Lock()
 		ewma := st.ewmaMS
 		p.statsMu.Unlock()
-		weights[i] = selectionWeight(ewma, st.failurePenalty.Load())
+		weights[i] = selectionWeight(ewma, st.failurePenalty.Load()) * float64(resolverSpec(r).SelectionWeight())
 	}
 
 	out := make([]Resolver, 0, len(candidates))
@@ -471,7 +540,7 @@ func selectionWeight(ewmaMS float64, failurePenalty int64) float64 {
 
 // exchange runs one upstream exchange with ECS, stats, and DNS64 handling.
 func (p *Pool) exchange(r Resolver, m *dns.Msg) (*dns.Msg, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), exchangeTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), resolverSpec(r).TimeoutDuration())
 	defer cancel()
 	return p.exchangeContext(ctx, r, m)
 }
@@ -493,12 +562,29 @@ func (p *Pool) exchangeContext(ctx context.Context, r Resolver, m *dns.Msg) (*dn
 
 	st := p.statFor(r.String())
 	if err != nil || resp == nil {
+		if err == nil {
+			err = fmt.Errorf("upstream %q returned an empty response", r.String())
+		}
 		st.failures.Add(1)
 		st.failurePenalty.Add(1)
+		failures := st.consecutiveFailures.Add(1)
+		st.consecutiveSuccesses.Store(0)
+		p.statsMu.Lock()
+		st.lastFailure = err.Error()
+		p.statsMu.Unlock()
+		if failures >= circuitFailureThreshold {
+			st.circuitUntil.Store(time.Now().Add(circuitCooldown).UnixNano())
+		}
 		return nil, err
 	}
 	st.successes.Add(1)
 	st.failurePenalty.Store(0)
+	st.consecutiveFailures.Store(0)
+	st.consecutiveSuccesses.Add(1)
+	st.circuitUntil.Store(0)
+	p.statsMu.Lock()
+	st.lastFailure = ""
+	p.statsMu.Unlock()
 	p.recordLatency(st, elapsed)
 
 	// DNS64: synthesize AAAA from A on empty AAAA answers.
@@ -519,6 +605,11 @@ func (p *Pool) recordLatency(st *stat, ms float64) {
 		st.ewmaMS = ms
 	} else {
 		st.ewmaMS = 0.25*ms + 0.75*st.ewmaMS
+	}
+	st.latencySamples[st.latencyIndex] = ms
+	st.latencyIndex = (st.latencyIndex + 1) % latencySampleLimit
+	if st.latencyCount < latencySampleLimit {
+		st.latencyCount++
 	}
 }
 
@@ -551,15 +642,40 @@ func (p *Pool) StatsSnapshot() []StatSnapshot {
 	defer p.statsMu.Unlock()
 	out := make([]StatSnapshot, 0, len(resolvers))
 	for _, r := range resolvers {
-		spec := r.String()
-		st := p.stats[spec]
-		snap := StatSnapshot{Spec: spec, Healthy: true}
+		raw := r.String()
+		parsed := resolverSpec(r)
+		st := p.stats[raw]
+		snap := StatSnapshot{
+			Spec: raw, NormalizedSpec: parsed.NormalizedKey(), Healthy: true,
+			TimeoutMS: float64(parsed.TimeoutDuration().Microseconds()) / 1000,
+			Weight:    parsed.SelectionWeight(),
+		}
 		if st != nil {
 			snap.EWMAms = st.ewmaMS
 			snap.Failures = st.failures.Load()
 			snap.Successes = st.successes.Load()
+			snap.ConsecutiveFailures = st.consecutiveFailures.Load()
+			snap.ConsecutiveSuccesses = st.consecutiveSuccesses.Load()
+			snap.LastFailure = st.lastFailure
+			samples := append([]float64(nil), st.latencySamples[:st.latencyCount]...)
+			sort.Float64s(samples)
+			snap.P50ms = latencyPercentile(samples, 0.50)
+			snap.P95ms = latencyPercentile(samples, 0.95)
+			snap.P99ms = latencyPercentile(samples, 0.99)
+			if until := st.circuitUntil.Load(); until > time.Now().UnixNano() {
+				snap.Healthy = false
+				snap.CircuitOpenUntil = time.Unix(0, until)
+			}
 		}
-		if lat, known := health[spec]; known && lat < 0 {
+		if runtimeProvider, ok := r.(interface{ runtimeInfo() resolverRuntime }); ok {
+			runtime := runtimeProvider.runtimeInfo()
+			snap.ResolvedEndpoint = runtime.Endpoint
+			snap.ConnectionsReused = runtime.Reused
+			snap.ConnectionsFresh = runtime.Fresh
+			snap.TLSIssuer = runtime.TLSIssuer
+			snap.TLSExpiresAt = runtime.TLSExpiry
+		}
+		if lat, known := health[raw]; known && lat < 0 {
 			snap.Healthy = false
 		}
 		out = append(out, snap)
@@ -567,11 +683,47 @@ func (p *Pool) StatsSnapshot() []StatSnapshot {
 	return out
 }
 
+// BootstrapStatus returns the current hostname-to-address cache.
+func (p *Pool) BootstrapStatus() []BootstrapStatus {
+	p.mu.RLock()
+	boot := p.boot
+	p.mu.RUnlock()
+	return boot.snapshot()
+}
+
+func resolverSpec(resolver Resolver) Spec {
+	switch typed := resolver.(type) {
+	case *dnsResolver:
+		return typed.spec
+	case *dohResolver:
+		return typed.spec
+	default:
+		spec, err := Parse(resolver.String())
+		if err == nil {
+			return spec
+		}
+		return Spec{Scheme: SchemeUDP, Host: resolver.String(), Port: "53", Raw: resolver.String()}
+	}
+}
+
+func latencyPercentile(sorted []float64, percentile float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	index := int(float64(len(sorted)-1)*percentile + 0.5)
+	return sorted[index]
+}
+
 // withECS attaches the configured EDNS0 client subnet to a copy of the
 // query. Without ECS configured the query is forwarded as-is — the client's
 // subnet is never passed through (privacy, AdGuard default).
 func (p *Pool) withECS(m *dns.Msg) *dns.Msg {
-	if p.ecsIP == nil {
+	p.mu.RLock()
+	ecsIP := append(net.IP(nil), p.ecsIP...)
+	ecsBits := p.ecsBits
+	ecsFamily := p.ecsFamily
+	p.mu.RUnlock()
+	if ecsIP == nil {
 		return m
 	}
 	out := m.Copy()
@@ -591,10 +743,10 @@ func (p *Pool) withECS(m *dns.Msg) *dns.Msg {
 
 	e := new(dns.EDNS0_SUBNET)
 	e.Code = dns.EDNS0SUBNET
-	e.Family = p.ecsFamily
-	e.SourceNetmask = uint8(p.ecsBits) // #nosec G115 -- ecsBits is bounded to 32/128 at parse time
+	e.Family = ecsFamily
+	e.SourceNetmask = uint8(ecsBits) // #nosec G115 -- ecsBits is bounded to 32/128 at parse time
 	e.SourceScope = 0
-	e.Address = p.ecsIP
+	e.Address = ecsIP
 
 	o := new(dns.OPT)
 	o.Hdr.Name = "."

@@ -96,6 +96,16 @@ const (
 	// in seconds (dnsmasq local-ttl=60 / max-ttl=600).
 	minCacheTTLDefault = 60
 	maxCacheTTLDefault = 600
+	// DefaultCachePrefetchWindow controls how soon before expiry hot entries are refreshed.
+	DefaultCachePrefetchWindow = 30 * time.Second
+	// DefaultCachePrefetchHits is the access threshold for prefetching a cache entry.
+	DefaultCachePrefetchHits = 3
+	// DefaultDNSTCPIdleTimeout limits how long an idle DNS TCP connection remains open.
+	DefaultDNSTCPIdleTimeout = 8 * time.Second
+	// DefaultDNSTCPMaxQueries limits queries served over one DNS TCP connection.
+	DefaultDNSTCPMaxQueries = 128
+	// DefaultDNSTCPMaxConnections limits concurrent DNS TCP connections.
+	DefaultDNSTCPMaxConnections = 256
 	// DefaultUpstreamLatencyThreshold is the default latency alert threshold in milliseconds.
 	DefaultUpstreamLatencyThreshold = 200
 
@@ -145,6 +155,10 @@ type Config struct {
 	Mode          string
 	ControllerURL string
 	NodeName      string
+	// NodeID is the stable, opaque identity used to distinguish cluster nodes
+	// that happen to share the same display name. Agents persist one when this
+	// value is not configured explicitly.
+	NodeID        string
 	Port          string
 	WebListenAddr string
 	HistoryDir    string
@@ -240,7 +254,11 @@ type Config struct {
 	CacheMinTTL uint32
 	CacheMaxTTL uint32
 	// CacheOptimistic serves stale entries while refreshing in background.
-	CacheOptimistic bool
+	CacheOptimistic     bool
+	CachePrefetch       bool
+	CachePrefetchWindow time.Duration
+	CachePrefetchHits   uint32
+	CacheSERVFAILTTL    time.Duration
 	// ClientsFile is the per-client registry JSON file.
 	ClientsFile string
 	// DNSAllowedClients restricts DNS service to these IPs/CIDRs when non-empty.
@@ -251,6 +269,9 @@ type Config struct {
 	RateLimitQPS int
 	// InternalRateLimitQPS limits LAN and Tailscale clients per IP (0 = disabled).
 	InternalRateLimitQPS int
+	// RateLimitEDE returns REFUSED with an Extended DNS Error to EDNS clients
+	// instead of silently dropping over-limit queries.
+	RateLimitEDE bool
 	// PrivatePTR answers PTR for known private clients locally (default true).
 	PrivatePTR bool
 	// DNSSEC enables DO-bit passthrough to upstreams (no local validation).
@@ -263,8 +284,11 @@ type Config struct {
 	DoTEnabled bool
 	DoTPort    int
 	// TLSCertFile/TLSKeyFile are required for DoT.
-	TLSCertFile string
-	TLSKeyFile  string
+	TLSCertFile          string
+	TLSKeyFile           string
+	DNSTCPIdleTimeout    time.Duration
+	DNSTCPMaxQueries     int
+	DNSTCPMaxConnections int
 	// UpstreamLatencyThreshold is the latency threshold in ms for alerting.
 	UpstreamLatencyThreshold int
 
@@ -943,6 +967,23 @@ func LoadConfig() *Config {
 		log.Printf("[WARN] CACHE_MAX_TTL %d < CACHE_MIN_TTL %d, using defaults %d/%d", cacheMaxTTL, cacheMinTTL, minCacheTTLDefault, maxCacheTTLDefault)
 		cacheMinTTL, cacheMaxTTL = minCacheTTLDefault, maxCacheTTLDefault
 	}
+	cacheSERVFAILTTL := parseDurationEnv("CACHE_SERVFAIL_TTL", 0)
+	if cacheSERVFAILTTL < 0 || cacheSERVFAILTTL > time.Second {
+		log.Printf("[WARN] CACHE_SERVFAIL_TTL must be between 0s and 1s; disabling it")
+		cacheSERVFAILTTL = 0
+	}
+	dnsTCPIdleTimeout := parseDurationEnv("DNS_TCP_IDLE_TIMEOUT", DefaultDNSTCPIdleTimeout)
+	if dnsTCPIdleTimeout <= 0 {
+		dnsTCPIdleTimeout = DefaultDNSTCPIdleTimeout
+	}
+	dnsTCPMaxQueries := parseIntEnv("DNS_TCP_MAX_QUERIES", DefaultDNSTCPMaxQueries)
+	if dnsTCPMaxQueries <= 0 {
+		dnsTCPMaxQueries = DefaultDNSTCPMaxQueries
+	}
+	dnsTCPMaxConnections := parseIntEnv("DNS_TCP_MAX_CONNECTIONS", DefaultDNSTCPMaxConnections)
+	if dnsTCPMaxConnections <= 0 {
+		dnsTCPMaxConnections = DefaultDNSTCPMaxConnections
+	}
 
 	latencyThreshold := resolveLatencyThreshold()
 
@@ -973,6 +1014,7 @@ func LoadConfig() *Config {
 		Mode:                       mode,
 		ControllerURL:              controllerURL,
 		NodeName:                   nodeName,
+		NodeID:                     strings.TrimSpace(os.Getenv("NODE_ID")),
 		Port:                       port,
 		WebListenAddr:              webListenAddr,
 		HistoryDir:                 historyDir,
@@ -1029,11 +1071,16 @@ func LoadConfig() *Config {
 		CacheMinTTL:                cacheMinTTL,
 		CacheMaxTTL:                cacheMaxTTL,
 		CacheOptimistic:            strings.ToLower(os.Getenv("CACHE_OPTIMISTIC")) == "true",
+		CachePrefetch:              strings.ToLower(os.Getenv("CACHE_PREFETCH")) == "true",
+		CachePrefetchWindow:        parseDurationEnv("CACHE_PREFETCH_WINDOW", DefaultCachePrefetchWindow),
+		CachePrefetchHits:          parseUint32Env("CACHE_PREFETCH_HITS", DefaultCachePrefetchHits),
+		CacheSERVFAILTTL:           cacheSERVFAILTTL,
 		ClientsFile:                clientsFile,
 		DNSAllowedClients:          os.Getenv("DNS_ALLOWED_CLIENTS"),
 		DNSDisallowedClients:       os.Getenv("DNS_DISALLOWED_CLIENTS"),
 		RateLimitQPS:               parseIntEnv("RATE_LIMIT_QPS", DefaultRateLimitQPS),
 		InternalRateLimitQPS:       parseIntEnv("RATE_LIMIT_INTERNAL_QPS", DefaultInternalRateLimitQPS),
+		RateLimitEDE:               strings.EqualFold(os.Getenv("RATE_LIMIT_EDE"), "true"),
 		PrivatePTR:                 strings.ToLower(os.Getenv("PRIVATE_PTR")) != "false",
 		DNSSEC:                     strings.ToLower(os.Getenv("DNSSEC")) == "true",
 		DoHEnabled:                 strings.ToLower(os.Getenv("DOH_ENABLED")) == "true",
@@ -1043,6 +1090,9 @@ func LoadConfig() *Config {
 		DoTPort:                    dotPort,
 		TLSCertFile:                os.Getenv("TLS_CERT_FILE"),
 		TLSKeyFile:                 os.Getenv("TLS_KEY_FILE"),
+		DNSTCPIdleTimeout:          dnsTCPIdleTimeout,
+		DNSTCPMaxQueries:           dnsTCPMaxQueries,
+		DNSTCPMaxConnections:       dnsTCPMaxConnections,
 		UpstreamLatencyThreshold:   latencyThreshold,
 		SSEKeepaliveInterval:       sseKeepalive,
 		BatchArchiveInterval:       batchArchive,
@@ -1160,6 +1210,11 @@ func (c *Config) FullFilterSubscriptionsPath() string {
 	return filepath.Join(c.FullConfigDir(), "filter-subscriptions.json")
 }
 
+// FullDNSSettingsPath returns the controller-managed live DNS policy path.
+func (c *Config) FullDNSSettingsPath() string {
+	return filepath.Join(c.FullConfigDir(), "dns-settings.json")
+}
+
 // FullTLSStateDir returns the generated TLS state directory. The history/tls
 // fallback preserves manually constructed Config values and older embedders.
 func (c *Config) FullTLSStateDir() string {
@@ -1246,6 +1301,9 @@ func (c *Config) VerifyConfig() ([]string, []string) {
 	}
 	if c.WebUsername == "" && c.WebPassword == "" && c.IngestSecret == "" {
 		errs = append(errs, "configure WEB_USERNAME/WEB_PASSWORD or INGEST_SECRET; internal endpoints may not run without authentication")
+	}
+	if c.Mode == ModeAgent && strings.TrimSpace(c.IngestSecret) == "" {
+		errs = append(errs, "INGEST_SECRET is required in agent mode for authenticated controller communication")
 	}
 
 	// 4. Port number validation

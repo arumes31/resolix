@@ -2,6 +2,7 @@ package dnsserver
 
 import (
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -208,9 +209,21 @@ func TestCNAMEChainLoopCap(t *testing.T) {
 		t.Errorf("loop rcode = %s, want SERVFAIL", dns.RcodeToString[resp.Rcode])
 	}
 	ev := h.nextEvent(t)
-	if ev.ResponseCode != "SERVFAIL" {
+	if ev.ResponseCode != "SERVFAIL" || ev.BlockReason != "CNAME_LOOP" || !strings.Contains(ev.MatchedRule, "CNAME loop") {
 		t.Errorf("loop event = %+v", ev)
 	}
+
+	ednsQuery := new(dns.Msg)
+	ednsQuery.SetQuestion("loop-a.test.", dns.TypeA)
+	ednsQuery.SetEdns0(1232, false)
+	ednsResponse, drop := h.srv.Resolve(ednsQuery, "192.0.2.1")
+	if drop || ednsResponse == nil {
+		t.Fatalf("EDNS loop response=%v drop=%t", ednsResponse, drop)
+	}
+	if code, ok := extendedErrorCode(ednsResponse); !ok || code != dns.ExtendedErrorCodeOther {
+		t.Fatalf("CNAME loop EDE = %d/%t", code, ok)
+	}
+	_ = h.nextEvent(t)
 }
 
 func TestSafeSearchE2E(t *testing.T) {

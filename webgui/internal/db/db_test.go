@@ -60,31 +60,57 @@ func TestInitDBMigratesOldSchema(t *testing.T) {
 		}
 		cols[name] = true
 	}
-	for _, want := range []string{"matched_rule", "block_reason", "dnssec", "blocked"} {
+	for _, want := range []string{
+		"matched_rule", "block_reason", "dnssec", "blocked",
+		"cache_status", "cache_ttl", "negative_soa",
+	} {
 		if !cols[want] {
 			t.Errorf("column %q missing after migration", want)
 		}
 	}
-	for _, want := range []string{"idx_queries_blocked", "idx_queries_response_code"} {
+	for _, want := range []string{
+		"idx_queries_blocked",
+		"idx_queries_response_code",
+		"idx_queries_history_time_id",
+		"idx_queries_type_time_id",
+		"idx_queries_cache_status_id",
+	} {
 		var name string
 		if err := db.QueryRow("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?", want).Scan(&name); err != nil {
 			t.Errorf("index %q missing after migration: %v", want, err)
 		}
 	}
 
-	// Old rows remain readable; new columns default to ''.
-	var domain, matchedRule, blockReason string
-	err = db.QueryRow("SELECT domain, matched_rule, block_reason FROM queries WHERE id = 1").Scan(&domain, &matchedRule, &blockReason)
+	// Old rows remain readable; new cache metadata uses zero values.
+	var domain, matchedRule, blockReason, cacheStatus, negativeSOA string
+	var cacheTTL int64
+	err = db.QueryRow(`SELECT domain, matched_rule, block_reason,
+		cache_status, cache_ttl, negative_soa FROM queries WHERE id = 1`).Scan(
+		&domain, &matchedRule, &blockReason, &cacheStatus, &cacheTTL, &negativeSOA,
+	)
 	if err != nil {
 		t.Fatalf("read migrated row: %v", err)
 	}
-	if domain != "old.example.com" || matchedRule != "" || blockReason != "" {
-		t.Errorf("migrated row = (%q, %q, %q)", domain, matchedRule, blockReason)
+	if domain != "old.example.com" || matchedRule != "" || blockReason != "" ||
+		cacheStatus != "" || cacheTTL != 0 || negativeSOA != "" {
+		t.Errorf("migrated row has unexpected values: domain=%q rule=%q reason=%q cache=%q/%d/%q",
+			domain, matchedRule, blockReason, cacheStatus, cacheTTL, negativeSOA)
+	}
+	var aggregateCount int
+	if err := db.QueryRow("SELECT total FROM query_hourly_totals WHERE hour = 0").Scan(&aggregateCount); err != nil {
+		t.Fatalf("read backfilled hourly total: %v", err)
+	}
+	if aggregateCount != 1 {
+		t.Fatalf("backfilled hourly total = %d, want 1", aggregateCount)
 	}
 
 	// Inserts with the new column set (as storage.go now issues) must work.
-	_, err = db.Exec(`INSERT INTO queries (unix_time, node, client_ip, domain, type, upstream, latency, dnssec, response_code, client_hostname, blocked, latency_alert, matched_rule, block_reason)
-		VALUES (2, 'n1', '2.2.2.2', 'blocked.example.com', 'A', 'Filtered', NULL, '', 'NXDOMAIN', '', 1, 0, '||blocked.example.com^', 'FilteredByBlocklist')`)
+	_, err = db.Exec(`INSERT INTO queries (unix_time, node, client_ip, domain, type,
+		upstream, latency, dnssec, response_code, client_hostname, blocked,
+		latency_alert, matched_rule, block_reason, cache_status, cache_ttl, negative_soa)
+		VALUES (2, 'n1', '2.2.2.2', 'blocked.example.com', 'A', 'Filtered', NULL, '',
+		'NXDOMAIN', '', 1, 0, '||blocked.example.com^', 'FilteredByBlocklist',
+		'negative', 30, 'example.com.')`)
 	if err != nil {
 		t.Fatalf("insert with new columns: %v", err)
 	}

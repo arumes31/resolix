@@ -12,12 +12,12 @@ Resolix is a self-hosted DNS control plane for Tailscale networks. One Go servic
 
 - Embedded UDP/TCP DNS server built with [`miekg/dns`](https://github.com/miekg/dns); no dnsmasq sidecar.
 - UDP, TCP, DNS-over-TLS, and DNS-over-HTTPS upstreams with strict, parallel, and load-balanced selection.
-- Adblock, hosts, plain-domain, and RE2 filter rules; URL subscriptions support ETag/Last-Modified and keep the last good copy.
-- Source-aware A/AAAA/CNAME/PTR/MX/TXT/SRV and RCODE rewrites, safe search, blocked services, private PTR, DNS64, DNSSEC passthrough, ACLs, and rate limiting.
-- Per-client filtering, safe search, service blocking, schedules, upstreams, and query-log/statistics exclusions.
+- First-class DNS blocklists and allowlists using Adblock, hosts, plain-domain, and RE2 rules; URL subscriptions support ETag/Last-Modified and keep the last good copy.
+- Source-aware A/AAAA/CNAME/PTR/MX/TXT/SRV and RCODE rewrites, safe search, private PTR, DNS64, DNSSEC passthrough, ACLs, and rate limiting.
+- Per-client filtering, safe search, upstreams, and query-log/statistics exclusions.
 - In-memory TTL-aware cache with negative caching, optimistic refresh, and in-process clearing.
 - SQLite history with bounded asynchronous batching, live SSE updates, metrics, health checks, and node status.
-- A dedicated `/config` control plane for upstreams, routes, filter subscriptions, custom rules, rewrites, clients, services, and cache management.
+- A dedicated `/config` control plane for upstreams, routes, blocklists, allowlists, custom rules, rewrites, clients, and cache management.
 - Controller/Agent clusters with content-addressed configuration snapshots and visible revision drift.
 - Generated controller HTTPS with tailnet-restricted CA pinning, plus external reverse-proxy TLS and subpath support.
 
@@ -154,7 +154,7 @@ Repeat this step for additional agents, changing `NODE_NAME`, `TS_AUTHKEY`, and 
 
 #### 3. Configure DNS once on the controller
 
-Open the controller's `/config` page and manage upstreams, bootstrap resolvers, DNS routes, filter subscriptions, custom rules, rewrites, and client policies there. These settings are stored in the dedicated `config` mount. Agents expose `/config` as read-only, periodically pull the controller's content-addressed snapshot, persist it locally, and report their applied revision. Query events and heartbeats flow back to the controller using the shared `INGEST_SECRET`.
+Open the controller's `/config` page and manage upstreams, bootstrap resolvers, DNS routes, blocklists, allowlists, custom rules, rewrites, and client policies there. These settings are stored in the dedicated `config` mount. Agents expose `/config` as read-only, periodically pull the controller's content-addressed snapshot, persist it locally, and report their applied revision. Query events and heartbeats flow back to the controller using the shared `INGEST_SECRET`.
 
 By default, every controller and agent serves DNS on UDP and TCP port 53. Tailnet clients can use the node's Tailscale IPv4 address and `DNS_LISTEN_PORT`; LAN clients can use the host's LAN address and `DNS_PUBLISH_PORT`. When overriding either default, clients must use the corresponding configured port. The Compose files publish DNS on all host IPv4 interfaces:
 
@@ -202,7 +202,7 @@ Legacy `MODE=master`, `MODE=slave`, and `MASTER_URL` values are accepted for upg
 
 ```text
 ACL/rate limit → refuse ANY / disable AAAA → rewrites → private PTR
-→ safe search → filtering → blocked services → cache → client upstreams
+→ safe search → filtering → cache → client upstreams
 → domain route → global upstream pool → bogus-NXDOMAIN → cache store → response
 ```
 
@@ -212,8 +212,10 @@ Cache hits are measured inside the DNS request lifecycle. Query events are emitt
 
 | Path | Purpose | Authentication |
 | --- | --- | --- |
-| `/` | Live queries, statistics, upstream health, agents, and block/unblock actions | Web session |
-| `/config` | DNS configuration, policies, services, runtime view, and cluster revision state | Web session; read-only on agents |
+| `/` | Aggregate traffic statistics and upstream health | Web session |
+| `/querylog` | Live query stream, filtering, resolution probes, client details, and block/unblock actions | Web session |
+| `/cluster` | Agent connectivity, versions, runtime resources, and last report time | Web session; controller only |
+| `/config` | DNS configuration, policies, runtime view, and cluster revision state | Web session; read-only on agents |
 | `/healthz` | Lightweight liveness check | None |
 | `/readyz` | Web, DNS listener, and SQLite readiness | None |
 | `/metrics` | Prometheus metrics | Application authentication |
@@ -225,6 +227,8 @@ Cache hits are measured inside the DNS request lifecycle. Query events are emitt
 Environment variables are the bootstrap layer. Settings that can be changed safely at runtime are managed from `/config` and synchronized from the controller to agents. Listener addresses, credentials, certificates, and storage paths remain environment-owned and require a restart.
 
 The **Upstreams** panel manages both upstream resolver specifications and the shared bootstrap resolver list. Bootstrap entries must be plain UDP IP literals (with an optional port); Resolix uses them to resolve hostname-based DoT and DoH endpoints, hot-reloads them without restarting DNS, and includes them in controller-to-agent configuration revisions. `BOOTSTRAP_DNS` supplies the initial list until the controller saves an explicit list in `/config`.
+
+The **Allowlists** panel accepts hosted Adblock, hosts-file, and plain-domain lists. Every valid entry becomes a DNS exception for the apex domain and its subdomains, so it takes precedence over matching blocklists and custom blocking rules. Lists can be enabled, disabled, edited, removed, or refreshed from the UI. Controller-managed allowlists are persisted with blocklists in one atomic configuration revision and synchronized to all agents. `ALLOWLIST_URLS` and `ALLOWLIST_FILE` remain available as first-boot/environment sources.
 
 ### Node, web, and cluster
 
@@ -307,7 +311,6 @@ The **Upstreams** panel manages both upstream resolver specifications and the sh
 | `AAAA_DISABLED` | Return NOERROR with no answers for AAAA queries | `false` |
 | `REFUSE_ANY` | Refuse QTYPE ANY | `true` |
 | `CLIENTS_FILE` | Per-client policy registry, relative to `CONFIG_DIR` unless absolute | `clients.json` |
-| `BLOCKED_SERVICES` | Globally blocked service IDs | unset |
 | `CLIENT_ALIASES` | Inline `IP:Alias` mappings | unset |
 | `CLIENT_ALIASES_FILE` | Hot-reloaded `IP=Alias` file | unset |
 
@@ -321,9 +324,9 @@ Rewrites created in `/config` can apply to every client, only Tailscale address 
 | `CONFIG_DIR` | Managed upstreams, routes, subscriptions, rules, rewrites, and clients | `/var/lib/resolix-config` |
 | `DB_PATH` | SQLite file name or absolute path | `dns.db` |
 | `BATCH_ARCHIVE_INTERVAL` | Maximum time between archive passes | `30m` |
-| `ARCHIVE_QUEUE_CAPACITY` | Maximum queued events during bursts/outages | `100000` |
-| `ARCHIVE_TRIGGER_SIZE` | Pending events that wake the archiver | `5000` |
-| `ARCHIVE_WRITE_BATCH_SIZE` | Maximum rows per SQLite transaction | `5000` |
+| `ARCHIVE_QUEUE_CAPACITY` | Maximum queued events during bursts/outages | `1000000` |
+| `ARCHIVE_TRIGGER_SIZE` | Pending events that wake the archiver | `20000` |
+| `ARCHIVE_WRITE_BATCH_SIZE` | Maximum rows per SQLite transaction | `20000` |
 | `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, or `ERROR` | `INFO` |
 | `LOG_FILE` | Optional file log destination; empty uses stderr | unset |
 | `DEBUG` | Enable additional debug behavior | `false` |

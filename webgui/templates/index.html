@@ -11,7 +11,7 @@
     <link rel="stylesheet" href="static/css/style.css">
 </head>
 
-<body class="app-page dashboard-page compact" data-base-url="{{.BaseURL}}" data-csrf-token="{{.CSRFToken}}" data-mode="{{.Mode}}">
+<body class="app-page dashboard-page compact" data-page="dashboard" data-base-url="{{.BaseURL}}" data-csrf-token="{{.CSRFToken}}" data-mode="{{.Mode}}">
     <div id="sidebarScrim" class="sidebar-scrim" aria-hidden="true"></div>
     <aside id="appSidebar" class="app-sidebar" aria-label="Primary navigation">
         <div class="sidebar-brand">
@@ -31,13 +31,13 @@
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13h6V4H4v9Zm0 7h6v-4H4v4Zm10 0h6v-9h-6v9Zm0-16v4h6V4h-6Z"/></svg>
                 <span>Dashboard</span>
             </a>
-            <a class="app-nav-link" href="#query-log" data-sidebar-view="query-log">
+            <a class="app-nav-link" href="querylog">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v3H5V4Zm0 6h14v3H5v-3Zm0 6h9v3H5v-3Z"/></svg>
                 <span>Query log</span>
                 <span class="nav-live">Live</span>
             </a>
             {{if eq .Mode "controller"}}
-            <a class="app-nav-link" href="#cluster-nodes" data-sidebar-view="cluster-nodes">
+            <a class="app-nav-link" href="cluster">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a4 4 0 0 1 4 4c0 .7-.18 1.36-.5 1.93L19.57 13A4 4 0 1 1 18 14.5l-4.07-4.07A4 4 0 0 1 12 11a4 4 0 0 1-1.93-.5L6 14.57A4 4 0 1 1 4.43 13l4.07-4.07A4 4 0 1 1 12 3Z"/></svg>
                 <span>Cluster nodes</span>
             </a>
@@ -50,7 +50,7 @@
         </nav>
         <div class="sidebar-footer">
             <div class="sidebar-footnote"><span>Mode</span><strong>{{.Mode}}</strong></div>
-            <form method="post" action="{{.BaseURL}}/logout" class="logout-form sidebar-logout">
+            <form method="post" action="logout" class="logout-form sidebar-logout">
                 <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
                 <button type="submit" class="app-nav-link sidebar-button" aria-label="Sign out">
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 17v3H4V4h6v3H7v10h3Zm4.59-9.59L16 6l6 6-6 6-1.41-1.41L18.17 13H9v-2h9.17l-3.58-3.59Z"/></svg>
@@ -70,28 +70,10 @@
             </div>
             <div class="topbar-actions">
                 <p id="systemStatus" class="system-status" role="status" aria-live="polite"><span class="status-dot status-online"></span> System online</p>
-                <div class="search-container">
-                    <svg class="search-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-                    </svg>
-                    <input type="text" id="searchInput" class="search-input" placeholder="Filter live queries…" aria-label="Filter DNS queries">
-                </div>
-                <button id="freezeBtn" type="button" class="btn-icon" title="Freeze live query log" aria-label="Freeze live query log" aria-pressed="false">Ⅱ</button>
-                <button id="clearViewBtn" type="button" class="btn-icon" title="Clear query view" aria-label="Clear query view">×</button>
             </div>
         </header>
 
         <main class="app-content container">
-            <div id="settingsNotice" class="settings-notice is-hidden" role="status" aria-live="polite"></div>
-            <section class="command-bar" aria-label="DNS lookup test">
-                <div class="command-copy"><span class="command-prompt" aria-hidden="true">›_</span><div><strong>Resolution probe</strong><span>Test the active policy path from this node</span></div></div>
-                <div class="simulator-box simulator-compact">
-                    <input type="text" id="simDomain" class="simulator-input" placeholder="domain.example" aria-label="Domain to test">
-                    <button id="simulateBtn" class="btn btn-primary">Run probe</button>
-                </div>
-            </section>
-            <div id="simulatorResult"></div>
-
             <section class="metric-grid" aria-label="Traffic summary">
                 <article class="metric-card"><span>Queries / minute</span><strong id="rpm_val">0 RPM</strong><small><i class="metric-dot blue"></i>Live request rate</small></article>
                 <article class="metric-card"><span>Queries / hour</span><strong id="rph_val">0</strong><small>Total observed: <b id="total_val">0</b></small></article>
@@ -115,42 +97,7 @@
                 <div class="card wide-card heatmap-card"><div class="stat-header"><span>24-hour traffic intensity</span></div><div class="heatmap-container" id="trafficHeatmap"></div></div>
             </div>
 
-            <section id="query-log" class="console-section query-log-section">
-                <div class="section-heading"><div><span class="page-kicker">Live stream</span><h2>DNS query log</h2></div><span class="section-chip healthy"><i class="metric-dot green"></i>Connected</span></div>
-                <div class="table-container">
-                    <div id="viewClearedBanner" class="view-cleared-banner is-hidden">View cleared — new events will appear as they arrive</div>
-                    <table>
-                        <thead><tr><th>Time</th><th>Node</th><th>Type</th><th>Domain</th><th>Client</th><th>Upstream</th><th>Latency</th><th>Action</th></tr></thead>
-                        <tbody id="eventTable"></tbody>
-                    </table>
-                </div>
-            </section>
-
-            {{if eq .Mode "controller"}}
-            <section id="cluster-nodes" class="node-status-panel console-section">
-                <div class="section-heading"><div><span class="page-kicker">Control plane</span><h2>Cluster nodes</h2></div></div>
-                <div id="nodeCards" class="node-status-grid"><p class="empty-state">No agent nodes connected</p></div>
-            </section>
-            {{end}}
         </main>
-    </div>
-
-    <div id="clientModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-hidden="true">
-        <div class="modal-content" tabindex="-1">
-            <h2 id="modalTitle" class="modal-title">Client Stats</h2>
-            <div id="modalCharts" class="modal-charts"></div>
-            <div class="modal-stats-grid">
-                <div class="card modal-stat-card">
-                    <div class="stat-header">RPM</div>
-                    <div class="stat-value" id="modalRPM">0</div>
-                </div>
-                <div class="card modal-stat-card">
-                    <div class="stat-header">RPH</div>
-                    <div class="stat-value" id="modalRPH">0</div>
-                </div>
-            </div>
-            <button id="modalCloseBtn" class="btn btn-primary modal-close">Close</button>
-        </div>
     </div>
     <script nonce="{{.Nonce}}" src="static/js/shell.js"></script>
     <script nonce="{{.Nonce}}" src="static/js/index.js"></script>

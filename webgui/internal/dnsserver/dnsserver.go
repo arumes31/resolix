@@ -1,7 +1,7 @@
 // Package dnsserver implements the in-process DNS server that replaces
 // dnsmasq. It serves UDP and TCP listeners and answers queries through an
 // ordered pipeline: refuse-ANY/AAAA-disable → typed rewrites → private PTR →
-// safe-search → filter → blocked services → cache → client upstreams →
+// safe-search → filter → cache → client upstreams →
 // domain route → global pool → bogus-NXDOMAIN → cache store → respond.
 // Every answered query is emitted as a models.QueryEvent into the existing
 // Store/SSE pipeline.
@@ -82,8 +82,6 @@ type Config struct {
 	Routes *dnsroutes.DNSRoutes
 	// Clients is the per-client policy registry (nil = all clients global).
 	Clients *clients.Registry
-	// BlockedServices lists globally blocked service IDs.
-	BlockedServices []string
 	// AliasFunc resolves a client IP to its display alias (CLIENT_ALIASES);
 	// a matching registry client's name takes precedence.
 	AliasFunc func(ip string) string
@@ -142,9 +140,6 @@ type Server struct {
 	// refreshInFlight tracks optimistic-cache background refreshes (single-flight).
 	refreshMu       sync.Mutex
 	refreshInFlight map[cacheKey]bool
-
-	// serviceHits counts blocked-service matches per service ID.
-	serviceHits sync.Map // map[string]*atomic.Int64
 }
 
 // New creates a DNS server. emit is invoked synchronously for every answered
@@ -398,7 +393,7 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 //
 // Order: refuse-ANY / AAAA-disable short-circuits → typed rewrites → private
 // PTR → safe-search (per-client aware) → filter (unless the client disabled
-// filtering) → blocked services (per-client, schedule-aware) → cache →
+// filtering) → cache →
 // forward (client upstreams → per-domain route → global pool) →
 // bogus-NXDOMAIN conversion → cache store. depth bounds chase chains.
 func (s *Server) resolve(r *dns.Msg, resp *dns.Msg, depth int, cl *clients.Client, clientIP string) resolution {
@@ -448,11 +443,6 @@ func (s *Server) resolve(r *dns.Msg, resp *dns.Msg, depth int, cl *clients.Clien
 		}
 	}
 
-	// Stage 3b: blocked services (global or per-client list, schedule-aware).
-	if res, handled := s.stageBlockedServices(r, q, resp, domain, cl); handled {
-		return res
-	}
-
 	// Stage 4: cache → forward → bogus-NXDOMAIN → cache store. Clients with
 	// custom upstreams get a distinct cache group so their answers never
 	// pollute the shared global cache.
@@ -473,53 +463,6 @@ func clientUpstreamGroup(cl *clients.Client) (group string, specs []string) {
 		return "", nil
 	}
 	return "up:" + strings.Join(cl.Upstreams, ","), cl.Upstreams
-}
-
-// stageBlockedServices enforces the blocked-services catalog. The service
-// list is global, or per-client when the client opted out of global
-// settings; a client schedule (when set) limits enforcement windows.
-func (s *Server) stageBlockedServices(r *dns.Msg, q dns.Question, resp *dns.Msg, domain string, cl *clients.Client) (resolution, bool) {
-	services := s.cfg.BlockedServices
-	var sched *clients.Schedule
-	if cl != nil {
-		sched = cl.Schedule
-		if !cl.UseGlobalSettings {
-			services = cl.BlockedServices
-		}
-	}
-	if len(services) == 0 || (sched != nil && !sched.Active(time.Now())) {
-		return resolution{}, false
-	}
-	id, ok := policy.MatchService(domain, services)
-	if !ok {
-		return resolution{}, false
-	}
-	s.serviceHit(id)
-	blockedResp := s.blockedResponse(r, q)
-	resp.Rcode = blockedResp.Rcode
-	resp.Answer = blockedResp.Answer
-	return resolution{
-		upstream:    "Filtered",
-		blocked:     true,
-		matchedRule: id,
-		blockReason: "BlockedService:" + id,
-	}, true
-}
-
-// serviceHit increments the per-service blocked counter.
-func (s *Server) serviceHit(id string) {
-	v, _ := s.serviceHits.LoadOrStore(id, &atomic.Int64{})
-	v.(*atomic.Int64).Add(1)
-}
-
-// ServiceStats returns blocked-service hit counts per service ID.
-func (s *Server) ServiceStats() map[string]int64 {
-	out := make(map[string]int64)
-	s.serviceHits.Range(func(k, v interface{}) bool {
-		out[k.(string)] = v.(*atomic.Int64).Load()
-		return true
-	})
-	return out
 }
 
 // stageRewrites applies typed rewrites from the store (or the legacy

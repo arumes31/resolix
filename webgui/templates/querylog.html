@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'nonce-{{.Nonce}}'; style-src 'self' 'nonce-{{.Nonce}}'; font-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';">
+    <title>Query Log · Resolix</title>
+    <link rel="icon" type="image/svg+xml" href="static/favicon.svg">
+    <link rel="stylesheet" href="static/css/style.css">
+</head>
+
+<body class="app-page querylog-page compact" data-page="querylog" data-base-url="{{.BaseURL}}" data-csrf-token="{{.CSRFToken}}" data-mode="{{.Mode}}">
+    <div id="sidebarScrim" class="sidebar-scrim" aria-hidden="true"></div>
+    <aside id="appSidebar" class="app-sidebar" aria-label="Primary navigation">
+        <div class="sidebar-brand">
+            <span class="brand-mark" aria-hidden="true">R</span>
+            <div><strong>Resolix</strong><span>{{if eq .Mode "controller"}}Controller{{else}}Agent{{end}} node</span></div>
+        </div>
+        <div class="sidebar-status">
+            <span class="status-beacon" aria-hidden="true"></span>
+            <div><strong>DNS control plane</strong><span>Protected and operational</span></div>
+        </div>
+        <nav class="app-nav" aria-label="Application">
+            <span class="nav-section-label">Observe</span>
+            <a class="app-nav-link" href="./">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13h6V4H4v9Zm0 7h6v-4H4v4Zm10 0h6v-9h-6v9Zm0-16v4h6V4h-6Z"/></svg><span>Dashboard</span>
+            </a>
+            <a class="app-nav-link is-active" href="querylog" aria-current="page">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v3H5V4Zm0 6h14v3H5v-3Zm0 6h9v3H5v-3Z"/></svg><span>Query log</span><span class="nav-live">Live</span>
+            </a>
+            {{if eq .Mode "controller"}}
+            <a class="app-nav-link" href="cluster">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a4 4 0 0 1 4 4c0 .7-.18 1.36-.5 1.93L19.57 13A4 4 0 1 1 18 14.5l-4.07-4.07A4 4 0 0 1 12 11a4 4 0 0 1-1.93-.5L6 14.57A4 4 0 1 1 4.43 13l4.07-4.07A4 4 0 1 1 12 3Z"/></svg><span>Cluster nodes</span>
+            </a>
+            {{end}}
+            <span class="nav-section-label">Manage</span>
+            <a class="app-nav-link" href="config">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19.14 12.94c.04-.3.06-.62.06-.94s-.02-.64-.07-.94l2.03-1.58-1.92-3.32-2.39.96a7.3 7.3 0 0 0-1.63-.94L14.86 3h-3.84l-.36 3.18c-.59.24-1.13.56-1.63.94l-2.39-.96-1.92 3.32 2.03 1.58c-.05.3-.08.63-.08.94s.03.64.08.94l-2.03 1.58 1.92 3.32 2.39-.96c.5.39 1.04.7 1.63.94l.36 3.18h3.84l.36-3.18a7.3 7.3 0 0 0 1.63-.94l2.39.96 1.92-3.32-2.02-1.58ZM12.94 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z"/></svg><span>Configuration</span>
+            </a>
+        </nav>
+        <div class="sidebar-footer">
+            <div class="sidebar-footnote"><span>Mode</span><strong>{{.Mode}}</strong></div>
+            <form method="post" action="logout" class="logout-form sidebar-logout">
+                <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+                <button type="submit" class="app-nav-link sidebar-button" aria-label="Sign out">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 17v3H4V4h6v3H7v10h3Zm4.59-9.59L16 6l6 6-6 6-1.41-1.41L18.17 13H9v-2h9.17l-3.58-3.59Z"/></svg><span>Sign out</span>
+                </button>
+            </form>
+        </div>
+    </aside>
+
+    <div class="app-main">
+        <header class="app-topbar">
+            <div class="topbar-title">
+                <button id="sidebarToggle" type="button" class="sidebar-toggle" aria-controls="appSidebar" aria-expanded="false" aria-label="Open navigation">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16v2H4V6Zm0 5h16v2H4v-2Zm0 5h16v2H4v-2Z"/></svg>
+                </button>
+                <div><span class="page-kicker">Traffic inspection</span><h1>DNS query log</h1></div>
+            </div>
+            <div class="topbar-actions">
+                <p id="systemStatus" class="system-status" role="status" aria-live="polite"><span class="status-dot status-online"></span> Connecting live stream</p>
+                <div class="search-container">
+                    <svg class="search-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+                    <input type="text" id="searchInput" class="search-input" placeholder="Filter live queries…" aria-label="Filter DNS queries">
+                </div>
+                <button id="freezeBtn" type="button" class="btn-icon" title="Freeze live query log" aria-label="Freeze live query log" aria-pressed="false">Ⅱ</button>
+                <button id="clearViewBtn" type="button" class="btn-icon" title="Clear query view" aria-label="Clear query view">×</button>
+            </div>
+        </header>
+
+        <main class="app-content container querylog-container">
+            <div class="config-intro">
+                <div><span class="page-kicker">Live traffic</span><h2>Inspect resolution activity</h2></div>
+                <p>Newest queries stay at the top. Filter the stream, inspect clients, or test a domain through the active policy path.</p>
+            </div>
+            <div id="settingsNotice" class="settings-notice is-hidden" role="status" aria-live="polite"></div>
+            <section class="command-bar" aria-label="DNS lookup test">
+                <div class="command-copy"><span class="command-prompt" aria-hidden="true">›_</span><div><strong>Resolution probe</strong><span>Test the active policy path from this node</span></div></div>
+                <div class="simulator-box simulator-compact">
+                    <input type="text" id="simDomain" class="simulator-input" placeholder="domain.example" aria-label="Domain to test">
+                    <button id="simulateBtn" class="btn btn-primary">Run probe</button>
+                </div>
+            </section>
+            <div id="simulatorResult"></div>
+
+            <section class="console-section query-log-section">
+                <div class="section-heading"><div><span class="page-kicker">Live stream</span><h2>DNS queries</h2></div><span class="section-chip healthy"><i class="metric-dot green"></i>Newest first</span></div>
+                <div class="table-container">
+                    <div id="viewClearedBanner" class="view-cleared-banner is-hidden">View cleared — new events will appear as they arrive</div>
+                    <table>
+                        <thead><tr><th>Time</th><th>Node</th><th>Type</th><th>Domain</th><th>Client</th><th>Upstream</th><th>Latency</th><th>Action</th></tr></thead>
+                        <tbody id="eventTable"></tbody>
+                    </table>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <div id="clientModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-hidden="true">
+        <div class="modal-content" tabindex="-1">
+            <h2 id="modalTitle" class="modal-title">Client Stats</h2>
+            <div id="modalCharts" class="modal-charts"></div>
+            <div class="modal-stats-grid">
+                <div class="card modal-stat-card"><div class="stat-header">RPM</div><div class="stat-value" id="modalRPM">0</div></div>
+                <div class="card modal-stat-card"><div class="stat-header">RPH</div><div class="stat-value" id="modalRPH">0</div></div>
+            </div>
+            <button id="modalCloseBtn" class="btn btn-primary modal-close">Close</button>
+        </div>
+    </div>
+    <script nonce="{{.Nonce}}" src="static/js/shell.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/index.js"></script>
+</body>
+
+</html>

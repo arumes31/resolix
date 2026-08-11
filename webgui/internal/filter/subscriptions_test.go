@@ -1,6 +1,9 @@
 package filter
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"path/filepath"
 	"testing"
@@ -61,5 +64,32 @@ func TestReplaceURLSourcesPreservesFiles(t *testing.T) {
 		if source.ID == "disabled" {
 			t.Fatalf("disabled source remained registered: %+v", sources)
 		}
+	}
+}
+
+func TestAllowOnlySubscriptionOverridesBlocklist(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("trusted.blocked.example\n"))
+	}))
+	t.Cleanup(server.Close)
+
+	engine := New()
+	engine.AddFileSource(writeTempList(t, "||blocked.example^\n"), false)
+	engine.ReplaceURLSources([]Subscription{{
+		ID:        "allow-list",
+		Name:      "Trusted domains",
+		URL:       server.URL,
+		AllowOnly: true,
+		Enabled:   true,
+	}})
+	engine.UpdateAll(context.Background())
+
+	result := engine.Match("trusted.blocked.example")
+	if !result.Allowed || result.Blocked {
+		t.Fatalf("allowlist result = %+v", result)
+	}
+	sources := engine.Sources()
+	if len(sources) != 2 || sources[1].AllowRuleCount != 1 || sources[1].RuleCount != 0 {
+		t.Fatalf("sources = %+v", sources)
 	}
 }

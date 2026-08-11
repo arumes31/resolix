@@ -45,7 +45,6 @@ import (
 	"github.com/arumes31/resolix/webgui/internal/forwarder"
 	"github.com/arumes31/resolix/webgui/internal/models"
 	"github.com/arumes31/resolix/webgui/internal/parser"
-	"github.com/arumes31/resolix/webgui/internal/policy"
 	"github.com/arumes31/resolix/webgui/internal/resolver"
 	"github.com/arumes31/resolix/webgui/internal/rewrites"
 	"github.com/arumes31/resolix/webgui/internal/storage"
@@ -906,6 +905,8 @@ func (s *Server) SetupMux() http.Handler {
 
 	// Protected routes
 	mux.Handle("/", s.authMiddleware(http.HandlerFunc(s.handleRoot)))
+	mux.Handle("/querylog", s.authMiddleware(http.HandlerFunc(s.handleQueryLogPage)))
+	mux.Handle("/cluster", s.authMiddleware(http.HandlerFunc(s.handleClusterPage)))
 	mux.Handle("/config", s.authMiddleware(http.HandlerFunc(s.handleConfigPage)))
 	mux.Handle("/api/events", s.authMiddleware(http.HandlerFunc(s.handleEvents)))
 	mux.Handle("/api/stats", s.authMiddleware(http.HandlerFunc(s.handleStats)))
@@ -918,6 +919,7 @@ func (s *Server) SetupMux() http.Handler {
 	// Filter engine: pause/resume protection and status
 	mux.Handle("/api/filtering/pause", s.authMiddleware(http.HandlerFunc(s.handleFilteringPause)))
 	mux.Handle("/api/filtering/status", s.authMiddleware(http.HandlerFunc(s.handleFilteringStatus)))
+	mux.Handle("/api/filtering/update", s.authMiddleware(http.HandlerFunc(s.handleFilteringUpdate)))
 	mux.Handle("/api/config/status", s.authMiddleware(http.HandlerFunc(s.handleConfigStatus)))
 	mux.Handle("/api/config/subscriptions", s.authMiddleware(http.HandlerFunc(s.handleFilterSubscriptions)))
 	mux.Handle("/api/config/user-rules", s.authMiddleware(http.HandlerFunc(s.handleUserRules)))
@@ -927,7 +929,6 @@ func (s *Server) SetupMux() http.Handler {
 
 	// Per-client registry CRUD (Step 5)
 	mux.Handle("/api/clients", s.authMiddleware(http.HandlerFunc(s.handleClients)))
-	mux.Handle("/api/services", s.authMiddleware(http.HandlerFunc(s.handleServices)))
 
 	// Query-log actions: block/unblock a domain via filter user rules
 	mux.Handle("/api/querylog/block", s.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1347,11 +1348,6 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(&buf, "# HELP dns_cache_cleared_entries_total Entries removed by cache clears\n# TYPE dns_cache_cleared_entries_total counter\ndns_cache_cleared_entries_total %d\n", cacheStats.Cleared)
 		fmt.Fprintf(&buf, "# HELP dns_cache_refreshes_total Successful optimistic cache refreshes\n# TYPE dns_cache_refreshes_total counter\ndns_cache_refreshes_total %d\n", cacheStats.Refreshes)
 
-		fmt.Fprintf(&buf, "# HELP blocked_service_hits_total Queries blocked per blocked-service ID\n")
-		fmt.Fprintf(&buf, "# TYPE blocked_service_hits_total counter\n")
-		for id, count := range dnsSrv.ServiceStats() {
-			fmt.Fprintf(&buf, "blocked_service_hits_total{service=\"%s\"} %d\n", escapePrometheusLabel(id), count)
-		}
 	}
 
 	s.fieldsMu.RLock()
@@ -1727,26 +1723,32 @@ func (s *Server) handleIngestEvents(w http.ResponseWriter, r *http.Request, body
 }
 
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
+	if r.URL.Path != "/" || r.Method != http.MethodGet {
 		http.NotFound(w, r)
 		return
 	}
-	nonce := ""
-	if s.nonceFromCtx != nil {
-		nonce = s.nonceFromCtx(r.Context())
-	}
+	s.renderPage(w, r, "index.html")
+}
 
-	csrfToken := ""
-	if cookie, err := r.Cookie(csrfCookieName); err == nil {
-		csrfToken = cookie.Value
+func (s *Server) handleQueryLogPage(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/querylog" || r.Method != http.MethodGet {
+		http.NotFound(w, r)
+		return
 	}
+	s.renderPage(w, r, "querylog.html")
+}
+
+func (s *Server) handleClusterPage(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/cluster" || r.Method != http.MethodGet || !s.isController() {
+		http.NotFound(w, r)
+		return
+	}
+	s.renderPage(w, r, "cluster.html")
+}
+
+func (s *Server) renderPage(w http.ResponseWriter, r *http.Request, name string) {
 	var buf bytes.Buffer
-	if err := s.tmpl.ExecuteTemplate(&buf, "index.html", map[string]interface{}{
-		"Nonce":     nonce,
-		"BaseURL":   s.cfg.BaseURL,
-		"Mode":      s.cfg.Mode,
-		"CSRFToken": csrfToken,
-	}); err != nil {
+	if err := s.tmpl.ExecuteTemplate(&buf, name, s.templateData(r)); err != nil {
 		log.Printf("Template execution error: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
@@ -2223,37 +2225,6 @@ func (s *Server) handleClients(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
-}
-
-// handleServices returns the blocked-service catalog, global enablement, and
-// live hit counts for the settings UI.
-func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet)
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	enabled := make(map[string]bool)
-	for _, id := range strings.FieldsFunc(s.cfg.BlockedServices, func(r rune) bool {
-		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
-	}) {
-		enabled[strings.ToLower(id)] = true
-	}
-	hits := make(map[string]int64)
-	if dnsSrv := s.getDNSServer(); dnsSrv != nil {
-		hits = dnsSrv.ServiceStats()
-	}
-	type serviceStatus struct {
-		ID      string `json:"id"`
-		Enabled bool   `json:"enabled"`
-		Hits    int64  `json:"hits"`
-	}
-	services := make([]serviceStatus, 0, len(policy.ServiceIDs()))
-	for _, id := range policy.ServiceIDs() {
-		services = append(services, serviceStatus{ID: id, Enabled: enabled[id], Hits: hits[id]})
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "services": services})
 }
 
 // ===== Query-Log Block/Unblock Actions =====

@@ -211,6 +211,22 @@ func TestFilterExceptionFallsThroughToUpstream(t *testing.T) {
 	if ev.Blocked {
 		t.Errorf("exception event must not be blocked: %+v", ev)
 	}
+
+	allowlistPath := filepath.Join(t.TempDir(), "allowlist.txt")
+	if err := os.WriteFile(allowlistPath, []byte("list-allowed.blocked.test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.engine.AddFileSource(allowlistPath, true)
+	resp = h.query("list-allowed.blocked.test", dns.TypeA)
+	if resp.Rcode != dns.RcodeSuccess || len(resp.Answer) != 1 {
+		t.Fatalf("allowlist response = %v", resp)
+	}
+	if h.upstream.Load() != 2 {
+		t.Errorf("allowlist query upstream hits = %d, want 2", h.upstream.Load())
+	}
+	if ev := h.nextEvent(t); ev.Blocked {
+		t.Errorf("allowlist event must not be blocked: %+v", ev)
+	}
 }
 
 func TestFilterPausedSkipsFiltering(t *testing.T) {

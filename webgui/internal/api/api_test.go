@@ -619,9 +619,9 @@ func TestHandleMetricsIncludesArchivePressure(t *testing.T) {
 	if !strings.Contains(body, "sqlite_archive_dropped_events_total 0\n") {
 		t.Fatalf("archive dropped metric missing from response:\n%s", body)
 	}
-	if !strings.Contains(body, "sqlite_archive_queue_capacity 100000\n") ||
-		!strings.Contains(body, "sqlite_archive_trigger_events 5000\n") ||
-		!strings.Contains(body, "sqlite_archive_write_batch_events 5000\n") {
+	if !strings.Contains(body, fmt.Sprintf("sqlite_archive_queue_capacity %d\n", config.DefaultArchiveQueueCapacity)) ||
+		!strings.Contains(body, fmt.Sprintf("sqlite_archive_trigger_events %d\n", config.DefaultArchiveTriggerSize)) ||
+		!strings.Contains(body, fmt.Sprintf("sqlite_archive_write_batch_events %d\n", config.DefaultArchiveWriteBatchSize)) {
 		t.Fatalf("archive limit metrics missing from response:\n%s", body)
 	}
 }

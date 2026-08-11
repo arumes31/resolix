@@ -27,11 +27,11 @@
             <a class="app-nav-link" href="./">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13h6V4H4v9Zm0 7h6v-4H4v4Zm10 0h6v-9h-6v9Zm0-16v4h6V4h-6Z"/></svg><span>Dashboard</span>
             </a>
-            <a class="app-nav-link" href="./#query-log">
+            <a class="app-nav-link" href="querylog">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v3H5V4Zm0 6h14v3H5v-3Zm0 6h9v3H5v-3Z"/></svg><span>Query log</span><span class="nav-live">Live</span>
             </a>
             {{if eq .Mode "controller"}}
-            <a class="app-nav-link" href="./#cluster-nodes">
+            <a class="app-nav-link" href="cluster">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a4 4 0 0 1 4 4c0 .7-.18 1.36-.5 1.93L19.57 13A4 4 0 1 1 18 14.5l-4.07-4.07A4 4 0 0 1 12 11a4 4 0 0 1-1.93-.5L6 14.57A4 4 0 1 1 4.43 13l4.07-4.07A4 4 0 1 1 12 3Z"/></svg><span>Cluster nodes</span>
             </a>
             {{end}}
@@ -82,11 +82,11 @@
             <button type="button" class="settings-tab active" data-settings-tab="upstreams">Upstreams</button>
             <button type="button" class="settings-tab" data-settings-tab="routes">DNS routes</button>
             <button type="button" class="settings-tab" data-settings-tab="blocklists">Blocklists</button>
+            <button type="button" class="settings-tab" data-settings-tab="allowlists">Allowlists</button>
             <button type="button" class="settings-tab" data-settings-tab="rules">Custom rules</button>
-            <button type="button" class="settings-tab" data-settings-tab="rewrites">Rewrites</button>
-            <button type="button" class="settings-tab" data-settings-tab="clients">Clients</button>
-            <button type="button" class="settings-tab" data-settings-tab="services">Services</button>
-            <button type="button" class="settings-tab" data-settings-tab="runtime">DNS & cache</button>
+			<button type="button" class="settings-tab" data-settings-tab="rewrites">Rewrites</button>
+			<button type="button" class="settings-tab" data-settings-tab="clients">Clients</button>
+			<button type="button" class="settings-tab" data-settings-tab="runtime">DNS & cache</button>
             <button type="button" class="settings-tab" data-settings-tab="cluster">Cluster</button>
         </nav>
 
@@ -125,26 +125,47 @@
 
             <section id="settings-blocklists" class="settings-panel" data-panel="blocklists" hidden>
                 <div class="panel-heading">
-                    <div><span class="panel-index">02</span><h2>Filter subscriptions</h2></div>
-                    <span id="subscriptionCount" class="state-pill">0 lists</span>
+                    <div><span class="panel-index">03</span><h2>DNS blocklists</h2></div>
+                    <span id="blocklistCount" class="state-pill">0 lists</span>
                 </div>
-                <form id="subscriptionForm" class="settings-form subscription-form controller-edit">
-                    <input id="subscriptionID" type="hidden">
-                    <label>Name<input id="subscriptionName" type="text" maxlength="120" placeholder="StevenBlack hosts"></label>
-                    <label class="field-wide">URL<input id="subscriptionURL" type="url" placeholder="https://example.com/blocklist.txt" required></label>
-                    <label class="check-field"><input id="subscriptionAllowOnly" type="checkbox"> Allowlist / exceptions</label>
-                    <label class="check-field"><input id="subscriptionEnabled" type="checkbox" checked> Enabled</label>
+                <p class="panel-copy">Block matching domains from hosted Adblock, hosts-file, or plain-domain lists. Allowlist matches always take precedence.</p>
+                <form id="blocklistForm" class="settings-form subscription-form controller-edit">
+                    <input id="blocklistID" type="hidden">
+                    <label>Name<input id="blocklistName" type="text" maxlength="120" placeholder="StevenBlack hosts"></label>
+                    <label class="field-wide">List URL<input id="blocklistURL" type="url" placeholder="https://example.com/blocklist.txt" required></label>
+                    <label class="check-field"><input id="blocklistEnabled" type="checkbox" checked> Enabled</label>
                     <div class="inline-actions field-wide">
-                        <button type="submit" id="subscriptionSaveBtn" class="btn btn-primary">Add subscription</button>
-                        <button type="button" id="subscriptionCancelBtn" class="btn btn-secondary is-hidden">Cancel edit</button>
+                        <button type="submit" id="blocklistSaveBtn" class="btn btn-primary">Add blocklist</button>
+                        <button type="button" id="blocklistCancelBtn" class="btn btn-secondary is-hidden">Cancel edit</button>
+                        <button type="button" id="refreshBlocklistsBtn" class="btn btn-secondary">Check for updates</button>
                     </div>
                 </form>
-                <div id="subscriptionList" class="settings-list"></div>
+                <div id="blocklistList" class="settings-list"></div>
+            </section>
+
+            <section id="settings-allowlists" class="settings-panel allowlist-panel" data-panel="allowlists" hidden>
+                <div class="panel-heading">
+                    <div><span class="panel-index">04</span><h2>DNS allowlists</h2></div>
+                    <span id="allowlistCount" class="state-pill">0 lists</span>
+                </div>
+                <p class="panel-copy">Domains from these lists are allowed even when a blocklist or custom blocking rule also matches. Apex domains and their subdomains are covered.</p>
+                <form id="allowlistForm" class="settings-form subscription-form controller-edit">
+                    <input id="allowlistID" type="hidden">
+                    <label>Name<input id="allowlistName" type="text" maxlength="120" placeholder="Trusted domains"></label>
+                    <label class="field-wide">List URL<input id="allowlistURL" type="url" placeholder="https://example.com/allowlist.txt" required></label>
+                    <label class="check-field"><input id="allowlistEnabled" type="checkbox" checked> Enabled</label>
+                    <div class="inline-actions field-wide">
+                        <button type="submit" id="allowlistSaveBtn" class="btn btn-primary">Add allowlist</button>
+                        <button type="button" id="allowlistCancelBtn" class="btn btn-secondary is-hidden">Cancel edit</button>
+                        <button type="button" id="refreshAllowlistsBtn" class="btn btn-secondary">Check for updates</button>
+                    </div>
+                </form>
+                <div id="allowlistList" class="settings-list"></div>
             </section>
 
             <section id="settings-rules" class="settings-panel" data-panel="rules" hidden>
                 <div class="panel-heading">
-                    <div><span class="panel-index">03</span><h2>Custom filter rules</h2></div>
+                    <div><span class="panel-index">05</span><h2>Custom filter rules</h2></div>
                     <span id="ruleCount" class="state-pill">0 rules</span>
                 </div>
                 <p class="panel-copy">Adblock rules, exceptions (<code>@@</code>), hosts entries, plain domains, and <code>/RE2/</code> expressions.</p>
@@ -156,7 +177,7 @@
 
             <section id="settings-rewrites" class="settings-panel" data-panel="rewrites" hidden>
                 <div class="panel-heading">
-                    <div><span class="panel-index">04</span><h2>DNS rewrites</h2></div>
+                    <div><span class="panel-index">06</span><h2>DNS rewrites</h2></div>
                     <span id="rewriteCount" class="state-pill">0 rules</span>
                 </div>
                 <p class="panel-copy">Return local DNS answers for every client, Tailscale clients only, or explicitly allowed source subnets.</p>
@@ -186,19 +207,18 @@
 
             <section id="settings-clients" class="settings-panel" data-panel="clients" hidden>
                 <div class="panel-heading">
-                    <div><span class="panel-index">05</span><h2>Client policies</h2></div>
+                    <div><span class="panel-index">07</span><h2>Client policies</h2></div>
                     <span id="clientCount" class="state-pill">0 clients</span>
                 </div>
                 <form id="clientForm" class="settings-form client-form controller-edit">
                     <label>Name<input id="clientName" type="text" placeholder="Kids devices" required></label>
                     <label class="field-wide">IPs or CIDRs<input id="clientIDs" type="text" placeholder="100.64.0.12, 192.168.20.0/24" required></label>
-                    <label class="check-field field-wide"><input id="clientUseGlobal" type="checkbox" checked> Inherit global filtering and service settings</label>
+					<label class="check-field field-wide"><input id="clientUseGlobal" type="checkbox" checked> Inherit global filtering and safe-search settings</label>
                     <div id="clientPolicyFields" class="client-policy-fields field-wide is-muted">
                         <label class="check-field"><input id="clientFiltering" type="checkbox" checked> Filtering</label>
                         <label class="check-field"><input id="clientSafeSearch" type="checkbox"> Safe search</label>
                         <label>Safe-search engines<input id="clientSafeEngines" type="text" placeholder="google,bing,youtube"></label>
-                        <fieldset class="service-picker"><legend>Blocked services</legend><div id="clientServicePicker"></div></fieldset>
-                    </div>
+					</div>
                     <label class="field-wide">Custom upstreams<input id="clientUpstreams" type="text" placeholder="tls://dns.example:853, 9.9.9.9"></label>
                     <label class="check-field"><input id="clientExcludeLog" type="checkbox"> Exclude from log</label>
                     <label class="check-field"><input id="clientExcludeStats" type="checkbox"> Exclude from stats</label>
@@ -210,21 +230,15 @@
                 <div id="clientList" class="settings-list"></div>
             </section>
 
-            <section id="settings-services" class="settings-panel" data-panel="services" hidden>
-                <div class="panel-heading"><div><span class="panel-index">06</span><h2>Blocked services</h2></div><span class="state-pill">Catalog</span></div>
-                <p class="panel-copy">Global service policy is seeded by <code>BLOCKED_SERVICES</code>. Client-specific overrides are managed in Client policies.</p>
-                <div id="serviceCatalog" class="service-catalog"></div>
-            </section>
-
-            <section id="settings-runtime" class="settings-panel" data-panel="runtime" hidden>
-                <div class="panel-heading"><div><span class="panel-index">07</span><h2>DNS, cache & protocols</h2></div><span class="state-pill paused">Restart required</span></div>
+			<section id="settings-runtime" class="settings-panel" data-panel="runtime" hidden>
+                <div class="panel-heading"><div><span class="panel-index">08</span><h2>DNS, cache & protocols</h2></div><span class="state-pill paused">Restart required</span></div>
                 <p class="panel-copy">These runtime values are visible here but remain environment-owned because changing listeners, ACLs, or protocol behavior safely requires a process restart.</p>
                 <div id="runtimeSettings" class="runtime-grid"></div>
                 <div class="inline-actions"><button type="button" id="pause5Btn" class="btn btn-secondary controller-edit">Pause filtering 5m</button><button type="button" id="resumeBtn" class="btn btn-primary controller-edit">Resume filtering</button></div>
             </section>
 
-            <section id="settings-cluster" class="settings-panel" data-panel="cluster" hidden>
-                <div class="panel-heading"><div><span class="panel-index">08</span><h2>Cluster synchronization</h2></div><span id="clusterMode" class="state-pill">Loading</span></div>
+			<section id="settings-cluster" class="settings-panel" data-panel="cluster" hidden>
+                <div class="panel-heading"><div><span class="panel-index">09</span><h2>Cluster synchronization</h2></div><span id="clusterMode" class="state-pill">Loading</span></div>
                 <p class="panel-copy">The controller is authoritative. Agent nodes verify and apply content-addressed snapshots containing upstreams, routes, subscriptions, custom rules, rewrites, and clients.</p>
                 <div id="clusterSummary" class="runtime-grid"></div>
             </section>

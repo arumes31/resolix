@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 func TestRegistryCRUDAndPersistence(t *testing.T) {
@@ -41,12 +40,12 @@ func TestRegistryCRUDAndPersistence(t *testing.T) {
 
 	// Update.
 	updated := c
-	updated.BlockedServices = []string{"tiktok"}
 	updated.UseGlobalSettings = false
+	updated.Upstreams = []string{"9.9.9.9"}
 	if err := r2.Update(updated); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
-	if got := r2.Find("192.168.1.50"); got == nil || len(got.BlockedServices) != 1 {
+	if got := r2.Find("192.168.1.50"); got == nil || len(got.Upstreams) != 1 {
 		t.Errorf("after update: %+v", got)
 	}
 	if err := r2.Update(Client{Name: "ghost", IDs: []string{"1.2.3.4"}}); err == nil {
@@ -106,34 +105,32 @@ func TestRegistryClonesAddAndUpdateCandidates(t *testing.T) {
 		t.Fatal(err)
 	}
 	candidate := Client{
-		Name: "owned",
-		IDs:  []string{"192.0.2.1"},
-		Tags: []string{"original"},
-		Schedule: &Schedule{Days: map[string][]TimeRange{
-			"mon": {{Start: "09:00", End: "17:00"}},
-		}},
+		Name:      "owned",
+		IDs:       []string{"192.0.2.1"},
+		Tags:      []string{"original"},
+		Upstreams: []string{"9.9.9.9"},
 	}
 	if err := registry.Add(candidate); err != nil {
 		t.Fatal(err)
 	}
 	candidate.IDs[0] = "198.51.100.1"
 	candidate.Tags[0] = "caller-mutated"
-	candidate.Schedule.Days["mon"][0].Start = "10:00"
+	candidate.Upstreams[0] = "1.1.1.1"
 	stored := registry.List()[0]
-	if stored.IDs[0] != "192.0.2.1" || stored.Tags[0] != "original" || stored.Schedule.Days["mon"][0].Start != "09:00" {
+	if stored.IDs[0] != "192.0.2.1" || stored.Tags[0] != "original" || stored.Upstreams[0] != "9.9.9.9" {
 		t.Fatalf("Add retained caller-owned state: %+v", stored)
 	}
 
 	updated := stored
 	updated.Tags = []string{"updated"}
-	updated.Schedule.Days["mon"][0].Start = "08:00"
+	updated.Upstreams = []string{"8.8.8.8"}
 	if err := registry.Update(updated); err != nil {
 		t.Fatal(err)
 	}
 	updated.Tags[0] = "caller-mutated-again"
-	updated.Schedule.Days["mon"][0].Start = "07:00"
+	updated.Upstreams[0] = "1.0.0.1"
 	stored = registry.List()[0]
-	if stored.Tags[0] != "updated" || stored.Schedule.Days["mon"][0].Start != "08:00" {
+	if stored.Tags[0] != "updated" || stored.Upstreams[0] != "8.8.8.8" {
 		t.Fatalf("Update retained caller-owned state: %+v", stored)
 	}
 }
@@ -175,80 +172,6 @@ func TestLongestPrefixMatch(t *testing.T) {
 	}
 	if r.Find("not-an-ip") != nil {
 		t.Error("invalid IP must not match")
-	}
-}
-
-func TestScheduleActive(t *testing.T) {
-	// 2024-01-01 was a Monday. Times are local wall-clock (schedule default TZ).
-	mon := func(hhmm string) time.Time {
-		t.Helper()
-		ts, err := time.ParseInLocation("2006-01-02 15:04", "2024-01-01 "+hhmm, time.Local)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return ts
-	}
-
-	var nilSched *Schedule
-	if !nilSched.Active(mon("03:00")) {
-		t.Error("nil schedule must always be active")
-	}
-
-	s := &Schedule{Days: map[string][]TimeRange{
-		"mon": {{Start: "09:00", End: "17:00"}},
-	}}
-	if !s.Active(mon("10:00")) || !s.Active(mon("09:00")) {
-		t.Error("inside window must be active")
-	}
-	if s.Active(mon("17:00")) || s.Active(mon("08:59")) {
-		t.Error("outside window must be inactive")
-	}
-	// Tuesday: not listed → inactive.
-	tue := mon("10:00").AddDate(0, 0, 1)
-	if s.Active(tue) {
-		t.Error("unlisted day must be inactive")
-	}
-
-	// Overnight window.
-	on := &Schedule{Days: map[string][]TimeRange{
-		"mon": {{Start: "22:00", End: "06:00"}},
-	}}
-	if !on.Active(mon("23:30")) || !on.Active(mon("05:59").AddDate(0, 0, 1)) {
-		t.Error("overnight window must cover past-midnight hours")
-	}
-	if on.Active(mon("12:00")) {
-		t.Error("midday must be inactive for overnight window")
-	}
-
-	equal := &Schedule{Days: map[string][]TimeRange{
-		"mon": {{Start: "09:00", End: "09:00"}},
-	}}
-	if equal.Active(mon("09:00")) || equal.Active(mon("12:00")) {
-		t.Error("equal schedule endpoints must be inactive")
-	}
-}
-
-func TestSchedulePreviousDayOvernightAndValidation(t *testing.T) {
-	location, err := time.LoadLocation("Europe/Vienna")
-	if err != nil {
-		t.Fatal(err)
-	}
-	schedule := &Schedule{Timezone: "Europe/Vienna", Days: map[string][]TimeRange{
-		"mon": {{Start: "22:00", End: "02:00"}},
-	}}
-	tuesday := time.Date(2024, time.January, 2, 1, 0, 0, 0, location)
-	if !schedule.Active(tuesday) {
-		t.Fatal("Monday overnight schedule should remain active early Tuesday")
-	}
-	tuesdayOnly := &Schedule{Timezone: "Europe/Vienna", Days: map[string][]TimeRange{
-		"tue": {{Start: "22:00", End: "02:00"}},
-	}}
-	if tuesdayOnly.Active(tuesday) {
-		t.Fatal("Tuesday overnight schedule must not start before Tuesday evening")
-	}
-	bad := Client{Name: "bad", IDs: []string{"192.0.2.1"}, Schedule: &Schedule{Timezone: "Not/AZone"}}
-	if err := bad.compile(); err == nil {
-		t.Fatal("invalid timezone passed validation")
 	}
 }
 

@@ -12,7 +12,6 @@ import (
 	"github.com/arumes31/resolix/webgui/internal/config"
 	"github.com/arumes31/resolix/webgui/internal/dnsserver"
 	"github.com/arumes31/resolix/webgui/internal/filter"
-	"github.com/arumes31/resolix/webgui/internal/policy"
 )
 
 func TestCheckCSRFRequiresMatchingCookieAndHeader(t *testing.T) {
@@ -77,37 +76,42 @@ func TestCacheClearEndpoint(t *testing.T) {
 	}
 }
 
-func TestServicesEndpoint(t *testing.T) {
-	s := testServer(&config.Config{
-		BaseURL:         "/",
-		MaxRequestSize:  1 << 20,
-		BlockedServices: "facebook, tiktok",
+func TestFilteringUpdateEndpoint(t *testing.T) {
+	controller := testServer(&config.Config{
+		Mode:        config.ModeController,
+		WebUsername: "admin",
+		WebPassword: "password",
 	})
-	s.SetDNSServer(dnsserver.New(dnsserver.Config{}, nil))
-	rec := httptest.NewRecorder()
-	s.SetupMux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/services", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+	controller.SetFilter(filter.New())
+
+	recorder := httptest.NewRecorder()
+	controller.handleFilteringUpdate(recorder, httptest.NewRequest(http.MethodGet, "/api/filtering/update", nil))
+	if recorder.Code != http.StatusMethodNotAllowed || recorder.Header().Get("Allow") != http.MethodPost {
+		t.Fatalf("GET: status=%d Allow=%q", recorder.Code, recorder.Header().Get("Allow"))
 	}
-	var body struct {
-		Services []struct {
-			ID      string `json:"id"`
-			Enabled bool   `json:"enabled"`
-		} `json:"services"`
+
+	recorder = httptest.NewRecorder()
+	controller.handleFilteringUpdate(recorder, httptest.NewRequest(http.MethodPost, "/api/filtering/update", nil))
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("missing CSRF: status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatal(err)
+
+	request := httptest.NewRequest(http.MethodPost, "/api/filtering/update", nil)
+	request.AddCookie(&http.Cookie{
+		Name: csrfCookieName, Value: "token", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
+	})
+	request.Header.Set("X-CSRF-Token", "token")
+	recorder = httptest.NewRecorder()
+	controller.handleFilteringUpdate(recorder, request)
+	if recorder.Code != http.StatusAccepted || !strings.Contains(recorder.Body.String(), `"status":"scheduled"`) {
+		t.Fatalf("controller: status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
-	if want := len(policy.ServiceIDs()); len(body.Services) != want {
-		t.Fatalf("service count = %d, want %d", len(body.Services), want)
-	}
-	seenEnabled := map[string]bool{}
-	for _, service := range body.Services {
-		if service.Enabled {
-			seenEnabled[service.ID] = true
-		}
-	}
-	if !seenEnabled["facebook"] || !seenEnabled["tiktok"] || len(seenEnabled) != 2 {
-		t.Fatalf("enabled services = %v", seenEnabled)
+
+	agent := testServer(&config.Config{Mode: config.ModeAgent})
+	agent.SetFilter(filter.New())
+	recorder = httptest.NewRecorder()
+	agent.handleFilteringUpdate(recorder, httptest.NewRequest(http.MethodPost, "/api/filtering/update", nil))
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("agent: status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
 }

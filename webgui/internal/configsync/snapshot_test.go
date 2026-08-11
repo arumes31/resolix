@@ -3,6 +3,7 @@ package configsync
 import (
 	"testing"
 
+	"github.com/arumes31/resolix/webgui/internal/filter"
 	"github.com/arumes31/resolix/webgui/internal/rewrites"
 )
 
@@ -77,5 +78,27 @@ func TestSnapshotRevisionDetectsMutation(t *testing.T) {
 	}
 	if valid {
 		t.Fatal("bootstrap resolver mutation did not invalidate revision")
+	}
+	snapshot, err = NewSnapshot(
+		[]string{"1.1.1.1"},
+		[]string{"9.9.9.9"},
+		nil,
+		[]filter.Subscription{{
+			ID: "trusted", URL: "https://allow.example/list.txt", AllowOnly: true, Enabled: true,
+		}},
+		"",
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Subscriptions[0].AllowOnly = false
+	valid, err = snapshot.ValidRevision()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if valid {
+		t.Fatal("allowlist type mutation did not invalidate revision")
 	}
 }

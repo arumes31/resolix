@@ -104,3 +104,68 @@ func TestUpdateBootstrapServersDefensivelyCopies(t *testing.T) {
 		t.Fatalf("bootstrap servers = %v", got)
 	}
 }
+
+func TestCheckerUsesInstalledPoolProbe(t *testing.T) {
+	checker := &Checker{
+		cfg:              &config.Config{HealthDomain: "health.test"},
+		bootstrapServers: []string{"192.0.2.53"},
+	}
+	var gotServer, gotDomain string
+	checker.SetProbeFunc(func(_ context.Context, server, domain string) error {
+		gotServer, gotDomain = server, domain
+		return nil
+	})
+
+	ok, latency := checker.CheckUpstream(context.Background(), "tls://dns.example")
+	if !ok || latency < 0 {
+		t.Fatalf("health result = %v/%f", ok, latency)
+	}
+	if gotServer != "tls://dns.example" || gotDomain != "health.test" {
+		t.Fatalf("probe arguments = %q/%q", gotServer, gotDomain)
+	}
+}
+
+func TestCheckerReportsBootstrapHealthUsingUpstreamHostname(t *testing.T) {
+	questions := make(chan string, 1)
+	packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &dns.Server{PacketConn: packetConn, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, request *dns.Msg) {
+		question := request.Question[0].Name
+		questions <- question
+		response := new(dns.Msg)
+		response.SetReply(request)
+		response.Answer = []dns.RR{&dns.A{
+			Hdr: dns.RR_Header{Name: question, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+			A:   net.ParseIP("192.0.2.1").To4(),
+		}}
+		_ = w.WriteMsg(response)
+	})}
+	done := make(chan error, 1)
+	go func() { done <- server.ActivateAndServe() }()
+	t.Cleanup(func() {
+		_ = server.Shutdown()
+		<-done
+	})
+
+	bootstrap := packetConn.LocalAddr().String()
+	checker := NewChecker(
+		&config.Config{HealthDomain: "fallback-health.test"},
+		"tls://dns.example",
+		[]string{bootstrap},
+	)
+	checker.SetProbeFunc(func(_ context.Context, _, _ string) error { return nil })
+	var health map[string]float64
+	checker.runChecks(context.Background(), func(_ []string, latencies map[string]float64) {
+		health = latencies
+	})
+
+	question := <-questions
+	if question != "dns.example." {
+		t.Fatalf("bootstrap question = %q, want encrypted upstream hostname", question)
+	}
+	if latency, ok := health[bootstrapLabel+bootstrap]; !ok || latency < 0 {
+		t.Fatalf("bootstrap health = %v", health)
+	}
+}

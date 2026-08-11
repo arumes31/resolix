@@ -7,6 +7,7 @@ import (
 	"log"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,6 +21,7 @@ const (
 	archiveRetryInitialDelay = time.Second
 	archiveRetryMaxDelay     = time.Minute
 	archiveDropLogInterval   = time.Minute
+	archiveInsertRows        = 64
 )
 
 // Store manages the in-memory ring buffer of events and SQLite disk persistence.
@@ -39,15 +41,16 @@ type Store struct {
 	idCounter uint64
 
 	// Database Batching
-	batchMu      sync.Mutex
-	batch        []models.QueryEvent
-	batchStart   int
-	batchDropped atomic.Int64
-	archiveMu    sync.Mutex
-	archiveReady chan struct{}
-	archiveMark  int
-	archiveLimit int
-	archiveBatch int
+	batchMu       sync.Mutex
+	batch         []models.QueryEvent
+	batchStart    int
+	batchDropped  atomic.Int64
+	batchInFlight atomic.Int64
+	archiveMu     sync.Mutex
+	archiveReady  chan struct{}
+	archiveMark   int
+	archiveLimit  int
+	archiveBatch  int
 
 	// Protected by batchMu.
 	batchDropLogAt      time.Time
@@ -84,7 +87,6 @@ type Store struct {
 	clientLastSeen   map[string]int64
 
 	// Prepared statements for frequently-used queries (cached at init)
-	stmtInsertQuery   *sql.Stmt
 	stmtGetTopDomains *sql.Stmt
 	stmtGetTopClients *sql.Stmt
 	stmtCleanup       *sql.Stmt
@@ -96,6 +98,10 @@ type Store struct {
 	// Configurable intervals for background maintenance
 	vacuumInterval     time.Duration
 	checkpointInterval time.Duration
+
+	// archiveInsert is overridden by tests that need to hold an archive write
+	// in flight. Production always uses insertArchiveBatch.
+	archiveInsert func(context.Context, []models.QueryEvent) error
 }
 
 type pendingInfo struct {
@@ -225,12 +231,6 @@ func (s *Store) Init() {
 func (s *Store) prepareStatements() error {
 	var err error
 
-	s.stmtInsertQuery, err = s.db.Prepare(
-		"INSERT INTO queries (unix_time, node, client_ip, domain, type, upstream, latency, dnssec, response_code, client_hostname, blocked, latency_alert, matched_rule, block_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-	if err != nil {
-		return fmt.Errorf("prepare stmtInsertQuery: %w", err)
-	}
-
 	s.stmtGetTopDomains, err = s.db.Prepare(
 		"SELECT domain, COUNT(*) as c FROM queries WHERE unix_time >= ? GROUP BY domain")
 	if err != nil {
@@ -268,10 +268,6 @@ func (s *Store) Close() {
 	}
 
 	// Close prepared statements
-	if s.stmtInsertQuery != nil {
-		_ = s.stmtInsertQuery.Close()
-		s.stmtInsertQuery = nil
-	}
 	if s.stmtGetTopDomains != nil {
 		_ = s.stmtGetTopDomains.Close()
 		s.stmtGetTopDomains = nil
@@ -1049,19 +1045,20 @@ func (s *Store) archiveStep(ctx context.Context, now time.Time) (int, error) {
 
 	archived := 0
 	for {
-		s.batchMu.Lock()
-		pending := s.pendingBatchLocked()
-		chunkSize := min(len(pending), s.archiveBatch)
-		toInsert := append([]models.QueryEvent(nil), pending[:chunkSize]...)
-		s.batchMu.Unlock()
+		toInsert := s.claimArchiveBatch()
 		if len(toInsert) == 0 {
 			break
 		}
 
-		if err := s.insertArchiveBatch(ctx, toInsert); err != nil {
+		insert := s.insertArchiveBatch
+		if s.archiveInsert != nil {
+			insert = s.archiveInsert
+		}
+		if err := insert(ctx, toInsert); err != nil {
+			s.restoreArchiveBatch(toInsert)
 			return archived, err
 		}
-		s.removeArchivedBatch(toInsert)
+		s.batchInFlight.Add(-int64(len(toInsert)))
 		archived += len(toInsert)
 	}
 
@@ -1070,35 +1067,78 @@ func (s *Store) archiveStep(ctx context.Context, now time.Time) (int, error) {
 	return archived, nil
 }
 
+func (s *Store) claimArchiveBatch() []models.QueryEvent {
+	s.batchMu.Lock()
+	defer s.batchMu.Unlock()
+
+	pending := s.pendingBatchLocked()
+	chunkSize := min(len(pending), s.archiveBatch)
+	if chunkSize == 0 {
+		return nil
+	}
+	claimed := append([]models.QueryEvent(nil), pending[:chunkSize]...)
+	clear(s.batch[s.batchStart : s.batchStart+chunkSize])
+	s.batchStart += chunkSize
+	s.batchInFlight.Add(int64(chunkSize))
+	if s.pendingBatchLenLocked() == 0 || s.batchStart >= max(1, s.archiveLimit/4) {
+		s.compactBatchLocked()
+	}
+	return claimed
+}
+
+func (s *Store) restoreArchiveBatch(claimed []models.QueryEvent) {
+	s.batchMu.Lock()
+	pending := append([]models.QueryEvent(nil), s.pendingBatchLocked()...)
+	combined := make([]models.QueryEvent, 0, len(claimed)+len(pending))
+	combined = append(combined, claimed...)
+	combined = append(combined, pending...)
+
+	dropped := max(0, len(combined)-s.archiveLimit)
+	clear(s.batch)
+	s.batch = append(s.batch[:0], combined[dropped:]...)
+	s.batchStart = 0
+	s.batchInFlight.Add(-int64(len(claimed)))
+	if dropped > 0 {
+		s.batchDropped.Add(int64(dropped))
+		s.batchDropUnreported += int64(dropped)
+	}
+	s.batchMu.Unlock()
+
+	if dropped > 0 {
+		log.Printf("[WARN] SQLite archive retry queue full; dropped %d oldest uncommitted event(s) (%d total)", dropped, s.batchDropped.Load())
+	}
+}
+
 func (s *Store) insertArchiveBatch(ctx context.Context, events []models.QueryEvent) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin transaction for %d events: %w", len(events), err)
 	}
 
-	var stmt *sql.Stmt
-	if s.stmtInsertQuery != nil {
-		stmt = tx.Stmt(s.stmtInsertQuery)
-	} else {
-		stmt, err = tx.PrepareContext(ctx, "INSERT INTO queries (unix_time, node, client_ip, domain, type, upstream, latency, dnssec, response_code, client_hostname, blocked, latency_alert, matched_rule, block_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-		if err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("prepare insert for %d events: %w", len(events), err)
+	const insertPrefix = "INSERT INTO queries (unix_time, node, client_ip, domain, type, upstream, latency, dnssec, response_code, client_hostname, blocked, latency_alert, matched_rule, block_reason) VALUES "
+	const rowPlaceholders = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+	for start := 0; start < len(events); start += archiveInsertRows {
+		end := min(start+archiveInsertRows, len(events))
+		var query strings.Builder
+		query.Grow(len(insertPrefix) + (end-start)*(len(rowPlaceholders)+1))
+		query.WriteString(insertPrefix)
+		args := make([]any, 0, (end-start)*14)
+		for index, event := range events[start:end] {
+			if index > 0 {
+				query.WriteByte(',')
+			}
+			query.WriteString(rowPlaceholders)
+			blocked := 0
+			if event.Blocked {
+				blocked = 1
+			}
+			latencyAlert := 0
+			if event.LatencyAlert {
+				latencyAlert = 1
+			}
+			args = append(args, event.UnixTime, event.Node, event.ClientIP, event.Domain, event.Type, event.Upstream, event.Latency, event.DNSSEC, event.ResponseCode, event.ClientHostname, blocked, latencyAlert, event.MatchedRule, event.BlockReason)
 		}
-	}
-	defer func() { _ = stmt.Close() }()
-
-	for _, event := range events {
-		blocked := 0
-		if event.Blocked {
-			blocked = 1
-		}
-		latencyAlert := 0
-		if event.LatencyAlert {
-			latencyAlert = 1
-		}
-		_, err = stmt.ExecContext(ctx, event.UnixTime, event.Node, event.ClientIP, event.Domain, event.Type, event.Upstream, event.Latency, event.DNSSEC, event.ResponseCode, event.ClientHostname, blocked, latencyAlert, event.MatchedRule, event.BlockReason)
-		if err != nil {
+		if _, err = tx.ExecContext(ctx, query.String(), args...); err != nil {
 			_ = tx.Rollback()
 			return fmt.Errorf("insert batch of %d events: %w", len(events), err)
 		}
@@ -1109,31 +1149,11 @@ func (s *Store) insertArchiveBatch(ctx context.Context, events []models.QueryEve
 	return nil
 }
 
-func (s *Store) removeArchivedBatch(events []models.QueryEvent) {
-	committed := make(map[string]struct{}, len(events))
-	for _, event := range events {
-		committed[event.ID] = struct{}{}
-	}
-
-	s.batchMu.Lock()
-	for s.batchStart < len(s.batch) {
-		if _, ok := committed[s.batch[s.batchStart].ID]; !ok {
-			break
-		}
-		s.batch[s.batchStart] = models.QueryEvent{}
-		s.batchStart++
-	}
-	if s.pendingBatchLenLocked() == 0 || s.batchStart >= max(1, s.archiveLimit/4) {
-		s.compactBatchLocked()
-	}
-	s.batchMu.Unlock()
-}
-
 // ArchiveMetrics returns current queue pressure, configured limits, and the
 // lifetime number of events dropped at the hard limit.
 func (s *Store) ArchiveMetrics() ArchiveQueueMetrics {
 	s.batchMu.Lock()
-	pending := s.pendingBatchLenLocked()
+	pending := s.pendingBatchLenLocked() + int(s.batchInFlight.Load())
 	s.batchMu.Unlock()
 	return ArchiveQueueMetrics{
 		Pending:    pending,

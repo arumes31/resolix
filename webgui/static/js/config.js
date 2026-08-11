@@ -3,11 +3,10 @@ const state = {
     editable: false,
     mode: '',
     revision: '',
-    routes: {},
-    subscriptions: [],
-    rewrites: [],
-    clients: [],
-    services: [],
+	routes: {},
+	subscriptions: [],
+	rewrites: [],
+	clients: [],
     editingRewrite: null,
     pendingRewriteDelete: null,
     rewriteDeleteTrigger: null,
@@ -83,7 +82,7 @@ async function loadStatus() {
         ['Role', data.mode],
         ['Authority', data.editable ? 'Controller-owned' : 'Mirrored / read only'],
         ['Revision', data.revision || 'Not available'],
-        ['Snapshot contents', 'Upstreams, bootstrap resolvers, routes, blocklists, rules, rewrites, clients']
+        ['Snapshot contents', 'Upstreams, bootstrap resolvers, routes, blocklists, allowlists, rules, rewrites, clients']
     ].map(([key, value]) => `<div class="runtime-item"><span>${escapeHtml(key)}</span><strong>${escapeHtml(value)}</strong></div>`).join('');
     document.getElementById('runtimeSettings').innerHTML = Object.entries(data.runtime || {}).map(([key, value]) =>
         `<div class="runtime-item"><span>${escapeHtml(formatRuntimeKey(key))}</span><strong>${escapeHtml(runtimeValue(value))}</strong></div>`
@@ -101,7 +100,7 @@ async function loadCluster() {
         ['Role', state.mode],
         ['Authority', state.editable ? 'Controller-owned' : 'Mirrored / read only'],
         ['Local revision', state.revision || 'Not available'],
-        ['Snapshot contents', 'Upstreams, bootstrap resolvers, routes, blocklists, rules, rewrites, clients']
+        ['Snapshot contents', 'Upstreams, bootstrap resolvers, routes, blocklists, allowlists, rules, rewrites, clients']
     ];
     nodes.forEach(node => summary.push([
         node.name || 'Unnamed node',
@@ -176,45 +175,64 @@ async function loadSubscriptions() {
     ]);
     state.subscriptions = data.subscriptions || [];
     const sourceByID = new Map((filterStatus.sources || []).map(source => [source.id, source]));
-    document.getElementById('subscriptionCount').textContent = `${state.subscriptions.length} ${state.subscriptions.length === 1 ? 'list' : 'lists'}`;
-    document.getElementById('subscriptionList').innerHTML = state.subscriptions.map(item => {
+    renderSubscriptionPanel(false, sourceByID);
+    renderSubscriptionPanel(true, sourceByID);
+    setEditable(state.editable);
+}
+
+function subscriptionPrefix(allowOnly) {
+    return allowOnly ? 'allowlist' : 'blocklist';
+}
+
+function subscriptionStatus(source, allowOnly) {
+    if (!source) return 'Awaiting first update';
+    if (source.last_error) return `Error · ${source.last_error}`;
+    const count = allowOnly ? source.allow_rule_count || 0 : source.rule_count || 0;
+    const label = `${count} ${count === 1 ? 'domain' : 'domains'}`;
+    if (!source.last_update || source.last_update.startsWith('0001-')) return label;
+    return `${label} · updated ${new Date(source.last_update).toLocaleString()}`;
+}
+
+function renderSubscriptionPanel(allowOnly, sourceByID) {
+    const prefix = subscriptionPrefix(allowOnly);
+    const items = state.subscriptions.filter(item => Boolean(item.allow_only) === allowOnly);
+    document.getElementById(`${prefix}Count`).textContent = `${items.length} ${items.length === 1 ? 'list' : 'lists'}`;
+    document.getElementById(`${prefix}List`).innerHTML = items.map(item => {
         const source = sourceByID.get(item.id);
-        const sourceState = source?.last_error
-            ? `error: ${source.last_error}`
-            : source ? `${source.rule_count || 0} block · ${source.allow_rule_count || 0} allow` : 'not loaded';
+        const sourceState = subscriptionStatus(source, allowOnly);
         return `
         <div class="settings-list-row ${item.enabled ? '' : 'is-muted'}">
             <div class="settings-list-main">
                 <div class="settings-list-title">${escapeHtml(item.name || item.url)}</div>
-                <div class="settings-list-meta">${item.allow_only ? 'Allowlist' : 'Blocklist'} · ${item.enabled ? 'enabled' : 'disabled'} · ${escapeHtml(sourceState)} · ${escapeHtml(item.url)}</div>
+                <div class="settings-list-meta">${item.enabled ? 'Enabled' : 'Disabled'} · ${escapeHtml(sourceState)} · ${escapeHtml(item.url)}</div>
             </div>
             <div class="row-actions controller-edit">
                 <button type="button" class="mini-action subscription-edit" data-id="${escapeHtml(item.id)}">Edit</button>
                 <button type="button" class="mini-action danger subscription-delete" data-id="${escapeHtml(item.id)}">Delete</button>
             </div>
         </div>`;
-    }).join('') || emptyState('No URL subscriptions configured');
-    setEditable(state.editable);
+    }).join('') || emptyState(`No DNS ${prefix}s configured`);
 }
 
-function resetSubscriptionForm() {
-    document.getElementById('subscriptionForm').reset();
-    document.getElementById('subscriptionID').value = '';
-    document.getElementById('subscriptionEnabled').checked = true;
-    document.getElementById('subscriptionSaveBtn').textContent = 'Add subscription';
-    document.getElementById('subscriptionCancelBtn').classList.add('is-hidden');
+function resetSubscriptionForm(allowOnly) {
+    const prefix = subscriptionPrefix(allowOnly);
+    document.getElementById(`${prefix}Form`).reset();
+    document.getElementById(`${prefix}ID`).value = '';
+    document.getElementById(`${prefix}Enabled`).checked = true;
+    document.getElementById(`${prefix}SaveBtn`).textContent = `Add ${prefix}`;
+    document.getElementById(`${prefix}CancelBtn`).classList.add('is-hidden');
 }
 
 function editSubscription(id) {
     const item = state.subscriptions.find(subscription => subscription.id === id);
     if (!item) return;
-    document.getElementById('subscriptionID').value = item.id;
-    document.getElementById('subscriptionName').value = item.name || '';
-    document.getElementById('subscriptionURL').value = item.url;
-    document.getElementById('subscriptionAllowOnly').checked = Boolean(item.allow_only);
-    document.getElementById('subscriptionEnabled').checked = Boolean(item.enabled);
-    document.getElementById('subscriptionSaveBtn').textContent = 'Save subscription';
-    document.getElementById('subscriptionCancelBtn').classList.remove('is-hidden');
+    const prefix = subscriptionPrefix(Boolean(item.allow_only));
+    document.getElementById(`${prefix}ID`).value = item.id;
+    document.getElementById(`${prefix}Name`).value = item.name || '';
+    document.getElementById(`${prefix}URL`).value = item.url;
+    document.getElementById(`${prefix}Enabled`).checked = Boolean(item.enabled);
+    document.getElementById(`${prefix}SaveBtn`).textContent = `Save ${prefix}`;
+    document.getElementById(`${prefix}CancelBtn`).classList.remove('is-hidden');
 }
 
 async function persistSubscriptions(items) {
@@ -225,25 +243,32 @@ async function persistSubscriptions(items) {
     await Promise.all([loadSubscriptions(), loadStatus()]);
 }
 
-async function saveSubscription(event) {
+async function saveSubscription(event, allowOnly) {
     event.preventDefault();
-    const id = document.getElementById('subscriptionID').value;
+    const prefix = subscriptionPrefix(allowOnly);
+    const id = document.getElementById(`${prefix}ID`).value;
     const item = {
         id,
-        name: document.getElementById('subscriptionName').value.trim(),
-        url: document.getElementById('subscriptionURL').value.trim(),
-        allow_only: document.getElementById('subscriptionAllowOnly').checked,
-        enabled: document.getElementById('subscriptionEnabled').checked
+        name: document.getElementById(`${prefix}Name`).value.trim(),
+        url: document.getElementById(`${prefix}URL`).value.trim(),
+        allow_only: allowOnly,
+        enabled: document.getElementById(`${prefix}Enabled`).checked
     };
     const items = id ? state.subscriptions.map(existing => existing.id === id ? item : existing) : [...state.subscriptions, item];
     await persistSubscriptions(items);
-    resetSubscriptionForm();
-    notice(id ? 'Subscription updated' : 'Subscription added');
+    resetSubscriptionForm(allowOnly);
+    notice(id ? `${allowOnly ? 'Allowlist' : 'Blocklist'} updated` : `${allowOnly ? 'Allowlist' : 'Blocklist'} added`);
 }
 
 async function deleteSubscription(id) {
     await persistSubscriptions(state.subscriptions.filter(item => item.id !== id));
-    notice('Subscription deleted');
+    notice('DNS list deleted');
+}
+
+async function requestSubscriptionUpdate() {
+    await apiJSON('/api/filtering/update', { method: 'POST' });
+    notice('DNS list update check started');
+    setTimeout(() => loadSubscriptions().catch(error => notice(error.message, true)), 1500);
 }
 
 async function loadRules() {
@@ -426,13 +451,6 @@ async function confirmRewriteDelete() {
     }
 }
 
-function renderServicePicker(selected = []) {
-    const chosen = new Set(selected);
-    document.getElementById('clientServicePicker').innerHTML = state.services.map(service =>
-        `<label class="service-option"><input type="checkbox" value="${escapeHtml(service.id)}" ${chosen.has(service.id) ? 'checked' : ''}> ${escapeHtml(service.id)}</label>`
-    ).join('');
-}
-
 function setClientPolicyState() {
     const inherit = document.getElementById('clientUseGlobal').checked;
     const fields = document.getElementById('clientPolicyFields');
@@ -447,7 +465,7 @@ function resetClientForm() {
     document.getElementById('clientFiltering').checked = true;
     document.getElementById('clientSaveBtn').textContent = 'Add client';
     document.getElementById('clientCancelBtn').classList.add('is-hidden');
-    renderServicePicker(); setClientPolicyState();
+	setClientPolicyState();
 }
 
 function editClient(name) {
@@ -464,7 +482,7 @@ function editClient(name) {
     document.getElementById('clientUpstreams').value = (client.upstreams || []).join(', ');
     document.getElementById('clientExcludeLog').checked = Boolean(client.exclude_from_log);
     document.getElementById('clientExcludeStats').checked = Boolean(client.exclude_from_stats);
-    renderServicePicker(client.blocked_services || []); setClientPolicyState();
+	setClientPolicyState();
     document.getElementById('clientSaveBtn').textContent = 'Save client';
     document.getElementById('clientCancelBtn').classList.remove('is-hidden');
 }
@@ -492,8 +510,7 @@ async function saveClient(event) {
         filtering_enabled: inherit || document.getElementById('clientFiltering').checked,
         safe_search_enabled: !inherit && document.getElementById('clientSafeSearch').checked,
         safe_search_engines: inherit ? [] : splitList(document.getElementById('clientSafeEngines').value),
-        blocked_services: inherit ? [] : Array.from(document.querySelectorAll('#clientServicePicker input:checked')).map(input => input.value),
-        upstreams: splitList(document.getElementById('clientUpstreams').value),
+		upstreams: splitList(document.getElementById('clientUpstreams').value),
         exclude_from_log: document.getElementById('clientExcludeLog').checked,
         exclude_from_stats: document.getElementById('clientExcludeStats').checked
     };
@@ -507,18 +524,9 @@ async function deleteClient(name) {
     notice('Client policy deleted'); await Promise.all([loadClients(), loadStatus()]);
 }
 
-async function loadServices() {
-    const data = await apiJSON('/api/services'); state.services = data.services || [];
-    document.getElementById('serviceCatalog').innerHTML = state.services.map(service => `
-        <div class="service-card ${service.enabled ? 'enabled' : ''}"><strong>${escapeHtml(service.id)}</strong><span>${service.enabled ? 'Global block active' : 'Available'} · ${service.hits || 0} hits</span></div>`
-    ).join('') || emptyState('Service catalog unavailable');
-    renderServicePicker(state.editingClient?.blocked_services || []); setClientPolicyState();
-}
-
 const loaders = {
-    upstreams: loadUpstreams, routes: loadRoutes, blocklists: loadSubscriptions, rules: loadRules,
-    rewrites: loadRewrites, clients: async () => { await loadServices(); await loadClients(); },
-    services: loadServices, runtime: loadStatus, cluster: loadCluster
+	upstreams: loadUpstreams, routes: loadRoutes, blocklists: loadSubscriptions, allowlists: loadSubscriptions, rules: loadRules,
+	rewrites: loadRewrites, clients: loadClients, runtime: loadStatus, cluster: loadCluster
 };
 
 async function activatePanel(name, updateHash = true) {
@@ -536,8 +544,10 @@ async function activatePanel(name, updateHash = true) {
 document.querySelectorAll('.settings-tab').forEach(tab => tab.addEventListener('click', () => activatePanel(tab.dataset.settingsTab)));
 document.getElementById('upstreamForm').addEventListener('submit', event => saveUpstreams(event).catch(error => notice(error.message, true)));
 document.getElementById('routeForm').addEventListener('submit', event => saveRoute(event).catch(error => notice(error.message, true)));
-document.getElementById('subscriptionForm').addEventListener('submit', event => saveSubscription(event).catch(error => notice(error.message, true)));
-document.getElementById('subscriptionCancelBtn').addEventListener('click', resetSubscriptionForm);
+document.getElementById('blocklistForm').addEventListener('submit', event => saveSubscription(event, false).catch(error => notice(error.message, true)));
+document.getElementById('blocklistCancelBtn').addEventListener('click', () => resetSubscriptionForm(false));
+document.getElementById('allowlistForm').addEventListener('submit', event => saveSubscription(event, true).catch(error => notice(error.message, true)));
+document.getElementById('allowlistCancelBtn').addEventListener('click', () => resetSubscriptionForm(true));
 document.getElementById('userRulesForm').addEventListener('submit', event => saveRules(event).catch(error => notice(error.message, true)));
 document.getElementById('rewriteType').addEventListener('change', rewriteValueState);
 document.getElementById('rewriteTailscaleOnly').addEventListener('change', rewriteScopeState);
@@ -546,11 +556,11 @@ document.getElementById('rewriteCancelBtn').addEventListener('click', resetRewri
 document.getElementById('clientForm').addEventListener('submit', event => saveClient(event).catch(error => notice(error.message, true)));
 document.getElementById('clientCancelBtn').addEventListener('click', resetClientForm);
 document.getElementById('clientUseGlobal').addEventListener('change', setClientPolicyState);
-document.getElementById('subscriptionList').addEventListener('click', event => {
+['blocklistList', 'allowlistList'].forEach(id => document.getElementById(id).addEventListener('click', event => {
     const edit = event.target.closest('.subscription-edit'); const remove = event.target.closest('.subscription-delete');
     if (edit) editSubscription(edit.dataset.id);
     if (remove) deleteSubscription(remove.dataset.id).catch(error => notice(error.message, true));
-});
+}));
 document.getElementById('routeList').addEventListener('click', event => {
     const button = event.target.closest('.route-delete');
     if (button) deleteRoute(button.dataset.pattern).catch(error => notice(error.message, true));
@@ -580,7 +590,9 @@ document.getElementById('clientList').addEventListener('click', event => {
 document.getElementById('clearCacheBtn').addEventListener('click', () => apiJSON('/api/cache/clear', { method: 'POST' }).then(() => notice('DNS cache cleared')).catch(error => notice(error.message, true)));
 document.getElementById('pause5Btn').addEventListener('click', () => apiJSON('/api/filtering/pause', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"minutes":5}' }).then(() => notice('Filtering paused for 5 minutes')).catch(error => notice(error.message, true)));
 document.getElementById('resumeBtn').addEventListener('click', () => apiJSON('/api/filtering/pause', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"minutes":0}' }).then(() => notice('Filtering resumed')).catch(error => notice(error.message, true)));
+document.getElementById('refreshBlocklistsBtn').addEventListener('click', () => requestSubscriptionUpdate().catch(error => notice(error.message, true)));
+document.getElementById('refreshAllowlistsBtn').addEventListener('click', () => requestSubscriptionUpdate().catch(error => notice(error.message, true)));
 document.getElementById('refreshSettingsBtn').addEventListener('click', () => Promise.all([loadStatus(), activatePanel((location.hash || '#upstreams').slice(1), false)]).then(() => notice('Configuration refreshed')).catch(error => notice(error.message, true)));
 
-resetRewriteForm(); resetSubscriptionForm(); resetClientForm();
+resetRewriteForm(); resetSubscriptionForm(false); resetSubscriptionForm(true); resetClientForm();
 loadStatus().then(() => activatePanel((location.hash || '#upstreams').slice(1), false)).catch(error => notice(error.message, true));

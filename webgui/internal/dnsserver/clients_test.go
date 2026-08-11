@@ -186,60 +186,6 @@ func TestPerClientSafeSearchOverride(t *testing.T) {
 	_ = h.nextEvent(t)
 }
 
-func TestBlockedServicesPerClientAndSchedule(t *testing.T) {
-	var hits atomic.Int32
-	upstreamAddr := startFakeUpstream(t, &hits)
-
-	never := &clients.Schedule{Days: map[string][]clients.TimeRange{}} // never active
-	reg := newTestRegistry(t,
-		clients.Client{
-			Name: "fbkid", IDs: []string{"100.64.0.22"},
-			UseGlobalSettings: false, BlockedServices: []string{"facebook"},
-		},
-		clients.Client{
-			Name: "schedkid", IDs: []string{"100.64.0.23"},
-			UseGlobalSettings: false, BlockedServices: []string{"facebook"}, Schedule: never,
-		},
-	)
-	pool := upstream.NewPool(upstream.PoolConfig{Mode: upstream.ModeStrict, PrimarySpecs: []string{upstreamAddr}})
-	h := startClientHarness(t, Config{Pool: pool, Clients: reg, BlockingMode: "nxdomain"})
-
-	// Inside (no schedule = always): facebook blocked.
-	resp := h.queryFrom(t, "100.64.0.22", "www.facebook.com")
-	if resp.Rcode != dns.RcodeNameError {
-		t.Errorf("fbkid rcode = %s, want NXDOMAIN", dns.RcodeToString[resp.Rcode])
-	}
-	ev := h.nextEvent(t)
-	if !ev.ev.Blocked || ev.ev.BlockReason != "BlockedService:facebook" || ev.ev.MatchedRule != "facebook" {
-		t.Errorf("blocked-service event = %+v", ev.ev)
-	}
-	if got := h.srv.ServiceStats()["facebook"]; got != 1 {
-		t.Errorf("service metric = %d, want 1", got)
-	}
-
-	// Outside schedule window: forwarded.
-	resp = h.queryFrom(t, "100.64.0.23", "www.facebook.com")
-	if len(resp.Answer) != 1 {
-		t.Errorf("schedkid answer = %v, want forwarded (schedule inactive)", resp.Answer)
-	}
-	_ = h.nextEvent(t)
-}
-
-func TestBlockedServicesGlobal(t *testing.T) {
-	var hits atomic.Int32
-	upstreamAddr := startFakeUpstream(t, &hits)
-	pool := upstream.NewPool(upstream.PoolConfig{Mode: upstream.ModeStrict, PrimarySpecs: []string{upstreamAddr}})
-	h := startClientHarness(t, Config{
-		Pool: pool, BlockedServices: []string{"tiktok"}, BlockingMode: "nxdomain",
-	})
-
-	resp := h.queryFrom(t, "100.64.0.10", "tiktok.com")
-	if resp.Rcode != dns.RcodeNameError {
-		t.Errorf("global tiktok rcode = %s, want NXDOMAIN", dns.RcodeToString[resp.Rcode])
-	}
-	_ = h.nextEvent(t)
-}
-
 func TestCustomUpstreamAndCacheIsolation(t *testing.T) {
 	var hitsA, hitsB atomic.Int32
 	upstreamA := startFakeUpstream(t, &hitsA)              // 93.184.216.34

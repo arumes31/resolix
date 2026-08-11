@@ -208,9 +208,16 @@ func Probe(ctx context.Context, raw, domain string, bootstrapServers []string) e
 	} else {
 		resolver = &dnsResolver{spec: spec, boot: boot}
 	}
+	return probeResolver(ctx, resolver, domain)
+}
+
+func probeResolver(ctx context.Context, resolver Resolver, domain string) error {
 	query := new(dns.Msg)
 	query.SetQuestion(dns.Fqdn(domain), dns.TypeA)
-	var response *dns.Msg
+	var (
+		response *dns.Msg
+		err      error
+	)
 	if contextual, ok := resolver.(interface {
 		ExchangeContext(context.Context, *dns.Msg) (*dns.Msg, error)
 	}); ok {
@@ -224,8 +231,8 @@ func Probe(ctx context.Context, raw, domain string, bootstrapServers []string) e
 	if response == nil {
 		return fmt.Errorf("empty DNS response")
 	}
-	if response.Rcode != dns.RcodeSuccess {
-		return fmt.Errorf("DNS health probe for %q returned RCODE %d", raw, response.Rcode)
+	if response.Rcode != dns.RcodeSuccess && response.Rcode != dns.RcodeNameError {
+		return fmt.Errorf("DNS health probe for %q returned RCODE %d", resolver.String(), response.Rcode)
 	}
 	return nil
 }

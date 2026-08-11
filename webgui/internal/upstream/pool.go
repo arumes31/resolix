@@ -218,6 +218,33 @@ func (p *Pool) SetHealthProvider(fn func() map[string]float64) {
 	p.healthFn.Store(fn)
 }
 
+// Probe checks one configured resolver through the exact resolver instance
+// used for live DNS traffic. This preserves its protocol, TLS settings, and
+// bootstrap address cache instead of creating a parallel health-only path.
+func (p *Pool) Probe(ctx context.Context, raw, domain string) error {
+	p.mu.RLock()
+	var selected Resolver
+	for _, resolver := range p.primary {
+		if resolver.String() == raw {
+			selected = resolver
+			break
+		}
+	}
+	if selected == nil {
+		for _, resolver := range p.fallback {
+			if resolver.String() == raw {
+				selected = resolver
+				break
+			}
+		}
+	}
+	p.mu.RUnlock()
+	if selected == nil {
+		return fmt.Errorf("upstream %q is not configured", raw)
+	}
+	return probeResolver(ctx, selected, domain)
+}
+
 // healthy filters resolvers by the health provider. Resolvers unknown to the
 // health data (e.g. encrypted upstreams the UDP prober cannot check) are
 // considered healthy.

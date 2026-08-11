@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'nonce-{{.Nonce}}'; style-src 'self' 'nonce-{{.Nonce}}'; font-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';">
+    <title>Cluster Nodes · Resolix</title>
+    <link rel="icon" type="image/svg+xml" href="static/favicon.svg">
+    <link rel="stylesheet" href="static/css/style.css">
+</head>
+
+<body class="app-page cluster-page compact" data-page="cluster" data-base-url="{{.BaseURL}}" data-csrf-token="{{.CSRFToken}}" data-mode="{{.Mode}}">
+    <div id="sidebarScrim" class="sidebar-scrim" aria-hidden="true"></div>
+    <aside id="appSidebar" class="app-sidebar" aria-label="Primary navigation">
+        <div class="sidebar-brand">
+            <span class="brand-mark" aria-hidden="true">R</span>
+            <div><strong>Resolix</strong><span>Controller node</span></div>
+        </div>
+        <div class="sidebar-status">
+            <span class="status-beacon" aria-hidden="true"></span>
+            <div><strong>DNS control plane</strong><span>Protected and operational</span></div>
+        </div>
+        <nav class="app-nav" aria-label="Application">
+            <span class="nav-section-label">Observe</span>
+            <a class="app-nav-link" href="./">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13h6V4H4v9Zm0 7h6v-4H4v4Zm10 0h6v-9h-6v9Zm0-16v4h6V4h-6Z"/></svg><span>Dashboard</span>
+            </a>
+            <a class="app-nav-link" href="querylog">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v3H5V4Zm0 6h14v3H5v-3Zm0 6h9v3H5v-3Z"/></svg><span>Query log</span><span class="nav-live">Live</span>
+            </a>
+            <a class="app-nav-link is-active" href="cluster" aria-current="page">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a4 4 0 0 1 4 4c0 .7-.18 1.36-.5 1.93L19.57 13A4 4 0 1 1 18 14.5l-4.07-4.07A4 4 0 0 1 12 11a4 4 0 0 1-1.93-.5L6 14.57A4 4 0 1 1 4.43 13l4.07-4.07A4 4 0 1 1 12 3Z"/></svg><span>Cluster nodes</span>
+            </a>
+            <span class="nav-section-label">Manage</span>
+            <a class="app-nav-link" href="config">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19.14 12.94c.04-.3.06-.62.06-.94s-.02-.64-.07-.94l2.03-1.58-1.92-3.32-2.39.96a7.3 7.3 0 0 0-1.63-.94L14.86 3h-3.84l-.36 3.18c-.59.24-1.13.56-1.63.94l-2.39-.96-1.92 3.32 2.03 1.58c-.05.3-.08.63-.08.94s.03.64.08.94l-2.03 1.58 1.92 3.32 2.39-.96c.5.39 1.04.7 1.63.94l.36 3.18h3.84l.36-3.18a7.3 7.3 0 0 0 1.63-.94l2.39.96 1.92-3.32-2.02-1.58ZM12.94 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z"/></svg><span>Configuration</span>
+            </a>
+        </nav>
+        <div class="sidebar-footer">
+            <div class="sidebar-footnote"><span>Mode</span><strong>{{.Mode}}</strong></div>
+            <form method="post" action="logout" class="logout-form sidebar-logout">
+                <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+                <button type="submit" class="app-nav-link sidebar-button" aria-label="Sign out">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 17v3H4V4h6v3H7v10h3Zm4.59-9.59L16 6l6 6-6 6-1.41-1.41L18.17 13H9v-2h9.17l-3.58-3.59Z"/></svg><span>Sign out</span>
+                </button>
+            </form>
+        </div>
+    </aside>
+
+    <div class="app-main">
+        <header class="app-topbar">
+            <div class="topbar-title">
+                <button id="sidebarToggle" type="button" class="sidebar-toggle" aria-controls="appSidebar" aria-expanded="false" aria-label="Open navigation">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16v2H4V6Zm0 5h16v2H4v-2Zm0 5h16v2H4v-2Z"/></svg>
+                </button>
+                <div><span class="page-kicker">Control plane</span><h1>Cluster nodes</h1></div>
+            </div>
+            <div class="topbar-actions">
+                <p id="systemStatus" class="system-status" role="status" aria-live="polite"><span class="status-dot status-online"></span> System online</p>
+                <button type="button" id="refreshNodesBtn" class="btn btn-secondary">Refresh nodes</button>
+            </div>
+        </header>
+
+        <main class="app-content container cluster-container">
+            <div class="config-intro">
+                <div><span class="page-kicker">Fleet visibility</span><h2>Controller and agent state</h2></div>
+                <p>Review connectivity, runtime resources, versions, and the last report received from each resolver node.</p>
+            </div>
+            <section class="node-status-panel console-section">
+                <div class="section-heading"><div><span class="page-kicker">Resolver fleet</span><h2>Reporting nodes</h2></div><span class="section-chip healthy"><i class="metric-dot green"></i>Auto refresh</span></div>
+                <div id="nodeCards" class="node-status-grid"><p class="empty-state">No agent nodes connected</p></div>
+            </section>
+        </main>
+    </div>
+    <script nonce="{{.Nonce}}" src="static/js/shell.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/index.js"></script>
+</body>
+
+</html>

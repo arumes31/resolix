@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -204,6 +205,8 @@ func TestDoTResolver(t *testing.T) {
 func TestDoTResolverUsesBootstrapServer(t *testing.T) {
 	const hostname = "dot.bootstrap.test"
 	var bootstrapHits atomic.Int32
+	var queriesMu sync.Mutex
+	var encryptedQueries []string
 	bootstrapAddress := startBootstrapServer(t, hostname, &bootstrapHits)
 
 	cert := selfSignedCert(t)
@@ -212,6 +215,9 @@ func TestDoTResolverUsesBootstrapServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := &dns.Server{Listener: listener, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, request *dns.Msg) {
+		queriesMu.Lock()
+		encryptedQueries = append(encryptedQueries, request.Question[0].Name)
+		queriesMu.Unlock()
 		response := new(dns.Msg)
 		response.SetReply(request)
 		response.Answer = []dns.RR{&dns.A{
@@ -233,13 +239,26 @@ func TestDoTResolverUsesBootstrapServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolver := &dnsResolver{spec: spec, boot: newBootstrapper([]string{bootstrapAddress})}
-	response, err := resolver.Exchange(queryA())
+	pool := NewPool(PoolConfig{
+		Mode:             ModeStrict,
+		PrimarySpecs:     []string{spec.Raw},
+		BootstrapServers: []string{bootstrapAddress},
+	})
+	response, _, err := pool.Exchange(queryA())
 	if err != nil {
 		t.Fatalf("DoT exchange through bootstrap: %v", err)
 	}
+	if err := pool.Probe(context.Background(), spec.Raw, "health.test"); err != nil {
+		t.Fatalf("DoT pool probe: %v", err)
+	}
+	queriesMu.Lock()
+	gotQueries := append([]string(nil), encryptedQueries...)
+	queriesMu.Unlock()
 	if len(response.Answer) != 1 || bootstrapHits.Load() != 1 {
 		t.Fatalf("DoT answer/bootstrap hits = %v/%d", response.Answer, bootstrapHits.Load())
+	}
+	if !slices.Equal(gotQueries, []string{"example.org.", "health.test."}) {
+		t.Fatalf("DoT encrypted queries = %v", gotQueries)
 	}
 }
 
@@ -292,6 +311,8 @@ func TestDoHResolver(t *testing.T) {
 func TestDoHResolverUsesBootstrapServer(t *testing.T) {
 	const hostname = "doh.bootstrap.test"
 	var bootstrapHits atomic.Int32
+	var queriesMu sync.Mutex
+	var encryptedQueries []string
 	bootstrapAddress := startBootstrapServer(t, hostname, &bootstrapHits)
 
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
@@ -305,6 +326,9 @@ func TestDoHResolverUsesBootstrapServer(t *testing.T) {
 			t.Errorf("unpack query: %v", err)
 			return
 		}
+		queriesMu.Lock()
+		encryptedQueries = append(encryptedQueries, query.Question[0].Name)
+		queriesMu.Unlock()
 		response := new(dns.Msg)
 		response.SetReply(query)
 		response.Answer = []dns.RR{&dns.A{
@@ -331,14 +355,26 @@ func TestDoHResolverUsesBootstrapServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolver := &dohResolver{spec: spec, boot: newBootstrapper([]string{bootstrapAddress})}
-	t.Cleanup(resolver.closeIdleConnections)
-	response, err := resolver.Exchange(queryA())
+	pool := NewPool(PoolConfig{
+		Mode:             ModeStrict,
+		PrimarySpecs:     []string{spec.Raw},
+		BootstrapServers: []string{bootstrapAddress},
+	})
+	response, _, err := pool.Exchange(queryA())
 	if err != nil {
 		t.Fatalf("DoH exchange through bootstrap: %v", err)
 	}
+	if err := pool.Probe(context.Background(), spec.Raw, "health.test"); err != nil {
+		t.Fatalf("DoH pool probe: %v", err)
+	}
+	queriesMu.Lock()
+	gotQueries := append([]string(nil), encryptedQueries...)
+	queriesMu.Unlock()
 	if len(response.Answer) != 1 || bootstrapHits.Load() != 1 {
 		t.Fatalf("DoH answer/bootstrap hits = %v/%d", response.Answer, bootstrapHits.Load())
+	}
+	if !slices.Equal(gotQueries, []string{"example.org.", "health.test."}) {
+		t.Fatalf("DoH encrypted queries = %v", gotQueries)
 	}
 }
 
@@ -374,6 +410,17 @@ func TestProbeRejectsUnsuccessfulRcode(t *testing.T) {
 	})
 	if err := Probe(context.Background(), addr, "health.test", nil); err == nil {
 		t.Fatal("Probe accepted SERVFAIL response")
+	}
+}
+
+func TestProbeAcceptsNXDOMAINResponse(t *testing.T) {
+	addr := startUDPUpstreamHandler(t, func(w dns.ResponseWriter, request *dns.Msg) {
+		response := new(dns.Msg)
+		response.SetRcode(request, dns.RcodeNameError)
+		_ = w.WriteMsg(response)
+	})
+	if err := Probe(context.Background(), addr, "health.test", nil); err != nil {
+		t.Fatalf("Probe rejected valid NXDOMAIN response: %v", err)
 	}
 }
 

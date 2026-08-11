@@ -18,8 +18,13 @@ import (
 	"github.com/arumes31/resolix/webgui/internal/rewrites"
 )
 
-func TestConfigPageIsDedicatedAndRootRejectsUnknownPaths(t *testing.T) {
-	tmpl, err := template.ParseFiles("../../templates/index.html", "../../templates/config.html")
+func TestDedicatedPagesAndRootRejectsUnknownPaths(t *testing.T) {
+	tmpl, err := template.ParseFiles(
+		"../../templates/index.html",
+		"../../templates/querylog.html",
+		"../../templates/cluster.html",
+		"../../templates/config.html",
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,8 +39,42 @@ func TestConfigPageIsDedicatedAndRootRejectsUnknownPaths(t *testing.T) {
 		!strings.Contains(body, `class="app-page config-page compact"`) ||
 		!strings.Contains(body, `id="configAuthority"`) ||
 		!strings.Contains(body, `id="bootstrapList"`) ||
+		!strings.Contains(body, `id="allowlistForm"`) ||
+		!strings.Contains(body, `id="allowlistList"`) ||
 		!strings.Contains(body, `id="rewriteDeleteDialog"`) {
 		t.Fatalf("config response = %d %q", recorder.Code, recorder.Body.String())
+	}
+
+	pageTests := []struct {
+		path       string
+		marker     string
+		notPresent []string
+	}{
+		{path: "/", marker: `id="rpm_val"`, notPresent: []string{`id="eventTable"`, `id="nodeCards"`}},
+		{path: "/querylog", marker: `id="eventTable"`, notPresent: []string{`id="rpm_val"`, `id="nodeCards"`}},
+		{path: "/cluster", marker: `id="nodeCards"`, notPresent: []string{`id="rpm_val"`, `id="eventTable"`}},
+	}
+	for _, test := range pageTests {
+		t.Run(test.path, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, test.path, nil))
+			if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), test.marker) {
+				t.Fatalf("response = %d %q", recorder.Code, recorder.Body.String())
+			}
+			for _, absent := range test.notPresent {
+				if strings.Contains(recorder.Body.String(), absent) {
+					t.Fatalf("response for %s unexpectedly contains %s", test.path, absent)
+				}
+			}
+		})
+	}
+
+	agent := testServer(&config.Config{BaseURL: "/", Mode: config.ModeAgent, MaxRequestSize: 1 << 20})
+	agent.tmpl = tmpl
+	recorder = httptest.NewRecorder()
+	agent.SetupMux().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/cluster", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("agent cluster status = %d", recorder.Code)
 	}
 
 	recorder = httptest.NewRecorder()
@@ -230,7 +269,11 @@ func TestApplyConfigSnapshotPersistsAllManagedSettings(t *testing.T) {
 	server.SetDNSRoutes(dnsRoutes)
 
 	snapshot, err := configsync.NewSnapshot(
-		[]string{"1.1.1.1"}, []string{"8.8.8.8"}, map[string]string{"internal": "9.9.9.9"}, nil, "||blocked.example^\n",
+		[]string{"1.1.1.1"}, []string{"8.8.8.8"}, map[string]string{"internal": "9.9.9.9"},
+		[]filter.Subscription{{
+			ID: "trusted-domains", Name: "Trusted domains", URL: "https://allow.example/list.txt", AllowOnly: true, Enabled: true,
+		}},
+		"||blocked.example^\n",
 		[]rewrites.Rewrite{{
 			ID:          "rewrite-1",
 			Domain:      "printer.internal",
@@ -261,6 +304,9 @@ func TestApplyConfigSnapshotPersistsAllManagedSettings(t *testing.T) {
 	}
 	if got := dnsRoutes.GetRoutesMap(); got["internal"] != "9.9.9.9" {
 		t.Fatalf("DNS routes = %v", got)
+	}
+	if got := subscriptions.List(); len(got) != 1 || !got[0].AllowOnly || got[0].ID != "trusted-domains" {
+		t.Fatalf("subscriptions = %+v", got)
 	}
 	if result := engine.Match("blocked.example"); !result.Blocked {
 		t.Fatalf("synced user rule did not block: %+v", result)

@@ -211,7 +211,6 @@ func (s *Server) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
 			"private_ptr":             s.cfg.PrivatePTR,
 			"rate_limit_qps":          s.cfg.RateLimitQPS,
 			"rate_limit_internal_qps": s.cfg.InternalRateLimitQPS,
-			"blocked_services":        s.cfg.BlockedServices,
 			"cache_min_ttl":           s.cfg.CacheMinTTL,
 			"cache_max_ttl":           s.cfg.CacheMaxTTL,
 			"cache_optimistic":        s.cfg.CacheOptimistic,
@@ -265,6 +264,28 @@ func (s *Server) handleFilterSubscriptions(w http.ResponseWriter, r *http.Reques
 		w.Header().Set("Allow", "GET, PUT")
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *Server) handleFilteringUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.requireController(w) || !s.checkCSRF(w, r) {
+		return
+	}
+	s.fieldsMu.RLock()
+	engine := s.filterEngine
+	s.fieldsMu.RUnlock()
+	if engine == nil {
+		http.Error(w, "Filter engine is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	engine.RequestUpdate()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "scheduled"})
 }
 
 func (s *Server) handleUserRules(w http.ResponseWriter, r *http.Request) {

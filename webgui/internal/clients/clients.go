@@ -1,6 +1,5 @@
 // Package clients implements the per-client policy registry: JSON-persisted
-// client profiles with longest-prefix IP/CIDR matching, hot-reload, and
-// weekly blocking schedules.
+// client profiles with longest-prefix IP/CIDR matching and hot reload.
 package clients
 
 import (
@@ -11,73 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 )
-
-// TimeRange is a daily window in "HH:MM" 24h format. Overnight windows
-// (end < start) wrap past midnight.
-type TimeRange struct {
-	Start string `json:"start"`
-	End   string `json:"end"`
-}
-
-// Schedule limits blocked-service enforcement to weekly windows.
-// Days keys are lowercase weekday abbreviations: mon, tue, wed, thu, fri, sat, sun.
-type Schedule struct {
-	Timezone string                 `json:"timezone,omitempty"` // IANA name; empty = local
-	Days     map[string][]TimeRange `json:"days"`
-}
-
-// Active reports whether the schedule is active at the given time.
-// A nil schedule is always active.
-func (s *Schedule) Active(now time.Time) bool {
-	if s == nil {
-		return true
-	}
-	loc := time.Local
-	if s.Timezone != "" {
-		if l, err := time.LoadLocation(s.Timezone); err == nil {
-			loc = l
-		}
-	}
-	now = now.In(loc)
-	mins := now.Hour()*60 + now.Minute()
-	day := strings.ToLower(now.Weekday().String()[:3])
-	for _, r := range s.Days[day] {
-		start, err1 := parseHHMM(r.Start)
-		end, err2 := parseHHMM(r.End)
-		if err1 != nil || err2 != nil {
-			continue
-		}
-		if end == start {
-			continue
-		}
-		if end < start {
-			if mins >= start {
-				return true
-			}
-		} else if mins >= start && mins < end {
-			return true
-		}
-	}
-	previous := strings.ToLower(now.AddDate(0, 0, -1).Weekday().String()[:3])
-	for _, r := range s.Days[previous] {
-		start, err1 := parseHHMM(r.Start)
-		end, err2 := parseHHMM(r.End)
-		if err1 == nil && err2 == nil && end < start && mins < end {
-			return true
-		}
-	}
-	return false
-}
-
-func parseHHMM(s string) (int, error) {
-	parsed, err := time.Parse("15:04", s)
-	if err != nil {
-		return 0, err
-	}
-	return parsed.Hour()*60 + parsed.Minute(), nil
-}
 
 // Client is a per-client policy profile.
 type Client struct {
@@ -85,8 +18,8 @@ type Client struct {
 	IDs  []string `json:"ids"` // IPv4/IPv6 addresses or CIDRs
 	Tags []string `json:"tags,omitempty"`
 
-	// UseGlobalSettings (default true): inherit filtering, safe search,
-	// blocked services, and upstreams from the global configuration.
+	// UseGlobalSettings (default true): inherit filtering, safe search, and
+	// upstreams from the global configuration.
 	UseGlobalSettings bool `json:"use_global_settings"`
 	// FilteringEnabled applies the filter engine to this client.
 	FilteringEnabled bool `json:"filtering_enabled"`
@@ -94,11 +27,6 @@ type Client struct {
 	SafeSearchEnabled bool `json:"safe_search_enabled"`
 	// SafeSearchEngines overrides the global engine list when non-empty.
 	SafeSearchEngines []string `json:"safe_search_engines,omitempty"`
-	// BlockedServices overrides the global blocked-service list when
-	// UseGlobalSettings is false.
-	BlockedServices []string `json:"blocked_services,omitempty"`
-	// Schedule limits blocked-service enforcement windows (nil = always).
-	Schedule *Schedule `json:"schedule,omitempty"`
 	// Upstreams overrides the global pool when non-empty.
 	Upstreams []string `json:"upstreams,omitempty"`
 	// ExcludeFromLog skips event emission entirely.
@@ -156,37 +84,6 @@ func (c *Client) compile() error {
 		c.nets = append(c.nets, cidrEntry{net: n, bits: bits})
 	}
 	sort.Slice(c.nets, func(i, j int) bool { return c.nets[i].bits > c.nets[j].bits })
-	if err := validateSchedule(c.Schedule); err != nil {
-		return fmt.Errorf("client %q schedule: %w", c.Name, err)
-	}
-	return nil
-}
-
-func validateSchedule(schedule *Schedule) error {
-	if schedule == nil {
-		return nil
-	}
-	if schedule.Timezone != "" {
-		if _, err := time.LoadLocation(schedule.Timezone); err != nil {
-			return fmt.Errorf("invalid timezone")
-		}
-	}
-	validDays := map[string]bool{"mon": true, "tue": true, "wed": true, "thu": true, "fri": true, "sat": true, "sun": true}
-	for day, ranges := range schedule.Days {
-		if !validDays[strings.ToLower(day)] {
-			return fmt.Errorf("invalid weekday %q", day)
-		}
-		for _, timeRange := range ranges {
-			start, err := parseHHMM(timeRange.Start)
-			if err != nil {
-				return fmt.Errorf("invalid start time")
-			}
-			end, err := parseHHMM(timeRange.End)
-			if err != nil || start == end {
-				return fmt.Errorf("invalid end time")
-			}
-		}
-	}
 	return nil
 }
 
@@ -360,17 +257,8 @@ func cloneClient(client Client) Client {
 	client.IDs = append([]string(nil), client.IDs...)
 	client.Tags = append([]string(nil), client.Tags...)
 	client.SafeSearchEngines = append([]string(nil), client.SafeSearchEngines...)
-	client.BlockedServices = append([]string(nil), client.BlockedServices...)
 	client.Upstreams = append([]string(nil), client.Upstreams...)
 	client.nets = append([]cidrEntry(nil), client.nets...)
-	if client.Schedule != nil {
-		schedule := *client.Schedule
-		schedule.Days = make(map[string][]TimeRange, len(client.Schedule.Days))
-		for day, ranges := range client.Schedule.Days {
-			schedule.Days[day] = append([]TimeRange(nil), ranges...)
-		}
-		client.Schedule = &schedule
-	}
 	return client
 }
 

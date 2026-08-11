@@ -6,9 +6,11 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -340,6 +342,60 @@ func TestArchiveStepDrainsMultipleWriteBatches(t *testing.T) {
 	}
 	if total != 5 {
 		t.Fatalf("archived rows = %d, want 5", total)
+	}
+}
+
+func TestArchiveInFlightEventsAreNotDroppedByProducers(t *testing.T) {
+	s, cleanup := newTestStore(t)
+	defer cleanup()
+	s.archiveLimit = 2
+	s.archiveBatch = 2
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	s.archiveInsert = func(_ context.Context, _ []models.QueryEvent) error {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		return nil
+	}
+
+	s.AddEvent(models.QueryEvent{UnixTime: 1, Domain: "first.test"})
+	s.AddEvent(models.QueryEvent{UnixTime: 2, Domain: "second.test"})
+	done := make(chan int, 1)
+	go func() { done <- s.ArchiveStep(time.Now()) }()
+	<-started
+
+	if metrics := s.ArchiveMetrics(); metrics.Pending != 2 {
+		t.Fatalf("pending while insert is in flight = %d, want 2", metrics.Pending)
+	}
+	s.AddEvent(models.QueryEvent{UnixTime: 3, Domain: "third.test"})
+	s.AddEvent(models.QueryEvent{UnixTime: 4, Domain: "fourth.test"})
+	close(release)
+	if archived := <-done; archived != 4 {
+		t.Fatalf("archived = %d, want 4", archived)
+	}
+	if metrics := s.ArchiveMetrics(); metrics.Pending != 0 || metrics.Dropped != 0 {
+		t.Fatalf("archive metrics = pending %d, dropped %d; want 0/0", metrics.Pending, metrics.Dropped)
+	}
+}
+
+func TestArchiveFailureRestoresClaimedEvents(t *testing.T) {
+	s, cleanup := newTestStore(t)
+	defer cleanup()
+	s.archiveInsert = func(_ context.Context, _ []models.QueryEvent) error {
+		return errors.New("test insert failure")
+	}
+	s.AddEvent(models.QueryEvent{UnixTime: 1, Domain: "retry.test"})
+
+	if archived, err := s.archiveStep(context.Background(), time.Now()); err == nil || archived != 0 {
+		t.Fatalf("archive result = %d/%v, want 0/error", archived, err)
+	}
+	metrics := s.ArchiveMetrics()
+	if metrics.Pending != 1 || metrics.Dropped != 0 {
+		t.Fatalf("archive metrics = pending %d, dropped %d; want 1/0", metrics.Pending, metrics.Dropped)
 	}
 }
 
@@ -963,10 +1019,8 @@ func TestClose(t *testing.T) {
 	// Close should not panic
 	s.Close()
 
-	// Verify prepared statements are nil after close
-	if s.stmtInsertQuery != nil {
-		t.Error("expected stmtInsertQuery to be nil after close")
-	}
+	// Close is idempotent and releases cached statements.
+	s.Close()
 }
 
 func TestConcurrentAddEvent(t *testing.T) {

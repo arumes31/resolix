@@ -104,11 +104,11 @@ const (
 	// DefaultBatchArchiveInterval is the default interval for batch archiving to SQLite.
 	DefaultBatchArchiveInterval = 30 * time.Minute
 	// DefaultArchiveQueueCapacity is the maximum number of events waiting for SQLite.
-	DefaultArchiveQueueCapacity = 100000
+	DefaultArchiveQueueCapacity = 1000000
 	// DefaultArchiveTriggerSize starts an archive pass before the queue is full.
-	DefaultArchiveTriggerSize = 5000
+	DefaultArchiveTriggerSize = 20000
 	// DefaultArchiveWriteBatchSize bounds each SQLite transaction.
-	DefaultArchiveWriteBatchSize = 5000
+	DefaultArchiveWriteBatchSize = 20000
 	// DefaultCleanupPendingInterval is the default interval for cleaning up stale pending queries.
 	DefaultCleanupPendingInterval = 1 * time.Hour
 	// DefaultForwarderRetryInterval is the default initial retry interval for the forwarder.
@@ -243,8 +243,6 @@ type Config struct {
 	CacheOptimistic bool
 	// ClientsFile is the per-client registry JSON file.
 	ClientsFile string
-	// BlockedServices lists globally blocked service IDs (comma-separated).
-	BlockedServices string
 	// DNSAllowedClients restricts DNS service to these IPs/CIDRs when non-empty.
 	DNSAllowedClients string
 	// DNSDisallowedClients drops queries from these IPs/CIDRs silently.
@@ -1032,7 +1030,6 @@ func LoadConfig() *Config {
 		CacheMaxTTL:                cacheMaxTTL,
 		CacheOptimistic:            strings.ToLower(os.Getenv("CACHE_OPTIMISTIC")) == "true",
 		ClientsFile:                clientsFile,
-		BlockedServices:            os.Getenv("BLOCKED_SERVICES"),
 		DNSAllowedClients:          os.Getenv("DNS_ALLOWED_CLIENTS"),
 		DNSDisallowedClients:       os.Getenv("DNS_DISALLOWED_CLIENTS"),
 		RateLimitQPS:               parseIntEnv("RATE_LIMIT_QPS", DefaultRateLimitQPS),

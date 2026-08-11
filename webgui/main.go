@@ -314,10 +314,8 @@ DB_PATH=dns.db
 # CACHE_MAX_TTL=600
 
 # Per-client policies (Step 5)
-# CLIENTS_FILE=clients.json (per-client registry: filtering/safe-search/blocked
-#   services/custom upstreams/schedules, hot-reloaded every 30s)
-# BLOCKED_SERVICES=facebook,tiktok (global blocked-service IDs; per-client
-#   overrides live in the clients file)
+# CLIENTS_FILE=clients.json (per-client registry: filtering, safe search,
+#   custom upstreams, and log/stat exclusions; hot-reloaded every 30s)
 
 # DNS access and encrypted serving (Step 6)
 # Comma/space-separated IPs or CIDRs. Deny-list matches, allow-list misses,
@@ -343,9 +341,9 @@ DB_PATH=dns.db
 # SSE_KEEPALIVE_INTERVAL=30s
 # Maximum periodic interval; busy queues also archive at the trigger size.
 # BATCH_ARCHIVE_INTERVAL=30m
-# ARCHIVE_QUEUE_CAPACITY=100000
-# ARCHIVE_TRIGGER_SIZE=5000
-# ARCHIVE_WRITE_BATCH_SIZE=5000
+# ARCHIVE_QUEUE_CAPACITY=1000000
+# ARCHIVE_TRIGGER_SIZE=20000
+# ARCHIVE_WRITE_BATCH_SIZE=20000
 # CLEANUP_INTERVAL=1h
 # FORWARDER_RETRY_INTERVAL=5s
 # HTTP_READ_TIMEOUT=10s
@@ -483,13 +481,6 @@ func main() {
 	// Initialize the protocol-aware health checker with the same bootstrap
 	// resolvers used by the live upstream pool.
 	checker := health.NewChecker(cfg, strings.Join(upstreamSpecs, " "), bootstrapServers)
-	go checker.Start(ctx, func(_ []string, latencies map[string]float64) {
-		store.SetUpstreamHealth(cfg.NodeName, latencies)
-		if cfg.Mode == config.ModeAgent {
-			fwd.ReportHealth(latencies)
-		}
-		logger.Debug("Health status updated for node %s. Latencies: %v", cfg.NodeName, latencies)
-	})
 
 	// Start Trend Analysis
 	store.StartStatsTrends(ctx)
@@ -514,7 +505,7 @@ func main() {
 	errChan := make(chan error, 2)
 
 	// Embedded DNS server (replaces dnsmasq). Pipeline: refuse-ANY/AAAA-disable
-	// → typed rewrites → private PTR → safe-search → filter → blocked services
+	// → typed rewrites → private PTR → safe-search → filter
 	// → cache → client upstreams → route → global pool → bogus-NXDOMAIN →
 	// cache store → respond.
 	// Each answered query becomes a QueryEvent fed into Store + SSE (and the
@@ -543,6 +534,14 @@ func main() {
 
 	// Upstream pool (Step 4): modes, fallback, bootstrap, ECS, DNS64.
 	pool := setupUpstreamPool(ctx, cfg, store, srv, checker, loadResolverSettings, upstreamSpecs, bootstrapServers)
+	checker.SetProbeFunc(pool.Probe)
+	go checker.Start(ctx, func(_ []string, latencies map[string]float64) {
+		store.SetUpstreamHealth(cfg.NodeName, latencies)
+		if cfg.Mode == config.ModeAgent {
+			fwd.ReportHealth(latencies)
+		}
+		logger.Debug("Health status updated for node %s. Latencies: %v", cfg.NodeName, latencies)
+	})
 	dr.SetOnChange(pool.ClearRouteCache)
 	fwd.SetDNSConfigFn(func(snapshot configsync.Snapshot) error {
 		return srv.ApplyConfigSnapshot(snapshot)
@@ -565,7 +564,6 @@ func main() {
 		Pool:            pool,
 		Routes:          dr,
 		Clients:         clientReg,
-		BlockedServices: splitListEnv(cfg.BlockedServices),
 		AliasFunc:       store.GetAlias,
 		CacheMinTTL:     cfg.CacheMinTTL,
 		CacheMaxTTL:     cfg.CacheMaxTTL,

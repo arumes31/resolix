@@ -38,6 +38,7 @@ function applyDynamicStyles(root) {
 // Base URL prefix for API requests (empty for root deployments)
 const apiBase = (document.body.dataset.baseUrl || '/').replace(/\/$/, '');
 const configReadOnly = document.body.dataset.mode === 'agent';
+const activePage = document.body.dataset.page || 'dashboard';
 
 function apiPath(path) {
     return apiBase + path;
@@ -73,7 +74,6 @@ let isFrozen = false;
 let isViewCleared = false;
 let statsInterval = null;
 let nodeStatusInterval = null;
-let knownServices = [];
 let configuredClients = [];
 let editingClient = null;
 let frozenEvents = [];
@@ -84,13 +84,17 @@ const loadedSettings = new Set();
 
 function renderSystemStatus() {
     const status = document.getElementById('systemStatus');
-    status.classList.toggle('offline', !streamConnected || !pollingHealthy);
+    if (!status) return;
+    const streamUnavailable = activePage === 'querylog' && !streamConnected;
+    status.classList.toggle('offline', streamUnavailable || !pollingHealthy);
     if (!pollingHealthy) {
         status.textContent = '● System Offline';
-    } else if (!streamConnected) {
+    } else if (streamUnavailable) {
         status.textContent = '● Live stream reconnecting';
-    } else {
+    } else if (activePage === 'querylog') {
         status.textContent = '● Live stream connected';
+    } else {
+        status.textContent = '● System online';
     }
 }
 
@@ -212,10 +216,6 @@ function updateRowInDom(e) {
     if (row) {
         row.innerHTML = createRowHtml(e);
     }
-}
-
-async function fetchAll() {
-    await Promise.allSettled([fetchEvents(), fetchStats(), fetchNodeStatus()]);
 }
 
 function fetchEvents() {
@@ -350,15 +350,20 @@ function fetchStats() {
         rpmHistory.push(stats.rpm);
         rpmHistory.shift();
         renderMiniChart();
-        } catch (e) { console.error(e); }
+        setPollingStatus(true);
+        } catch (e) {
+            console.error(e);
+            setPollingStatus(false);
+        }
     });
 }
 function fetchNodeStatus() {
     return coalesceRequest('nodes', async () => {
         try {
         const response = await fetch(apiPath('/api/nodes'));
-        if (!response.ok) return;
+        if (!response.ok) throw new Error(`Nodes API failed (${response.status})`);
         const data = await response.json();
+        setPollingStatus(true);
         const nodes = data.nodes || [];
         const container = document.getElementById('nodeCards');
         if (!container) return;
@@ -394,7 +399,8 @@ function fetchNodeStatus() {
         }).join('');
         replaceHTMLIfChanged(container, nodeCardsHTML);
         } catch (e) {
-        // Silently fail - node status is non-critical
+            console.error(e);
+            setPollingStatus(false);
         }
     });
 }
@@ -683,13 +689,6 @@ async function deleteRewrite(id) {
     await loadRewrites();
 }
 
-function renderClientServicePicker(selected = []) {
-    const selectedSet = new Set(selected);
-    document.getElementById('clientServicePicker').innerHTML = knownServices.map(service => `
-        <label class="service-option"><input type="checkbox" value="${escapeHtml(service.id)}" ${selectedSet.has(service.id) ? 'checked' : ''}> ${escapeHtml(service.id)}</label>
-    `).join('') || '<span class="settings-list-meta">Service catalog unavailable</span>';
-}
-
 function setClientPolicyState() {
     const inherit = document.getElementById('clientUseGlobal').checked;
     const fields = document.getElementById('clientPolicyFields');
@@ -706,8 +705,7 @@ function resetClientForm() {
     document.getElementById('clientFiltering').checked = true;
     document.getElementById('clientSaveBtn').textContent = 'Add client';
     document.getElementById('clientCancelBtn').classList.add('is-hidden');
-    renderClientServicePicker();
-    setClientPolicyState();
+	setClientPolicyState();
 }
 
 function editClient(name) {
@@ -724,8 +722,7 @@ function editClient(name) {
     document.getElementById('clientUpstreams').value = (client.upstreams || []).join(', ');
     document.getElementById('clientExcludeLog').checked = Boolean(client.exclude_from_log);
     document.getElementById('clientExcludeStats').checked = Boolean(client.exclude_from_stats);
-    renderClientServicePicker(client.blocked_services || []);
-    setClientPolicyState();
+	setClientPolicyState();
     document.getElementById('clientSaveBtn').textContent = 'Save client';
     document.getElementById('clientCancelBtn').classList.remove('is-hidden');
     document.getElementById('clientForm').scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -737,11 +734,10 @@ async function loadClients() {
     document.getElementById('clientCount').textContent = `${configuredClients.length} ${configuredClients.length === 1 ? 'client' : 'clients'}`;
     document.getElementById('clientList').innerHTML = configuredClients.map(client => {
         const mode = client.use_global_settings ? 'Global policy' : 'Custom policy';
-        const services = (client.blocked_services || []).length ? ` · ${(client.blocked_services || []).join(', ')}` : '';
-        return `<div class="settings-list-row">
+		return `<div class="settings-list-row">
             <div class="settings-list-main">
                 <div class="settings-list-title">${escapeHtml(client.name)}</div>
-                <div class="settings-list-meta">${escapeHtml((client.ids || []).join(', '))} · ${mode}${escapeHtml(services)}</div>
+				<div class="settings-list-meta">${escapeHtml((client.ids || []).join(', '))} · ${mode}</div>
             </div>
             <div class="row-actions">
                 <button type="button" class="mini-action client-edit-btn" data-name="${escapeHtml(client.name)}">Edit</button>
@@ -755,8 +751,7 @@ async function saveClient(event) {
     event.preventDefault();
     await withFormBusy(event.target, async () => {
         const inherit = document.getElementById('clientUseGlobal').checked;
-        const selectedServices = Array.from(document.querySelectorAll('#clientServicePicker input:checked')).map(input => input.value);
-        const client = {
+		const client = {
             ...(editingClient || {}),
             name: document.getElementById('clientName').value.trim(),
             ids: splitSettingList(document.getElementById('clientIDs').value),
@@ -764,8 +759,7 @@ async function saveClient(event) {
             filtering_enabled: inherit || document.getElementById('clientFiltering').checked,
             safe_search_enabled: !inherit && document.getElementById('clientSafeSearch').checked,
             safe_search_engines: inherit ? [] : splitSettingList(document.getElementById('clientSafeEngines').value),
-            blocked_services: inherit ? [] : selectedServices,
-            upstreams: splitSettingList(document.getElementById('clientUpstreams').value),
+			upstreams: splitSettingList(document.getElementById('clientUpstreams').value),
             exclude_from_log: document.getElementById('clientExcludeLog').checked,
             exclude_from_stats: document.getElementById('clientExcludeStats').checked
         };
@@ -787,32 +781,16 @@ async function deleteClient(name) {
     await loadClients();
 }
 
-async function loadServices() {
-    const data = await apiJSON('/api/services');
-    knownServices = data.services || [];
-    document.getElementById('serviceCatalog').innerHTML = knownServices.map(service => `
-        <div class="service-card ${service.enabled ? 'enabled' : ''}">
-            <div class="service-card-name">${escapeHtml(service.id)}</div>
-            <div class="service-card-meta">${service.enabled ? 'Globally blocked' : 'Available'} · ${formatNumber(service.hits || 0)} hits</div>
-        </div>`).join('') || emptySettings('Service catalog unavailable');
-    renderClientServicePicker(editingClient ? editingClient.blocked_services || [] : []);
-    setClientPolicyState();
-}
-
 function activeSettingsPanel() {
     return document.querySelector('.settings-tab.active')?.dataset.settingsTab || 'filters';
 }
 
 async function loadSettings(panelName = activeSettingsPanel()) {
-    const loaders = {
-        filters: loadFilterSettings,
-        rewrites: loadRewrites,
-        clients: async () => {
-            if (!loadedSettings.has('services')) await loadSettings('services');
-            await loadClients();
-        },
-        services: loadServices
-    };
+	const loaders = {
+		filters: loadFilterSettings,
+		rewrites: loadRewrites,
+		clients: loadClients
+	};
     const loader = loaders[panelName];
     if (!loader) return;
     await coalesceRequest(`settings:${panelName}`, loader);
@@ -851,7 +829,7 @@ async function applyQueryAction(button) {
     }
 }
 
-document.getElementById('freezeBtn').addEventListener('click', function () {
+document.getElementById('freezeBtn')?.addEventListener('click', function () {
     isFrozen = !isFrozen;
     this.classList.toggle('freeze-active', isFrozen);
     this.textContent = isFrozen ? '▶️' : '⏸️';
@@ -864,35 +842,41 @@ document.getElementById('freezeBtn').addEventListener('click', function () {
     }
 });
 
-document.getElementById('clearViewBtn').addEventListener('click', function () {
+document.getElementById('clearViewBtn')?.addEventListener('click', function () {
     clearView();
 });
 
-document.getElementById('simulateBtn').addEventListener('click', simulateQuery);
-document.getElementById('modalCloseBtn').addEventListener('click', function () {
+document.getElementById('simulateBtn')?.addEventListener('click', simulateQuery);
+document.getElementById('modalCloseBtn')?.addEventListener('click', function () {
     closeClientModal();
 });
-document.getElementById('clientModal').addEventListener('click', function (event) {
+document.getElementById('clientModal')?.addEventListener('click', function (event) {
     if (event.target === this) closeClientModal();
 });
 document.addEventListener('keydown', event => {
     const modal = document.getElementById('clientModal');
-    if (event.key === 'Escape' && modal.classList.contains('open')) closeClientModal();
+    if (event.key === 'Escape' && modal?.classList.contains('open')) closeClientModal();
 });
 
-document.getElementById('searchInput').addEventListener('input', renderEvents);
+document.getElementById('searchInput')?.addEventListener('input', renderEvents);
+document.getElementById('refreshNodesBtn')?.addEventListener('click', () => { void fetchNodeStatus(); });
 
 function updateVisibility() {
     isTabVisible = document.visibilityState === 'visible';
     if (statsInterval) clearInterval(statsInterval);
     if (nodeStatusInterval) clearInterval(nodeStatusInterval);
 
-    const rate = isTabVisible ? 10000 : 60000;
-    statsInterval = setInterval(() => { void fetchStats(); }, rate);
-    nodeStatusInterval = setInterval(() => { void fetchNodeStatus(); }, 30000);
-
-    if (isTabVisible) {
-        fetchAll(); // Catch up immediately
+    const backgroundAwareRate = isTabVisible ? 10000 : 60000;
+    if (activePage === 'dashboard') {
+        statsInterval = setInterval(() => { void fetchStats(); }, backgroundAwareRate);
+        if (isTabVisible) void fetchStats();
+    } else if (activePage === 'querylog') {
+        statsInterval = setInterval(() => { void fetchEvents(); }, backgroundAwareRate);
+        if (isTabVisible) void fetchEvents();
+    } else if (activePage === 'cluster') {
+        const nodeRate = isTabVisible ? 30000 : 60000;
+        nodeStatusInterval = setInterval(() => { void fetchNodeStatus(); }, nodeRate);
+        if (isTabVisible) void fetchNodeStatus();
     }
 }
 
@@ -915,8 +899,10 @@ document.addEventListener('click', function (e) {
     if (clientCell) showClientStats(clientCell.dataset.clientIp);
 });
 
-startStream();
+if (activePage === 'querylog') startStream();
 updateVisibility(); // Initial set
-setInterval(() => {
-    if (isTabVisible && !isFrozen) refreshEventTimes();
-}, 30000);
+if (activePage === 'querylog') {
+    setInterval(() => {
+        if (isTabVisible && !isFrozen) refreshEventTimes();
+    }, 30000);
+}

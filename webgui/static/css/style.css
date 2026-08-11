@@ -2798,64 +2798,6 @@ tr:hover .test-domain-btn {
   opacity: 0.45;
 }
 
-.service-picker {
-  grid-column: 1 / -1;
-  padding: 0.65rem;
-  border: 1px solid var(--border-color);
-  border-radius: 0.6rem;
-}
-
-#clientServicePicker {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.45rem 0.8rem;
-  margin-top: 0.45rem;
-}
-
-.service-option {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.3rem;
-  color: var(--text-secondary);
-  font-size: 0.7rem;
-}
-
-.service-catalog {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 0.65rem;
-  margin-top: 1rem;
-}
-
-.service-card {
-  position: relative;
-  padding: 0.85rem;
-  border: 1px solid var(--border-color);
-  border-radius: 0.7rem;
-  background: var(--card-inner-bg);
-  overflow: hidden;
-}
-
-.service-card.enabled::before {
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: 3px;
-  background: var(--status-error);
-  content: '';
-}
-
-.service-card-name {
-  font-family: 'Outfit', sans-serif;
-  font-size: 0.85rem;
-  text-transform: capitalize;
-}
-
-.service-card-meta {
-  margin-top: 0.35rem;
-  color: var(--text-secondary);
-  font-size: 0.68rem;
-}
-
 .empty-settings {
   padding: 1rem;
   border: 1px dashed var(--border-color);
@@ -3765,6 +3707,8 @@ body.app-page .panel-heading {
 body.app-page .panel-heading h2 { color: #e1ecfa; font-size: 1.12rem; font-weight: 600; }
 body.app-page .panel-index { color: #75a7ff; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 body.app-page .panel-copy { color: #8093ac; line-height: 1.65; }
+body.app-page .allowlist-panel .panel-heading { background: linear-gradient(90deg, rgba(45, 212, 164, 0.1), rgba(19, 38, 62, 0.6)); }
+body.app-page .allowlist-panel .panel-index { color: #45d8ad; }
 
 body.app-page .settings-form,
 body.app-page .settings-list-row,

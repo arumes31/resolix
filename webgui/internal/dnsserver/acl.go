@@ -57,8 +57,9 @@ func (s *Server) aclDrop(clientIP string) bool {
 	return cidrListContains(s.disallowed, clientIP)
 }
 
-// aclRefuse reports whether the client is outside a non-empty allowed list.
-func (s *Server) aclRefuse(clientIP string) bool {
+// aclAllowlistDrop reports whether the client is outside a non-empty allowed
+// list and must receive no response.
+func (s *Server) aclAllowlistDrop(clientIP string) bool {
 	return s.allowedConfigured && !cidrListContains(s.allowed, clientIP)
 }
 

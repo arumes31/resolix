@@ -124,14 +124,14 @@ type Server struct {
 	client    *dns.Client
 
 	// ACL and rate limiting (Step 6)
-	allowed           []*net.IPNet
-	allowedConfigured bool
-	disallowed        []*net.IPNet
-	rateLimiter       *rateLimiter
-	rateLimitDropped  atomic.Int64
-	aclDropped        atomic.Int64
-	aclRefused        atomic.Int64
-	ready             atomic.Bool
+	allowed             []*net.IPNet
+	allowedConfigured   bool
+	disallowed          []*net.IPNet
+	rateLimiter         *rateLimiter
+	rateLimitDropped    atomic.Int64
+	aclDropped          atomic.Int64
+	aclAllowlistDropped atomic.Int64
+	ready               atomic.Bool
 
 	rewriteHits    atomic.Int64
 	safeSearchHits atomic.Int64
@@ -307,9 +307,8 @@ type resolution struct {
 }
 
 // Resolve answers a query message through the full pipeline and emits the
-// query event. It returns drop=true when the client is on the disallowed
-// list (silent drop, anti-amplification). ACL refusals and rate-limit drops
-// return a REFUSED response without emitting an event. Shared by the
+// query event. It returns drop=true for deny-list matches, allow-list misses,
+// and rate-limit excess so DNS listeners emit no response. Shared by the
 // UDP/TCP/DoT listeners and the DoH endpoint.
 func (s *Server) Resolve(r *dns.Msg, clientIP string) (resp *dns.Msg, drop bool) {
 	start := time.Now()
@@ -323,17 +322,15 @@ func (s *Server) Resolve(r *dns.Msg, clientIP string) (resp *dns.Msg, drop bool)
 		s.aclDropped.Add(1)
 		return nil, true
 	}
-	// Stage 0b: ACL — outside a non-empty allowed list → REFUSED (no event).
-	if s.aclRefuse(clientIP) {
-		s.aclRefused.Add(1)
-		resp.Rcode = dns.RcodeRefused
-		return resp, false
+	// Stage 0b: ACL — outside a non-empty allowed list → silent drop.
+	if s.aclAllowlistDrop(clientIP) {
+		s.aclAllowlistDropped.Add(1)
+		return nil, true
 	}
-	// Stage 0c: per-subnet rate limit → REFUSED (AdGuard convention; no event).
+	// Stage 0c: per-subnet rate limit → silent drop.
 	if s.rateLimiter != nil && !s.rateLimiter.allow(clientIP) {
 		s.rateLimitDropped.Add(1)
-		resp.Rcode = dns.RcodeRefused
-		return resp, false
+		return nil, true
 	}
 
 	// Per-client resolution happens once at query start.
@@ -998,7 +995,7 @@ func (s *Server) Stats() (rewriteHits, safeSearchHits, bogusNXHits int64) {
 	return s.rewriteHits.Load(), s.safeSearchHits.Load(), s.bogusNXHits.Load()
 }
 
-// RateLimitDropped returns the number of queries refused by the rate limiter.
+// RateLimitDropped returns the number of queries silently dropped by the rate limiter.
 func (s *Server) RateLimitDropped() int64 {
 	return s.rateLimitDropped.Load()
 }
@@ -1008,12 +1005,12 @@ func (s *Server) Ready() bool {
 	return s.ready.Load()
 }
 
-// ACLStats reports ACL decisions and active rate-limit buckets.
-func (s *Server) ACLStats() (dropped, refused int64, buckets int) {
+// ACLStats reports ACL drops and active rate-limit buckets.
+func (s *Server) ACLStats() (deniedDropped, allowlistDropped int64, buckets int) {
 	if s.rateLimiter != nil {
 		buckets = s.rateLimiter.bucketCount()
 	}
-	return s.aclDropped.Load(), s.aclRefused.Load(), buckets
+	return s.aclDropped.Load(), s.aclAllowlistDropped.Load(), buckets
 }
 
 // CacheStats returns a snapshot of the in-process response cache.

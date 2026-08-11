@@ -12,13 +12,13 @@ import (
 )
 
 func TestNewManagerPersistsCAAndRotatesLeaf(t *testing.T) {
-	historyDir := t.TempDir()
-	manager, err := NewManager(historyDir, "100.64.12.34")
+	tlsStateDir := t.TempDir()
+	manager, err := NewManager(tlsStateDir, "100.64.12.34")
 	if err != nil {
 		t.Fatalf("NewManager() error = %v", err)
 	}
 
-	caPath := filepath.Join(historyDir, tlsDirectory, caFileName)
+	caPath := filepath.Join(tlsStateDir, caFileName)
 	info, err := os.Stat(caPath)
 	if err != nil {
 		t.Fatalf("stat generated CA: %v", err)
@@ -43,7 +43,7 @@ func TestNewManagerPersistsCAAndRotatesLeaf(t *testing.T) {
 		t.Fatalf("CA expires too early: %s", ca.NotAfter)
 	}
 
-	reloaded, err := NewManager(historyDir, "100.64.12.34")
+	reloaded, err := NewManager(tlsStateDir, "100.64.12.34")
 	if err != nil {
 		t.Fatalf("reload NewManager() error = %v", err)
 	}
@@ -93,15 +93,15 @@ func TestParseTailnetIPv4(t *testing.T) {
 }
 
 func TestNewManagerRejectsCorruptPersistentCA(t *testing.T) {
-	historyDir := t.TempDir()
-	if _, err := NewManager(historyDir, "100.64.1.1"); err != nil {
+	tlsStateDir := t.TempDir()
+	if _, err := NewManager(tlsStateDir, "100.64.1.1"); err != nil {
 		t.Fatalf("NewManager() setup error = %v", err)
 	}
-	caPath := filepath.Join(historyDir, tlsDirectory, caFileName)
+	caPath := filepath.Join(tlsStateDir, caFileName)
 	if err := os.WriteFile(caPath, []byte("corrupt"), 0o600); err != nil {
 		t.Fatalf("corrupt CA fixture: %v", err)
 	}
-	if _, err := NewManager(historyDir, "100.64.1.1"); err == nil {
+	if _, err := NewManager(tlsStateDir, "100.64.1.1"); err == nil {
 		t.Fatal("NewManager() accepted a corrupt persistent CA")
 	}
 }

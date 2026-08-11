@@ -15,13 +15,14 @@ services:
       - WEB_TLS_MODE=${WEB_TLS_MODE:-off}
       - WEB_TLS_IP=${WEB_TLS_IP:-}
       - CONTROLLER_TLS_TRUST=${CONTROLLER_TLS_TRUST:-system}
-      - CONTROLLER_TLS_PIN_FILE=${CONTROLLER_TLS_PIN_FILE:-tls/controller-ca-pin.json}
+      - TLS_STATE_DIR=/var/lib/resolix-tls
+      - CONTROLLER_TLS_PIN_FILE=${CONTROLLER_TLS_PIN_FILE:-controller-ca-pin.json}
       - BASE_URL=${BASE_URL:-/}
       - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}
       - INGEST_SECRET=${INGEST_SECRET:?INGEST_SECRET is required}
       - DNS_ALLOWED_CLIENTS=${DNS_ALLOWED_CLIENTS:-127.0.0.0/8,10.0.0.0/8,100.64.0.0/10,172.16.0.0/12,192.168.0.0/16}
       - DNS_DISALLOWED_CLIENTS=${DNS_DISALLOWED_CLIENTS:-}
-      - DNS_LISTEN_ADDR=${DNS_LISTEN_ADDR:-0.0.0.0}
+      - DNS_LISTEN_ADDR=0.0.0.0
       - DNS_LISTEN_PORT=${DNS_LISTEN_PORT:-53}
       - RATE_LIMIT_QPS=${RATE_LIMIT_QPS:-20}
       - PRIVATE_PTR=${PRIVATE_PTR:-true}
@@ -39,6 +40,7 @@ services:
       - "${DNS_PUBLISH_ADDR:-0.0.0.0}:${DNS_PUBLISH_PORT:-53}:${DNS_LISTEN_PORT:-53}/tcp"
     volumes:
       - ./history:/var/lib/resolix
+      - ./tls:/var/lib/resolix-tls
       - ./tailscale:/var/lib/tailscale
       # Mount certificates when DOT_ENABLED=true:
       # - ./certs:/etc/resolix/certs:ro

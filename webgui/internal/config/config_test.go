@@ -1,6 +1,7 @@
 package config
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -245,11 +246,15 @@ func TestLoadConfigControllerTLSModes(t *testing.T) {
 	t.Setenv("WEB_TLS_MODE", "")
 	t.Setenv("CONTROLLER_TLS_TRUST", "")
 	t.Setenv("CONTROLLER_TLS_PIN_FILE", "")
+	t.Setenv("TLS_STATE_DIR", "")
 	cfg := LoadConfig()
 	if cfg.WebTLSMode != "off" || cfg.ControllerTLSTrust != "system" {
 		t.Fatalf("default TLS modes = %q/%q, want off/system", cfg.WebTLSMode, cfg.ControllerTLSTrust)
 	}
-	if cfg.ControllerTLSPinFile != "tls/controller-ca-pin.json" {
+	if cfg.TLSStateDir != DefaultTLSStateDir {
+		t.Fatalf("default TLS state directory = %q", cfg.TLSStateDir)
+	}
+	if cfg.ControllerTLSPinFile != "controller-ca-pin.json" {
 		t.Fatalf("default controller pin file = %q", cfg.ControllerTLSPinFile)
 	}
 
@@ -257,9 +262,42 @@ func TestLoadConfigControllerTLSModes(t *testing.T) {
 	t.Setenv("CONTROLLER_URL", "https://100.64.10.20:35353")
 	t.Setenv("CONTROLLER_TLS_TRUST", "tofu-tailnet")
 	t.Setenv("CONTROLLER_TLS_PIN_FILE", "custom-pin.json")
+	t.Setenv("TLS_STATE_DIR", t.TempDir())
 	cfg = LoadConfig()
 	if cfg.ControllerTLSTrust != "tofu-tailnet" || cfg.ControllerTLSPinFile != "custom-pin.json" {
 		t.Fatalf("configured controller TLS = %q/%q", cfg.ControllerTLSTrust, cfg.ControllerTLSPinFile)
+	}
+
+	t.Setenv("CONTROLLER_TLS_PIN_FILE", "tls/controller-ca-pin.json")
+	cfg = LoadConfig()
+	if cfg.ControllerTLSPinFile != "controller-ca-pin.json" {
+		t.Fatalf("legacy controller pin file = %q", cfg.ControllerTLSPinFile)
+	}
+}
+
+func TestControllerTLSPinPathUsesTLSStateDirectory(t *testing.T) {
+	tlsStateDir := t.TempDir()
+	cfg := &Config{
+		HistoryDir:           filepath.Join(t.TempDir(), "history"),
+		TLSStateDir:          tlsStateDir,
+		ControllerTLSPinFile: "controller-ca-pin.json",
+	}
+	if got, want := cfg.FullControllerTLSPinPath(), filepath.Join(tlsStateDir, "controller-ca-pin.json"); got != want {
+		t.Fatalf("FullControllerTLSPinPath() = %q, want %q", got, want)
+	}
+
+	absolute := filepath.Join(t.TempDir(), "absolute-pin.json")
+	cfg.ControllerTLSPinFile = absolute
+	if got := cfg.FullControllerTLSPinPath(); got != absolute {
+		t.Fatalf("absolute FullControllerTLSPinPath() = %q, want %q", got, absolute)
+	}
+
+	legacyConfig := &Config{
+		HistoryDir:           cfg.HistoryDir,
+		ControllerTLSPinFile: "tls/controller-ca-pin.json",
+	}
+	if got, want := legacyConfig.FullControllerTLSPinPath(), filepath.Join(cfg.HistoryDir, "tls", "controller-ca-pin.json"); got != want {
+		t.Fatalf("legacy FullControllerTLSPinPath() = %q, want %q", got, want)
 	}
 }
 

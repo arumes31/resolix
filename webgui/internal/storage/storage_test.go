@@ -440,6 +440,79 @@ func TestGetStatsIncludesPendingTopLists(t *testing.T) {
 	}
 }
 
+func TestGetStatsMergesArchivedCandidatesBeforeTopLimit(t *testing.T) {
+	s, cleanup := newTestStore(t)
+	defer cleanup()
+
+	now := time.Now().Unix()
+	archived := 0
+	for i := range 10 {
+		count := 20 - i
+		for range count {
+			s.AddEvent(models.QueryEvent{
+				UnixTime: now,
+				Domain:   fmt.Sprintf("archived-%02d.test", i),
+				Type:     "A",
+				ClientIP: fmt.Sprintf("192.0.2.%d", i+1),
+			})
+			archived++
+		}
+	}
+	s.AddEvent(models.QueryEvent{
+		UnixTime: now,
+		Domain:   "pending-winner.test",
+		Type:     "A",
+		ClientIP: "198.51.100.1",
+	})
+	archived++
+	if got := s.ArchiveStep(time.Now()); got != archived {
+		t.Fatalf("archived = %d, want %d", got, archived)
+	}
+	for range 20 {
+		s.AddEvent(models.QueryEvent{
+			UnixTime: now,
+			Domain:   "pending-winner.test",
+			Type:     "A",
+			ClientIP: "198.51.100.1",
+		})
+	}
+
+	stats := s.GetStats()
+	topDomains := stats["top_domains"].([]models.StatEntry)
+	if len(topDomains) != 10 || topDomains[0].Key != "pending-winner.test" || topDomains[0].Count != 21 {
+		t.Fatalf("top_domains = %+v, want pending-winner.test first with combined count 21", topDomains)
+	}
+	topClients := stats["top_clients"].([]models.StatEntry)
+	if len(topClients) != 10 || topClients[0].Key != "198.51.100.1" || topClients[0].Count != 21 {
+		t.Fatalf("top_clients = %+v, want 198.51.100.1 first with combined count 21", topClients)
+	}
+}
+
+func TestGetStatsMergesArchivedAndPendingHeatmapCounts(t *testing.T) {
+	s, cleanup := newTestStore(t)
+	defer cleanup()
+
+	now := time.Now()
+	event := models.QueryEvent{
+		UnixTime: now.Unix(),
+		Domain:   "heatmap.test",
+		Type:     "A",
+		ClientIP: "192.0.2.1",
+	}
+	s.AddEvent(event)
+	if got := s.ArchiveStep(now); got != 1 {
+		t.Fatalf("archived = %d, want 1", got)
+	}
+	s.AddEvent(event)
+
+	stats := s.GetStats()
+	heatmap := stats["heatmap"].(map[string]int)
+	hour := now.Format("15:00")
+	if heatmap[hour] != 2 {
+		t.Fatalf("heatmap[%q] = %d, want combined count 2", hour, heatmap[hour])
+	}
+}
+
 func TestGetStats_EmptyStore(t *testing.T) {
 	s, cleanup := newTestStore(t)
 	defer cleanup()

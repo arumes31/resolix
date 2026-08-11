@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -324,12 +325,14 @@ func TestSendBatch_Success(t *testing.T) {
 }
 
 func TestReportingUsesCanonicalControllerEndpoints(t *testing.T) {
+	var paths []string
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
 		switch r.URL.Path {
 		case "/api/ingest", "/api/heartbeat":
 			w.WriteHeader(http.StatusNoContent)
 		default:
-			http.Redirect(w, r, "/api/ingest", http.StatusTemporaryRedirect)
+			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
@@ -345,6 +348,10 @@ func TestReportingUsesCanonicalControllerEndpoints(t *testing.T) {
 	}
 	if err := fwd.sendHeartbeat(server.Client(), nil); err != nil {
 		t.Fatalf("sendHeartbeat() with default base URL: %v", err)
+	}
+	wantPaths := []string{"/api/ingest", "/api/heartbeat"}
+	if !slices.Equal(paths, wantPaths) {
+		t.Fatalf("request paths = %q, want %q", paths, wantPaths)
 	}
 }
 

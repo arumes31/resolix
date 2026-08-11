@@ -419,7 +419,7 @@ async function confirmRewriteDelete() {
     button.textContent = 'Deleting…';
     try {
         await deleteRewrite(id);
-        closeRewriteDeleteDialog(false);
+        if (state.pendingRewriteDelete === id) closeRewriteDeleteDialog(false);
     } finally {
         button.disabled = false;
         button.textContent = originalText;

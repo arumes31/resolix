@@ -63,6 +63,35 @@ func TestStoreCRUDAndPersistence(t *testing.T) {
 	}
 }
 
+func TestStoreUpdateAndPersistence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rewrites.json")
+	store, err := Load(path, "example.com:192.0.2.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalID := store.List()[0].ID
+	updated, found, err := store.Update(originalID, "Updated.Example.", "AAAA", "2001:db8::10", "100.100.1.1/10")
+	if err != nil || !found {
+		t.Fatalf("Update() = %+v, found %v, err %v", updated, found, err)
+	}
+	if updated.ID != originalID || updated.Domain != "updated.example" || updated.Type != TypeAAAA ||
+		updated.Value != "2001:db8::10" || len(updated.SourceCIDRs) != 1 || updated.SourceCIDRs[0] != "100.64.0.0/10" {
+		t.Fatalf("updated rewrite = %+v", updated)
+	}
+
+	store, err = Load(path, "")
+	if err != nil {
+		t.Fatalf("reload after update: %v", err)
+	}
+	items := store.List()
+	if len(items) != 1 || items[0].ID != originalID || items[0].Domain != "updated.example" {
+		t.Fatalf("update was not persisted: %+v", items)
+	}
+	if _, found, err := store.Update("missing", "missing.example", "A", "192.0.2.2"); err != nil || found {
+		t.Fatalf("Update() missing ID = found %v, err %v; want false, nil", found, err)
+	}
+}
+
 func TestDeleteReturnsPersistenceErrorAndRollsBack(t *testing.T) {
 	store, err := Load("", "")
 	if err != nil {
@@ -94,6 +123,23 @@ func TestReplaceDoesNotPublishBeforePersistence(t *testing.T) {
 	items := store.List()
 	if len(items) != 1 || items[0].Domain != "example.test" {
 		t.Fatalf("failed replacement was published: %+v", items)
+	}
+}
+
+func TestUpdateDoesNotPublishBeforePersistence(t *testing.T) {
+	store, err := Load("", "example.test:192.0.2.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := store.List()[0]
+	store.path = filepath.Join(t.TempDir(), "missing", "rewrites.json")
+	_, found, err := store.Update(original.ID, "updated.example", TypeA, "192.0.2.2")
+	if !found || err == nil {
+		t.Fatalf("Update() = found %v, err %v; want true and persistence error", found, err)
+	}
+	items := store.List()
+	if len(items) != 1 || items[0].ID != original.ID || items[0].Domain != original.Domain || items[0].Value != original.Value {
+		t.Fatalf("failed update was published: %+v", items)
 	}
 }
 

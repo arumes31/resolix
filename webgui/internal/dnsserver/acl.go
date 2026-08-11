@@ -63,14 +63,13 @@ func (s *Server) aclAllowlistDrop(clientIP string) bool {
 	return s.allowedConfigured && !cidrListContains(s.allowed, clientIP)
 }
 
-// rateBucket is a per-subnet token bucket.
+// rateBucket is a per-client-IP token bucket.
 type rateBucket struct {
 	tokens float64
 	last   time.Time
 }
 
-// rateLimiter is a bounded per-subnet token-bucket limiter keyed by IPv4
-// /24 and IPv6 /56.
+// rateLimiter is a bounded per-client-IP token-bucket limiter.
 type rateLimiter struct {
 	mu         sync.Mutex
 	qps        float64
@@ -86,24 +85,34 @@ func newRateLimiter(qps int) *rateLimiter {
 	}
 }
 
-// subnetKey returns the rate-limit bucket key: IPv4 /24, IPv6 /56.
-func subnetKey(ipStr string) string {
+// clientKey returns a canonical per-IP rate-limit bucket key.
+func clientKey(ipStr string) string {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		return ""
 	}
 	if v4 := ip.To4(); v4 != nil {
-		return v4.Mask(net.CIDRMask(24, 32)).String() + "/24"
+		return v4.String()
 	}
-	return ip.Mask(net.CIDRMask(56, 128)).String() + "/56"
+	return ip.String()
 }
 
-// allow consumes one token for the client's subnet.
+// allow consumes one token for the client using the default rate.
 func (rl *rateLimiter) allow(ipStr string) bool {
-	key := subnetKey(ipStr)
+	return rl.allowAtRate(ipStr, int(rl.qps))
+}
+
+// allowAtRate consumes one token for the client using qps as the refill rate
+// and one-second burst capacity. A non-positive rate disables limiting.
+func (rl *rateLimiter) allowAtRate(ipStr string, qps int) bool {
+	if qps <= 0 {
+		return true
+	}
+	key := clientKey(ipStr)
 	if key == "" {
 		return true
 	}
+	limit := float64(qps)
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
@@ -121,14 +130,14 @@ func (rl *rateLimiter) allow(ipStr string) bool {
 			}
 			delete(rl.buckets, oldestKey)
 		}
-		b = &rateBucket{tokens: rl.qps, last: now}
+		b = &rateBucket{tokens: limit, last: now}
 		rl.buckets[key] = b
 	}
 	// Refill (burst capacity = one second of qps).
 	elapsed := now.Sub(b.last).Seconds()
-	b.tokens += elapsed * rl.qps
-	if b.tokens > rl.qps {
-		b.tokens = rl.qps
+	b.tokens += elapsed * limit
+	if b.tokens > limit {
+		b.tokens = limit
 	}
 	b.last = now
 
@@ -137,6 +146,20 @@ func (rl *rateLimiter) allow(ipStr string) bool {
 		return true
 	}
 	return false
+}
+
+// isInternalClientIP reports whether a source belongs to loopback, LAN,
+// link-local, or the Tailscale IPv4 CGNAT range. IPv6 ULA includes Tailscale.
+func isInternalClientIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+		return true
+	}
+	v4 := ip.To4()
+	return v4 != nil && v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127
 }
 
 // cleanup evicts buckets idle longer than the given duration.

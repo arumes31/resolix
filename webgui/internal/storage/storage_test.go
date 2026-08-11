@@ -409,6 +409,37 @@ func TestGetStats(t *testing.T) {
 	}
 }
 
+func TestGetStatsIncludesPendingTopLists(t *testing.T) {
+	s, cleanup := newTestStore(t)
+	defer cleanup()
+
+	now := time.Now().Unix()
+	s.AddEvent(models.QueryEvent{UnixTime: now, Domain: "pending.test", Type: "A", ClientIP: "100.64.0.1"})
+	if archived := s.ArchiveStep(time.Now()); archived != 1 {
+		t.Fatalf("archived = %d, want 1", archived)
+	}
+	s.AddEvent(models.QueryEvent{UnixTime: now, Domain: "pending.test", Type: "AAAA", ClientIP: "100.64.0.1"})
+	s.AddEvent(models.QueryEvent{UnixTime: now, Domain: "pending.test", Type: "A", ClientIP: "100.64.0.1"})
+	s.AddEvent(models.QueryEvent{UnixTime: now, Domain: "other.test", Type: "A", ClientIP: "100.64.0.2"})
+
+	stats := s.GetStats()
+	topDomains, ok := stats["top_domains"].([]models.StatEntry)
+	if !ok {
+		t.Fatalf("top_domains type = %T, want []models.StatEntry", stats["top_domains"])
+	}
+	if len(topDomains) != 2 || topDomains[0].Key != "pending.test" || topDomains[0].Count != 3 {
+		t.Fatalf("top_domains = %+v, want pending.test first with count 3", topDomains)
+	}
+
+	topClients, ok := stats["top_clients"].([]models.StatEntry)
+	if !ok {
+		t.Fatalf("top_clients type = %T, want []models.StatEntry", stats["top_clients"])
+	}
+	if len(topClients) != 2 || topClients[0].Key != "100.64.0.1" || topClients[0].Count != 3 {
+		t.Fatalf("top_clients = %+v, want 100.64.0.1 first with count 3", topClients)
+	}
+}
+
 func TestGetStats_EmptyStore(t *testing.T) {
 	s, cleanup := newTestStore(t)
 	defer cleanup()

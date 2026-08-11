@@ -428,6 +428,51 @@ func (s *Store) Add(domain, typ, value string, sourceCIDRs ...string) (Rewrite, 
 	return rw, nil
 }
 
+// Update replaces an existing rewrite by ID. The validated replacement is
+// persisted before it becomes visible to DNS lookups.
+func (s *Store) Update(id, domain, typ, value string, sourceCIDRs ...string) (updated Rewrite, found bool, err error) {
+	rw, err := prepareRewrite(Rewrite{
+		ID:          id,
+		Domain:      domain,
+		Type:        typ,
+		Value:       value,
+		SourceCIDRs: sourceCIDRs,
+	})
+	if err != nil {
+		return Rewrite{}, false, err
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	s.mu.RLock()
+	items := make([]Rewrite, len(s.items))
+	for i, item := range s.items {
+		items[i] = cloneRewrite(item)
+	}
+	s.mu.RUnlock()
+
+	idx := -1
+	for i, item := range items {
+		if item.ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return Rewrite{}, false, nil
+	}
+	items[idx] = rw
+	if err := s.saveItems(items); err != nil {
+		return Rewrite{}, true, err
+	}
+
+	s.mu.Lock()
+	s.items = items
+	s.mu.Unlock()
+	return cloneRewrite(rw), true, nil
+}
+
 // Delete removes a rewrite by ID, persisting the store. found is false when
 // the ID does not exist; persistence failures are returned separately.
 func (s *Store) Delete(id string) (found bool, err error) {

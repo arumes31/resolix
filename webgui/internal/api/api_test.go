@@ -337,6 +337,38 @@ func TestRewriteAPIStoresSourceCIDRs(t *testing.T) {
 	}
 }
 
+func TestRewriteAPIUpdatesExistingRule(t *testing.T) {
+	store, err := rewrites.Load("", "internal.example:192.0.2.10")
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := store.List()[0]
+	s := testServer(&config.Config{
+		Mode:           config.ModeController,
+		BaseURL:        "/",
+		MaxRequestSize: config.DefaultMaxRequestSize,
+	})
+	s.SetRewritesStore(store)
+	body := strings.NewReader(`{
+		"domain":"renamed.example",
+		"type":"AAAA",
+		"value":"2001:db8::20",
+		"source_cidrs":["100.100.1.1/10"]
+	}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/rewrites?id="+original.ID, body)
+	rec := httptest.NewRecorder()
+	s.SetupMux().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	items := store.List()
+	if len(items) != 1 || items[0].ID != original.ID || items[0].Domain != "renamed.example" ||
+		items[0].Type != rewrites.TypeAAAA || items[0].Value != "2001:db8::20" ||
+		!slices.Equal(items[0].SourceCIDRs, []string{"100.64.0.0/10"}) {
+		t.Fatalf("updated rewrites = %+v", items)
+	}
+}
+
 func TestInternalRoutesFailClosedWithoutAnyAuthentication(t *testing.T) {
 	s := testServer(&config.Config{BaseURL: "/"})
 	req := httptest.NewRequest(http.MethodPost, "/api/ingest", nil)
@@ -436,7 +468,14 @@ func TestHandleRootDoesNotEmbedQueryHistory(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d", recorder.Code)
 	}
-	if strings.Contains(recorder.Body.String(), "must-not-be-in-page.example") {
+	body := recorder.Body.String()
+	if !strings.Contains(body, `class="app-page dashboard-page compact"`) {
+		t.Fatal("root response did not enable compact mode")
+	}
+	if strings.Contains(body, `id="compactToggle"`) {
+		t.Fatal("root response still rendered the compact mode toggle")
+	}
+	if strings.Contains(body, "must-not-be-in-page.example") {
 		t.Fatal("root response embedded query history that the events API loads separately")
 	}
 }

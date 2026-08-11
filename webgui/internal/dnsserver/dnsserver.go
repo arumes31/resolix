@@ -96,8 +96,10 @@ type Config struct {
 	AllowedClients string
 	// DisallowedClients drops queries from these IPs/CIDRs silently.
 	DisallowedClients string
-	// RateLimitQPS limits queries per second per subnet (0 = disabled).
+	// RateLimitQPS limits public clients per IP (0 = disabled).
 	RateLimitQPS int
+	// InternalRateLimitQPS limits LAN and Tailscale clients per IP (0 = disabled).
+	InternalRateLimitQPS int
 	// PrivatePTR answers PTR for known private clients locally.
 	PrivatePTR bool
 	// DNSSEC enables DO-bit passthrough to upstreams (no local validation).
@@ -172,7 +174,7 @@ func New(cfg Config, emit func(models.QueryEvent, bool)) *Server {
 	s.allowed = parseCIDRList(cfg.AllowedClients)
 	s.allowedConfigured = strings.TrimSpace(cfg.AllowedClients) != ""
 	s.disallowed = parseCIDRList(cfg.DisallowedClients)
-	if cfg.RateLimitQPS > 0 {
+	if cfg.RateLimitQPS > 0 || cfg.InternalRateLimitQPS > 0 {
 		s.rateLimiter = newRateLimiter(cfg.RateLimitQPS)
 	}
 	handler := dns.HandlerFunc(s.ServeDNS)
@@ -327,8 +329,13 @@ func (s *Server) Resolve(r *dns.Msg, clientIP string) (resp *dns.Msg, drop bool)
 		s.aclAllowlistDropped.Add(1)
 		return nil, true
 	}
-	// Stage 0c: per-subnet rate limit → silent drop.
-	if s.rateLimiter != nil && !s.rateLimiter.allow(clientIP) {
+	// Stage 0c: per-IP rate limit → silent drop. LAN and Tailscale clients use
+	// the higher internal rate without relaxing the public-client limit.
+	rateLimitQPS := s.cfg.RateLimitQPS
+	if isInternalClientIP(clientIP) {
+		rateLimitQPS = s.cfg.InternalRateLimitQPS
+	}
+	if s.rateLimiter != nil && !s.rateLimiter.allowAtRate(clientIP, rateLimitQPS) {
 		s.rateLimitDropped.Add(1)
 		return nil, true
 	}

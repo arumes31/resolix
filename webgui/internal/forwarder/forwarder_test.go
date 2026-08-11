@@ -280,7 +280,7 @@ func TestSendBatch_Success(t *testing.T) {
 	var receivedEvents []models.QueryEvent
 	var requestCount atomic.Int32
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount.Add(1)
 
 		// Verify content type
@@ -303,7 +303,7 @@ func TestSendBatch_Success(t *testing.T) {
 	}
 	fwd := NewForwarder(cfg)
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := server.Client()
 	events := testEvents("one.example.com", "two.example.com", "three.example.com")
 	err := fwd.sendBatch(client, events, nil)
 	if err != nil {
@@ -323,10 +323,35 @@ func TestSendBatch_Success(t *testing.T) {
 	}
 }
 
+func TestReportingUsesCanonicalControllerEndpoints(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/ingest", "/api/heartbeat":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Redirect(w, r, "/api/ingest", http.StatusTemporaryRedirect)
+		}
+	}))
+	defer server.Close()
+
+	fwd := NewForwarder(&config.Config{
+		Mode:          config.ModeAgent,
+		ControllerURL: server.URL,
+		NodeName:      "test-node",
+		BaseURL:       "/",
+	})
+	if err := fwd.sendBatch(server.Client(), testEvents("example.com"), nil); err != nil {
+		t.Fatalf("sendBatch() with default base URL: %v", err)
+	}
+	if err := fwd.sendHeartbeat(server.Client(), nil); err != nil {
+		t.Fatalf("sendHeartbeat() with default base URL: %v", err)
+	}
+}
+
 func TestSendBatch_WithIngestSecret(t *testing.T) {
 	var receivedAuth string
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedAuth = r.Header.Get("Authorization")
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -341,7 +366,7 @@ func TestSendBatch_WithIngestSecret(t *testing.T) {
 	}
 	fwd := NewForwarder(cfg)
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := server.Client()
 	err := fwd.sendBatch(client, testEvents("line1.example.com"), nil)
 	if err != nil {
 		t.Fatalf("sendBatch failed: %v", err)
@@ -354,7 +379,7 @@ func TestSendBatch_WithIngestSecret(t *testing.T) {
 }
 
 func TestSendBatch_ServerError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer server.Close()
@@ -367,7 +392,7 @@ func TestSendBatch_ServerError(t *testing.T) {
 	}
 	fwd := NewForwarder(cfg)
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := server.Client()
 	err := fwd.sendBatch(client, testEvents("line1.example.com"), nil)
 	if err == nil {
 		t.Error("expected error for 500 response, got nil")
@@ -377,7 +402,7 @@ func TestSendBatch_ServerError(t *testing.T) {
 func TestSendBatch_ConnectionRefused(t *testing.T) {
 	cfg := &config.Config{
 		Mode:          config.ModeAgent,
-		ControllerURL: "http://localhost:0", // Port 0 is invalid/unreachable
+		ControllerURL: "https://localhost:0", // Port 0 is invalid/unreachable
 		NodeName:      "test-node",
 		BaseURL:       "",
 	}
@@ -393,7 +418,7 @@ func TestSendBatch_ConnectionRefused(t *testing.T) {
 func TestSendBatch_WithHealth(t *testing.T) {
 	var receivedHealth map[string]float64
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var payload map[string]interface{}
 		_ = decodeJSONBody(r, &payload)
 		if h, ok := payload["health"].(map[string]interface{}); ok {
@@ -416,7 +441,7 @@ func TestSendBatch_WithHealth(t *testing.T) {
 	}
 	fwd := NewForwarder(cfg)
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := server.Client()
 	health := map[string]float64{"8.8.8.8": 15.5, "1.1.1.1": 8.2}
 	err := fwd.sendBatch(client, nil, health)
 	if err != nil {
@@ -613,7 +638,7 @@ func TestBatchSizeLimit(t *testing.T) {
 	fwd := NewForwarder(cfg)
 	fwd.httpClient = server.Client()
 
-	// Enqueue more than 100 lines
+	// Enqueue more than 100 lines.
 	for i := 0; i < 150; i++ {
 		fwd.EnqueueEvent(models.QueryEvent{Domain: fmt.Sprintf("batch-line-%d.example.com", i), Node: "test-node"})
 	}
@@ -640,7 +665,7 @@ func TestBatchSizeLimit(t *testing.T) {
 	sizes := append([]int(nil), batchSizes...)
 	mu.Unlock()
 
-	// A full batch should reach exactly the 100-line limit
+	// A full batch should reach exactly the 100-line limit.
 	found := false
 	for _, n := range sizes {
 		if n == 100 {
@@ -792,7 +817,7 @@ func TestGzipCompress(t *testing.T) {
 func TestVersionHeaders(t *testing.T) {
 	var nodeVersion, goVersion, buildInfo string
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		nodeVersion = r.Header.Get("X-Node-Version")
 		goVersion = r.Header.Get("X-Go-Version")
 		buildInfo = r.Header.Get("X-Node-Build")
@@ -808,7 +833,7 @@ func TestVersionHeaders(t *testing.T) {
 	}
 	fwd := NewForwarder(cfg)
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := server.Client()
 	_ = fwd.sendBatch(client, testEvents("line1.example.com"), nil)
 
 	if nodeVersion != Version {

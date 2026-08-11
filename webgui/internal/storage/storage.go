@@ -591,10 +591,10 @@ func (s *Store) GetEventsAfter(cursor string, since int64, limit int) []models.Q
 //nolint:gocyclo
 func (s *Store) GetStats() map[string]interface{} {
 	s.archiveMu.Lock()
+	defer s.archiveMu.Unlock()
 	s.batchMu.Lock()
 	pending := append([]models.QueryEvent(nil), s.pendingBatchLocked()...)
 	s.batchMu.Unlock()
-	s.archiveMu.Unlock()
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
@@ -648,6 +648,9 @@ func (s *Store) GetStats() map[string]interface{} {
 	var rpd int
 	var cacheHits, totalReplies int64
 	var queryErrors []string
+	domainCounts := make(map[string]int)
+	clientCounts := make(map[string]int)
+	heatmap := make(map[string]int)
 	if s.db != nil {
 		if err := s.db.QueryRow("SELECT COUNT(*) FROM queries").Scan(&totalEvents); err != nil && err != sql.ErrNoRows {
 			log.Printf("Error getting totalEvents: %v", err)
@@ -675,6 +678,10 @@ func (s *Store) GetStats() map[string]interface{} {
 		if event.Upstream == "System Cache" {
 			cacheHits++
 		}
+		domainCounts[event.Domain]++
+		clientCounts[event.ClientIP]++
+		hour := time.Unix(event.UnixTime, 0).Format("15:00")
+		heatmap[hour]++
 	}
 
 	cacheHitRatio := 0.0
@@ -685,10 +692,6 @@ func (s *Store) GetStats() map[string]interface{} {
 	// Item 67: Bandwidth savings estimate (100 bytes per cached query)
 	bandwidthSaved := cacheHits * 100
 
-	domainCounts := make(map[string]int)
-	clientCounts := make(map[string]int)
-	heatmap := make(map[string]int)
-
 	if s.db != nil {
 		// Top 10 Domains (use cached prepared statement if available)
 		if s.stmtGetTopDomains != nil {
@@ -698,7 +701,7 @@ func (s *Store) GetStats() map[string]interface{} {
 					var d string
 					var c int
 					if rowsDomains.Scan(&d, &c) == nil {
-						domainCounts[d] = c
+						domainCounts[d] += c
 					}
 				}
 				if err := rowsDomains.Err(); err != nil {
@@ -716,7 +719,7 @@ func (s *Store) GetStats() map[string]interface{} {
 					var ip string
 					var c int
 					if rowsClients.Scan(&ip, &c) == nil {
-						clientCounts[ip] = c
+						clientCounts[ip] += c
 					}
 				}
 				if err := rowsClients.Err(); err != nil {

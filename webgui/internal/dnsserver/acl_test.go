@@ -105,14 +105,14 @@ func TestRateLimiter(t *testing.T) {
 		t.Error("4th query in the same /24 must be limited")
 	}
 
-	// Different /24 is isolated.
-	if !rl.allow("100.64.2.9") {
-		t.Error("different /24 must have its own bucket")
+	// A different client in the same /24 is isolated.
+	if !rl.allow("100.64.1.6") {
+		t.Error("different client IP must have its own bucket")
 	}
 
 	// Refill after a second.
 	rl.mu.Lock()
-	rl.buckets["100.64.1.0/24"].last = time.Now().Add(-2 * time.Second)
+	rl.buckets["100.64.1.5"].last = time.Now().Add(-2 * time.Second)
 	rl.mu.Unlock()
 	if !rl.allow("100.64.1.5") {
 		t.Error("bucket must refill over time")
@@ -120,7 +120,7 @@ func TestRateLimiter(t *testing.T) {
 
 	// Cleanup evicts idle buckets.
 	rl.mu.Lock()
-	rl.buckets["100.64.1.0/24"].last = time.Now().Add(-time.Hour)
+	rl.buckets["100.64.1.5"].last = time.Now().Add(-time.Hour)
 	rl.mu.Unlock()
 	before := rl.bucketCount()
 	rl.cleanup(10 * time.Minute)
@@ -141,8 +141,31 @@ func TestRateLimiterBucketBound(t *testing.T) {
 	if got := rl.bucketCount(); got != 1 {
 		t.Fatalf("bucket count = %d, want 1", got)
 	}
-	if _, ok := rl.buckets["192.0.2.0/24"]; ok {
+	if _, ok := rl.buckets["192.0.2.1"]; ok {
 		t.Fatal("least-recently-used bucket was not evicted")
+	}
+}
+
+func TestIsInternalClientIP(t *testing.T) {
+	tests := []struct {
+		name string
+		ip   string
+		want bool
+	}{
+		{name: "loopback", ip: "127.0.0.1", want: true},
+		{name: "RFC1918", ip: "192.168.1.10", want: true},
+		{name: "link local", ip: "169.254.1.10", want: true},
+		{name: "Tailscale IPv4", ip: "100.100.1.10", want: true},
+		{name: "Tailscale IPv6", ip: "fd7a:115c:a1e0::1", want: true},
+		{name: "public", ip: "8.8.8.8", want: false},
+		{name: "invalid", ip: "not-an-ip", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isInternalClientIP(tt.ip); got != tt.want {
+				t.Fatalf("isInternalClientIP(%q) = %t, want %t", tt.ip, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -166,7 +189,7 @@ func TestRateLimitEndToEnd(t *testing.T) {
 	var hits atomic.Int32
 	upstreamAddr := startFakeUpstream(t, &hits)
 	pool := upstream.NewPool(upstream.PoolConfig{Mode: upstream.ModeStrict, PrimarySpecs: []string{upstreamAddr}})
-	h := startClientHarness(t, Config{Pool: pool, RateLimitQPS: 2})
+	h := startClientHarness(t, Config{Pool: pool, RateLimitQPS: 1, InternalRateLimitQPS: 2})
 
 	m := func() *dns.Msg {
 		q := new(dns.Msg)
@@ -184,6 +207,17 @@ func TestRateLimitEndToEnd(t *testing.T) {
 	}
 	if got := h.srv.RateLimitDropped(); got != 1 {
 		t.Errorf("dropped = %d, want 1", got)
+	}
+
+	public := &fakeResponseWriter{remote: &net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 53000}}
+	h.srv.ServeDNS(public, m()) // 1: allowed at the public rate
+	publicLimited := &fakeResponseWriter{remote: public.remote}
+	h.srv.ServeDNS(publicLimited, m()) // 2: silently dropped
+	if publicLimited.last != nil {
+		t.Fatalf("2nd public query returned a response: %v", publicLimited.last)
+	}
+	if got := h.srv.RateLimitDropped(); got != 2 {
+		t.Errorf("dropped = %d, want 2", got)
 	}
 }
 

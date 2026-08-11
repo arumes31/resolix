@@ -33,21 +33,27 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "${openssl_subject}" \
   -keyout "${smoke_dir}/tls.key" -out "${smoke_dir}/tls.crt" >/dev/null 2>&1
 
 compose_tls_dir='/var/lib/resolix-custom-tls'
+compose_config_dir='/var/lib/resolix-custom-config'
 for compose_file in docker-compose.yaml docker-compose.example.yaml; do
-  TS_AUTHKEY=compose-test INGEST_SECRET=compose-test TLS_STATE_DIR="${compose_tls_dir}" \
+  TS_AUTHKEY=compose-test INGEST_SECRET=compose-test CONFIG_DIR="${compose_config_dir}" TLS_STATE_DIR="${compose_tls_dir}" \
     docker compose -f "${compose_file}" config --format json \
     | python3 -c '
 import json
 import sys
 
 config = json.load(sys.stdin)
-expected, compose_file = sys.argv[1:]
+expected_tls, expected_config, compose_file = sys.argv[1:]
 service = config["services"]["resolix"]
-if service["environment"].get("TLS_STATE_DIR") != expected:
-    raise SystemExit(f"{compose_file}: TLS_STATE_DIR environment did not resolve to {expected}")
-if not any(volume.get("target") == expected for volume in service.get("volumes", [])):
-    raise SystemExit(f"{compose_file}: TLS state volume target did not resolve to {expected}")
-' "${compose_tls_dir}" "${compose_file}"
+if service["environment"].get("TLS_STATE_DIR") != expected_tls:
+    raise SystemExit(f"{compose_file}: TLS_STATE_DIR environment did not resolve to {expected_tls}")
+if service["environment"].get("CONFIG_DIR") != expected_config:
+    raise SystemExit(f"{compose_file}: CONFIG_DIR environment did not resolve to {expected_config}")
+targets = {volume.get("target") for volume in service.get("volumes", [])}
+if expected_tls not in targets:
+    raise SystemExit(f"{compose_file}: TLS state volume target did not resolve to {expected_tls}")
+if expected_config not in targets:
+    raise SystemExit(f"{compose_file}: config volume target did not resolve to {expected_config}")
+' "${compose_tls_dir}" "${compose_config_dir}" "${compose_file}"
 done
 
 docker build \
@@ -59,6 +65,7 @@ docker build \
 # default entrypoint exercises coordinated tailscaled/Resolix startup without
 # requiring access to a real tailnet or auth key.
 docker volume create "${socket_volume}" >/dev/null
+mkdir -p "${smoke_dir}/config"
 MSYS_NO_PATHCONV=1 docker run -d --name "${socket_container}" \
   -v "${socket_volume}:/var/run/tailscale" \
   alpine:3.24 sh -c \
@@ -71,6 +78,7 @@ MSYS_NO_PATHCONV=1 docker run -d --name "${container_name}" \
   -p 127.0.0.1:0:35353/tcp \
   -p 127.0.0.1:0:1853/tcp \
   -v "${smoke_mount}:/smoke:ro" \
+  -v "${smoke_mount}/config:/var/lib/resolix-config" \
   -v "${smoke_mount}/tailscale:/usr/bin/tailscale:ro" \
   -v "${smoke_mount}/tailscaled:/usr/sbin/tailscaled:ro" \
   -v "${socket_volume}:/var/run/tailscale" \
@@ -89,10 +97,13 @@ MSYS_NO_PATHCONV=1 docker run -d --name "${container_name}" \
   -e TLS_KEY_FILE=/smoke/tls.key \
   resolix:smoke >/dev/null
 
-dns_udp_port="$(docker port "${container_name}" 1053/udp | awk -F: 'NR == 1 { print $NF }')"
-dns_tcp_port="$(docker port "${container_name}" 1053/tcp | awk -F: 'NR == 1 { print $NF }')"
-web_port="$(docker port "${container_name}" 35353/tcp | awk -F: 'NR == 1 { print $NF }')"
-dot_port="$(docker port "${container_name}" 1853/tcp | awk -F: 'NR == 1 { print $NF }')"
+refresh_ports() {
+  dns_udp_port="$(docker port "${container_name}" 1053/udp | awk -F: 'NR == 1 { print $NF }')"
+  dns_tcp_port="$(docker port "${container_name}" 1053/tcp | awk -F: 'NR == 1 { print $NF }')"
+  web_port="$(docker port "${container_name}" 35353/tcp | awk -F: 'NR == 1 { print $NF }')"
+  dot_port="$(docker port "${container_name}" 1853/tcp | awk -F: 'NR == 1 { print $NF }')"
+}
+refresh_ports
 
 for _ in $(seq 1 60); do
   if curl --fail --silent "http://127.0.0.1:${web_port}/readyz" >/dev/null; then
@@ -118,6 +129,21 @@ curl --fail --silent --request POST "http://127.0.0.1:${web_port}/api/rewrites" 
 scoped_answer="$(docker exec "${container_name}" dig @127.0.0.1 -p 1053 scoped.test A +short)"
 if [[ "${scoped_answer}" != "192.0.2.77" ]]; then
   echo "Source-scoped rewrite returned '${scoped_answer}' inside the container" >&2
+  exit 1
+fi
+
+docker restart "${container_name}" >/dev/null
+refresh_ports
+for _ in $(seq 1 60); do
+  if curl --fail --silent "http://127.0.0.1:${web_port}/readyz" >/dev/null; then
+    break
+  fi
+  sleep 1
+done
+curl --fail --silent "http://127.0.0.1:${web_port}/readyz" >/dev/null
+persisted_answer="$(docker exec "${container_name}" dig @127.0.0.1 -p 1053 scoped.test A +short)"
+if [[ "${persisted_answer}" != "192.0.2.77" ]]; then
+  echo "Rewrite was not restored from the dedicated config mount after restart" >&2
   exit 1
 fi
 

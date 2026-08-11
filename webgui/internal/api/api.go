@@ -1322,7 +1322,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(&buf, "# TYPE bogus_nxdomain_total counter\n")
 		fmt.Fprintf(&buf, "bogus_nxdomain_total %d\n", bogusNXHits)
 
-		fmt.Fprintf(&buf, "# HELP dns_ratelimit_dropped_total Queries silently dropped by the per-subnet rate limiter\n")
+		fmt.Fprintf(&buf, "# HELP dns_ratelimit_dropped_total Queries silently dropped by the per-client-IP rate limiter\n")
 		fmt.Fprintf(&buf, "# TYPE dns_ratelimit_dropped_total counter\n")
 		fmt.Fprintf(&buf, "dns_ratelimit_dropped_total %d\n", dnsSrv.RateLimitDropped())
 		aclDropped, allowlistDropped, rateBuckets := dnsSrv.ACLStats()
@@ -1335,7 +1335,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(&buf, "# HELP dns_acl_refused_total Deprecated; unauthorized DNS queries are now silently dropped\n")
 		fmt.Fprintf(&buf, "# TYPE dns_acl_refused_total counter\n")
 		fmt.Fprintf(&buf, "dns_acl_refused_total 0\n")
-		fmt.Fprintf(&buf, "# HELP dns_ratelimit_buckets Active per-subnet rate-limit buckets\n")
+		fmt.Fprintf(&buf, "# HELP dns_ratelimit_buckets Active per-client-IP rate-limit buckets\n")
 		fmt.Fprintf(&buf, "# TYPE dns_ratelimit_buckets gauge\n")
 		fmt.Fprintf(&buf, "dns_ratelimit_buckets %d\n", rateBuckets)
 
@@ -2056,8 +2056,9 @@ func (s *Server) handleFilteringPause(w http.ResponseWriter, r *http.Request) {
 
 // ===== Typed Rewrites CRUD =====
 
-// handleRewrites dispatches GET (list), POST (add), and DELETE (?id=) for
-// typed DNS rewrites. Changes take effect live in the DNS pipeline.
+// handleRewrites dispatches GET (list), POST (add), PUT (update by ?id=), and
+// DELETE (?id=) for typed DNS rewrites. Changes take effect live in the DNS
+// pipeline.
 func (s *Server) handleRewrites(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if r.Method != http.MethodGet && !s.requireController(w) {
@@ -2098,6 +2099,35 @@ func (s *Server) handleRewrites(w http.ResponseWriter, r *http.Request) {
 		rw, err := store.Add(req.Domain, req.Type, req.Value, req.SourceCIDRs...)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Invalid rewrite: %v", err), http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "rewrite": rw})
+	case http.MethodPut:
+		if !s.checkCSRF(w, r) {
+			return
+		}
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			http.Error(w, "Missing id parameter", http.StatusBadRequest)
+			return
+		}
+		var req struct {
+			Domain      string   `json:"domain"`
+			Type        string   `json:"type"`
+			Value       string   `json:"value"`
+			SourceCIDRs []string `json:"source_cidrs"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+		rw, found, err := store.Update(id, req.Domain, req.Type, req.Value, req.SourceCIDRs...)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid rewrite: %v", err), http.StatusBadRequest)
+			return
+		}
+		if !found {
+			http.Error(w, "Rewrite not found", http.StatusNotFound)
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "rewrite": rw})
@@ -2231,7 +2261,7 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 // userRulesPath returns the filter user-rules file managed by the
 // query-log actions (a plain file source of the filter engine).
 func (s *Server) userRulesPath() string {
-	return filepath.Join(s.cfg.HistoryDir, "user_rules.txt")
+	return s.cfg.FullUserRulesPath()
 }
 
 // handleQuerylogAction adds a block rule (block=true) or removes it / adds
@@ -2333,7 +2363,7 @@ func modifyUserRule(path, ruleLine string, remove bool) (bool, error) {
 }
 
 func modifyUserRuleLocked(path, ruleLine string, remove bool) (bool, error) {
-	data, err := os.ReadFile(path) // #nosec G304 G703 -- path derived from trusted HistoryDir config plus a constant filename, not request input
+	data, err := os.ReadFile(path) // #nosec G304 G703 -- path derived from trusted ConfigDir plus a constant filename, not request input
 	if err != nil && !os.IsNotExist(err) {
 		return false, err
 	}

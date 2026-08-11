@@ -26,7 +26,7 @@ func TestMigrateLegacyStateCopiesManagedFilesWithoutOverwriting(t *testing.T) {
 		t.Fatalf("write current pin: %v", err)
 	}
 
-	migrated, err := MigrateLegacyState(legacyDir, stateDir)
+	migrated, err := MigrateLegacyState(legacyDir, stateDir, DefaultPinFile)
 	if err != nil {
 		t.Fatalf("MigrateLegacyState() error = %v", err)
 	}
@@ -46,19 +46,40 @@ func TestMigrateLegacyStateCopiesManagedFilesWithoutOverwriting(t *testing.T) {
 	}
 }
 
+func TestMigrateLegacyStateCopiesConfiguredCustomPin(t *testing.T) {
+	legacyDir := filepath.Join(t.TempDir(), "history", "tls")
+	stateDir := filepath.Join(t.TempDir(), "tls-state")
+	customPin := filepath.Join("agents", "custom-pin.json")
+	if err := os.MkdirAll(filepath.Join(legacyDir, filepath.Dir(customPin)), 0o700); err != nil {
+		t.Fatalf("create legacy pin directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, customPin), []byte("custom-pin"), 0o600); err != nil {
+		t.Fatalf("write legacy custom pin: %v", err)
+	}
+
+	migrated, err := MigrateLegacyState(legacyDir, stateDir, customPin)
+	if err != nil {
+		t.Fatalf("MigrateLegacyState() error = %v", err)
+	}
+	if migrated != 1 {
+		t.Fatalf("MigrateLegacyState() count = %d, want 1", migrated)
+	}
+	assertFileContents(t, filepath.Join(stateDir, customPin), "custom-pin")
+}
+
 func TestMigrateLegacyStateRejectsNonRegularSource(t *testing.T) {
 	legacyDir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(legacyDir, caFileName), 0o700); err != nil {
 		t.Fatalf("create non-regular source: %v", err)
 	}
-	if _, err := MigrateLegacyState(legacyDir, t.TempDir()); err == nil {
+	if _, err := MigrateLegacyState(legacyDir, t.TempDir(), DefaultPinFile); err == nil {
 		t.Fatal("MigrateLegacyState() accepted a non-regular source")
 	}
 }
 
 func TestMigrateLegacyStateSameDirectoryIsNoOp(t *testing.T) {
 	dir := t.TempDir()
-	migrated, err := MigrateLegacyState(dir, dir)
+	migrated, err := MigrateLegacyState(dir, dir, DefaultPinFile)
 	if err != nil || migrated != 0 {
 		t.Fatalf("MigrateLegacyState() = %d, %v; want 0, nil", migrated, err)
 	}
@@ -72,7 +93,7 @@ func TestMigrateLegacyStateSecuresDestinationDirectory(t *testing.T) {
 	if err := os.Chmod(stateDir, 0o755); err != nil { // #nosec G302 -- the test deliberately creates an over-broad directory to verify hardening.
 		t.Fatalf("relax state directory permissions: %v", err)
 	}
-	if _, err := MigrateLegacyState(t.TempDir(), stateDir); err != nil {
+	if _, err := MigrateLegacyState(t.TempDir(), stateDir, DefaultPinFile); err != nil {
 		t.Fatalf("MigrateLegacyState() error = %v", err)
 	}
 	info, err := os.Stat(stateDir)

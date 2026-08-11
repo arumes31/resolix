@@ -273,6 +273,12 @@ func TestLoadConfigControllerTLSModes(t *testing.T) {
 	if cfg.ControllerTLSPinFile != "controller-ca-pin.json" {
 		t.Fatalf("legacy controller pin file = %q", cfg.ControllerTLSPinFile)
 	}
+
+	t.Setenv("CONTROLLER_TLS_PIN_FILE", "tls/agents/custom-pin.json")
+	cfg = LoadConfig()
+	if want := filepath.Join("agents", "custom-pin.json"); cfg.ControllerTLSPinFile != want {
+		t.Fatalf("custom legacy controller pin file = %q, want %q", cfg.ControllerTLSPinFile, want)
+	}
 }
 
 func TestControllerTLSPinPathUsesTLSStateDirectory(t *testing.T) {

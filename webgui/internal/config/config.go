@@ -772,6 +772,18 @@ func resolveBlocking() (mode, ip4, ip6 string) {
 	return mode, ip4, ip6
 }
 
+func legacyTLSPinFile(path string) (string, bool) {
+	cleanPath := filepath.Clean(path)
+	if filepath.IsAbs(cleanPath) {
+		return path, false
+	}
+	relativePath, err := filepath.Rel("tls", cleanPath)
+	if err != nil || relativePath == "." || !filepath.IsLocal(relativePath) {
+		return path, false
+	}
+	return relativePath, true
+}
+
 // LoadConfig reads configuration from environment variables.
 //
 //nolint:gocyclo // Environment mapping is intentionally centralized so defaults remain auditable in one place.
@@ -846,9 +858,9 @@ func LoadConfig() *Config {
 	controllerTLSPinFile := strings.TrimSpace(os.Getenv("CONTROLLER_TLS_PIN_FILE"))
 	if controllerTLSPinFile == "" {
 		controllerTLSPinFile = controllertls.DefaultPinFile
-	} else if filepath.Clean(controllerTLSPinFile) == filepath.Join("tls", controllertls.DefaultPinFile) {
+	} else if migratedPinFile, legacy := legacyTLSPinFile(controllerTLSPinFile); legacy {
 		log.Printf("[WARN] CONTROLLER_TLS_PIN_FILE=%s is deprecated; the pin is now relative to TLS_STATE_DIR", sanitizeForLog(controllerTLSPinFile)) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-		controllerTLSPinFile = controllertls.DefaultPinFile
+		controllerTLSPinFile = migratedPinFile
 	}
 
 	// Load new configuration values

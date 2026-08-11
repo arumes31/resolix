@@ -139,7 +139,11 @@ func migrateTLSState(cfg *config.Config) {
 		return
 	}
 	legacyTLSDir := filepath.Join(cfg.HistoryDir, "tls")
-	migratedTLSFiles, err := controllertls.MigrateLegacyState(legacyTLSDir, cfg.FullTLSStateDir())
+	migratedTLSFiles, err := controllertls.MigrateLegacyState(
+		legacyTLSDir,
+		cfg.FullTLSStateDir(),
+		cfg.ControllerTLSPinFile,
+	)
 	if err != nil {
 		logger.Fatal("Failed to migrate legacy TLS state: %v", err)
 	}

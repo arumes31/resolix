@@ -32,6 +32,24 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "${openssl_subject}" \
   -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' \
   -keyout "${smoke_dir}/tls.key" -out "${smoke_dir}/tls.crt" >/dev/null 2>&1
 
+compose_tls_dir='/var/lib/resolix-custom-tls'
+for compose_file in docker-compose.yaml docker-compose.example.yaml; do
+  TS_AUTHKEY=compose-test INGEST_SECRET=compose-test TLS_STATE_DIR="${compose_tls_dir}" \
+    docker compose -f "${compose_file}" config --format json \
+    | python3 -c '
+import json
+import sys
+
+config = json.load(sys.stdin)
+expected, compose_file = sys.argv[1:]
+service = config["services"]["resolix"]
+if service["environment"].get("TLS_STATE_DIR") != expected:
+    raise SystemExit(f"{compose_file}: TLS_STATE_DIR environment did not resolve to {expected}")
+if not any(volume.get("target") == expected for volume in service.get("volumes", [])):
+    raise SystemExit(f"{compose_file}: TLS state volume target did not resolve to {expected}")
+' "${compose_tls_dir}" "${compose_file}"
+done
+
 docker build \
   --build-arg VERSION=smoke \
   --build-arg BUILD_INFO="${GITHUB_SHA:-local}" \

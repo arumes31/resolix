@@ -15,7 +15,7 @@ services:
       - WEB_TLS_MODE=${WEB_TLS_MODE:-off}
       - WEB_TLS_IP=${WEB_TLS_IP:-}
       - CONTROLLER_TLS_TRUST=${CONTROLLER_TLS_TRUST:-system}
-      - TLS_STATE_DIR=/var/lib/resolix-tls
+      - TLS_STATE_DIR=${TLS_STATE_DIR:-/var/lib/resolix-tls}
       - CONTROLLER_TLS_PIN_FILE=${CONTROLLER_TLS_PIN_FILE:-controller-ca-pin.json}
       - BASE_URL=${BASE_URL:-/}
       - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}
@@ -40,7 +40,7 @@ services:
       - "${DNS_PUBLISH_ADDR:-0.0.0.0}:${DNS_PUBLISH_PORT:-53}:${DNS_LISTEN_PORT:-53}/tcp"
     volumes:
       - ./history:/var/lib/resolix
-      - ./tls:/var/lib/resolix-tls
+      - ./tls:${TLS_STATE_DIR:-/var/lib/resolix-tls}
       - ./tailscale:/var/lib/tailscale
       # Mount certificates when DOT_ENABLED=true:
       # - ./certs:/etc/resolix/certs:ro

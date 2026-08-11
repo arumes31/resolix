@@ -156,7 +156,17 @@ Repeat this step for additional agents, changing `NODE_NAME`, `TS_AUTHKEY`, and 
 
 Open the controller's `/config` page and manage upstreams, bootstrap resolvers, DNS routes, filter subscriptions, custom rules, rewrites, and client policies there. Agents expose `/config` as read-only, periodically pull the controller's content-addressed snapshot, persist it locally, and report their applied revision. Query events and heartbeats flow back to the controller using the shared `INGEST_SECRET`.
 
-Point clients at the Tailscale IPv4 address of the desired controller or agent on UDP/TCP port 53. Ensure Tailscale ACLs permit clients to reach DNS on the resolver nodes and permit agents to reach the controller's HTTPS port.
+Every controller and agent serves DNS on UDP and TCP port 53. Tailnet clients can use the node's Tailscale IPv4 address directly. The Compose files also publish port 53 on all host IPv4 interfaces so LAN clients can use the host's LAN address:
+
+```dotenv
+DNS_LISTEN_ADDR=0.0.0.0
+DNS_LISTEN_PORT=53
+DNS_PUBLISH_ADDR=0.0.0.0
+DNS_PUBLISH_PORT=53
+DNS_ALLOWED_CLIENTS=127.0.0.0/8,10.0.0.0/8,100.64.0.0/10,172.16.0.0/12,192.168.0.0/16
+```
+
+These are the Compose defaults. They accept loopback, RFC1918 LAN, and Tailscale IPv4 clients while silently dropping other source networks without sending a DNS response. Rate-limit excess and explicit deny-list matches are also dropped silently. Set `DNS_PUBLISH_ADDR` to one specific LAN address to narrow host exposure, and extend `DNS_ALLOWED_CLIENTS` for additional routed private subnets. Never expose a recursive resolver to untrusted or public networks. Ensure Tailscale ACLs permit clients to reach UDP/TCP 53 on resolver nodes and agents to reach the controller's HTTPS port.
 
 #### Reverse-proxy certificate instead of generated TLS
 
@@ -184,7 +194,7 @@ The proxy must preserve the `/api` paths and provide HTTPS all the way to the ag
 | Agent does not appear on the controller | Confirm network reachability, unique `NODE_NAME` values, and an identical `INGEST_SECRET` on both nodes. |
 | Agent rejects the controller certificate | Confirm the URL uses the controller's exact Tailscale IPv4 address. After an intentional CA replacement, stop the agent, independently verify the new controller fingerprint, remove its configured pin file, and restart. |
 | Agent configuration is read-only | Expected: edit `/config` on the controller and wait for the revision to synchronize. |
-| DNS is unreachable | Confirm the node is connected to Tailscale and that ACLs allow UDP and TCP port 53 to its Tailscale address. |
+| DNS is unreachable | Confirm UDP and TCP host port 53 are free, the node is connected to Tailscale, the client is in `DNS_ALLOWED_CLIENTS`, and firewall/Tailscale ACL rules permit port 53. |
 
 Legacy `MODE=master`, `MODE=slave`, and `MASTER_URL` values are accepted for upgrades and normalized to the new names. `CONTROLLER_URL` takes precedence when both URL variables are present.
 
@@ -245,11 +255,13 @@ The **Upstreams** panel manages both upstream resolver specifications and the sh
 
 | Variable | Description | Default |
 | --- | --- | --- |
-| `DNS_LISTEN_ADDR` | DNS bind address; falls back to the Tailscale IP, then all interfaces | automatic |
+| `DNS_LISTEN_ADDR` | DNS bind address; falls back to the Tailscale IP, while Compose binds all interfaces for host publication | automatic; Compose `0.0.0.0` |
 | `DNS_LISTEN_PORT` | UDP/TCP DNS port | `53` |
-| `DNS_ALLOWED_CLIENTS` | IP/CIDR allow list; empty allows all clients not denied | unset |
-| `DNS_DISALLOWED_CLIENTS` | IP/CIDR deny list; denied queries are dropped | unset |
-| `RATE_LIMIT_QPS` | Per IPv4 `/24` or IPv6 `/56` QPS limit; `0` disables | `20` |
+| `DNS_PUBLISH_ADDR` | Docker host address used to publish UDP/TCP DNS | Compose `0.0.0.0` |
+| `DNS_PUBLISH_PORT` | Docker host UDP/TCP DNS port | Compose `53` |
+| `DNS_ALLOWED_CLIENTS` | IP/CIDR allow list; clients outside it are silently dropped | unset; Compose private/tailnet ranges |
+| `DNS_DISALLOWED_CLIENTS` | IP/CIDR deny list; denied queries are silently dropped | unset |
+| `RATE_LIMIT_QPS` | Per IPv4 `/24` or IPv6 `/56` QPS limit; excess queries are silently dropped; `0` disables | `20` |
 | `PRIVATE_PTR` | Answer known private/tailnet client PTRs as `<name>.lan` | `true` |
 | `DNSSEC` | Forward the DO bit and pass DNSSEC records without local validation | `false` |
 | `DOH_ENABLED` | Serve DoH on the web listener | `false` |

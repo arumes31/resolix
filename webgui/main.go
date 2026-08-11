@@ -286,9 +286,9 @@ DB_PATH=dns.db
 #   overrides live in the clients file)
 
 # DNS access and encrypted serving (Step 6)
-# Comma/space-separated IPs or CIDRs. Disallowed clients are dropped; when an
-# allowed list is set, all clients outside it receive REFUSED.
-# DNS_ALLOWED_CLIENTS=100.64.0.0/10,192.168.0.0/16
+# Comma/space-separated IPs or CIDRs. Deny-list matches, allow-list misses,
+# and rate-limit excess are dropped silently without a DNS response.
+# DNS_ALLOWED_CLIENTS=127.0.0.0/8,10.0.0.0/8,100.64.0.0/10,172.16.0.0/12,192.168.0.0/16
 # DNS_DISALLOWED_CLIENTS=100.64.0.5
 # RATE_LIMIT_QPS=20 (per IPv4 /24 or IPv6 /56; 0 disables)
 # PRIVATE_PTR=true (answer known RFC1918/CGNAT/ULA client PTRs as <name>.lan)

@@ -43,11 +43,11 @@ func TestACLAllowDenyDrop(t *testing.T) {
 	}
 	_ = h.nextEvent(t)
 
-	// Outside the allowed list: REFUSED, no event.
+	// Outside the allowed list: dropped silently, no event.
 	w = &fakeResponseWriter{remote: &net.UDPAddr{IP: net.ParseIP("192.168.1.10"), Port: 53000}}
 	h.srv.ServeDNS(w, m)
-	if w.last == nil || w.last.Rcode != dns.RcodeRefused {
-		t.Fatalf("outsider: got %v, want REFUSED", w.last)
+	if w.last != nil {
+		t.Fatalf("outsider got a response: %v", w.last)
 	}
 	h.expectNoEvent(t)
 
@@ -59,6 +59,10 @@ func TestACLAllowDenyDrop(t *testing.T) {
 	}
 	if hits.Load() != 1 {
 		t.Errorf("upstream hits = %d, want 1 (only the allowed client)", hits.Load())
+	}
+	deniedDropped, allowlistDropped, _ := h.srv.ACLStats()
+	if deniedDropped != 1 || allowlistDropped != 1 {
+		t.Errorf("ACL drops = deny:%d allowlist:%d, want 1 each", deniedDropped, allowlistDropped)
 	}
 }
 
@@ -77,28 +81,28 @@ func TestACLDefaultAllowsAll(t *testing.T) {
 	}
 }
 
-func TestInvalidConfiguredAllowACLRefusesAll(t *testing.T) {
+func TestInvalidConfiguredAllowACLDropsAll(t *testing.T) {
 	h := startClientHarness(t, Config{AllowedClients: "not-a-cidr"})
 	w := &fakeResponseWriter{remote: &net.UDPAddr{IP: net.ParseIP("192.0.2.1"), Port: 53000}}
 	request := new(dns.Msg)
 	request.SetQuestion("example.org.", dns.TypeA)
 	h.srv.ServeDNS(w, request)
-	if w.last == nil || w.last.Rcode != dns.RcodeRefused {
-		t.Fatalf("invalid configured allow ACL returned %v, want REFUSED", w.last)
+	if w.last != nil {
+		t.Fatalf("invalid configured allow ACL returned a response: %v", w.last)
 	}
 }
 
 func TestRateLimiter(t *testing.T) {
 	rl := newRateLimiter(3)
 
-	// Burst of 3 allowed, 4th refused.
+	// Burst of 3 allowed, 4th limited.
 	for i := 0; i < 3; i++ {
 		if !rl.allow("100.64.1.5") {
 			t.Fatalf("query %d must be allowed", i+1)
 		}
 	}
 	if rl.allow("100.64.1.5") {
-		t.Error("4th query in the same /24 must be refused")
+		t.Error("4th query in the same /24 must be limited")
 	}
 
 	// Different /24 is isolated.
@@ -129,10 +133,10 @@ func TestRateLimiterBucketBound(t *testing.T) {
 	rl := newRateLimiter(1)
 	rl.maxBuckets = 1
 	if !rl.allow("192.0.2.1") {
-		t.Fatal("first subnet was refused")
+		t.Fatal("first subnet was unexpectedly limited")
 	}
 	if !rl.allow("198.51.100.1") {
-		t.Fatal("new subnet was refused after the bucket limit was reached")
+		t.Fatal("new subnet was unexpectedly limited after the bucket limit was reached")
 	}
 	if got := rl.bucketCount(); got != 1 {
 		t.Fatalf("bucket count = %d, want 1", got)
@@ -174,9 +178,9 @@ func TestRateLimitEndToEnd(t *testing.T) {
 	h.srv.ServeDNS(w, m()) // 1: forwarded
 	h.srv.ServeDNS(w, m()) // 2: cache hit
 	w3 := &fakeResponseWriter{remote: w.remote}
-	h.srv.ServeDNS(w3, m()) // 3: REFUSED (over limit)
-	if w3.last == nil || w3.last.Rcode != dns.RcodeRefused {
-		t.Fatalf("3rd query: got %v, want REFUSED", w3.last)
+	h.srv.ServeDNS(w3, m()) // 3: silently dropped (over limit)
+	if w3.last != nil {
+		t.Fatalf("3rd query returned a response: %v", w3.last)
 	}
 	if got := h.srv.RateLimitDropped(); got != 1 {
 		t.Errorf("dropped = %d, want 1", got)

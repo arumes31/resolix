@@ -19,8 +19,10 @@ services:
       - BASE_URL=${BASE_URL:-/}
       - TRUSTED_PROXIES=${TRUSTED_PROXIES:-}
       - INGEST_SECRET=${INGEST_SECRET:?INGEST_SECRET is required}
-      - DNS_ALLOWED_CLIENTS=${DNS_ALLOWED_CLIENTS:-}
+      - DNS_ALLOWED_CLIENTS=${DNS_ALLOWED_CLIENTS:-127.0.0.0/8,10.0.0.0/8,100.64.0.0/10,172.16.0.0/12,192.168.0.0/16}
       - DNS_DISALLOWED_CLIENTS=${DNS_DISALLOWED_CLIENTS:-}
+      - DNS_LISTEN_ADDR=${DNS_LISTEN_ADDR:-0.0.0.0}
+      - DNS_LISTEN_PORT=${DNS_LISTEN_PORT:-53}
       - RATE_LIMIT_QPS=${RATE_LIMIT_QPS:-20}
       - PRIVATE_PTR=${PRIVATE_PTR:-true}
       - DNSSEC=${DNSSEC:-false}
@@ -33,6 +35,8 @@ services:
       - TLS_KEY_FILE=${TLS_KEY_FILE:-}
     ports:
       - "127.0.0.1:${PORT:-35353}:35353"
+      - "${DNS_PUBLISH_ADDR:-0.0.0.0}:${DNS_PUBLISH_PORT:-53}:${DNS_LISTEN_PORT:-53}/udp"
+      - "${DNS_PUBLISH_ADDR:-0.0.0.0}:${DNS_PUBLISH_PORT:-53}:${DNS_LISTEN_PORT:-53}/tcp"
     volumes:
       - ./history:/var/lib/resolix
       - ./tailscale:/var/lib/tailscale

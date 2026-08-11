@@ -203,7 +203,7 @@ func (v *tofuVerifier) persistPin(digest [sha256.Size]byte) error {
 		return fmt.Errorf("encode controller CA pin: %w", err)
 	}
 	data = append(data, '\n')
-	if err := os.MkdirAll(filepath.Dir(v.pinPath), 0o700); err != nil {
+	if err := secureStateDir(filepath.Dir(v.pinPath)); err != nil {
 		return err
 	}
 	if err := writeNewFile(v.pinPath, data); err == nil {

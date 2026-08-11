@@ -27,6 +27,7 @@ import (
 	"github.com/arumes31/resolix/webgui/internal/clients"
 	"github.com/arumes31/resolix/webgui/internal/config"
 	"github.com/arumes31/resolix/webgui/internal/configsync"
+	"github.com/arumes31/resolix/webgui/internal/controllertls"
 	"github.com/arumes31/resolix/webgui/internal/dnsroutes"
 	"github.com/arumes31/resolix/webgui/internal/dnsserver"
 	"github.com/arumes31/resolix/webgui/internal/filter"
@@ -133,6 +134,24 @@ func verifyConfig(cfg *config.Config) {
 	}
 }
 
+func migrateTLSState(cfg *config.Config) {
+	if cfg.WebTLSMode != controllertls.WebTLSAuto && cfg.ControllerTLSTrust != controllertls.TrustTOFUTailnet {
+		return
+	}
+	legacyTLSDir := filepath.Join(cfg.HistoryDir, "tls")
+	migratedTLSFiles, err := controllertls.MigrateLegacyState(
+		legacyTLSDir,
+		cfg.FullTLSStateDir(),
+		cfg.ControllerTLSPinFile,
+	)
+	if err != nil {
+		logger.Fatal("Failed to migrate legacy TLS state: %v", err)
+	}
+	if migratedTLSFiles > 0 {
+		logger.Info("Copied %d legacy TLS state file(s) to the dedicated state directory", migratedTLSFiles)
+	}
+}
+
 // generateEnvFile creates a default .env file in the working directory if one does not exist.
 // It reads from .env.example if available, otherwise generates from hardcoded defaults.
 // It never overwrites an existing .env file.
@@ -196,8 +215,10 @@ MODE=controller
 # CONTROLLER_URL=https://controller-ip:35353
 # Agent trust: system for a public/reverse-proxy certificate, or tofu-tailnet
 # to pin the first CA seen at a direct 100.64.0.0/10 controller address.
+# Generated CA and agent pin state use a dedicated persistent directory.
+# TLS_STATE_DIR=/var/lib/resolix-tls
 # CONTROLLER_TLS_TRUST=system
-# CONTROLLER_TLS_PIN_FILE=tls/controller-ca-pin.json
+# CONTROLLER_TLS_PIN_FILE=controller-ca-pin.json
 # Legacy upgrades may still use MASTER_URL; CONTROLLER_URL takes precedence.
 
 # Unique identifier for this node
@@ -367,6 +388,7 @@ func main() {
 
 	// Run startup configuration verification (Items 54 & 55)
 	verifyConfig(cfg)
+	migrateTLSState(cfg)
 
 	// Initialize storage
 	store := storage.NewStore(cfg)

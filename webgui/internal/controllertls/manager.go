@@ -36,10 +36,9 @@ const (
 	TrustTOFUTailnet = "tofu-tailnet"
 
 	// DefaultPinFile is the agent-side controller CA pin file.
-	DefaultPinFile = "tls/controller-ca-pin.json"
+	DefaultPinFile = "controller-ca-pin.json"
 
 	caFileName    = "controller-ca.pem"
-	tlsDirectory  = "tls"
 	rotationLead  = 30 * 24 * time.Hour
 	rotationCheck = 24 * time.Hour
 	clockSkew     = 5 * time.Minute
@@ -60,17 +59,16 @@ type Manager struct {
 }
 
 // NewManager loads or creates the controller CA and issues the first leaf.
-func NewManager(historyDir, rawTailnetIP string) (*Manager, error) {
+func NewManager(tlsStateDir, rawTailnetIP string) (*Manager, error) {
 	tailnetIP, err := ParseTailnetIPv4(rawTailnetIP)
 	if err != nil {
 		return nil, err
 	}
-	tlsDir := filepath.Join(historyDir, tlsDirectory)
-	if err := os.MkdirAll(tlsDir, 0o700); err != nil {
+	if err := secureStateDir(tlsStateDir); err != nil {
 		return nil, fmt.Errorf("create controller TLS directory: %w", err)
 	}
 
-	caPath := filepath.Join(tlsDir, caFileName)
+	caPath := filepath.Join(tlsStateDir, caFileName)
 	caCert, caKey, err := loadOrCreateCA(caPath, time.Now())
 	if err != nil {
 		return nil, fmt.Errorf("load controller CA: %w", err)
@@ -156,7 +154,7 @@ func (m *Manager) rotateIfNeeded(now time.Time) (bool, error) {
 }
 
 func loadOrCreateCA(path string, now time.Time) (*x509.Certificate, *rsa.PrivateKey, error) {
-	data, err := os.ReadFile(path) // #nosec G304 -- path is derived from the trusted HISTORY_DIR and a constant filename.
+	data, err := os.ReadFile(path) // #nosec G304 -- path is derived from the trusted TLS_STATE_DIR and a constant filename.
 	if err == nil {
 		if chmodErr := os.Chmod(path, 0o600); chmodErr != nil {
 			return nil, nil, fmt.Errorf("secure controller CA file: %w", chmodErr)

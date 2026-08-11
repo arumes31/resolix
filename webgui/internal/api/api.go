@@ -2935,7 +2935,7 @@ func (s *Server) Start(ctx context.Context, staticHandler http.Handler, cspMiddl
 	}
 	var tlsManager *controllertls.Manager
 	if s.cfg.WebTLSMode == controllertls.WebTLSAuto {
-		manager, err := controllertls.NewManager(s.cfg.HistoryDir, s.cfg.WebTLSIP)
+		manager, err := controllertls.NewManager(s.cfg.FullTLSStateDir(), s.cfg.WebTLSIP)
 		if err != nil {
 			return fmt.Errorf("configure generated web TLS: %w", err)
 		}

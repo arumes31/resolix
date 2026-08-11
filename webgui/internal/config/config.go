@@ -31,6 +31,8 @@ const (
 	DefaultWebListenAddr = "0.0.0.0"
 	// DefaultHistoryDir is the default directory for JSONL history files.
 	DefaultHistoryDir = "/var/lib/resolix"
+	// DefaultTLSStateDir is the default directory for generated controller TLS state.
+	DefaultTLSStateDir = "/var/lib/resolix-tls"
 	// DefaultDBPath is the default database file name.
 	DefaultDBPath = "dns.db"
 	// DefaultMaxEvents is the maximum number of events to keep in memory.
@@ -142,6 +144,7 @@ type Config struct {
 	Port             string
 	WebListenAddr    string
 	HistoryDir       string
+	TLSStateDir      string
 	DBPath           string
 	MaxEvents        int
 	HealthDomain     string
@@ -769,6 +772,18 @@ func resolveBlocking() (mode, ip4, ip6 string) {
 	return mode, ip4, ip6
 }
 
+func legacyTLSPinFile(path string) (string, bool) {
+	cleanPath := filepath.Clean(path)
+	if filepath.IsAbs(cleanPath) {
+		return path, false
+	}
+	relativePath, err := filepath.Rel("tls", cleanPath)
+	if err != nil || relativePath == "." || !filepath.IsLocal(relativePath) {
+		return path, false
+	}
+	return relativePath, true
+}
+
 // LoadConfig reads configuration from environment variables.
 //
 //nolint:gocyclo // Environment mapping is intentionally centralized so defaults remain auditable in one place.
@@ -786,6 +801,10 @@ func LoadConfig() *Config {
 	historyDir := os.Getenv("HISTORY_DIR")
 	if historyDir == "" {
 		historyDir = DefaultHistoryDir
+	}
+	tlsStateDir := strings.TrimSpace(os.Getenv("TLS_STATE_DIR"))
+	if tlsStateDir == "" {
+		tlsStateDir = DefaultTLSStateDir
 	}
 
 	dbPath := os.Getenv("DB_PATH")
@@ -839,6 +858,9 @@ func LoadConfig() *Config {
 	controllerTLSPinFile := strings.TrimSpace(os.Getenv("CONTROLLER_TLS_PIN_FILE"))
 	if controllerTLSPinFile == "" {
 		controllerTLSPinFile = controllertls.DefaultPinFile
+	} else if migratedPinFile, legacy := legacyTLSPinFile(controllerTLSPinFile); legacy {
+		log.Printf("[WARN] CONTROLLER_TLS_PIN_FILE=%s is deprecated; the pin is now relative to TLS_STATE_DIR", sanitizeForLog(controllerTLSPinFile)) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
+		controllerTLSPinFile = migratedPinFile
 	}
 
 	// Load new configuration values
@@ -944,6 +966,7 @@ func LoadConfig() *Config {
 		Port:                       port,
 		WebListenAddr:              webListenAddr,
 		HistoryDir:                 historyDir,
+		TLSStateDir:                tlsStateDir,
 		DBPath:                     dbPath,
 		MaxEvents:                  DefaultMaxEvents,
 		HealthDomain:               healthDomain,
@@ -1106,6 +1129,15 @@ func (c *Config) FullBlocklistPath() string {
 	return filepath.Join(c.HistoryDir, c.BlocklistFile)
 }
 
+// FullTLSStateDir returns the generated TLS state directory. The history/tls
+// fallback preserves manually constructed Config values and older embedders.
+func (c *Config) FullTLSStateDir() string {
+	if c.TLSStateDir != "" {
+		return c.TLSStateDir
+	}
+	return filepath.Join(c.HistoryDir, "tls")
+}
+
 // FullControllerTLSPinPath returns the configured controller CA pin path.
 func (c *Config) FullControllerTLSPinPath() string {
 	if c.ControllerTLSPinFile == "" {
@@ -1114,7 +1146,10 @@ func (c *Config) FullControllerTLSPinPath() string {
 	if filepath.IsAbs(c.ControllerTLSPinFile) {
 		return c.ControllerTLSPinFile
 	}
-	return filepath.Join(c.HistoryDir, c.ControllerTLSPinFile)
+	if c.TLSStateDir == "" {
+		return filepath.Join(c.HistoryDir, c.ControllerTLSPinFile)
+	}
+	return filepath.Join(c.FullTLSStateDir(), c.ControllerTLSPinFile)
 }
 
 // VerifyConfig checks critical configuration values before the server starts.

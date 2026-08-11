@@ -409,6 +409,110 @@ func TestGetStats(t *testing.T) {
 	}
 }
 
+func TestGetStatsIncludesPendingTopLists(t *testing.T) {
+	s, cleanup := newTestStore(t)
+	defer cleanup()
+
+	now := time.Now().Unix()
+	s.AddEvent(models.QueryEvent{UnixTime: now, Domain: "pending.test", Type: "A", ClientIP: "100.64.0.1"})
+	if archived := s.ArchiveStep(time.Now()); archived != 1 {
+		t.Fatalf("archived = %d, want 1", archived)
+	}
+	s.AddEvent(models.QueryEvent{UnixTime: now, Domain: "pending.test", Type: "AAAA", ClientIP: "100.64.0.1"})
+	s.AddEvent(models.QueryEvent{UnixTime: now, Domain: "pending.test", Type: "A", ClientIP: "100.64.0.1"})
+	s.AddEvent(models.QueryEvent{UnixTime: now, Domain: "other.test", Type: "A", ClientIP: "100.64.0.2"})
+
+	stats := s.GetStats()
+	topDomains, ok := stats["top_domains"].([]models.StatEntry)
+	if !ok {
+		t.Fatalf("top_domains type = %T, want []models.StatEntry", stats["top_domains"])
+	}
+	if len(topDomains) != 2 || topDomains[0].Key != "pending.test" || topDomains[0].Count != 3 {
+		t.Fatalf("top_domains = %+v, want pending.test first with count 3", topDomains)
+	}
+
+	topClients, ok := stats["top_clients"].([]models.StatEntry)
+	if !ok {
+		t.Fatalf("top_clients type = %T, want []models.StatEntry", stats["top_clients"])
+	}
+	if len(topClients) != 2 || topClients[0].Key != "100.64.0.1" || topClients[0].Count != 3 {
+		t.Fatalf("top_clients = %+v, want 100.64.0.1 first with count 3", topClients)
+	}
+}
+
+func TestGetStatsMergesArchivedCandidatesBeforeTopLimit(t *testing.T) {
+	s, cleanup := newTestStore(t)
+	defer cleanup()
+
+	now := time.Now().Unix()
+	archived := 0
+	for i := range 10 {
+		count := 20 - i
+		for range count {
+			s.AddEvent(models.QueryEvent{
+				UnixTime: now,
+				Domain:   fmt.Sprintf("archived-%02d.test", i),
+				Type:     "A",
+				ClientIP: fmt.Sprintf("192.0.2.%d", i+1),
+			})
+			archived++
+		}
+	}
+	s.AddEvent(models.QueryEvent{
+		UnixTime: now,
+		Domain:   "pending-winner.test",
+		Type:     "A",
+		ClientIP: "198.51.100.1",
+	})
+	archived++
+	if got := s.ArchiveStep(time.Now()); got != archived {
+		t.Fatalf("archived = %d, want %d", got, archived)
+	}
+	for range 20 {
+		s.AddEvent(models.QueryEvent{
+			UnixTime: now,
+			Domain:   "pending-winner.test",
+			Type:     "A",
+			ClientIP: "198.51.100.1",
+		})
+	}
+
+	stats := s.GetStats()
+	topDomains := stats["top_domains"].([]models.StatEntry)
+	if len(topDomains) != 10 || topDomains[0].Key != "pending-winner.test" || topDomains[0].Count != 21 {
+		t.Fatalf("top_domains = %+v, want pending-winner.test first with combined count 21", topDomains)
+	}
+	topClients := stats["top_clients"].([]models.StatEntry)
+	if len(topClients) != 10 || topClients[0].Key != "198.51.100.1" || topClients[0].Count != 21 {
+		t.Fatalf("top_clients = %+v, want 198.51.100.1 first with combined count 21", topClients)
+	}
+}
+
+func TestGetStatsMergesArchivedAndPendingHeatmapCounts(t *testing.T) {
+	s, cleanup := newTestStore(t)
+	defer cleanup()
+
+	now := time.Now()
+	event := models.QueryEvent{
+		UnixTime: now.Unix(),
+		Domain:   "heatmap.test",
+		Type:     "A",
+		ClientIP: "192.0.2.1",
+	}
+	s.AddEvent(event)
+	if got := s.ArchiveStep(now); got != 1 {
+		t.Fatalf("archived = %d, want 1", got)
+	}
+	s.AddEvent(event)
+
+	stats := s.GetStats()
+	heatmap := stats["heatmap"].(map[string]int)
+	hour := now.Format("15:00")
+	if heatmap[hour] != 2 {
+		t.Fatalf("heatmap[%q] = %d, want combined count 2", hour, heatmap[hour])
+	}
+}
+
 func TestGetStats_EmptyStore(t *testing.T) {
 	s, cleanup := newTestStore(t)
 	defer cleanup()

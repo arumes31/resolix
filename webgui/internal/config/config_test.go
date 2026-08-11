@@ -76,6 +76,41 @@ func TestParseUint32EnvEnforcesBitSize(t *testing.T) {
 	}
 }
 
+func TestLoadConfigOperationalLimits(t *testing.T) {
+	t.Setenv("MODE", ModeController)
+	t.Setenv("CONTROLLER_URL", "")
+	t.Setenv("MASTER_URL", "")
+	t.Setenv("RATE_LIMIT_QPS", "")
+	t.Setenv("RATE_LIMIT_INTERNAL_QPS", "")
+	t.Setenv("MAX_REQUEST_SIZE", "")
+	cfg := LoadConfig()
+	if cfg.RateLimitQPS != 80 || cfg.InternalRateLimitQPS != 1000 {
+		t.Fatalf("default rate limits = %d/%d, want 80/1000", cfg.RateLimitQPS, cfg.InternalRateLimitQPS)
+	}
+	if cfg.MaxRequestSize != 1<<20 {
+		t.Fatalf("default MAX_REQUEST_SIZE = %d, want %d", cfg.MaxRequestSize, 1<<20)
+	}
+
+	t.Setenv("RATE_LIMIT_QPS", "250")
+	t.Setenv("RATE_LIMIT_INTERNAL_QPS", "500")
+	cfg = LoadConfig()
+	if cfg.RateLimitQPS != 250 || cfg.InternalRateLimitQPS != 500 {
+		t.Fatalf("configured rate limits = %d/%d, want 250/500", cfg.RateLimitQPS, cfg.InternalRateLimitQPS)
+	}
+}
+
+func TestLoadConfigDefaultsDNSRoutesToConfigDir(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("CONFIG_DIR", configDir)
+	t.Setenv("DNS_ROUTES_FILE", "")
+
+	cfg := LoadConfig()
+	want := filepath.Join(configDir, "dns-routes.json")
+	if got := cfg.FullDNSRoutesPath(); got != want {
+		t.Fatalf("FullDNSRoutesPath() = %q, want persistent default %q", got, want)
+	}
+}
+
 func TestClientAliasesAreCopied(t *testing.T) {
 	cfg := &Config{}
 	aliases := map[string]string{"192.0.2.1": "router"}

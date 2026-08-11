@@ -152,6 +152,16 @@ func migrateTLSState(cfg *config.Config) {
 	}
 }
 
+func migrateConfigState(cfg *config.Config) {
+	migratedConfigFiles, err := config.MigrateLegacyState(cfg)
+	if err != nil {
+		logger.Fatal("Failed to migrate managed configuration: %v", err)
+	}
+	if migratedConfigFiles > 0 {
+		logger.Info("Copied %d managed configuration file(s) to the dedicated config directory", migratedConfigFiles)
+	}
+}
+
 // generateEnvFile creates a default .env file in the working directory if one does not exist.
 // It reads from .env.example if available, otherwise generates from hardcoded defaults.
 // It never overwrites an existing .env file.
@@ -242,6 +252,9 @@ BASE_URL=/
 # TRUSTED_PROXIES=127.0.0.1,10.0.0.0/8
 
 # Database file name or absolute path (default: dns.db)
+# Query history and managed DNS configuration use separate persistent mounts.
+# HISTORY_DIR=/var/lib/resolix
+# CONFIG_DIR=/var/lib/resolix-config
 # If relative, it is placed inside HISTORY_DIR
 DB_PATH=dns.db
 
@@ -254,11 +267,11 @@ DB_PATH=dns.db
 # Path to a hosts-format blocklist file (Item 61)
 # BLOCKLIST_FILE=/etc/resolix/blocklist.hosts
 
-# Path to a JSON file with upstream DNS server list (Item 62)
-# UPSTREAMS_FILE=/etc/resolix/upstreams.json
+# Managed upstream file, relative to CONFIG_DIR unless absolute (Item 62)
+# UPSTREAMS_FILE=upstreams.json
 
-# Path to a JSON file with domain-specific DNS routing rules (Item 66)
-# DNS_ROUTES_FILE=/etc/resolix/dns-routes.json
+# Managed domain-route file, relative to CONFIG_DIR unless absolute (Item 66)
+# DNS_ROUTES_FILE=dns-routes.json
 
 # DNS server listen address and port for the embedded DNS server (replaces dnsmasq)
 # DNS_LISTEN_ADDR defaults to TAILSCALE_IP (set by entrypoint.sh), then 0.0.0.0
@@ -311,7 +324,8 @@ DB_PATH=dns.db
 # and rate-limit excess are dropped silently without a DNS response.
 # DNS_ALLOWED_CLIENTS=127.0.0.0/8,10.0.0.0/8,100.64.0.0/10,172.16.0.0/12,192.168.0.0/16
 # DNS_DISALLOWED_CLIENTS=100.64.0.5
-# RATE_LIMIT_QPS=20 (per IPv4 /24 or IPv6 /56; 0 disables)
+# RATE_LIMIT_QPS=80 (public clients, per IP; 0 disables)
+# RATE_LIMIT_INTERNAL_QPS=1000 (LAN/Tailscale clients, per IP; 0 disables)
 # PRIVATE_PTR=true (answer known RFC1918/CGNAT/ULA client PTRs as <name>.lan)
 # DNSSEC=false (pass the DNSSEC DO bit upstream; no local validation)
 # DOH_ENABLED=false
@@ -369,6 +383,7 @@ func main() {
 
 	// Load configuration
 	cfg := config.LoadConfig()
+	migrateConfigState(cfg)
 
 	// Initialize the level-aware logger (Item 51)
 	logger.SetLevel(cfg.LogLevel)
@@ -556,21 +571,22 @@ func main() {
 		CacheMaxTTL:     cfg.CacheMaxTTL,
 		CacheOptimistic: cfg.CacheOptimistic,
 		// Step 6: ACL, rate limit, private PTR, DNSSEC, DoT.
-		AllowedClients:    cfg.DNSAllowedClients,
-		DisallowedClients: cfg.DNSDisallowedClients,
-		RateLimitQPS:      cfg.RateLimitQPS,
-		PrivatePTR:        cfg.PrivatePTR,
-		DNSSEC:            cfg.DNSSEC,
-		Resolver:          res,
-		DoTEnabled:        cfg.DoTEnabled,
-		DoTPort:           cfg.DoTPort,
-		TLSCertFile:       cfg.TLSCertFile,
-		TLSKeyFile:        cfg.TLSKeyFile,
-		NodeName:          cfg.NodeName,
-		Filter:            filterEng,
-		BlockingMode:      cfg.BlockingMode,
-		BlockCustomIP4:    cfg.BlockCustomIP4,
-		BlockCustomIP6:    cfg.BlockCustomIP6,
+		AllowedClients:       cfg.DNSAllowedClients,
+		DisallowedClients:    cfg.DNSDisallowedClients,
+		RateLimitQPS:         cfg.RateLimitQPS,
+		InternalRateLimitQPS: cfg.InternalRateLimitQPS,
+		PrivatePTR:           cfg.PrivatePTR,
+		DNSSEC:               cfg.DNSSEC,
+		Resolver:             res,
+		DoTEnabled:           cfg.DoTEnabled,
+		DoTPort:              cfg.DoTPort,
+		TLSCertFile:          cfg.TLSCertFile,
+		TLSKeyFile:           cfg.TLSKeyFile,
+		NodeName:             cfg.NodeName,
+		Filter:               filterEng,
+		BlockingMode:         cfg.BlockingMode,
+		BlockCustomIP4:       cfg.BlockCustomIP4,
+		BlockCustomIP6:       cfg.BlockCustomIP6,
 	}, func(ev models.QueryEvent, excludeFromStats bool) {
 		// exclude_from_stats clients emit to SSE only (no store/forwarder).
 		if !excludeFromStats {
@@ -667,7 +683,7 @@ func setupFilterEngine(ctx context.Context, cfg *config.Config, srv *api.Server)
 	eng := filter.New()
 
 	// User rules (query-log block/unblock actions) — a plain file source.
-	userRulesPath := filepath.Join(cfg.HistoryDir, "user_rules.txt")
+	userRulesPath := cfg.FullUserRulesPath()
 	if _, err := os.Stat(userRulesPath); os.IsNotExist(err) {
 		if err := os.WriteFile(userRulesPath, []byte("! user rules (managed via /api/querylog)\n"), 0o600); err != nil {
 			logger.Warning("Failed to create user rules file: %v", err)
@@ -688,7 +704,7 @@ func setupFilterEngine(ctx context.Context, cfg *config.Config, srv *api.Server)
 	for _, u := range splitListEnv(cfg.AllowlistURLs) {
 		seeds = append(seeds, filter.Subscription{URL: u, AllowOnly: true, Enabled: true})
 	}
-	subscriptionPath := filepath.Join(cfg.HistoryDir, "filter-subscriptions.json")
+	subscriptionPath := cfg.FullFilterSubscriptionsPath()
 	subscriptions, err := filter.LoadSubscriptionStore(subscriptionPath, seeds)
 	if err != nil {
 		logger.Fatal("Failed to load filter subscriptions: %v", err)

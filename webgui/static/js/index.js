@@ -187,6 +187,9 @@ function createRowHtml(e) {
 
 function prependRowToDom(e) {
     const tableBody = document.getElementById('eventTable');
+    const previousFirstRow = tableBody.firstElementChild;
+    const preserveViewport = previousFirstRow && tableBody.getBoundingClientRect().top < 0;
+    const previousFirstRowTop = preserveViewport ? previousFirstRow.getBoundingClientRect().top : 0;
     const row = document.createElement('tr');
     row.id = `row-${e.id}`;
     row.innerHTML = createRowHtml(e);
@@ -195,6 +198,12 @@ function prependRowToDom(e) {
     // Limit DOM size
     if (tableBody.children.length > 100) {
         tableBody.removeChild(tableBody.lastChild);
+    }
+
+    // Keep the row being reviewed in place when a live event arrives above it.
+    // At the top of the log, leave the viewport alone so the newest row is visible.
+    if (preserveViewport) {
+        window.scrollBy(0, previousFirstRow.getBoundingClientRect().top - previousFirstRowTop);
     }
 }
 
@@ -853,11 +862,6 @@ document.getElementById('freezeBtn').addEventListener('click', function () {
         frozenEvents = [];
         renderEvents();
     }
-});
-
-document.getElementById('compactToggle').addEventListener('click', function () {
-    const active = document.body.classList.toggle('compact');
-    this.setAttribute('aria-pressed', String(active));
 });
 
 document.getElementById('clearViewBtn').addEventListener('click', function () {

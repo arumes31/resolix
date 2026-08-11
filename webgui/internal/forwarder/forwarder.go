@@ -341,7 +341,11 @@ func (f *Forwarder) sendBatch(client *http.Client, events []models.QueryEvent, h
 		bodyReader = bytes.NewBuffer(compressed)
 	}
 
-	req, err := http.NewRequest("POST", f.cfg.ControllerURL+f.cfg.BaseURL+"/api/ingest", bodyReader)
+	requestURL, err := controllerEndpoint(f.cfg, "/api/ingest")
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", requestURL, bodyReader)
 	if err != nil {
 		return err
 	}
@@ -400,7 +404,11 @@ func (f *Forwarder) sendHeartbeat(client *http.Client, health map[string]float64
 		bodyReader = bytes.NewBuffer(compressed)
 	}
 
-	req, err := http.NewRequest("POST", f.cfg.ControllerURL+f.cfg.BaseURL+"/api/heartbeat", bodyReader)
+	requestURL, err := controllerEndpoint(f.cfg, "/api/heartbeat")
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", requestURL, bodyReader)
 	if err != nil {
 		return err
 	}

@@ -29,9 +29,12 @@ func TestConfigPageIsDedicatedAndRootRejectsUnknownPaths(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config", nil))
+	body := recorder.Body.String()
 	if recorder.Code != http.StatusOK ||
-		!strings.Contains(recorder.Body.String(), `id="configAuthority"`) ||
-		!strings.Contains(recorder.Body.String(), `id="bootstrapList"`) {
+		!strings.Contains(body, `class="app-page config-page compact"`) ||
+		!strings.Contains(body, `id="configAuthority"`) ||
+		!strings.Contains(body, `id="bootstrapList"`) ||
+		!strings.Contains(body, `id="rewriteDeleteDialog"`) {
 		t.Fatalf("config response = %d %q", recorder.Code, recorder.Body.String())
 	}
 

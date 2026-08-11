@@ -11,7 +11,7 @@
     <link rel="stylesheet" href="static/css/style.css">
 </head>
 
-<body class="app-page config-page" data-base-url="{{.BaseURL}}" data-csrf-token="{{.CSRFToken}}" data-mode="{{.Mode}}">
+<body class="app-page config-page compact" data-base-url="{{.BaseURL}}" data-csrf-token="{{.CSRFToken}}" data-mode="{{.Mode}}">
     <div id="sidebarScrim" class="sidebar-scrim" aria-hidden="true"></div>
     <aside id="appSidebar" class="app-sidebar" aria-label="Primary navigation">
         <div class="sidebar-brand">
@@ -176,7 +176,10 @@
                         </div>
                         <p id="rewriteScopeHelp" class="field-help">Leave custom subnets empty to apply this rewrite to every client.</p>
                     </fieldset>
-                    <div class="inline-actions field-wide"><button type="submit" class="btn btn-primary">Add rewrite</button></div>
+                    <div class="inline-actions field-wide">
+                        <button type="submit" id="rewriteSaveBtn" class="btn btn-primary">Add rewrite</button>
+                        <button type="button" id="rewriteCancelBtn" class="btn btn-secondary is-hidden">Cancel edit</button>
+                    </div>
                 </form>
                 <div id="rewriteList" class="settings-list"></div>
             </section>
@@ -228,6 +231,20 @@
         </div>
         </main>
     </div>
+    <dialog id="rewriteDeleteDialog" class="confirm-dialog" aria-labelledby="rewriteDeleteTitle" aria-describedby="rewriteDeleteMessage">
+        <div class="confirm-dialog-heading">
+            <span class="confirm-dialog-icon" aria-hidden="true">!</span>
+            <div>
+                <span class="confirm-dialog-eyebrow">Permanent action</span>
+                <h2 id="rewriteDeleteTitle">Delete DNS rewrite?</h2>
+            </div>
+        </div>
+        <p id="rewriteDeleteMessage" class="confirm-dialog-message">This rewrite will be removed from every synchronized node.</p>
+        <div class="confirm-dialog-actions">
+            <button type="button" id="rewriteDeleteCancelBtn" class="btn btn-secondary">Keep rewrite</button>
+            <button type="button" id="rewriteDeleteConfirmBtn" class="btn btn-danger">Delete rewrite</button>
+        </div>
+    </dialog>
     <script nonce="{{.Nonce}}" src="static/js/shell.js"></script>
     <script nonce="{{.Nonce}}" src="static/js/config.js"></script>
 </body>

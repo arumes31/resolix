@@ -88,7 +88,7 @@ flowchart LR
 | `controller` | Authoritative dashboard, query history, configuration editor, and cluster status | `MODE=controller` (default) |
 | `agent` | Managed resolver that forwards events and applies verified configuration snapshots | `MODE=agent`, an HTTPS `CONTROLLER_URL`, and the controller's `INGEST_SECRET` |
 
-Run each node as a separate Compose deployment with its own `history` and `tailscale` directories. Use the same immutable `IMAGE_VERSION` and `INGEST_SECRET` on every node, but give every node a unique `NODE_NAME` and Tailscale identity. Never share persistent directories between nodes.
+Run each node as a separate Compose deployment with its own `history`, `config`, `tls`, and `tailscale` directories. Use the same immutable `IMAGE_VERSION` and `INGEST_SECRET` on every node, but give every node a unique `NODE_NAME` and Tailscale identity. Never share persistent directories between nodes.
 
 Generate the cluster secret once and keep it out of source control:
 
@@ -154,7 +154,7 @@ Repeat this step for additional agents, changing `NODE_NAME`, `TS_AUTHKEY`, and 
 
 #### 3. Configure DNS once on the controller
 
-Open the controller's `/config` page and manage upstreams, bootstrap resolvers, DNS routes, filter subscriptions, custom rules, rewrites, and client policies there. Agents expose `/config` as read-only, periodically pull the controller's content-addressed snapshot, persist it locally, and report their applied revision. Query events and heartbeats flow back to the controller using the shared `INGEST_SECRET`.
+Open the controller's `/config` page and manage upstreams, bootstrap resolvers, DNS routes, filter subscriptions, custom rules, rewrites, and client policies there. These settings are stored in the dedicated `config` mount. Agents expose `/config` as read-only, periodically pull the controller's content-addressed snapshot, persist it locally, and report their applied revision. Query events and heartbeats flow back to the controller using the shared `INGEST_SECRET`.
 
 By default, every controller and agent serves DNS on UDP and TCP port 53. Tailnet clients can use the node's Tailscale IPv4 address and `DNS_LISTEN_PORT`; LAN clients can use the host's LAN address and `DNS_PUBLISH_PORT`. When overriding either default, clients must use the corresponding configured port. The Compose files publish DNS on all host IPv4 interfaces:
 
@@ -262,7 +262,8 @@ The **Upstreams** panel manages both upstream resolver specifications and the sh
 | `DNS_PUBLISH_PORT` | Docker host UDP/TCP DNS port | Compose `53` |
 | `DNS_ALLOWED_CLIENTS` | IP/CIDR allow list; clients outside it are silently dropped | unset; Compose private/tailnet ranges |
 | `DNS_DISALLOWED_CLIENTS` | IP/CIDR deny list; denied queries are silently dropped | unset |
-| `RATE_LIMIT_QPS` | Per IPv4 `/24` or IPv6 `/56` QPS limit; excess queries are silently dropped; `0` disables | `20` |
+| `RATE_LIMIT_QPS` | Per-public-client-IP QPS limit; excess queries are silently dropped; `0` disables | `80` |
+| `RATE_LIMIT_INTERNAL_QPS` | Per-IP QPS limit for loopback, LAN, link-local, and Tailscale sources; `0` disables | `1000` |
 | `PRIVATE_PTR` | Answer known private/tailnet client PTRs as `<name>.lan` | `true` |
 | `DNSSEC` | Forward the DO bit and pass DNSSEC records without local validation | `false` |
 | `DOH_ENABLED` | Serve DoH on the web listener | `false` |
@@ -281,8 +282,8 @@ The **Upstreams** panel manages both upstream resolver specifications and the sh
 | `FALLBACK_DNS` | Used only when every primary upstream fails | unset |
 | `BOOTSTRAP_DNS` | Initial space-separated plain UDP IP resolvers for hostname-based DoT/DoH; `/config` overrides | unset |
 | `ECS_CLIENT_SUBNET` | EDNS Client Subnet sent upstream | unset |
-| `UPSTREAMS_FILE` | Persisted upstream list, relative to `HISTORY_DIR` unless absolute | `upstreams.json` |
-| `DNS_ROUTES_FILE` | Persisted domain-route map | unset |
+| `UPSTREAMS_FILE` | Persisted upstream list, relative to `CONFIG_DIR` unless absolute | `upstreams.json` |
+| `DNS_ROUTES_FILE` | Persisted domain-route map, relative to `CONFIG_DIR` unless absolute | `dns-routes.json` |
 | `HEALTHCHECK_DOMAIN` | Name used by upstream health checks | `google.com` |
 | `UPSTREAM_LATENCY_THRESHOLD` | Slow-upstream threshold in milliseconds | `200` |
 | `CACHE_MIN_TTL` / `CACHE_MAX_TTL` | Positive and negative cache TTL bounds in seconds | `60` / `600` |
@@ -299,13 +300,13 @@ The **Upstreams** panel manages both upstream resolver specifications and the sh
 | `FILTER_UPDATE_INTERVAL` | Subscription refresh interval | `24h` |
 | `BLOCKING_MODE` | `nxdomain`, `null_ip`, `refused`, or `custom_ip` | `nxdomain` |
 | `BLOCK_CUSTOM_IP4` / `BLOCK_CUSTOM_IP6` | Addresses returned by `custom_ip` mode | `0.0.0.0` / `::` |
-| `REWRITES_FILE` | Typed rewrite persistence file | `rewrites.json` |
+| `REWRITES_FILE` | Typed rewrite persistence file, relative to `CONFIG_DIR` unless absolute | `rewrites.json` |
 | `DOMAINS` | First-boot seed in `domain:ip` format | unset |
 | `SAFE_SEARCH` | `google`, `bing`, `ddg`, and/or `youtube` | unset |
 | `BOGUS_NXDOMAIN` | IP/CIDR answers that should become NXDOMAIN | unset |
 | `AAAA_DISABLED` | Return NOERROR with no answers for AAAA queries | `false` |
 | `REFUSE_ANY` | Refuse QTYPE ANY | `true` |
-| `CLIENTS_FILE` | Per-client policy registry | `clients.json` |
+| `CLIENTS_FILE` | Per-client policy registry, relative to `CONFIG_DIR` unless absolute | `clients.json` |
 | `BLOCKED_SERVICES` | Globally blocked service IDs | unset |
 | `CLIENT_ALIASES` | Inline `IP:Alias` mappings | unset |
 | `CLIENT_ALIASES_FILE` | Hot-reloaded `IP=Alias` file | unset |
@@ -316,7 +317,8 @@ Rewrites created in `/config` can apply to every client, only Tailscale address 
 
 | Variable | Description | Default |
 | --- | --- | --- |
-| `HISTORY_DIR` | SQLite and managed-configuration directory | `/var/lib/resolix` |
+| `HISTORY_DIR` | SQLite query-history directory | `/var/lib/resolix` |
+| `CONFIG_DIR` | Managed upstreams, routes, subscriptions, rules, rewrites, and clients | `/var/lib/resolix-config` |
 | `DB_PATH` | SQLite file name or absolute path | `dns.db` |
 | `BATCH_ARCHIVE_INTERVAL` | Maximum time between archive passes | `30m` |
 | `ARCHIVE_QUEUE_CAPACITY` | Maximum queued events during bursts/outages | `100000` |
@@ -399,21 +401,22 @@ If the proxy also exposes DoH, configure `DOH_AUTH_TOKEN` and forward `DOH_PATH`
 
 ## Data, backup, and upgrades
 
-Stop the container before copying SQLite, generated TLS trust state, and Tailscale state:
+Stop the container before copying SQLite history, managed DNS configuration, generated TLS trust state, and Tailscale state:
 
 ```bash
 docker compose stop resolix
-tar -czf resolix-backup.tgz history tls tailscale
+tar -czf resolix-backup.tgz history config tls tailscale
 docker compose start resolix
 ```
 
-Restore all three directories while the container is stopped, retain ownership and permissions, start the same image tag, and confirm `/readyz` before upgrading. `tls` is the default controller CA and agent pin mount. If `TLS_STATE_DIR` or `CONTROLLER_TLS_PIN_FILE` points elsewhere, also back up those configured paths. These files must remain private.
+Restore all four directories while the container is stopped, retain ownership and permissions, start the same image tag, and confirm `/readyz` before upgrading. `config` contains the settings edited in `/config`; `tls` contains the controller CA or agent pin. If `CONFIG_DIR`, `TLS_STATE_DIR`, or `CONTROLLER_TLS_PIN_FILE` points elsewhere, also back up those configured paths. These files must remain private.
 
 ### Migration from the former project name
 
 - Use `https://github.com/arumes31/resolix.git` and `ghcr.io/arumes31/resolix`. GitHub redirects the former repository URL; the former GHCR package remains frozen.
-- New deployments use `/var/lib/resolix` for history/configuration, `/var/lib/resolix-tls` for generated trust state, and `/etc/resolix` for operator-supplied configuration and certificates.
+- New deployments use `/var/lib/resolix` for query history, `/var/lib/resolix-config` for managed DNS configuration, `/var/lib/resolix-tls` for generated trust state, and `/etc/resolix` for operator-supplied certificates and absolute-path files.
 - The container automatically uses a populated legacy `/var/lib/tailscale-dnsrewrite` mount when `HISTORY_DIR` is not explicitly set and the new directory is empty.
+- On first start with the dedicated `config` mount, Resolix copies managed settings from the active `HISTORY_DIR` when their destinations are absent. Existing files in `CONFIG_DIR` always win, and recovery copies remain in history.
 - On first start with the dedicated TLS mount, Resolix copies known CA and pin files from legacy `HISTORY_DIR/tls` when their destinations are absent. The recovery copies are left in place and may be removed after the new mount is backed up and verified.
 - Native installs should use [`contrib/resolix.service`](contrib/resolix.service). It still reads the legacy environment and state locations as fallbacks.
 - Replace `MODE=master` with `MODE=controller`, `MODE=slave` with `MODE=agent`, and `MASTER_URL` with `CONTROLLER_URL`. Legacy values remain accepted during migration.

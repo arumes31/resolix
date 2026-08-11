@@ -1,5 +1,18 @@
 const apiBase = (document.body.dataset.baseUrl || '/').replace(/\/$/, '');
-const state = { editable: false, mode: '', revision: '', routes: {}, subscriptions: [], clients: [], services: [], editingClient: null };
+const state = {
+    editable: false,
+    mode: '',
+    revision: '',
+    routes: {},
+    subscriptions: [],
+    rewrites: [],
+    clients: [],
+    services: [],
+    editingRewrite: null,
+    pendingRewriteDelete: null,
+    rewriteDeleteTrigger: null,
+    editingClient: null
+};
 const tailscaleRewriteCIDRs = ['100.64.0.0/10', 'fd7a:115c:a1e0::/48'];
 
 function apiPath(path) { return apiBase + path; }
@@ -266,22 +279,84 @@ function rewriteScopeState() {
 
 function rewriteScopeLabel(sourceCIDRs = []) {
     if (sourceCIDRs.length === 0) return 'All clients';
+    return isTailscaleRewriteScope(sourceCIDRs) ? 'Tailscale only' : sourceCIDRs.join(', ');
+}
+
+function isTailscaleRewriteScope(sourceCIDRs = []) {
     const sorted = [...sourceCIDRs].sort();
-    const tailscaleOnly = sorted.length === tailscaleRewriteCIDRs.length &&
+    return sorted.length === tailscaleRewriteCIDRs.length &&
         tailscaleRewriteCIDRs.every((cidr, index) => sorted[index] === cidr);
-    return tailscaleOnly ? 'Tailscale only' : sourceCIDRs.join(', ');
+}
+
+function findRewrite(id) {
+    return state.rewrites.find(item => item.id === id);
+}
+
+function resetRewriteForm() {
+    document.getElementById('rewriteForm').reset();
+    state.editingRewrite = null;
+    document.getElementById('rewriteSaveBtn').textContent = 'Add rewrite';
+    document.getElementById('rewriteCancelBtn').classList.add('is-hidden');
+    rewriteValueState();
+    rewriteScopeState();
+}
+
+function populateRewriteForm(item, editing) {
+    resetRewriteForm();
+    state.editingRewrite = editing ? item.id : null;
+    document.getElementById('rewriteDomain').value = item.domain || '';
+    document.getElementById('rewriteType').value = item.type || 'A';
+    document.getElementById('rewriteValue').value = item.value || '';
+
+    const sourceCIDRs = item.source_cidrs || [];
+    const tailscaleOnly = isTailscaleRewriteScope(sourceCIDRs);
+    document.getElementById('rewriteTailscaleOnly').checked = tailscaleOnly;
+    document.getElementById('rewriteSourceCIDRs').value = tailscaleOnly ? '' : sourceCIDRs.join(', ');
+    document.getElementById('rewriteSaveBtn').textContent = editing ? 'Save changes' : 'Add cloned rewrite';
+    document.getElementById('rewriteCancelBtn').classList.remove('is-hidden');
+    rewriteValueState();
+    rewriteScopeState();
+
+    const form = document.getElementById('rewriteForm');
+    form.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    document.getElementById('rewriteDomain').focus({ preventScroll: true });
+    notice(editing ? `Editing rewrite for ${item.domain}` : `Cloned ${item.domain}; review and add the new rewrite`);
+}
+
+function editRewrite(id) {
+    const item = findRewrite(id);
+    if (!item) {
+        notice('Rewrite no longer exists; refresh and try again', true);
+        return;
+    }
+    populateRewriteForm(item, true);
+}
+
+function cloneRewrite(id) {
+    const item = findRewrite(id);
+    if (!item) {
+        notice('Rewrite no longer exists; refresh and try again', true);
+        return;
+    }
+    populateRewriteForm(item, false);
 }
 
 async function loadRewrites() {
     const data = await apiJSON('/api/rewrites');
     const items = data.rewrites || [];
+    state.rewrites = items;
+    if (state.editingRewrite && !findRewrite(state.editingRewrite)) resetRewriteForm();
     document.getElementById('rewriteCount').textContent = `${items.length} ${items.length === 1 ? 'rule' : 'rules'}`;
     document.getElementById('rewriteList').innerHTML = items.map(item => `
         <div class="settings-list-row"><div class="settings-list-main">
             <div class="settings-list-title">${escapeHtml(item.domain)}</div>
             <div class="settings-list-meta">${escapeHtml(item.type)}${item.value ? ` → ${escapeHtml(item.value)}` : ''}</div>
             <div class="settings-list-meta">Sources: ${escapeHtml(rewriteScopeLabel(item.source_cidrs || []))}</div>
-        </div><div class="row-actions controller-edit"><button type="button" class="mini-action danger rewrite-delete" data-id="${escapeHtml(item.id)}">Delete</button></div></div>`
+        </div><div class="row-actions controller-edit">
+            <button type="button" class="mini-action rewrite-edit" data-id="${escapeHtml(item.id)}">Edit</button>
+            <button type="button" class="mini-action rewrite-clone" data-id="${escapeHtml(item.id)}">Clone</button>
+            <button type="button" class="mini-action danger rewrite-delete" data-id="${escapeHtml(item.id)}">Delete</button>
+        </div></div>`
     ).join('') || emptyState('No DNS rewrites configured');
     setEditable(state.editable);
 }
@@ -292,20 +367,63 @@ async function saveRewrite(event) {
     const sourceCIDRs = document.getElementById('rewriteTailscaleOnly').checked
         ? tailscaleRewriteCIDRs
         : splitList(document.getElementById('rewriteSourceCIDRs').value);
-    await apiJSON('/api/rewrites', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+    const editingID = state.editingRewrite;
+    const path = editingID ? `/api/rewrites?id=${encodeURIComponent(editingID)}` : '/api/rewrites';
+    await apiJSON(path, {
+        method: editingID ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
             domain, type: document.getElementById('rewriteType').value,
             value: document.getElementById('rewriteValue').value.trim(), source_cidrs: sourceCIDRs
         })
     });
-    event.target.reset(); rewriteValueState(); rewriteScopeState(); notice(`Rewrite added for ${domain}`);
+    resetRewriteForm();
+    notice(editingID ? `Rewrite updated for ${domain}` : `Rewrite added for ${domain}`);
     await Promise.all([loadRewrites(), loadStatus()]);
 }
 
 async function deleteRewrite(id) {
     await apiJSON(`/api/rewrites?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (state.editingRewrite === id) resetRewriteForm();
     notice('Rewrite deleted');
     await Promise.all([loadRewrites(), loadStatus()]);
+}
+
+function openRewriteDeleteDialog(id, trigger) {
+    const item = findRewrite(id);
+    if (!item) {
+        notice('Rewrite no longer exists; refresh and try again', true);
+        return;
+    }
+    state.pendingRewriteDelete = id;
+    state.rewriteDeleteTrigger = trigger;
+    document.getElementById('rewriteDeleteMessage').textContent =
+        `Delete ${item.type} rewrite for “${item.domain}”? It will be removed from every synchronized node.`;
+    document.getElementById('rewriteDeleteDialog').showModal();
+    document.getElementById('rewriteDeleteConfirmBtn').focus();
+}
+
+function closeRewriteDeleteDialog(restoreFocus = true) {
+    const dialog = document.getElementById('rewriteDeleteDialog');
+    const trigger = state.rewriteDeleteTrigger;
+    state.pendingRewriteDelete = null;
+    state.rewriteDeleteTrigger = null;
+    if (dialog.open) dialog.close();
+    if (restoreFocus && trigger && trigger.isConnected) trigger.focus();
+}
+
+async function confirmRewriteDelete() {
+    const id = state.pendingRewriteDelete;
+    if (!id) return;
+    const button = document.getElementById('rewriteDeleteConfirmBtn');
+    const originalText = button.textContent;
+    button.disabled = true;
+    button.textContent = 'Deleting…';
+    try {
+        await deleteRewrite(id);
+        if (state.pendingRewriteDelete === id) closeRewriteDeleteDialog(false);
+    } finally {
+        button.disabled = false;
+        button.textContent = originalText;
+    }
 }
 
 function renderServicePicker(selected = []) {
@@ -424,6 +542,7 @@ document.getElementById('userRulesForm').addEventListener('submit', event => sav
 document.getElementById('rewriteType').addEventListener('change', rewriteValueState);
 document.getElementById('rewriteTailscaleOnly').addEventListener('change', rewriteScopeState);
 document.getElementById('rewriteForm').addEventListener('submit', event => saveRewrite(event).catch(error => notice(error.message, true)));
+document.getElementById('rewriteCancelBtn').addEventListener('click', resetRewriteForm);
 document.getElementById('clientForm').addEventListener('submit', event => saveClient(event).catch(error => notice(error.message, true)));
 document.getElementById('clientCancelBtn').addEventListener('click', resetClientForm);
 document.getElementById('clientUseGlobal').addEventListener('change', setClientPolicyState);
@@ -437,8 +556,21 @@ document.getElementById('routeList').addEventListener('click', event => {
     if (button) deleteRoute(button.dataset.pattern).catch(error => notice(error.message, true));
 });
 document.getElementById('rewriteList').addEventListener('click', event => {
-    const button = event.target.closest('.rewrite-delete');
-    if (button) deleteRewrite(button.dataset.id).catch(error => notice(error.message, true));
+    const edit = event.target.closest('.rewrite-edit');
+    const clone = event.target.closest('.rewrite-clone');
+    const remove = event.target.closest('.rewrite-delete');
+    if (edit) editRewrite(edit.dataset.id);
+    if (clone) cloneRewrite(clone.dataset.id);
+    if (remove) openRewriteDeleteDialog(remove.dataset.id, remove);
+});
+document.getElementById('rewriteDeleteCancelBtn').addEventListener('click', () => closeRewriteDeleteDialog());
+document.getElementById('rewriteDeleteConfirmBtn').addEventListener('click', () => confirmRewriteDelete().catch(error => notice(error.message, true)));
+document.getElementById('rewriteDeleteDialog').addEventListener('cancel', event => {
+    event.preventDefault();
+    closeRewriteDeleteDialog();
+});
+document.getElementById('rewriteDeleteDialog').addEventListener('click', event => {
+    if (event.target === event.currentTarget) closeRewriteDeleteDialog();
 });
 document.getElementById('clientList').addEventListener('click', event => {
     const edit = event.target.closest('.client-edit'); const remove = event.target.closest('.client-delete');
@@ -450,5 +582,5 @@ document.getElementById('pause5Btn').addEventListener('click', () => apiJSON('/a
 document.getElementById('resumeBtn').addEventListener('click', () => apiJSON('/api/filtering/pause', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"minutes":0}' }).then(() => notice('Filtering resumed')).catch(error => notice(error.message, true)));
 document.getElementById('refreshSettingsBtn').addEventListener('click', () => Promise.all([loadStatus(), activatePanel((location.hash || '#upstreams').slice(1), false)]).then(() => notice('Configuration refreshed')).catch(error => notice(error.message, true)));
 
-rewriteValueState(); rewriteScopeState(); resetSubscriptionForm(); resetClientForm();
+resetRewriteForm(); resetSubscriptionForm(); resetClientForm();
 loadStatus().then(() => activatePanel((location.hash || '#upstreams').slice(1), false)).catch(error => notice(error.message, true));

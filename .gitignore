@@ -29,6 +29,10 @@ __pycache__/
 # App specific
 webgui/coverage
 coverage*
+# Persistent Compose state
+/config/
+/history/
+/tailscale/
 # Generated controller CA and agent trust pins (dedicated Compose mount)
 /tls/
 graphify-out/

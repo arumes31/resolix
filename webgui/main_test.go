@@ -39,6 +39,7 @@ func setupTest() (*config.Config, *storage.Store, *parser.Parser, *api.Server) {
 		panic(fmt.Sprintf("failed to create temp dir: %v", err))
 	}
 	cfg.HistoryDir = tmp
+	cfg.ConfigDir = tmp
 	store := storage.NewStore(cfg)
 	store.Init()
 	prs := parser.NewParser(store, false)

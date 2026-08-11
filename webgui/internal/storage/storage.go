@@ -232,13 +232,13 @@ func (s *Store) prepareStatements() error {
 	}
 
 	s.stmtGetTopDomains, err = s.db.Prepare(
-		"SELECT domain, COUNT(*) as c FROM queries WHERE unix_time >= ? GROUP BY domain ORDER BY c DESC LIMIT 10")
+		"SELECT domain, COUNT(*) as c FROM queries WHERE unix_time >= ? GROUP BY domain")
 	if err != nil {
 		return fmt.Errorf("prepare stmtGetTopDomains: %w", err)
 	}
 
 	s.stmtGetTopClients, err = s.db.Prepare(
-		"SELECT client_ip, COUNT(*) as c FROM queries WHERE unix_time >= ? GROUP BY client_ip ORDER BY c DESC LIMIT 10")
+		"SELECT client_ip, COUNT(*) as c FROM queries WHERE unix_time >= ? GROUP BY client_ip")
 	if err != nil {
 		return fmt.Errorf("prepare stmtGetTopClients: %w", err)
 	}
@@ -591,10 +591,10 @@ func (s *Store) GetEventsAfter(cursor string, since int64, limit int) []models.Q
 //nolint:gocyclo
 func (s *Store) GetStats() map[string]interface{} {
 	s.archiveMu.Lock()
+	defer s.archiveMu.Unlock()
 	s.batchMu.Lock()
 	pending := append([]models.QueryEvent(nil), s.pendingBatchLocked()...)
 	s.batchMu.Unlock()
-	s.archiveMu.Unlock()
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
@@ -648,6 +648,9 @@ func (s *Store) GetStats() map[string]interface{} {
 	var rpd int
 	var cacheHits, totalReplies int64
 	var queryErrors []string
+	domainCounts := make(map[string]int)
+	clientCounts := make(map[string]int)
+	heatmap := make(map[string]int)
 	if s.db != nil {
 		if err := s.db.QueryRow("SELECT COUNT(*) FROM queries").Scan(&totalEvents); err != nil && err != sql.ErrNoRows {
 			log.Printf("Error getting totalEvents: %v", err)
@@ -675,6 +678,10 @@ func (s *Store) GetStats() map[string]interface{} {
 		if event.Upstream == "System Cache" {
 			cacheHits++
 		}
+		domainCounts[event.Domain]++
+		clientCounts[event.ClientIP]++
+		hour := time.Unix(event.UnixTime, 0).Format("15:00")
+		heatmap[hour]++
 	}
 
 	cacheHitRatio := 0.0
@@ -685,12 +692,8 @@ func (s *Store) GetStats() map[string]interface{} {
 	// Item 67: Bandwidth savings estimate (100 bytes per cached query)
 	bandwidthSaved := cacheHits * 100
 
-	domainCounts := make(map[string]int)
-	clientCounts := make(map[string]int)
-	heatmap := make(map[string]int)
-
 	if s.db != nil {
-		// Top 10 Domains (use cached prepared statement if available)
+		// Domain candidates (the Top 10 are selected after pending counts are merged).
 		if s.stmtGetTopDomains != nil {
 			rowsDomains, err := s.stmtGetTopDomains.Query(cutoff24h)
 			if err == nil {
@@ -698,7 +701,7 @@ func (s *Store) GetStats() map[string]interface{} {
 					var d string
 					var c int
 					if rowsDomains.Scan(&d, &c) == nil {
-						domainCounts[d] = c
+						domainCounts[d] += c
 					}
 				}
 				if err := rowsDomains.Err(); err != nil {
@@ -708,7 +711,7 @@ func (s *Store) GetStats() map[string]interface{} {
 			}
 		}
 
-		// Top 10 Clients (use cached prepared statement if available)
+		// Client candidates (the Top 10 are selected after pending counts are merged).
 		if s.stmtGetTopClients != nil {
 			rowsClients, err := s.stmtGetTopClients.Query(cutoff24h)
 			if err == nil {
@@ -716,7 +719,7 @@ func (s *Store) GetStats() map[string]interface{} {
 					var ip string
 					var c int
 					if rowsClients.Scan(&ip, &c) == nil {
-						clientCounts[ip] = c
+						clientCounts[ip] += c
 					}
 				}
 				if err := rowsClients.Err(); err != nil {
@@ -735,7 +738,7 @@ func (s *Store) GetStats() map[string]interface{} {
 				var c int
 				if rowsHeatmap.Scan(&hr, &c) == nil {
 					t := time.Unix(hr*3600, 0)
-					heatmap[t.Format("15:00")] = c
+					heatmap[t.Format("15:00")] += c
 				}
 			}
 			if err := rowsHeatmap.Err(); err != nil {

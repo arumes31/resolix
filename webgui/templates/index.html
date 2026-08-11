@@ -11,7 +11,7 @@
     <link rel="stylesheet" href="static/css/style.css">
 </head>
 
-<body class="app-page dashboard-page" data-base-url="{{.BaseURL}}" data-csrf-token="{{.CSRFToken}}" data-mode="{{.Mode}}">
+<body class="app-page dashboard-page compact" data-base-url="{{.BaseURL}}" data-csrf-token="{{.CSRFToken}}" data-mode="{{.Mode}}">
     <div id="sidebarScrim" class="sidebar-scrim" aria-hidden="true"></div>
     <aside id="appSidebar" class="app-sidebar" aria-label="Primary navigation">
         <div class="sidebar-brand">
@@ -77,7 +77,6 @@
                     <input type="text" id="searchInput" class="search-input" placeholder="Filter live queries…" aria-label="Filter DNS queries">
                 </div>
                 <button id="freezeBtn" type="button" class="btn-icon" title="Freeze live query log" aria-label="Freeze live query log" aria-pressed="false">Ⅱ</button>
-                <button id="compactToggle" type="button" class="btn-icon" title="Toggle compact mode" aria-label="Toggle compact mode" aria-pressed="false">↕</button>
                 <button id="clearViewBtn" type="button" class="btn-icon" title="Clear query view" aria-label="Clear query view">×</button>
             </div>
         </header>

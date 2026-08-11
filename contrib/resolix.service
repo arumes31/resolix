@@ -33,13 +33,13 @@ Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
 RuntimeDirectory=tailscale
-StateDirectory=tailscale resolix tailscale-dnsrewrite
+StateDirectory=tailscale resolix resolix-config tailscale-dnsrewrite
 
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/tailscale /var/lib/resolix /var/lib/tailscale-dnsrewrite /var/run/tailscale
+ReadWritePaths=/var/lib/tailscale /var/lib/resolix /var/lib/resolix-config /var/lib/tailscale-dnsrewrite /var/run/tailscale
 PrivateTmp=true
 
 # Logging

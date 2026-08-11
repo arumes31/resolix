@@ -144,7 +144,7 @@ func (s *Server) configuredBootstrapServers() []string {
 }
 
 func (s *Server) currentConfigSnapshot() (configsync.Snapshot, error) {
-	rules, err := os.ReadFile(s.userRulesPath()) // #nosec G304 -- path is derived from trusted HistoryDir configuration
+	rules, err := os.ReadFile(s.userRulesPath()) // #nosec G304 -- path is derived from trusted ConfigDir configuration
 	if err != nil && !os.IsNotExist(err) {
 		return configsync.Snapshot{}, fmt.Errorf("read user rules: %w", err)
 	}
@@ -194,37 +194,38 @@ func (s *Server) handleConfigStatus(w http.ResponseWriter, r *http.Request) {
 		"editable": s.isController(),
 		"revision": snapshot.Revision,
 		"runtime": map[string]interface{}{
-			"upstream_mode":          s.cfg.UpstreamMode,
-			"fallback_dns":           s.cfg.FallbackDNS,
-			"bootstrap_dns":          strings.Join(snapshot.BootstrapServers, " "),
-			"ecs_client_subnet":      s.cfg.ECSClientSubnet,
-			"blocking_mode":          s.cfg.BlockingMode,
-			"block_custom_ipv4":      s.cfg.BlockCustomIP4,
-			"block_custom_ipv6":      s.cfg.BlockCustomIP6,
-			"safe_search":            s.cfg.SafeSearch,
-			"bogus_nxdomain":         s.cfg.BogusNXDOMAIN,
-			"aaaa_disabled":          s.cfg.AAAADisabled,
-			"refuse_any":             s.cfg.RefuseANY,
-			"dnssec":                 s.cfg.DNSSEC,
-			"dns64":                  s.cfg.DNS64,
-			"dns64_prefixes":         s.cfg.DNS64Prefixes,
-			"private_ptr":            s.cfg.PrivatePTR,
-			"rate_limit_qps":         s.cfg.RateLimitQPS,
-			"blocked_services":       s.cfg.BlockedServices,
-			"cache_min_ttl":          s.cfg.CacheMinTTL,
-			"cache_max_ttl":          s.cfg.CacheMaxTTL,
-			"cache_optimistic":       s.cfg.CacheOptimistic,
-			"filter_update_interval": s.cfg.FilterUpdateInterval.String(),
-			"doh_enabled":            s.cfg.DoHEnabled,
-			"doh_path":               s.cfg.DoHPath,
-			"dot_enabled":            s.cfg.DoTEnabled,
-			"dot_port":               s.cfg.DoTPort,
-			"dns_listen_address":     s.cfg.DNSListenAddr,
-			"dns_listen_port":        s.cfg.DNSListenPort,
-			"dns_allowed_clients":    s.cfg.DNSAllowedClients,
-			"dns_disallowed_clients": s.cfg.DNSDisallowedClients,
-			"healthcheck_domain":     s.cfg.HealthDomain,
-			"history_retention":      s.cfg.HistoryRetention.String(),
+			"upstream_mode":           s.cfg.UpstreamMode,
+			"fallback_dns":            s.cfg.FallbackDNS,
+			"bootstrap_dns":           strings.Join(snapshot.BootstrapServers, " "),
+			"ecs_client_subnet":       s.cfg.ECSClientSubnet,
+			"blocking_mode":           s.cfg.BlockingMode,
+			"block_custom_ipv4":       s.cfg.BlockCustomIP4,
+			"block_custom_ipv6":       s.cfg.BlockCustomIP6,
+			"safe_search":             s.cfg.SafeSearch,
+			"bogus_nxdomain":          s.cfg.BogusNXDOMAIN,
+			"aaaa_disabled":           s.cfg.AAAADisabled,
+			"refuse_any":              s.cfg.RefuseANY,
+			"dnssec":                  s.cfg.DNSSEC,
+			"dns64":                   s.cfg.DNS64,
+			"dns64_prefixes":          s.cfg.DNS64Prefixes,
+			"private_ptr":             s.cfg.PrivatePTR,
+			"rate_limit_qps":          s.cfg.RateLimitQPS,
+			"rate_limit_internal_qps": s.cfg.InternalRateLimitQPS,
+			"blocked_services":        s.cfg.BlockedServices,
+			"cache_min_ttl":           s.cfg.CacheMinTTL,
+			"cache_max_ttl":           s.cfg.CacheMaxTTL,
+			"cache_optimistic":        s.cfg.CacheOptimistic,
+			"filter_update_interval":  s.cfg.FilterUpdateInterval.String(),
+			"doh_enabled":             s.cfg.DoHEnabled,
+			"doh_path":                s.cfg.DoHPath,
+			"dot_enabled":             s.cfg.DoTEnabled,
+			"dot_port":                s.cfg.DoTPort,
+			"dns_listen_address":      s.cfg.DNSListenAddr,
+			"dns_listen_port":         s.cfg.DNSListenPort,
+			"dns_allowed_clients":     s.cfg.DNSAllowedClients,
+			"dns_disallowed_clients":  s.cfg.DNSDisallowedClients,
+			"healthcheck_domain":      s.cfg.HealthDomain,
+			"history_retention":       s.cfg.HistoryRetention.String(),
 		},
 	})
 }
@@ -270,7 +271,7 @@ func (s *Server) handleUserRules(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch r.Method {
 	case http.MethodGet:
-		data, err := os.ReadFile(s.userRulesPath()) // #nosec G304 -- path is derived from trusted HistoryDir configuration
+		data, err := os.ReadFile(s.userRulesPath()) // #nosec G304 -- path is derived from trusted ConfigDir configuration
 		if err != nil && !os.IsNotExist(err) {
 			http.Error(w, "Failed to read user rules", http.StatusInternalServerError)
 			return

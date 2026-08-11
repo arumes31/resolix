@@ -31,6 +31,8 @@ const (
 	DefaultWebListenAddr = "0.0.0.0"
 	// DefaultHistoryDir is the default directory for JSONL history files.
 	DefaultHistoryDir = "/var/lib/resolix"
+	// DefaultConfigDir is the default directory for persistent managed settings.
+	DefaultConfigDir = "/var/lib/resolix-config"
 	// DefaultTLSStateDir is the default directory for generated controller TLS state.
 	DefaultTLSStateDir = "/var/lib/resolix-tls"
 	// DefaultDBPath is the default database file name.
@@ -60,7 +62,7 @@ const (
 	// DefaultUpstreamsFile is the default path to the upstreams JSON file.
 	DefaultUpstreamsFile = "upstreams.json"
 	// DefaultDNSRoutesFile is the default path to the DNS routes JSON file.
-	DefaultDNSRoutesFile = ""
+	DefaultDNSRoutesFile = "dns-routes.json"
 	// DefaultDNSMasqPIDFile is the default path to the dnsmasq PID file.
 	//
 	// Deprecated: dnsmasq has been replaced by the in-process DNS server.
@@ -81,8 +83,10 @@ const (
 	DefaultRewritesFile = "rewrites.json"
 	// DefaultClientsFile is the default per-client registry file name.
 	DefaultClientsFile = "clients.json"
-	// DefaultRateLimitQPS is the default per-subnet query rate limit.
-	DefaultRateLimitQPS = 20
+	// DefaultRateLimitQPS is the default per-IP query limit for public clients.
+	DefaultRateLimitQPS = 80
+	// DefaultInternalRateLimitQPS is the default per-IP limit for LAN and Tailscale clients.
+	DefaultInternalRateLimitQPS = 1000
 	// DefaultDoHPath is the default DNS-over-HTTPS endpoint path.
 	DefaultDoHPath = "/dns-query"
 	// DefaultDoTPort is the default DNS-over-TLS listen port.
@@ -138,12 +142,14 @@ const (
 
 // Config holds the application configuration.
 type Config struct {
-	Mode             string
-	ControllerURL    string
-	NodeName         string
-	Port             string
-	WebListenAddr    string
-	HistoryDir       string
+	Mode          string
+	ControllerURL string
+	NodeName      string
+	Port          string
+	WebListenAddr string
+	HistoryDir    string
+	// ConfigDir contains persistent controller-managed DNS configuration.
+	ConfigDir        string
 	TLSStateDir      string
 	DBPath           string
 	MaxEvents        int
@@ -243,8 +249,10 @@ type Config struct {
 	DNSAllowedClients string
 	// DNSDisallowedClients drops queries from these IPs/CIDRs silently.
 	DNSDisallowedClients string
-	// RateLimitQPS limits queries per second per subnet (0 = disabled).
+	// RateLimitQPS limits queries per second per public client IP (0 = disabled).
 	RateLimitQPS int
+	// InternalRateLimitQPS limits LAN and Tailscale clients per IP (0 = disabled).
+	InternalRateLimitQPS int
 	// PrivatePTR answers PTR for known private clients locally (default true).
 	PrivatePTR bool
 	// DNSSEC enables DO-bit passthrough to upstreams (no local validation).
@@ -802,6 +810,10 @@ func LoadConfig() *Config {
 	if historyDir == "" {
 		historyDir = DefaultHistoryDir
 	}
+	configDir := strings.TrimSpace(os.Getenv("CONFIG_DIR"))
+	if configDir == "" {
+		configDir = DefaultConfigDir
+	}
 	tlsStateDir := strings.TrimSpace(os.Getenv("TLS_STATE_DIR"))
 	if tlsStateDir == "" {
 		tlsStateDir = DefaultTLSStateDir
@@ -966,6 +978,7 @@ func LoadConfig() *Config {
 		Port:                       port,
 		WebListenAddr:              webListenAddr,
 		HistoryDir:                 historyDir,
+		ConfigDir:                  configDir,
 		TLSStateDir:                tlsStateDir,
 		DBPath:                     dbPath,
 		MaxEvents:                  DefaultMaxEvents,
@@ -1023,6 +1036,7 @@ func LoadConfig() *Config {
 		DNSAllowedClients:          os.Getenv("DNS_ALLOWED_CLIENTS"),
 		DNSDisallowedClients:       os.Getenv("DNS_DISALLOWED_CLIENTS"),
 		RateLimitQPS:               parseIntEnv("RATE_LIMIT_QPS", DefaultRateLimitQPS),
+		InternalRateLimitQPS:       parseIntEnv("RATE_LIMIT_INTERNAL_QPS", DefaultInternalRateLimitQPS),
 		PrivatePTR:                 strings.ToLower(os.Getenv("PRIVATE_PTR")) != "false",
 		DNSSEC:                     strings.ToLower(os.Getenv("DNSSEC")) == "true",
 		DoHEnabled:                 strings.ToLower(os.Getenv("DOH_ENABLED")) == "true",
@@ -1074,6 +1088,16 @@ func (c *Config) FullDBPath() string {
 	return filepath.Join(c.HistoryDir, c.DBPath)
 }
 
+// FullConfigDir returns the persistent managed-configuration directory. The
+// HistoryDir fallback preserves manually constructed Config values and older
+// embedders that have not set ConfigDir yet.
+func (c *Config) FullConfigDir() string {
+	if c.ConfigDir != "" {
+		return c.ConfigDir
+	}
+	return c.HistoryDir
+}
+
 // FullUpstreamsPath returns the complete upstreams file path.
 func (c *Config) FullUpstreamsPath() string {
 	if c.UpstreamsFile == "" {
@@ -1082,7 +1106,7 @@ func (c *Config) FullUpstreamsPath() string {
 	if filepath.IsAbs(c.UpstreamsFile) {
 		return c.UpstreamsFile
 	}
-	return filepath.Join(c.HistoryDir, c.UpstreamsFile)
+	return filepath.Join(c.FullConfigDir(), c.UpstreamsFile)
 }
 
 // FullDNSRoutesPath returns the complete DNS routes file path.
@@ -1093,7 +1117,7 @@ func (c *Config) FullDNSRoutesPath() string {
 	if filepath.IsAbs(c.DNSRoutesFile) {
 		return c.DNSRoutesFile
 	}
-	return filepath.Join(c.HistoryDir, c.DNSRoutesFile)
+	return filepath.Join(c.FullConfigDir(), c.DNSRoutesFile)
 }
 
 // FullRewritesPath returns the complete rewrites file path.
@@ -1104,7 +1128,7 @@ func (c *Config) FullRewritesPath() string {
 	if filepath.IsAbs(c.RewritesFile) {
 		return c.RewritesFile
 	}
-	return filepath.Join(c.HistoryDir, c.RewritesFile)
+	return filepath.Join(c.FullConfigDir(), c.RewritesFile)
 }
 
 // FullClientsPath returns the complete clients registry file path.
@@ -1115,7 +1139,7 @@ func (c *Config) FullClientsPath() string {
 	if filepath.IsAbs(c.ClientsFile) {
 		return c.ClientsFile
 	}
-	return filepath.Join(c.HistoryDir, c.ClientsFile)
+	return filepath.Join(c.FullConfigDir(), c.ClientsFile)
 }
 
 // FullBlocklistPath returns the complete blocklist file path.
@@ -1126,7 +1150,17 @@ func (c *Config) FullBlocklistPath() string {
 	if filepath.IsAbs(c.BlocklistFile) {
 		return c.BlocklistFile
 	}
-	return filepath.Join(c.HistoryDir, c.BlocklistFile)
+	return filepath.Join(c.FullConfigDir(), c.BlocklistFile)
+}
+
+// FullUserRulesPath returns the controller-managed custom rules path.
+func (c *Config) FullUserRulesPath() string {
+	return filepath.Join(c.FullConfigDir(), "user_rules.txt")
+}
+
+// FullFilterSubscriptionsPath returns the managed filter-subscription path.
+func (c *Config) FullFilterSubscriptionsPath() string {
+	return filepath.Join(c.FullConfigDir(), "filter-subscriptions.json")
 }
 
 // FullTLSStateDir returns the generated TLS state directory. The history/tls

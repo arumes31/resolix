@@ -239,6 +239,8 @@ func TestDashboardQuickWinMarkers(t *testing.T) {
 		"dashboardWarningCount",
 		"updateDashboardAttention",
 		"syncAllDashboardNodes",
+		"stats.upstream_node_names || {}",
+		"nodeNames[node] || node",
 	} {
 		if !bytes.Contains(scriptContent, []byte(marker)) {
 			t.Fatalf("dashboard script is missing quick-win behavior %q", marker)

@@ -22,15 +22,16 @@ const (
 
 // Device is the subset of the Tailscale device schema needed for MagicDNS.
 type Device struct {
-	ID          string   `json:"id"`
-	NodeID      string   `json:"nodeId"`
-	Name        string   `json:"name"`
-	Hostname    string   `json:"hostname"`
-	Addresses   []string `json:"addresses"`
-	Expires     string   `json:"expires"`
-	Authorized  bool     `json:"authorized"`
-	IsExternal  bool     `json:"isExternal"`
-	IsEphemeral bool     `json:"isEphemeral"`
+	ID                string   `json:"id"`
+	NodeID            string   `json:"nodeId"`
+	Name              string   `json:"name"`
+	Hostname          string   `json:"hostname"`
+	Addresses         []string `json:"addresses"`
+	Expires           string   `json:"expires"`
+	Authorized        bool     `json:"authorized"`
+	KeyExpiryDisabled bool     `json:"keyExpiryDisabled"`
+	IsExternal        bool     `json:"isExternal"`
+	IsEphemeral       bool     `json:"isEphemeral"`
 }
 
 type tokenResponse struct {

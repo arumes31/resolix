@@ -57,7 +57,7 @@ function renderDashboardStats(stats) {
     renderNodeComparison(stats.series || [], breakdowns.node_totals || {});
     renderTypeBreakdown(breakdowns.type_counts || {});
     renderTrafficHeatmap(stats.series || [], range.bucket_seconds || 0);
-    renderUpstreamHealth(stats.upstream_health || {}, stats.upstream_health_history || {});
+    renderUpstreamHealth(stats.upstream_health || {}, stats.upstream_health_history || {}, stats.upstream_node_names || {});
     renderFilteringStatus(stats.filtering || {});
     renderDashboardDegraded(stats);
     updateDashboardAttention(stats, false);
@@ -284,7 +284,7 @@ function renderTrafficHeatmap(series, bucketSeconds) {
     replaceHTMLIfChanged(element, html || '<div class="empty-small">No data</div>');
 }
 
-function renderUpstreamHealth(health, history) {
+function renderUpstreamHealth(health, history, nodeNames) {
     const element = document.getElementById('upstreamHealth');
     const nodes = Object.entries(health);
     if (nodes.length === 0) {
@@ -292,6 +292,7 @@ function renderUpstreamHealth(health, history) {
         return;
     }
     const html = nodes.map(([node, upstreams]) => {
+        const displayName = nodeNames[node] || node;
         const rows = Object.entries(upstreams).map(([upstream, latency]) => {
             const samples = history[node]?.[upstream] || [];
             const maxLatency = Math.max(...samples.filter(value => value > 0), 1);
@@ -302,7 +303,7 @@ function renderUpstreamHealth(health, history) {
             const isDown = latency === -1;
             return `<div class="health-row"><div class="health-label"><span class="health-ip">${escapeHtml(upstream)}</span><div class="sparkline">${sparkline}</div></div><span class="top-count health-status ${isDown ? 'down' : 'up'}">${isDown ? 'DOWN' : Number(latency).toFixed(1) + 'ms'}</span></div>`;
         }).join('');
-        return `<li class="health-node"><div class="health-node-title">Node: ${escapeHtml(node)}</div>${rows}</li>`;
+        return `<li class="health-node"><div class="health-node-title" title="Node ID: ${escapeHtml(node)}">Node: ${escapeHtml(displayName)}</div>${rows}</li>`;
     }).join('');
     replaceHTMLIfChanged(element, html);
 }

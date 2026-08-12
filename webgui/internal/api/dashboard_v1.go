@@ -78,19 +78,20 @@ type dashboardBreakdowns struct {
 }
 
 type dashboardV1Response struct {
-	SchemaVersion   int                             `json:"schema_version"`
-	GeneratedAt     time.Time                       `json:"generated_at"`
-	Range           dashboardRangeMetadata          `json:"range"`
-	Summary         storage.DashboardSummary        `json:"summary"`
-	Comparison      dashboardComparison             `json:"comparison"`
-	Runtime         dashboardRuntime                `json:"runtime"`
-	Series          []storage.DashboardSeriesPoint  `json:"series"`
-	Breakdowns      dashboardBreakdowns             `json:"breakdowns"`
-	Filtering       dashboardFilteringStatus        `json:"filtering"`
-	UpstreamHealth  map[string]map[string]float64   `json:"upstream_health"`
-	UpstreamHistory map[string]map[string][]float64 `json:"upstream_health_history"`
-	Degraded        bool                            `json:"degraded"`
-	Errors          []string                        `json:"errors"`
+	SchemaVersion     int                             `json:"schema_version"`
+	GeneratedAt       time.Time                       `json:"generated_at"`
+	Range             dashboardRangeMetadata          `json:"range"`
+	Summary           storage.DashboardSummary        `json:"summary"`
+	Comparison        dashboardComparison             `json:"comparison"`
+	Runtime           dashboardRuntime                `json:"runtime"`
+	Series            []storage.DashboardSeriesPoint  `json:"series"`
+	Breakdowns        dashboardBreakdowns             `json:"breakdowns"`
+	Filtering         dashboardFilteringStatus        `json:"filtering"`
+	UpstreamHealth    map[string]map[string]float64   `json:"upstream_health"`
+	UpstreamHistory   map[string]map[string][]float64 `json:"upstream_health_history"`
+	UpstreamNodeNames map[string]string               `json:"upstream_node_names"`
+	Degraded          bool                            `json:"degraded"`
+	Errors            []string                        `json:"errors"`
 }
 
 type statsCacheEntry struct {
@@ -178,6 +179,14 @@ func (s *Server) dashboardV1Response(
 		return nil, fmt.Errorf("collect dashboard stats: %w", err)
 	}
 	upstreamHealth, upstreamHistory := s.store.UpstreamHealthSnapshot()
+	upstreamNodeNames := make(map[string]string)
+	for _, node := range s.store.GetNodeStatuses() {
+		identity := strings.TrimSpace(node.ID)
+		name := strings.TrimSpace(node.Name)
+		if identity != "" && name != "" {
+			upstreamNodeNames[identity] = name
+		}
+	}
 	filtering := s.dashboardFilteringStatus()
 	errorsList := append([]string{}, stats.Errors...)
 	if !filtering.Enabled {
@@ -219,11 +228,12 @@ func (s *Server) dashboardV1Response(
 			NodeTotals:        stats.NodeTotals,
 			ResponseCodes:     stats.ResponseCodes,
 		},
-		Filtering:       filtering,
-		UpstreamHealth:  upstreamHealth,
-		UpstreamHistory: upstreamHistory,
-		Degraded:        stats.Degraded || !filtering.Enabled || filtering.SourceErrors > 0,
-		Errors:          errorsList,
+		Filtering:         filtering,
+		UpstreamHealth:    upstreamHealth,
+		UpstreamHistory:   upstreamHistory,
+		UpstreamNodeNames: upstreamNodeNames,
+		Degraded:          stats.Degraded || !filtering.Enabled || filtering.SourceErrors > 0,
+		Errors:            errorsList,
 	}
 	if response.Comparison.Available {
 		response.Comparison.Summary = stats.PreviousSummary

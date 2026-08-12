@@ -39,7 +39,12 @@ func TestClient_ListDevices(t *testing.T) {
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"devices": []Device{{NodeID: "node-1", Name: "host.example.ts.net", Authorized: true}},
+				"devices": []map[string]interface{}{{
+					"nodeId":            "node-1",
+					"name":              "host.example.ts.net",
+					"authorized":        true,
+					"keyExpiryDisabled": true,
+				}},
 			})
 		default:
 			http.NotFound(w, r)
@@ -56,7 +61,7 @@ func TestClient_ListDevices(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ListDevices: %v", err)
 		}
-		if len(devices) != 1 || devices[0].NodeID != "node-1" {
+		if len(devices) != 1 || devices[0].NodeID != "node-1" || !devices[0].KeyExpiryDisabled {
 			t.Fatalf("devices = %#v", devices)
 		}
 	}
@@ -124,10 +129,18 @@ func TestRecordsFromDevices(t *testing.T) {
 			Authorized: true,
 			Expires:    now.Add(-time.Minute).Format(time.RFC3339),
 		},
+		{
+			NodeID:            "node-4",
+			Name:              "never-expires.ts.net",
+			Addresses:         []string{"100.64.0.13"},
+			Authorized:        true,
+			KeyExpiryDisabled: true,
+			Expires:           now.Add(-time.Minute).Format(time.RFC3339),
+		},
 	}
 	records, devicesIncluded := RecordsFromDevices(devices, now)
-	if devicesIncluded != 1 || len(records) != 2 {
-		t.Fatalf("included devices/records = %d/%d, want 1/2", devicesIncluded, len(records))
+	if devicesIncluded != 2 || len(records) != 3 {
+		t.Fatalf("included devices/records = %d/%d, want 2/3", devicesIncluded, len(records))
 	}
 	if records[0].Name != "alpha.tailnet.ts.net" || records[0].Type != "A" || records[1].Type != "AAAA" {
 		t.Fatalf("records = %#v", records)

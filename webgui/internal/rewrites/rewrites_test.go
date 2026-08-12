@@ -210,6 +210,112 @@ func TestLookupMatching(t *testing.T) {
 	}
 }
 
+func TestLookupWildcardAndDomainSpecificity(t *testing.T) {
+	s, err := Load("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []Rewrite{
+		{Domain: "*.example.com", Type: TypeA, Value: "192.0.2.1"},
+		{Domain: "home.example.com", Type: TypeA, Value: "192.0.2.2"},
+		{Domain: "home.example.com", Type: TypeA, Value: "192.0.2.3"},
+		{Domain: "*.lab.example.com", Type: TypeA, Value: "192.0.2.4"},
+	} {
+		if _, err := s.Add(item.Domain, item.Type, item.Value); err != nil {
+			t.Fatalf("Add(%q): %v", item.Domain, err)
+		}
+	}
+
+	tests := []struct {
+		name   string
+		domain string
+		want   []string
+	}{
+		{name: "wildcard excludes apex", domain: "example.com"},
+		{name: "wildcard matches one label", domain: "printer.example.com", want: []string{"192.0.2.1"}},
+		{name: "wildcard matches multiple labels", domain: "deep.printer.example.com", want: []string{"192.0.2.1"}},
+		{name: "exact domain takes priority", domain: "home.example.com", want: []string{"192.0.2.2", "192.0.2.3"}},
+		{name: "more specific wildcard takes priority", domain: "printer.lab.example.com", want: []string{"192.0.2.4"}},
+		{name: "specific wildcard excludes its apex", domain: "lab.example.com", want: []string{"192.0.2.1"}},
+		{name: "label boundary", domain: "notexample.com"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := s.Lookup(test.domain)
+			if len(got) != len(test.want) {
+				t.Fatalf("Lookup(%q) = %+v, want values %v", test.domain, got, test.want)
+			}
+			for i, item := range got {
+				if item.Value != test.want[i] {
+					t.Errorf("Lookup(%q)[%d].Value = %q, want %q", test.domain, i, item.Value, test.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestLookupForClientPrefersNarrowestSource(t *testing.T) {
+	s, err := Load("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []Rewrite{
+		{Domain: "service.example", Type: TypeA, Value: "192.0.2.1"},
+		{Domain: "service.example", Type: TypeA, Value: "192.0.2.2", SourceCIDRs: []string{"100.64.0.0/10"}},
+		{Domain: "service.example", Type: TypeA, Value: "192.0.2.3", SourceCIDRs: []string{"100.100.0.0/16"}},
+		{Domain: "service.example", Type: TypeA, Value: "192.0.2.4", SourceCIDRs: []string{"100.100.0.0/16"}},
+	} {
+		if _, err := s.Add(item.Domain, item.Type, item.Value, item.SourceCIDRs...); err != nil {
+			t.Fatalf("Add(%q, %q): %v", item.Domain, item.Value, err)
+		}
+	}
+
+	tests := []struct {
+		name     string
+		clientIP string
+		want     []string
+	}{
+		{name: "outside uses all clients", clientIP: "192.168.1.20", want: []string{"192.0.2.1"}},
+		{name: "tailnet scope overrides all clients", clientIP: "100.101.1.20", want: []string{"192.0.2.2"}},
+		{name: "narrow subnet overrides tailnet", clientIP: "100.100.1.20", want: []string{"192.0.2.3", "192.0.2.4"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := s.LookupForClient("service.example", test.clientIP)
+			if len(got) != len(test.want) {
+				t.Fatalf("LookupForClient(%q) = %+v, want values %v", test.clientIP, got, test.want)
+			}
+			for i, item := range got {
+				if item.Value != test.want[i] {
+					t.Errorf("LookupForClient(%q)[%d].Value = %q, want %q", test.clientIP, i, item.Value, test.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestLookupForClientFallsBackWhenSpecificScopeDoesNotMatch(t *testing.T) {
+	s, err := Load("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Add("*.example.com", TypeA, "192.0.2.1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Add("home.example.com", TypeA, "192.0.2.2", "100.64.0.0/10"); err != nil {
+		t.Fatal(err)
+	}
+
+	outside := s.LookupForClient("home.example.com", "192.168.1.20")
+	if len(outside) != 1 || outside[0].Value != "192.0.2.1" {
+		t.Fatalf("outside client lookup = %+v, want wildcard fallback", outside)
+	}
+	tailnet := s.LookupForClient("home.example.com", "100.100.1.20")
+	if len(tailnet) != 1 || tailnet[0].Value != "192.0.2.2" {
+		t.Fatalf("tailnet client lookup = %+v, want exact scoped rewrite", tailnet)
+	}
+}
+
 func TestLookupFiltersBySourceCIDR(t *testing.T) {
 	s, err := Load("", "")
 	if err != nil {
@@ -303,6 +409,7 @@ func TestBuildRRPerType(t *testing.T) {
 func TestValidate(t *testing.T) {
 	valid := []struct{ domain, typ, value string }{
 		{"example.com", TypeA, "192.0.2.1"},
+		{"*.example.com", TypeA, "192.0.2.1"},
 		{"example.com", TypeAAAA, "2001:db8::1"},
 		{"example.com", TypeCNAME, "target.example.net"},
 		{"example.com", TypePTR, "host.example.net"},
@@ -321,6 +428,9 @@ func TestValidate(t *testing.T) {
 
 	invalid := []struct{ domain, typ, value string }{
 		{"", TypeA, "192.0.2.1"},
+		{"*example.com", TypeA, "192.0.2.1"},
+		{"*..example.com", TypeA, "192.0.2.1"},
+		{"foo.*.example.com", TypeA, "192.0.2.1"},
 		{"example.com", TypeA, "999.1.1.1"},
 		{"example.com", TypeAAAA, "192.0.2.1"},
 		{"example.com", TypeCNAME, ""},

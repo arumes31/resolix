@@ -29,6 +29,10 @@ func (s *Server) Unsubscribe(ch chan models.QueryEvent) {
 // channel is full, the event is dropped and the drop counter is incremented.
 // Subscribers that exceed 10 consecutive drops are removed.
 func (s *Server) BroadcastEvent(e models.QueryEvent) {
+	if e.ID == "" && s.store != nil {
+		e = s.store.AssignEventID(e)
+	}
+
 	// Item 59: Enrich with reverse DNS hostname
 	s.fieldsMu.RLock()
 	res := s.resolver

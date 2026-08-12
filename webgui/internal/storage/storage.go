@@ -293,8 +293,15 @@ func (s *Store) GetConfig() *config.Config {
 	return s.cfg
 }
 
-// AddEvent adds a new query event to the ring buffer and batches it for SQLite.
-func (s *Store) AddEvent(e models.QueryEvent) {
+// AssignEventID returns an event with a new store-scoped sequence ID.
+func (s *Store) AssignEventID(e models.QueryEvent) models.QueryEvent {
+	e.ID = fmt.Sprintf("%d", atomic.AddUint64(&s.idCounter, 1))
+	return e
+}
+
+// AddEvent adds a new query event to the ring buffer, batches it for SQLite,
+// and returns the stored copy with its assigned ID.
+func (s *Store) AddEvent(e models.QueryEvent) models.QueryEvent {
 	s.statsMu.Lock()
 	// Rolling buckets update
 	secBucket := e.UnixTime % 60
@@ -363,7 +370,7 @@ func (s *Store) AddEvent(e models.QueryEvent) {
 	s.statsMu.Unlock()
 
 	s.eventsMu.Lock()
-	e.ID = fmt.Sprintf("%d", atomic.AddUint64(&s.idCounter, 1))
+	e = s.AssignEventID(e)
 	s.events[s.head] = e
 	s.head = (s.head + 1) % s.cfg.MaxEvents
 	if s.count < s.cfg.MaxEvents {
@@ -403,6 +410,7 @@ func (s *Store) AddEvent(e models.QueryEvent) {
 	if droppedSinceWarning > 0 {
 		log.Printf("[WARN] SQLite archive batch full; dropped %d oldest event(s) since the previous warning (%d total)", droppedSinceWarning, droppedTotal)
 	}
+	return e
 }
 
 // UpdateEvent searches for a matching pending event and updates its latency and upstream in memory and batch.

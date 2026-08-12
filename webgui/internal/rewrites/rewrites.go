@@ -1,7 +1,8 @@
 // Package rewrites implements typed DNS rewrites with JSON persistence —
-// a superset of the dnsmasq address= semantics (apex + all subdomains,
-// label-boundary safe). Supported record types: A, AAAA, CNAME, PTR, MX,
-// TXT, SRV, plus RCODE rewrites (NXDOMAIN, REFUSED, NOERROR-empty).
+// a superset of the dnsmasq address= semantics. Plain domains match the apex
+// and all subdomains; leading wildcards match subdomains only. Both forms are
+// label-boundary safe. Supported record types: A, AAAA, CNAME, PTR, MX, TXT,
+// SRV, plus RCODE rewrites (NXDOMAIN, REFUSED, NOERROR-empty).
 package rewrites
 
 import (
@@ -45,7 +46,7 @@ const AnswerTTL = 60
 // Rewrite is a single typed DNS rewrite rule.
 type Rewrite struct {
 	ID             string   `json:"id"`
-	Domain         string   `json:"domain"` // normalized: lowercase, no leading/trailing dot
+	Domain         string   `json:"domain"` // normalized: lowercase, optional "*.", no trailing dot
 	Type           string   `json:"type"`
 	Value          string   `json:"value,omitempty"`
 	SourceCIDRs    []string `json:"source_cidrs,omitempty"`
@@ -60,25 +61,38 @@ func (rw Rewrite) String() string {
 	return fmt.Sprintf("%s %s %s", rw.Domain, rw.Type, rw.Value)
 }
 
-// matches reports whether the rewrite applies to the domain (apex + all
-// subdomains, label-boundary safe).
-func (rw Rewrite) matches(domain string) bool {
-	return domain == rw.Domain || strings.HasSuffix(domain, "."+rw.Domain)
+// domainSpecificity reports whether the rewrite applies to domain and returns
+// the length of its matching suffix. A leading wildcard excludes the apex.
+func (rw Rewrite) domainSpecificity(domain string) (int, bool) {
+	base := strings.TrimPrefix(rw.Domain, "*.")
+	if domain == base {
+		return len(base), !strings.HasPrefix(rw.Domain, "*.")
+	}
+	return len(base), strings.HasSuffix(domain, "."+base)
 }
 
 func (rw Rewrite) allowsSource(addr netip.Addr) bool {
+	_, allowed := rw.sourceSpecificity(addr)
+	return allowed
+}
+
+// sourceSpecificity returns the longest matching source prefix. Unrestricted
+// rules have specificity zero, so any matching subnet with a non-zero prefix
+// takes precedence while an explicit /0 remains tied with "all clients".
+func (rw Rewrite) sourceSpecificity(addr netip.Addr) (int, bool) {
 	if len(rw.sourcePrefixes) == 0 {
-		return len(rw.SourceCIDRs) == 0
+		return 0, len(rw.SourceCIDRs) == 0
 	}
 	if !addr.IsValid() {
-		return false
+		return 0, false
 	}
+	best := -1
 	for _, prefix := range rw.sourcePrefixes {
-		if prefix.Contains(addr) {
-			return true
+		if prefix.Contains(addr) && prefix.Bits() > best {
+			best = prefix.Bits()
 		}
 	}
-	return false
+	return best, best >= 0
 }
 
 // BuildRR constructs the DNS record for this rewrite. name is the original
@@ -194,7 +208,12 @@ func parseSRVValue(value string) (prio, weight, port uint16, target string, ok b
 // Validate checks a rewrite for well-formedness (used by the API).
 func Validate(domain, typ, value string) error {
 	domain = NormalizeDomain(domain)
-	if domain == "" || !strings.Contains(domain, ".") && domain != "localhost" {
+	base := strings.TrimPrefix(domain, "*.")
+	if base == "" ||
+		strings.Contains(base, "*") ||
+		strings.HasPrefix(base, ".") ||
+		strings.Contains(base, "..") ||
+		(!strings.Contains(base, ".") && base != "localhost") {
 		return fmt.Errorf("invalid domain %q", domain)
 	}
 	switch typ {
@@ -341,12 +360,14 @@ func Load(path, seedDomains string) (*Store, error) {
 	return s, nil
 }
 
-// Lookup returns all rewrites matching the domain.
+// Lookup returns rewrites at the most-specific matching domain. Source scopes
+// are not filtered, so records from every scope at that domain are returned.
 func (s *Store) Lookup(domain string) []Rewrite {
 	return s.lookup(domain, netip.Addr{}, false)
 }
 
-// LookupForClient returns rewrites matching both the domain and source IP.
+// LookupForClient returns the most-specific rewrites matching both the domain
+// and source IP. Domain specificity is considered before source specificity.
 func (s *Store) LookupForClient(domain, clientIP string) []Rewrite {
 	addr, _ := netip.ParseAddr(strings.TrimSpace(clientIP))
 	return s.lookup(domain, addr.Unmap(), true)
@@ -355,13 +376,31 @@ func (s *Store) LookupForClient(domain, clientIP string) []Rewrite {
 func (s *Store) lookup(domain string, sourceAddr netip.Addr, filterSource bool) []Rewrite {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	domain = NormalizeDomain(domain)
 	out := make([]Rewrite, 0)
+	bestDomain := -1
+	bestSource := -1
 	for _, rw := range s.items {
-		if !rw.matches(domain) {
+		domainSpecificity, matches := rw.domainSpecificity(domain)
+		if !matches {
 			continue
 		}
-		if filterSource && !rw.allowsSource(sourceAddr) {
+		sourceSpecificity := 0
+		if filterSource {
+			var allowed bool
+			sourceSpecificity, allowed = rw.sourceSpecificity(sourceAddr)
+			if !allowed {
+				continue
+			}
+		}
+		if domainSpecificity < bestDomain ||
+			domainSpecificity == bestDomain && sourceSpecificity < bestSource {
 			continue
+		}
+		if domainSpecificity > bestDomain || sourceSpecificity > bestSource {
+			out = out[:0]
+			bestDomain = domainSpecificity
+			bestSource = sourceSpecificity
 		}
 		out = append(out, cloneRewrite(rw))
 	}

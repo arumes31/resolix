@@ -193,6 +193,8 @@ func TestLoginAndLogoutLifecycle(t *testing.T) {
 func TestIngestStructuredEventValidationAndSuccess(t *testing.T) {
 	server := newAPIStateTestServer(t)
 	server.cfg.IngestSecret = "shared"
+	subscriber := server.Subscribe()
+	defer server.Unsubscribe(subscriber)
 
 	tests := []struct {
 		name   string
@@ -233,8 +235,36 @@ func TestIngestStructuredEventValidationAndSuccess(t *testing.T) {
 		t.Fatalf("success status = %d body=%q", recorder.Code, recorder.Body.String())
 	}
 	status := server.store.GetNodeStatusByID("stable-agent")
-	if status == nil || status.Version != "2.4.25" || len(server.store.GetOrderedEvents(10)) != 1 {
-		t.Fatalf("node status=%+v events=%v", status, server.store.GetOrderedEvents(10))
+	stored := server.store.GetOrderedEvents(10)
+	if status == nil || status.Version != "2.4.25" || len(stored) != 1 {
+		t.Fatalf("node status=%+v events=%v", status, stored)
+	}
+	select {
+	case event := <-subscriber:
+		if event.ID == "" || event.ID != stored[0].ID {
+			t.Fatalf("broadcast ID = %q, stored ID = %q", event.ID, stored[0].ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("subscriber did not receive ingested event")
+	}
+}
+
+func TestBroadcastEventAssignsIDWithoutStoring(t *testing.T) {
+	server := newAPIStateTestServer(t)
+	subscriber := server.Subscribe()
+	defer server.Unsubscribe(subscriber)
+
+	server.BroadcastEvent(models.QueryEvent{Domain: "stream-only.example"})
+	select {
+	case event := <-subscriber:
+		if event.ID == "" {
+			t.Fatal("broadcast event has an empty ID")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("subscriber did not receive event")
+	}
+	if events := server.store.GetOrderedEvents(10); len(events) != 0 {
+		t.Fatalf("broadcast-only event was stored: %+v", events)
 	}
 }
 

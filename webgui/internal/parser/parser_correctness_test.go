@@ -43,7 +43,7 @@ func TestParsePipeDNSSEC(t *testing.T) {
 }
 
 func TestParserQueryAndResponseFlow(t *testing.T) {
-	prs, _ := newTestParser(t, false)
+	prs, store := newTestParser(t, false)
 	event := prs.ParseLogBytes(
 		[]byte("Jan 02 15:04:05 dnsmasq[12]: query[AAAA] EXAMPLE.COM. from 192.0.2.10"),
 		"node-a",
@@ -51,6 +51,10 @@ func TestParserQueryAndResponseFlow(t *testing.T) {
 	if event == nil || event.Domain != "example.com" || event.Type != "AAAA" ||
 		event.ClientIP != "192.0.2.10" || event.Node != "node-a" {
 		t.Fatalf("query event = %+v", event)
+	}
+	stored := store.GetOrderedEvents(1)
+	if event.ID == "" || len(stored) != 1 || event.ID != stored[0].ID {
+		t.Fatalf("query event ID = %q, stored events = %+v", event.ID, stored)
 	}
 	prs.ParseLogBytes([]byte("forwarded example.com to 192.0.2.53"), "node-a")
 	completed := prs.ParseLogBytes([]byte("reply example.com is NXDOMAIN"), "node-a")

@@ -57,8 +57,9 @@ func TestCSPMiddleware(t *testing.T) {
 	}
 	csp := recorder.Header().Get("Content-Security-Policy")
 	if !strings.Contains(csp, "script-src 'nonce-"+observedNonce+"'") ||
-		!strings.Contains(csp, "style-src 'self' 'nonce-"+observedNonce+"'") {
-		t.Fatalf("CSP does not contain the request nonce: %q", csp)
+		!strings.Contains(csp, "style-src 'self' 'nonce-"+observedNonce+"'") ||
+		!strings.Contains(csp, "frame-ancestors 'none'") {
+		t.Fatalf("CSP does not contain the required directives: %q", csp)
 	}
 	wantHeaders := map[string]string{
 		"X-Content-Type-Options":       "nosniff",

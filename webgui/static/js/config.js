@@ -18,6 +18,7 @@ const state = {
     configSyncTarget: '',
     configSyncNode: '',
     configSyncStartedAt: 0,
+	configSyncGeneration: 0,
     editingRewrite: null,
     pendingRewriteDelete: null,
     rewriteDeleteTrigger: null,
@@ -298,19 +299,21 @@ function renderConfigSyncProgress(nodes, targetRevision, requestedNode = '') {
 	return statuses.some(item => ['scheduled', 'applying', 'offline'].includes(item.status.key));
 }
 
-async function refreshConfigSyncProgress() {
-	if (!state.configSyncTarget || state.mode !== 'controller') return;
+async function refreshConfigSyncProgress(generation) {
+	if (generation !== state.configSyncGeneration || !state.configSyncTarget || state.mode !== 'controller') return;
 	try {
 		const data = await apiJSON('/api/nodes');
+		if (generation !== state.configSyncGeneration) return;
 		const nodes = data.nodes || [];
 		const active = renderConfigSyncProgress(nodes, state.configSyncTarget, state.configSyncNode);
 		if (document.querySelector('.settings-panel.active')?.dataset.panel === 'cluster') renderClusterSummary(nodes);
 		if (active && Date.now() - state.configSyncStartedAt < 60000) {
-			state.configSyncTimer = setTimeout(refreshConfigSyncProgress, 2000);
+			state.configSyncTimer = setTimeout(() => void refreshConfigSyncProgress(generation), 2000);
 		} else {
 			state.configSyncTimer = null;
 		}
 	} catch (error) {
+		if (generation !== state.configSyncGeneration) return;
 		state.configSyncTimer = null;
 		notice(`Cluster rollout status unavailable: ${error.message}`, true);
 	}
@@ -322,7 +325,8 @@ function startConfigSyncMonitor(targetRevision, node = '') {
 	state.configSyncTarget = targetRevision;
 	state.configSyncNode = node;
 	state.configSyncStartedAt = Date.now();
-	void refreshConfigSyncProgress();
+	const generation = ++state.configSyncGeneration;
+	void refreshConfigSyncProgress(generation);
 }
 
 async function loadCluster() {
@@ -335,8 +339,16 @@ async function loadCluster() {
 	renderClusterSummary(nodes);
 }
 
+function magicDNSTimestamp(value) {
+	const timestamp = String(value || '').trim();
+	return timestamp === '0001-01-01T00:00:00Z' ? '' : timestamp;
+}
+
 function magicDNSRuntimeItems(data) {
 	const status = data.status || {};
+	const lastSuccess = magicDNSTimestamp(status.last_success);
+	const lastAttempt = magicDNSTimestamp(status.last_attempt);
+	const syncedAt = magicDNSTimestamp(data.synced_at);
 	return [
 		['Source', data.mode === 'controller' ? 'Tailscale API · controller owned' : 'Controller mirror'],
 		['Tailnet', data.tailnet || 'Not configured'],
@@ -347,8 +359,8 @@ function magicDNSRuntimeItems(data) {
 		['Answer TTL', `${data.ttl || 60} seconds`],
 		['Devices imported', status.device_count || 0],
 		['Address records', status.record_count || 0],
-		['Last successful sync', status.last_success || data.synced_at || 'Not yet synchronized'],
-		['Last attempt', status.last_attempt || 'Not yet attempted'],
+		['Last successful sync', lastSuccess || syncedAt || 'Not yet synchronized'],
+		['Last attempt', lastAttempt || 'Not yet attempted'],
 		['Generation', data.generation ? data.generation.slice(0, 16) : 'No snapshot'],
 		['Last error', status.last_error || 'None']
 	];

@@ -171,7 +171,15 @@ func TestLoadConfigMagicDNS(t *testing.T) {
 	if !cfg.MagicDNSEnabled || cfg.MagicDNSTailnet != "tailnet-id" ||
 		cfg.MagicDNSClientID != "client-id" || cfg.MagicDNSClientSecret != "client-secret" ||
 		cfg.MagicDNSSyncInterval != 6*time.Hour || cfg.MagicDNSTTL != 120 {
-		t.Fatalf("MagicDNS config = %+v", cfg)
+		t.Fatalf(
+			"MagicDNS config: enabled=%t tailnet=%q client_id=%q client_secret_matches=%t sync_interval=%s ttl=%d",
+			cfg.MagicDNSEnabled,
+			cfg.MagicDNSTailnet,
+			cfg.MagicDNSClientID,
+			cfg.MagicDNSClientSecret == "client-secret",
+			cfg.MagicDNSSyncInterval,
+			cfg.MagicDNSTTL,
+		)
 	}
 	if filepath.Base(cfg.FullMagicDNSStatePath()) != "tailscale-records.json" {
 		t.Fatalf("MagicDNS state path = %q", cfg.FullMagicDNSStatePath())

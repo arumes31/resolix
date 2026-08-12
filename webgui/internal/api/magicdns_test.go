@@ -29,6 +29,8 @@ func TestMagicDNSStatusAndSyncEndpoints(t *testing.T) {
 		MagicDNSClientSecret: "hidden",
 		MagicDNSSyncInterval: 4 * time.Hour,
 		MagicDNSTTL:          60,
+		WebUsername:          "admin",
+		WebPassword:          "password",
 	}
 	server := testServer(cfg)
 	store := magicdns.NewStore("")
@@ -40,8 +42,22 @@ func TestMagicDNSStatusAndSyncEndpoints(t *testing.T) {
 	}
 	server.SetMagicDNS(store, syncer)
 
+	rejectedResponse := httptest.NewRecorder()
+	server.handleMagicDNSSync(rejectedResponse, httptest.NewRequest(http.MethodPost, "/api/magicdns/sync", nil))
+	if rejectedResponse.Code != http.StatusForbidden {
+		t.Fatalf("sync without CSRF status = %d, want %d", rejectedResponse.Code, http.StatusForbidden)
+	}
+	if records := store.Snapshot().Records; len(records) != 0 {
+		t.Fatalf("sync without CSRF persisted %d records", len(records))
+	}
+
+	syncRequest := httptest.NewRequest(http.MethodPost, "/api/magicdns/sync", nil)
+	syncRequest.AddCookie(&http.Cookie{
+		Name: csrfCookieName, Value: "token", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
+	})
+	syncRequest.Header.Set("X-CSRF-Token", "token")
 	syncResponse := httptest.NewRecorder()
-	server.handleMagicDNSSync(syncResponse, httptest.NewRequest(http.MethodPost, "/api/magicdns/sync", nil))
+	server.handleMagicDNSSync(syncResponse, syncRequest)
 	if syncResponse.Code != http.StatusOK {
 		t.Fatalf("sync status = %d body=%q", syncResponse.Code, syncResponse.Body.String())
 	}

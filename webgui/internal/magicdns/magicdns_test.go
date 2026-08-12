@@ -19,10 +19,14 @@ func TestClient_ListDevices(t *testing.T) {
 		case "/api/v2/oauth/token":
 			tokenRequests.Add(1)
 			if err := r.ParseForm(); err != nil {
-				t.Fatalf("parse token form: %v", err)
+				t.Errorf("parse token form: %v", err)
+				http.Error(w, "invalid token request", http.StatusBadRequest)
+				return
 			}
 			if r.Form.Get("client_id") != "client" || r.Form.Get("client_secret") != "secret" {
-				t.Fatal("OAuth credentials were not submitted")
+				t.Errorf("OAuth credentials were not submitted")
+				http.Error(w, "invalid OAuth credentials", http.StatusUnauthorized)
+				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"access_token": "access",
@@ -62,8 +66,9 @@ func TestClient_ListDevices(t *testing.T) {
 }
 
 func TestClient_RejectsRedirects(t *testing.T) {
-	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		t.Fatal("redirect target received credentials")
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Errorf("redirect target received credentials")
+		http.Error(w, "unexpected redirect", http.StatusInternalServerError)
 	}))
 	defer target.Close()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

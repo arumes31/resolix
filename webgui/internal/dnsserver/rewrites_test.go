@@ -62,11 +62,17 @@ func TestMagicDNSWireAndRewritePrecedence(t *testing.T) {
 	}
 
 	response, event := query("host.tailnet.ts.net")
+	if len(response.Answer) == 0 {
+		t.Fatalf("manual precedence response/event = %v / %#v", response.Answer, event)
+	}
 	answer, ok := response.Answer[0].(*dns.A)
 	if !ok || answer.A.String() != "192.0.2.9" || event.Upstream != "Rewrite" {
 		t.Fatalf("manual precedence response/event = %v / %#v", response.Answer, event)
 	}
 	response, event = query("other.tailnet.ts.net")
+	if len(response.Answer) == 0 {
+		t.Fatalf("MagicDNS response/event = %v / %#v", response.Answer, event)
+	}
 	answer, ok = response.Answer[0].(*dns.A)
 	if !ok || answer.A.String() != "100.64.0.11" || answer.Hdr.Ttl != 120 || event.Upstream != "MagicDNS" {
 		t.Fatalf("MagicDNS response/event = %v / %#v", response.Answer, event)

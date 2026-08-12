@@ -87,6 +87,9 @@ func (s *Server) handleMagicDNSSync(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "MagicDNS synchronization is not enabled", http.StatusConflict)
 		return
 	}
+	if !s.checkCSRF(w, r) {
+		return
+	}
 	if err := syncer.Sync(r.Context()); err != nil {
 		http.Error(w, "MagicDNS synchronization failed", http.StatusBadGateway)
 		return

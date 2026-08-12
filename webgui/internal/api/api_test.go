@@ -25,8 +25,11 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/miekg/dns"
+
 	"github.com/arumes31/resolix/webgui/internal/blocklist"
 	"github.com/arumes31/resolix/webgui/internal/config"
+	"github.com/arumes31/resolix/webgui/internal/dnsserver"
 	"github.com/arumes31/resolix/webgui/internal/models"
 	"github.com/arumes31/resolix/webgui/internal/rewrites"
 	"github.com/arumes31/resolix/webgui/internal/storage"
@@ -619,10 +622,42 @@ func TestHandleMetricsIncludesArchivePressure(t *testing.T) {
 	if !strings.Contains(body, "sqlite_archive_dropped_events_total 0\n") {
 		t.Fatalf("archive dropped metric missing from response:\n%s", body)
 	}
+	if !strings.Contains(body, "sqlite_archive_pending_bytes ") ||
+		!strings.Contains(body, "sqlite_busy_errors_total 0\n") ||
+		!strings.Contains(body, "sqlite_checkpoint_age_seconds -1.000\n") {
+		t.Fatalf("archive/database telemetry missing from response:\n%s", body)
+	}
 	if !strings.Contains(body, fmt.Sprintf("sqlite_archive_queue_capacity %d\n", config.DefaultArchiveQueueCapacity)) ||
 		!strings.Contains(body, fmt.Sprintf("sqlite_archive_trigger_events %d\n", config.DefaultArchiveTriggerSize)) ||
 		!strings.Contains(body, fmt.Sprintf("sqlite_archive_write_batch_events %d\n", config.DefaultArchiveWriteBatchSize)) {
 		t.Fatalf("archive limit metrics missing from response:\n%s", body)
+	}
+}
+
+func TestHandleMetricsIncludesCacheDimensions(t *testing.T) {
+	s := testServer(&config.Config{})
+	dnsServer := dnsserver.New(dnsserver.Config{CacheSize: 2}, nil)
+	query := new(dns.Msg)
+	query.SetQuestion("metrics.test.", dns.TypeA)
+	if response, dropped := dnsServer.Resolve(query, "192.0.2.1"); dropped || response == nil {
+		t.Fatalf("seed cache miss response=%v dropped=%t", response, dropped)
+	}
+	s.SetDNSServer(dnsServer)
+
+	recorder := httptest.NewRecorder()
+	s.handleMetrics(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := recorder.Body.String()
+	for _, want := range []string{
+		"dns_cache_capacity 2\n",
+		"dns_cache_utilization 0.000000\n",
+		"dns_cache_qtype_hits_total{qtype=\"A\"} 0\n",
+		"dns_cache_qtype_misses_total{qtype=\"A\"} 1\n",
+		"dns_cache_qtype_evictions_total{qtype=\"A\"} 0\n",
+		"dns_cache_qtype_expirations_total{qtype=\"A\"} 0\n",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("cache metric %q missing from response:\n%s", want, body)
+		}
 	}
 }
 

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" role="img" aria-label="System warning">
+  <path d="M32 4 8 16v16c0 14.4 10.24 27.84 24 32 13.76-4.16 24-17.6 24-32V16L32 4Z" fill="#1e293b" stroke="#fb7185" stroke-width="3"/>
+  <path d="M32 14 49 46H15L32 14Z" fill="#f97316" stroke="#fed7aa" stroke-width="2" stroke-linejoin="round"/>
+  <path d="M32 25v10" stroke="#fff7ed" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="32" cy="41" r="2.5" fill="#fff7ed"/>
+</svg>

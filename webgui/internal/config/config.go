@@ -1,21 +1,11 @@
 package config
 
 import (
-	"bufio"
-	"context"
-	"fmt"
 	"log"
-	"maps"
-	"net"
-	"net/url"
 	"os"
-	pathpkg "path"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 
 	"github.com/arumes31/resolix/webgui/internal/controllertls"
 )
@@ -91,11 +81,28 @@ const (
 	DefaultDoHPath = "/dns-query"
 	// DefaultDoTPort is the default DNS-over-TLS listen port.
 	DefaultDoTPort = 853
+	// DefaultMagicDNSStateFile persists the last successful Tailscale inventory.
+	DefaultMagicDNSStateFile = "magicdns.json"
+	// DefaultMagicDNSSyncInterval is intentionally infrequent to avoid needless
+	// Tailscale API traffic while still reconciling routine device changes.
+	DefaultMagicDNSSyncInterval = 4 * time.Hour
+	// DefaultMagicDNSTTL is the TTL used for generated A and AAAA answers.
+	DefaultMagicDNSTTL = 60
 
 	// minCacheTTLDefault/maxCacheTTLDefault are the default cache TTL bounds
 	// in seconds (dnsmasq local-ttl=60 / max-ttl=600).
 	minCacheTTLDefault = 60
 	maxCacheTTLDefault = 600
+	// DefaultCachePrefetchWindow controls how soon before expiry hot entries are refreshed.
+	DefaultCachePrefetchWindow = 30 * time.Second
+	// DefaultCachePrefetchHits is the access threshold for prefetching a cache entry.
+	DefaultCachePrefetchHits = 3
+	// DefaultDNSTCPIdleTimeout limits how long an idle DNS TCP connection remains open.
+	DefaultDNSTCPIdleTimeout = 8 * time.Second
+	// DefaultDNSTCPMaxQueries limits queries served over one DNS TCP connection.
+	DefaultDNSTCPMaxQueries = 128
+	// DefaultDNSTCPMaxConnections limits concurrent DNS TCP connections.
+	DefaultDNSTCPMaxConnections = 256
 	// DefaultUpstreamLatencyThreshold is the default latency alert threshold in milliseconds.
 	DefaultUpstreamLatencyThreshold = 200
 
@@ -145,6 +152,10 @@ type Config struct {
 	Mode          string
 	ControllerURL string
 	NodeName      string
+	// NodeID is the stable, opaque identity used to distinguish cluster nodes
+	// that happen to share the same display name. Agents persist one when this
+	// value is not configured explicitly.
+	NodeID        string
 	Port          string
 	WebListenAddr string
 	HistoryDir    string
@@ -240,7 +251,11 @@ type Config struct {
 	CacheMinTTL uint32
 	CacheMaxTTL uint32
 	// CacheOptimistic serves stale entries while refreshing in background.
-	CacheOptimistic bool
+	CacheOptimistic     bool
+	CachePrefetch       bool
+	CachePrefetchWindow time.Duration
+	CachePrefetchHits   uint32
+	CacheSERVFAILTTL    time.Duration
 	// ClientsFile is the per-client registry JSON file.
 	ClientsFile string
 	// DNSAllowedClients restricts DNS service to these IPs/CIDRs when non-empty.
@@ -251,6 +266,9 @@ type Config struct {
 	RateLimitQPS int
 	// InternalRateLimitQPS limits LAN and Tailscale clients per IP (0 = disabled).
 	InternalRateLimitQPS int
+	// RateLimitEDE returns REFUSED with an Extended DNS Error to EDNS clients
+	// instead of silently dropping over-limit queries.
+	RateLimitEDE bool
 	// PrivatePTR answers PTR for known private clients locally (default true).
 	PrivatePTR bool
 	// DNSSEC enables DO-bit passthrough to upstreams (no local validation).
@@ -263,8 +281,11 @@ type Config struct {
 	DoTEnabled bool
 	DoTPort    int
 	// TLSCertFile/TLSKeyFile are required for DoT.
-	TLSCertFile string
-	TLSKeyFile  string
+	TLSCertFile          string
+	TLSKeyFile           string
+	DNSTCPIdleTimeout    time.Duration
+	DNSTCPMaxQueries     int
+	DNSTCPMaxConnections int
 	// UpstreamLatencyThreshold is the latency threshold in ms for alerting.
 	UpstreamLatencyThreshold int
 
@@ -307,487 +328,17 @@ type Config struct {
 	SyncUpstreamHealthInterval time.Duration
 	// NodeOfflineThreshold is the time after which a node is considered offline.
 	NodeOfflineThreshold time.Duration
-}
 
-// clientAliasesProvider manages loading and periodic reloading of client aliases from a file.
-type clientAliasesProvider struct {
-	path    string
-	aliases map[string]string
-	mu      sync.RWMutex
-}
-
-// newClientAliasesProvider creates a new provider and loads the initial aliases from the file.
-func newClientAliasesProvider(path string) *clientAliasesProvider {
-	p := &clientAliasesProvider{
-		path:    path,
-		aliases: make(map[string]string),
-	}
-	p.load()
-	return p
-}
-
-// load reads the aliases file and updates the in-memory map.
-// File format: one entry per line, IP=Alias (e.g., 192.168.1.1=Gateway).
-// Lines starting with # are comments, empty lines are skipped.
-func (p *clientAliasesProvider) load() {
-	newAliases := make(map[string]string)
-
-	file, err := os.Open(p.path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			log.Printf("[WARN] Client aliases file not found: %s", p.path)
-		} else {
-			log.Printf("[ERROR] Failed to open client aliases file: %v", err)
-		}
-		p.mu.Lock()
-		p.aliases = newAliases
-		p.mu.Unlock()
-		return
-	}
-	defer func() { _ = file.Close() }()
-
-	scanner := bufio.NewScanner(file)
-	lineNum := 0
-	for scanner.Scan() {
-		lineNum++
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			log.Printf("[WARN] Invalid client alias entry at line %d: %q", lineNum, line)
-			continue
-		}
-		key := strings.TrimSpace(parts[0])
-		val := strings.TrimSpace(parts[1])
-		if key == "" || val == "" {
-			log.Printf("[WARN] Invalid client alias entry at line %d: %q", lineNum, line)
-			continue
-		}
-		newAliases[key] = val
-	}
-
-	if err := scanner.Err(); err != nil {
-		log.Printf("[ERROR] Error reading client aliases file: %v", err)
-	}
-
-	p.mu.Lock()
-	p.aliases = newAliases
-	p.mu.Unlock()
-	log.Printf("[INFO] Loaded %d client aliases from %s", len(newAliases), p.path)
-}
-
-// startReload begins periodic reloading of the aliases file.
-func (p *clientAliasesProvider) startReload(ctx context.Context) {
-	ticker := time.NewTicker(DefaultClientAliasesReloadInterval)
-	go func() {
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				p.load()
-			}
-		}
-	}()
-}
-
-// GetAlias returns the alias for the given IP, or empty string if not found.
-func (p *clientAliasesProvider) GetAlias(ip string) string {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.aliases[ip]
-}
-
-// GetAllAliases returns a copy of all aliases.
-func (p *clientAliasesProvider) GetAllAliases() map[string]string {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	result := make(map[string]string, len(p.aliases))
-	for k, v := range p.aliases {
-		result[k] = v
-	}
-	return result
-}
-
-// GetClientAlias returns the alias for a given IP address.
-// It checks the file-based aliases first, then falls back to the env var aliases.
-func (c *Config) GetClientAlias(ip string) string {
-	// Check file-based aliases first (more dynamic)
-	if c.aliasesProvider != nil {
-		if alias := c.aliasesProvider.GetAlias(ip); alias != "" {
-			return alias
-		}
-	}
-	// Fall back to env var aliases
-	c.clientAliasesMu.RLock()
-	defer c.clientAliasesMu.RUnlock()
-	if c.clientAliases != nil {
-		return c.clientAliases[ip]
-	}
-	return ""
-}
-
-// StartClientAliasesReload starts the periodic reload of the client aliases file.
-func (c *Config) StartClientAliasesReload(ctx context.Context) {
-	if c.aliasesProvider != nil {
-		c.aliasesProvider.startReload(ctx)
-	}
-}
-
-// SetClientAliases updates the client aliases map (Item 90).
-// This is used by the forwarder sync callback to apply aliases synced from the controller.
-func (c *Config) SetClientAliases(aliases map[string]string) {
-	if aliases == nil {
-		return
-	}
-	c.clientAliasesMu.Lock()
-	defer c.clientAliasesMu.Unlock()
-	c.clientAliases = maps.Clone(aliases)
-}
-
-// GetAllClientAliases returns a copy of the configured client aliases.
-// File-based provider aliases are merged over the env var aliases, matching
-// GetClientAlias precedence (provider values override environment aliases).
-func (c *Config) GetAllClientAliases() map[string]string {
-	c.clientAliasesMu.RLock()
-	result := maps.Clone(c.clientAliases)
-	c.clientAliasesMu.RUnlock()
-	if result == nil {
-		result = make(map[string]string)
-	}
-	if c.aliasesProvider != nil {
-		for k, v := range c.aliasesProvider.GetAllAliases() {
-			result[k] = v
-		}
-	}
-	return result
-}
-
-// sanitizeForLog strips CR/LF characters from an untrusted value before it is
-// written to the logs, preventing log injection (gosec G706).
-func sanitizeForLog(s string) string {
-	return strings.NewReplacer("\r", "", "\n", "").Replace(s)
-}
-
-// parseDurationEnv reads an environment variable and parses it as a duration.
-// Returns the default value if the variable is empty or cannot be parsed.
-func parseDurationEnv(key string, defaultVal time.Duration) time.Duration {
-	val := os.Getenv(key)
-	if val == "" {
-		return defaultVal
-	}
-	d, err := time.ParseDuration(val)
-	if err != nil {
-		log.Printf("[WARN] Invalid %s '%s', falling back to %s: %v", key, sanitizeForLog(val), defaultVal, err) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-		return defaultVal
-	}
-	if d <= 0 {
-		log.Printf("[WARN] Invalid %s '%s', falling back to %s: duration must be positive", key, sanitizeForLog(val), defaultVal) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-		return defaultVal
-	}
-	return d
-}
-
-// parseInt64Env reads an environment variable and parses it as an int64.
-// Returns the default value if the variable is empty or cannot be parsed.
-func parseInt64Env(key string, defaultVal int64) int64 {
-	val := os.Getenv(key)
-	if val == "" {
-		return defaultVal
-	}
-	n, err := strconv.ParseInt(val, 10, 64)
-	if err != nil || n < 0 {
-		log.Printf("[WARN] Invalid %s '%s', falling back to %d: %v", key, sanitizeForLog(val), defaultVal, err) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-		return defaultVal
-	}
-	return n
-}
-
-// parseIntEnv reads an environment variable and parses it as an int.
-// Returns the default value if the variable is empty or cannot be parsed.
-func parseIntEnv(key string, defaultVal int) int {
-	val := os.Getenv(key)
-	if val == "" {
-		return defaultVal
-	}
-	n, err := strconv.Atoi(val)
-	if err != nil || n < 0 {
-		log.Printf("[WARN] Invalid %s '%s', falling back to %d: %v", key, sanitizeForLog(val), defaultVal, err) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-		return defaultVal
-	}
-	return n
-}
-
-func resolveArchiveQueueSettings() (capacity, trigger, writeBatch int) {
-	capacity = parseIntEnv("ARCHIVE_QUEUE_CAPACITY", DefaultArchiveQueueCapacity)
-	if capacity < 1 {
-		log.Printf("[WARN] ARCHIVE_QUEUE_CAPACITY must be positive; using %d", DefaultArchiveQueueCapacity)
-		capacity = DefaultArchiveQueueCapacity
-	}
-
-	trigger = parseIntEnv("ARCHIVE_TRIGGER_SIZE", DefaultArchiveTriggerSize)
-	if trigger < 1 || trigger > capacity {
-		fallback := min(DefaultArchiveTriggerSize, max(1, capacity/2))
-		log.Printf("[WARN] ARCHIVE_TRIGGER_SIZE must be between 1 and ARCHIVE_QUEUE_CAPACITY; using %d", fallback)
-		trigger = fallback
-	}
-
-	writeBatch = parseIntEnv("ARCHIVE_WRITE_BATCH_SIZE", DefaultArchiveWriteBatchSize)
-	if writeBatch < 1 || writeBatch > capacity {
-		fallback := min(DefaultArchiveWriteBatchSize, capacity)
-		log.Printf("[WARN] ARCHIVE_WRITE_BATCH_SIZE must be between 1 and ARCHIVE_QUEUE_CAPACITY; using %d", fallback)
-		writeBatch = fallback
-	}
-	return capacity, trigger, writeBatch
-}
-
-// parseUint32Env reads a non-negative 32-bit integer environment variable.
-func parseUint32Env(key string, defaultVal uint32) uint32 {
-	val := os.Getenv(key)
-	if val == "" {
-		return defaultVal
-	}
-	n, err := strconv.ParseUint(val, 10, 32)
-	if err != nil {
-		log.Printf("[WARN] Invalid %s '%s', falling back to %d: %v", key, sanitizeForLog(val), defaultVal, err) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-		return defaultVal
-	}
-	return uint32(n)
-}
-
-// resolveMode reads MODE and normalizes legacy role names.
-func resolveMode() string {
-	mode := strings.ToLower(strings.TrimSpace(os.Getenv("MODE")))
-	switch mode {
-	case "", ModeController:
-		return ModeController
-	case ModeAgent:
-		return ModeAgent
-	case "master":
-		log.Printf("[WARN] MODE=master is deprecated; use MODE=%s", ModeController)
-		return ModeController
-	case "slave":
-		log.Printf("[WARN] MODE=slave is deprecated; use MODE=%s", ModeAgent)
-		return ModeAgent
-	default:
-		log.Printf("[WARN] Invalid MODE '%s', falling back to %s", sanitizeForLog(mode), ModeController) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-		return ModeController
-	}
-}
-
-// resolveNodeName reads NODE_NAME, falling back to the OS hostname.
-func resolveNodeName() string {
-	nodeName := os.Getenv("NODE_NAME")
-	if nodeName != "" {
-		return nodeName
-	}
-	host, err := os.Hostname()
-	if err != nil {
-		log.Printf("[ERROR] Error getting hostname: %v", err)
-		return "unknown-node"
-	}
-	return host
-}
-
-// resolvePort reads and validates the PORT environment variable.
-func resolvePort() string {
-	port := os.Getenv("PORT")
-	if port == "" {
-		return DefaultPort
-	}
-	if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
-		log.Printf("[WARN] Invalid PORT '%s', falling back to %s", sanitizeForLog(port), DefaultPort) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-		return DefaultPort
-	}
-	return port
-}
-
-// validateControllerURL exits fatally when controllerURL is set but invalid.
-func validateControllerURL(controllerURL string) {
-	if controllerURL == "" {
-		return
-	}
-	if !isValidControllerURL(controllerURL) {
-		log.Fatalf("[FATAL] Invalid CONTROLLER_URL: must start with https:// (got: %s)", sanitizeForLog(controllerURL)) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-	}
-	if _, err := url.ParseRequestURI(controllerURL); err != nil {
-		log.Fatalf("[FATAL] Invalid CONTROLLER_URL: %v", err)
-	}
-}
-
-func resolveControllerURL() string {
-	controllerURL := os.Getenv("CONTROLLER_URL")
-	if controllerURL == "" {
-		controllerURL = os.Getenv("MASTER_URL")
-		if controllerURL != "" {
-			log.Printf("[WARN] MASTER_URL is deprecated; use CONTROLLER_URL")
-		}
-	}
-	return strings.TrimSuffix(controllerURL, "/")
-}
-
-// loadEnvAliases parses the CLIENT_ALIASES environment variable
-// (comma-separated IP:Alias pairs) into a map.
-func loadEnvAliases() map[string]string {
-	aliases := make(map[string]string)
-	if a := os.Getenv("CLIENT_ALIASES"); a != "" {
-		for _, pair := range strings.Split(a, ",") {
-			parts := strings.Split(pair, ":")
-			if len(parts) == 2 {
-				key := strings.TrimSpace(parts[0])
-				val := strings.TrimSpace(parts[1])
-				if key == "" || val == "" {
-					log.Printf("[WARN] Invalid CLIENT_ALIASES mapping: %q", sanitizeForLog(pair)) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-					continue
-				}
-				aliases[key] = val
-			} else {
-				log.Printf("[WARN] Invalid CLIENT_ALIASES mapping: %q", sanitizeForLog(pair)) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-			}
-		}
-	}
-	return aliases
-}
-
-// parseTrustedProxies parses the TRUSTED_PROXIES environment variable
-// (comma-separated list) into a slice.
-func parseTrustedProxies() []string {
-	var trustedProxies []string
-	for _, proxy := range strings.Split(os.Getenv("TRUSTED_PROXIES"), ",") {
-		if proxy = strings.TrimSpace(proxy); proxy != "" {
-			trustedProxies = append(trustedProxies, proxy)
-		}
-	}
-	return trustedProxies
-}
-
-// normalizeBaseURL reads BASE_URL and reduces it to a local, absolute path.
-func normalizeBaseURL() string {
-	raw := strings.TrimSpace(os.Getenv("BASE_URL"))
-	if raw == "" {
-		return DefaultBaseURL
-	}
-	candidate, err := url.Parse(raw)
-	if err != nil || candidate.IsAbs() || candidate.Host != "" || candidate.RawQuery != "" ||
-		candidate.Fragment != "" || strings.ContainsAny(raw, "\\\r\n") {
-		log.Printf("[WARN] Invalid BASE_URL '%s', falling back to %s", sanitizeForLog(raw), DefaultBaseURL) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-		return DefaultBaseURL
-	}
-	if !strings.HasPrefix(raw, "/") {
-		raw = "/" + raw
-	}
-	if len(raw) > 1 && raw[0] == '/' && (raw[1] == '/' || raw[1] == '\\') {
-		log.Printf("[WARN] Invalid BASE_URL '%s', falling back to %s", sanitizeForLog(raw), DefaultBaseURL) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-		return DefaultBaseURL
-	}
-	parsed, err := url.ParseRequestURI(raw)
-	if err != nil || parsed.IsAbs() || parsed.Host != "" || parsed.RawQuery != "" ||
-		parsed.Fragment != "" {
-		log.Printf("[WARN] Invalid BASE_URL '%s', falling back to %s", sanitizeForLog(raw), DefaultBaseURL) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-		return DefaultBaseURL
-	}
-	decodedPath, err := url.PathUnescape(parsed.EscapedPath())
-	if err != nil || strings.HasPrefix(decodedPath, "//") || strings.ContainsAny(decodedPath, "\\?#") ||
-		strings.IndexFunc(decodedPath, unicode.IsControl) >= 0 {
-		log.Printf("[WARN] Invalid BASE_URL '%s', falling back to %s", sanitizeForLog(raw), DefaultBaseURL) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-		return DefaultBaseURL
-	}
-	cleaned := pathpkg.Clean("/" + strings.TrimLeft(parsed.Path, "/"))
-	if cleaned == "." || cleaned == "" {
-		return DefaultBaseURL
-	}
-	return cleaned
-}
-
-// resolveLatencyThreshold reads and validates UPSTREAM_LATENCY_THRESHOLD.
-func resolveLatencyThreshold() int {
-	if lt := os.Getenv("UPSTREAM_LATENCY_THRESHOLD"); lt != "" {
-		if val, err := strconv.Atoi(lt); err == nil && val > 0 {
-			return val
-		}
-		log.Printf("[WARN] Invalid UPSTREAM_LATENCY_THRESHOLD '%s', falling back to %d", sanitizeForLog(lt), DefaultUpstreamLatencyThreshold) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-	}
-	return DefaultUpstreamLatencyThreshold
-}
-
-// resolveDoHPath reads DOH_PATH and normalizes it to a safe, non-conflicting
-// literal path on the existing HTTP mux.
-func resolveDoHPath() string {
-	p := strings.TrimSpace(os.Getenv("DOH_PATH"))
-	if p == "" {
-		return DefaultDoHPath
-	}
-	if strings.HasPrefix(p, "//") || strings.ContainsAny(p, " \t\r\n?#{}\\") {
-		log.Printf("[WARN] Invalid DOH_PATH '%s', falling back to %s", sanitizeForLog(p), DefaultDoHPath) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-		return DefaultDoHPath
-	}
-	if !strings.HasPrefix(p, "/") {
-		p = "/" + p
-	}
-	if len(p) > 1 && (p[1] == '/' || p[1] == '\\') {
-		log.Printf("[WARN] Invalid DOH_PATH '%s', falling back to %s", sanitizeForLog(p), DefaultDoHPath) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-		return DefaultDoHPath
-	}
-	p = pathpkg.Clean(p)
-	if !validDoHPath(p) {
-		log.Printf("[WARN] Conflicting DOH_PATH '%s', falling back to %s", sanitizeForLog(p), DefaultDoHPath) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-		return DefaultDoHPath
-	}
-	return p
-}
-
-func validDoHPath(p string) bool {
-	if p == "" || p == "/" || strings.HasPrefix(p, "//") || strings.ContainsAny(p, " \t\r\n?#{}\\") {
-		return false
-	}
-	if p == "/healthz" || p == "/login" || p == "/logout" || p == "/metrics" {
-		return false
-	}
-	return p != "/api" && !strings.HasPrefix(p, "/api/") &&
-		p != "/static" && !strings.HasPrefix(p, "/static/")
-}
-
-// resolveBlocking reads and validates BLOCKING_MODE and BLOCK_CUSTOM_IP4/IP6.
-func resolveBlocking() (mode, ip4, ip6 string) {
-	mode = strings.ToLower(strings.TrimSpace(os.Getenv("BLOCKING_MODE")))
-	switch mode {
-	case "":
-		mode = DefaultBlockingMode
-	case "nxdomain", "null_ip", "refused", "custom_ip":
-	default:
-		log.Printf("[WARN] Invalid BLOCKING_MODE '%s', falling back to %s", sanitizeForLog(mode), DefaultBlockingMode) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-		mode = DefaultBlockingMode
-	}
-	ip4 = strings.TrimSpace(os.Getenv("BLOCK_CUSTOM_IP4"))
-	if parsed := net.ParseIP(ip4); ip4 == "" || parsed == nil || parsed.To4() == nil {
-		if ip4 != "" {
-			log.Printf("[WARN] Invalid BLOCK_CUSTOM_IP4 '%s', falling back to %s", sanitizeForLog(ip4), DefaultBlockCustomIP4) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-		}
-		ip4 = DefaultBlockCustomIP4
-	}
-	ip6 = strings.TrimSpace(os.Getenv("BLOCK_CUSTOM_IP6"))
-	if parsed := net.ParseIP(ip6); ip6 == "" || parsed == nil || parsed.To4() != nil {
-		if ip6 != "" {
-			log.Printf("[WARN] Invalid BLOCK_CUSTOM_IP6 '%s', falling back to %s", sanitizeForLog(ip6), DefaultBlockCustomIP6) // #nosec G706 -- CR/LF stripped by sanitizeForLog; gosec taint analysis cannot see through the helper
-		}
-		ip6 = DefaultBlockCustomIP6
-	}
-	return mode, ip4, ip6
-}
-
-func legacyTLSPinFile(path string) (string, bool) {
-	cleanPath := filepath.Clean(path)
-	if filepath.IsAbs(cleanPath) {
-		return path, false
-	}
-	relativePath, err := filepath.Rel("tls", cleanPath)
-	if err != nil || relativePath == "." || !filepath.IsLocal(relativePath) {
-		return path, false
-	}
-	return relativePath, true
+	// MagicDNSEnabled allows the controller to import the Tailscale device
+	// inventory. OAuth credentials stay environment-owned and never enter
+	// controller snapshots or agent configuration.
+	MagicDNSEnabled      bool
+	MagicDNSTailnet      string
+	MagicDNSClientID     string
+	MagicDNSClientSecret string
+	MagicDNSSyncInterval time.Duration
+	MagicDNSStateFile    string
+	MagicDNSTTL          uint32
 }
 
 // LoadConfig reads configuration from environment variables.
@@ -943,6 +494,25 @@ func LoadConfig() *Config {
 		log.Printf("[WARN] CACHE_MAX_TTL %d < CACHE_MIN_TTL %d, using defaults %d/%d", cacheMaxTTL, cacheMinTTL, minCacheTTLDefault, maxCacheTTLDefault)
 		cacheMinTTL, cacheMaxTTL = minCacheTTLDefault, maxCacheTTLDefault
 	}
+	cacheSERVFAILTTL := parseDurationEnv("CACHE_SERVFAIL_TTL", 0)
+	if cacheSERVFAILTTL < 0 {
+		cacheSERVFAILTTL = 0
+	} else if cacheSERVFAILTTL > time.Second {
+		log.Printf("[WARN] CACHE_SERVFAIL_TTL exceeds 1s; clamping it to 1s")
+		cacheSERVFAILTTL = time.Second
+	}
+	dnsTCPIdleTimeout := parseDurationEnv("DNS_TCP_IDLE_TIMEOUT", DefaultDNSTCPIdleTimeout)
+	if dnsTCPIdleTimeout <= 0 {
+		dnsTCPIdleTimeout = DefaultDNSTCPIdleTimeout
+	}
+	dnsTCPMaxQueries := parseIntEnv("DNS_TCP_MAX_QUERIES", DefaultDNSTCPMaxQueries)
+	if dnsTCPMaxQueries <= 0 {
+		dnsTCPMaxQueries = DefaultDNSTCPMaxQueries
+	}
+	dnsTCPMaxConnections := parseIntEnv("DNS_TCP_MAX_CONNECTIONS", DefaultDNSTCPMaxConnections)
+	if dnsTCPMaxConnections <= 0 {
+		dnsTCPMaxConnections = DefaultDNSTCPMaxConnections
+	}
 
 	latencyThreshold := resolveLatencyThreshold()
 
@@ -968,11 +538,24 @@ func LoadConfig() *Config {
 	syncDNSRoutesInterval := parseDurationEnv("SYNC_DNSROUTES_INTERVAL", DefaultSyncDNSRoutesInterval)
 	syncUpstreamHealthInterval := parseDurationEnv("SYNC_UPSTREAM_HEALTH_INTERVAL", DefaultSyncUpstreamHealthInterval)
 	nodeOfflineThreshold := parseDurationEnv("NODE_OFFLINE_THRESHOLD", DefaultNodeOfflineThreshold)
+	magicDNSSyncInterval := parseDurationEnv("MAGICDNS_SYNC_INTERVAL", DefaultMagicDNSSyncInterval)
+	if magicDNSSyncInterval <= 0 {
+		magicDNSSyncInterval = DefaultMagicDNSSyncInterval
+	}
+	magicDNSStateFile := strings.TrimSpace(os.Getenv("MAGICDNS_STATE_FILE"))
+	if magicDNSStateFile == "" {
+		magicDNSStateFile = DefaultMagicDNSStateFile
+	}
+	magicDNSTTL := parseUint32Env("MAGICDNS_TTL", DefaultMagicDNSTTL)
+	if magicDNSTTL == 0 || magicDNSTTL > 86400 {
+		magicDNSTTL = DefaultMagicDNSTTL
+	}
 
 	cfg := &Config{
 		Mode:                       mode,
 		ControllerURL:              controllerURL,
 		NodeName:                   nodeName,
+		NodeID:                     strings.TrimSpace(os.Getenv("NODE_ID")),
 		Port:                       port,
 		WebListenAddr:              webListenAddr,
 		HistoryDir:                 historyDir,
@@ -1029,11 +612,16 @@ func LoadConfig() *Config {
 		CacheMinTTL:                cacheMinTTL,
 		CacheMaxTTL:                cacheMaxTTL,
 		CacheOptimistic:            strings.ToLower(os.Getenv("CACHE_OPTIMISTIC")) == "true",
+		CachePrefetch:              strings.ToLower(os.Getenv("CACHE_PREFETCH")) == "true",
+		CachePrefetchWindow:        parseDurationEnv("CACHE_PREFETCH_WINDOW", DefaultCachePrefetchWindow),
+		CachePrefetchHits:          parseUint32Env("CACHE_PREFETCH_HITS", DefaultCachePrefetchHits),
+		CacheSERVFAILTTL:           cacheSERVFAILTTL,
 		ClientsFile:                clientsFile,
 		DNSAllowedClients:          os.Getenv("DNS_ALLOWED_CLIENTS"),
 		DNSDisallowedClients:       os.Getenv("DNS_DISALLOWED_CLIENTS"),
 		RateLimitQPS:               parseIntEnv("RATE_LIMIT_QPS", DefaultRateLimitQPS),
 		InternalRateLimitQPS:       parseIntEnv("RATE_LIMIT_INTERNAL_QPS", DefaultInternalRateLimitQPS),
+		RateLimitEDE:               strings.EqualFold(os.Getenv("RATE_LIMIT_EDE"), "true"),
 		PrivatePTR:                 strings.ToLower(os.Getenv("PRIVATE_PTR")) != "false",
 		DNSSEC:                     strings.ToLower(os.Getenv("DNSSEC")) == "true",
 		DoHEnabled:                 strings.ToLower(os.Getenv("DOH_ENABLED")) == "true",
@@ -1043,6 +631,9 @@ func LoadConfig() *Config {
 		DoTPort:                    dotPort,
 		TLSCertFile:                os.Getenv("TLS_CERT_FILE"),
 		TLSKeyFile:                 os.Getenv("TLS_KEY_FILE"),
+		DNSTCPIdleTimeout:          dnsTCPIdleTimeout,
+		DNSTCPMaxQueries:           dnsTCPMaxQueries,
+		DNSTCPMaxConnections:       dnsTCPMaxConnections,
 		UpstreamLatencyThreshold:   latencyThreshold,
 		SSEKeepaliveInterval:       sseKeepalive,
 		BatchArchiveInterval:       batchArchive,
@@ -1062,6 +653,13 @@ func LoadConfig() *Config {
 		SyncDNSRoutesInterval:      syncDNSRoutesInterval,
 		SyncUpstreamHealthInterval: syncUpstreamHealthInterval,
 		NodeOfflineThreshold:       nodeOfflineThreshold,
+		MagicDNSEnabled:            strings.EqualFold(strings.TrimSpace(os.Getenv("MAGICDNS_ENABLED")), "true"),
+		MagicDNSTailnet:            strings.TrimSpace(os.Getenv("MAGICDNS_TAILNET")),
+		MagicDNSClientID:           strings.TrimSpace(os.Getenv("MAGICDNS_CLIENT_ID")),
+		MagicDNSClientSecret:       strings.TrimSpace(os.Getenv("MAGICDNS_CLIENT_SECRET")),
+		MagicDNSSyncInterval:       magicDNSSyncInterval,
+		MagicDNSStateFile:          magicDNSStateFile,
+		MagicDNSTTL:                magicDNSTTL,
 	}
 
 	if cfg.Mode == ModeAgent && cfg.ControllerURL == "" {
@@ -1072,285 +670,3 @@ func LoadConfig() *Config {
 }
 
 // isValidControllerURL checks that the URL uses protected HTTPS transport.
-func isValidControllerURL(rawURL string) bool {
-	return strings.HasPrefix(rawURL, "https://")
-}
-
-// FullDBPath returns the complete database path by joining HistoryDir and DBPath.
-// If DBPath is an absolute path, it is returned as-is.
-func (c *Config) FullDBPath() string {
-	if filepath.IsAbs(c.DBPath) {
-		return c.DBPath
-	}
-	return filepath.Join(c.HistoryDir, c.DBPath)
-}
-
-// FullConfigDir returns the persistent managed-configuration directory. The
-// HistoryDir fallback preserves manually constructed Config values and older
-// embedders that have not set ConfigDir yet.
-func (c *Config) FullConfigDir() string {
-	if c.ConfigDir != "" {
-		return c.ConfigDir
-	}
-	return c.HistoryDir
-}
-
-// FullUpstreamsPath returns the complete upstreams file path.
-func (c *Config) FullUpstreamsPath() string {
-	if c.UpstreamsFile == "" {
-		return ""
-	}
-	if filepath.IsAbs(c.UpstreamsFile) {
-		return c.UpstreamsFile
-	}
-	return filepath.Join(c.FullConfigDir(), c.UpstreamsFile)
-}
-
-// FullDNSRoutesPath returns the complete DNS routes file path.
-func (c *Config) FullDNSRoutesPath() string {
-	if c.DNSRoutesFile == "" {
-		return ""
-	}
-	if filepath.IsAbs(c.DNSRoutesFile) {
-		return c.DNSRoutesFile
-	}
-	return filepath.Join(c.FullConfigDir(), c.DNSRoutesFile)
-}
-
-// FullRewritesPath returns the complete rewrites file path.
-func (c *Config) FullRewritesPath() string {
-	if c.RewritesFile == "" {
-		return ""
-	}
-	if filepath.IsAbs(c.RewritesFile) {
-		return c.RewritesFile
-	}
-	return filepath.Join(c.FullConfigDir(), c.RewritesFile)
-}
-
-// FullClientsPath returns the complete clients registry file path.
-func (c *Config) FullClientsPath() string {
-	if c.ClientsFile == "" {
-		return ""
-	}
-	if filepath.IsAbs(c.ClientsFile) {
-		return c.ClientsFile
-	}
-	return filepath.Join(c.FullConfigDir(), c.ClientsFile)
-}
-
-// FullBlocklistPath returns the complete blocklist file path.
-func (c *Config) FullBlocklistPath() string {
-	if c.BlocklistFile == "" {
-		return ""
-	}
-	if filepath.IsAbs(c.BlocklistFile) {
-		return c.BlocklistFile
-	}
-	return filepath.Join(c.FullConfigDir(), c.BlocklistFile)
-}
-
-// FullUserRulesPath returns the controller-managed custom rules path.
-func (c *Config) FullUserRulesPath() string {
-	return filepath.Join(c.FullConfigDir(), "user_rules.txt")
-}
-
-// FullFilterSubscriptionsPath returns the managed filter-subscription path.
-func (c *Config) FullFilterSubscriptionsPath() string {
-	return filepath.Join(c.FullConfigDir(), "filter-subscriptions.json")
-}
-
-// FullTLSStateDir returns the generated TLS state directory. The history/tls
-// fallback preserves manually constructed Config values and older embedders.
-func (c *Config) FullTLSStateDir() string {
-	if c.TLSStateDir != "" {
-		return c.TLSStateDir
-	}
-	return filepath.Join(c.HistoryDir, "tls")
-}
-
-// FullControllerTLSPinPath returns the configured controller CA pin path.
-func (c *Config) FullControllerTLSPinPath() string {
-	if c.ControllerTLSPinFile == "" {
-		return ""
-	}
-	if filepath.IsAbs(c.ControllerTLSPinFile) {
-		return c.ControllerTLSPinFile
-	}
-	if c.TLSStateDir == "" {
-		return filepath.Join(c.HistoryDir, c.ControllerTLSPinFile)
-	}
-	return filepath.Join(c.FullTLSStateDir(), c.ControllerTLSPinFile)
-}
-
-// VerifyConfig checks critical configuration values before the server starts.
-// Returns a slice of error messages for critical failures and a slice of warning messages.
-//
-//nolint:gocyclo // Each independent validation is retained so all startup errors can be reported together.
-func (c *Config) VerifyConfig() ([]string, []string) {
-	var errs []string
-	var warnings []string
-
-	// 1. Database path is writable
-	dbDir := filepath.Dir(c.FullDBPath())
-	if err := os.MkdirAll(dbDir, 0750); err != nil {
-		errs = append(errs, fmt.Sprintf("Cannot create database directory %s: %v", dbDir, err))
-	} else {
-		// CreateTemp picks a random name inside the trusted config directory,
-		// avoiding a predictable-path write (gosec G304).
-		if f, err := os.CreateTemp(dbDir, ".write_test*"); err != nil {
-			errs = append(errs, fmt.Sprintf("Database directory %s is not writable: %v", dbDir, err))
-		} else {
-			testFile := f.Name()
-			_ = f.Close()
-			_ = os.Remove(testFile)
-		}
-	}
-
-	// 2. CONTROLLER_URL schema validation (if set)
-	if c.ControllerURL != "" && !isValidControllerURL(c.ControllerURL) {
-		errs = append(errs, fmt.Sprintf("CONTROLLER_URL must start with https:// (got: %s)", c.ControllerURL))
-	}
-	switch c.WebTLSMode {
-	case "", controllertls.WebTLSOff:
-	case controllertls.WebTLSAuto:
-		if c.Mode != "" && c.Mode != ModeController {
-			errs = append(errs, "WEB_TLS_MODE=auto is supported only in controller mode")
-		}
-		if _, err := controllertls.ParseTailnetIPv4(c.WebTLSIP); err != nil {
-			errs = append(errs, "WEB_TLS_MODE=auto requires WEB_TLS_IP or TAILSCALE_IP in 100.64.0.0/10")
-		}
-	default:
-		errs = append(errs, "WEB_TLS_MODE must be off or auto")
-	}
-	switch c.ControllerTLSTrust {
-	case "", controllertls.TrustSystem:
-	case controllertls.TrustTOFUTailnet:
-		if c.Mode != ModeAgent {
-			errs = append(errs, "CONTROLLER_TLS_TRUST=tofu-tailnet is supported only in agent mode")
-		}
-		if err := controllertls.ValidateTOFUControllerURL(c.ControllerURL); err != nil {
-			errs = append(errs, "CONTROLLER_TLS_TRUST=tofu-tailnet requires CONTROLLER_URL to use a 100.64.0.0/10 address")
-		}
-		if c.FullControllerTLSPinPath() == "" {
-			errs = append(errs, "CONTROLLER_TLS_PIN_FILE is required for tofu-tailnet trust")
-		}
-	default:
-		errs = append(errs, "CONTROLLER_TLS_TRUST must be system or tofu-tailnet")
-	}
-
-	// 3. Authentication must be either fully configured or explicitly backed
-	// by an ingest secret. Internal endpoints must never silently fail open.
-	if (c.WebUsername == "") != (c.WebPassword == "") {
-		errs = append(errs, "WEB_USERNAME and WEB_PASSWORD must be configured together")
-	}
-	if c.WebUsername == "" && c.WebPassword == "" && c.IngestSecret == "" {
-		errs = append(errs, "configure WEB_USERNAME/WEB_PASSWORD or INGEST_SECRET; internal endpoints may not run without authentication")
-	}
-
-	// 4. Port number validation
-	if p, err := strconv.Atoi(c.Port); err != nil || p < 1 || p > 65535 {
-		errs = append(errs, fmt.Sprintf("Invalid PORT '%s' — must be a number between 1 and 65535", c.Port))
-	}
-	if strings.ContainsAny(c.WebListenAddr, "\r\n\x00") {
-		errs = append(errs, "WEB_LISTEN_ADDR contains invalid characters")
-	}
-
-	// 4b. DNSMASQ_PID_FILE deprecation notice (non-critical warning)
-	if os.Getenv("DNSMASQ_PID_FILE") != "" {
-		warnings = append(warnings, "DNSMASQ_PID_FILE is deprecated and ignored: cache clearing is handled by the in-process DNS server")
-	}
-
-	// 4c. DoT requires TLS certificates (critical failure)
-	if c.DoTEnabled && (c.TLSCertFile == "" || c.TLSKeyFile == "") {
-		errs = append(errs, "DOT_ENABLED requires TLS_CERT_FILE and TLS_KEY_FILE")
-	}
-	if c.DoTEnabled && (c.DoTPort < 1 || c.DoTPort > 65535) {
-		errs = append(errs, "DOT_PORT must be between 1 and 65535")
-	}
-	if c.DoHEnabled && !validDoHPath(c.DoHPath) {
-		errs = append(errs, "DOH_PATH must be a non-conflicting literal HTTP path")
-	}
-
-	for _, setting := range []struct {
-		name string
-		raw  string
-	}{
-		{name: "DNS_ALLOWED_CLIENTS", raw: c.DNSAllowedClients},
-		{name: "DNS_DISALLOWED_CLIENTS", raw: c.DNSDisallowedClients},
-	} {
-		for _, value := range splitConfigList(setting.raw) {
-			if !validIPOrCIDR(value) {
-				errs = append(errs, fmt.Sprintf("%s contains an invalid IP or CIDR", setting.name))
-				break
-			}
-		}
-	}
-
-	if c.DNS64 {
-		for _, value := range splitConfigList(c.DNS64Prefixes) {
-			ip, network, err := net.ParseCIDR(value)
-			ones, bits := 0, 0
-			if err == nil {
-				ones, bits = network.Mask.Size()
-			}
-			if err != nil || ip.To4() != nil || bits != 128 || ones != 96 {
-				errs = append(errs, "DNS64_PREFIXES must contain only IPv6 /96 prefixes")
-				break
-			}
-		}
-	}
-
-	for _, setting := range []struct {
-		name string
-		raw  string
-	}{
-		{name: "BLOCKLIST_URLS", raw: c.BlocklistURLs},
-		{name: "ALLOWLIST_URLS", raw: c.AllowlistURLs},
-	} {
-		for _, value := range splitConfigList(setting.raw) {
-			u, err := url.Parse(value)
-			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
-				errs = append(errs, fmt.Sprintf("%s contains an invalid URL (only http/https without embedded credentials is allowed)", setting.name))
-				break
-			}
-		}
-	}
-
-	// 5. Client aliases file check (non-critical warning)
-	if c.ClientAliasesFile != "" {
-		if _, err := os.Stat(c.ClientAliasesFile); os.IsNotExist(err) {
-			warnings = append(warnings, fmt.Sprintf("CLIENT_ALIASES_FILE '%s' does not exist (will be watched for creation)", c.ClientAliasesFile))
-		}
-	}
-
-	// 6. Blocklist file check (non-critical warning)
-	if c.BlocklistFile != "" {
-		if _, err := os.Stat(c.FullBlocklistPath()); os.IsNotExist(err) {
-			warnings = append(warnings, fmt.Sprintf("BLOCKLIST_FILE '%s' does not exist (will be watched for creation)", c.FullBlocklistPath()))
-		}
-	}
-
-	// 7. DNS routes file check (non-critical warning)
-	if c.DNSRoutesFile != "" {
-		if _, err := os.Stat(c.FullDNSRoutesPath()); os.IsNotExist(err) {
-			warnings = append(warnings, fmt.Sprintf("DNS_ROUTES_FILE '%s' does not exist (will be created on first save)", c.FullDNSRoutesPath()))
-		}
-	}
-
-	return errs, warnings
-}
-
-func splitConfigList(raw string) []string {
-	return strings.FieldsFunc(raw, func(r rune) bool {
-		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
-	})
-}
-
-func validIPOrCIDR(value string) bool {
-	if net.ParseIP(value) != nil {
-		return true
-	}
-	_, _, err := net.ParseCIDR(value)
-	return err == nil
-}

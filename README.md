@@ -15,8 +15,8 @@ Resolix is a self-hosted DNS control plane for Tailscale networks. One Go servic
 - First-class DNS blocklists and allowlists using Adblock, hosts, plain-domain, and RE2 rules; URL subscriptions support ETag/Last-Modified and keep the last good copy.
 - Source-aware A/AAAA/CNAME/PTR/MX/TXT/SRV and RCODE rewrites, safe search, private PTR, DNS64, DNSSEC passthrough, ACLs, and rate limiting.
 - Per-client filtering, safe search, upstreams, and query-log/statistics exclusions.
-- In-memory TTL-aware cache with negative caching, optimistic refresh, and in-process clearing.
-- SQLite history with bounded asynchronous batching, live SSE updates, metrics, health checks, and node status.
+- In-memory TTL-aware cache with negative/SERVFAIL caching, request coalescing, prefetch, optimistic stale refresh, targeted invalidation, and per-record-type metrics.
+- SQLite history with incremental hourly aggregates, keyset filtering, bounded asynchronous batching, live SSE updates, storage pressure metrics, and retention maintenance.
 - A dedicated `/config` control plane for upstreams, routes, blocklists, allowlists, custom rules, rewrites, clients, and cache management.
 - Controller/Agent clusters with content-addressed configuration snapshots and visible revision drift.
 - Generated controller HTTPS with tailnet-restricted CA pinning, plus external reverse-proxy TLS and subpath support.
@@ -57,8 +57,8 @@ The dashboard is available at `http://127.0.0.1:35353/`. Persistent data remains
 For production, pin an immutable release instead of relying on `latest`:
 
 ```bash
-IMAGE_VERSION=v2.3.7 docker compose -f docker-compose.example.yaml pull
-IMAGE_VERSION=v2.3.7 docker compose -f docker-compose.example.yaml up -d
+IMAGE_VERSION=vX.Y.Z docker compose -f docker-compose.example.yaml pull
+IMAGE_VERSION=vX.Y.Z docker compose -f docker-compose.example.yaml up -d
 ```
 
 To build locally, use `docker compose up -d --build`.
@@ -213,22 +213,27 @@ Cache hits are measured inside the DNS request lifecycle. Query events are emitt
 | Path | Purpose | Authentication |
 | --- | --- | --- |
 | `/` | Aggregate traffic statistics and upstream health | Web session |
-| `/querylog` | Live query stream, filtering, resolution probes, client details, and block/unblock actions | Web session |
-| `/cluster` | Agent connectivity, versions, runtime resources, and last report time | Web session; controller only |
+| `/querylog` | Virtualized live query stream, persistent filters, decision traces, resolution probes, and undoable block/allow actions | Web session |
+| `/cluster` | Agent connectivity, versions, configuration sync, storage state, and last report time | Web session; controller only |
 | `/config` | DNS configuration, policies, runtime view, and cluster revision state | Web session; read-only on agents |
 | `/healthz` | Lightweight liveness check | None |
 | `/readyz` | Web, DNS listener, and SQLite readiness | None |
 | `/metrics` | Prometheus metrics | Application authentication |
 | `/api/version` | Build and Go runtime metadata | Web/API authentication |
+| `/api/cache/status` | Cache counters; optional bounded `entries=negative` or `entries=all` diagnostics | Web/API authentication |
+| `/api/history` | Keyset-paginated persisted queries with domain, client, type, and decision filters | Web/API authentication |
+| `/api/storage/status` | SQLite, WAL, archive-queue, checkpoint, and maintenance state | Web/API authentication |
 | `/dns-query` | DoH endpoint when enabled | Bearer token or restricted direct private/tailnet access |
 
 ## Configuration reference
 
 Environment variables are the bootstrap layer. Settings that can be changed safely at runtime are managed from `/config` and synchronized from the controller to agents. Listener addresses, credentials, certificates, and storage paths remain environment-owned and require a restart.
 
-The **Upstreams** panel manages both upstream resolver specifications and the shared bootstrap resolver list. Bootstrap entries must be plain UDP IP literals (with an optional port); Resolix uses them to resolve hostname-based DoT and DoH endpoints, hot-reloads them without restarting DNS, and includes them in controller-to-agent configuration revisions. `BOOTSTRAP_DNS` supplies the initial list until the controller saves an explicit list in `/config`.
+The **Upstreams** panel manages both upstream resolver specifications and the shared bootstrap resolver list. Bootstrap entries must be plain UDP IP literals (with an optional port); Resolix uses them only to resolve hostname-based DoT and DoH endpoints, hot-reloads them without restarting DNS, and includes them in controller-to-agent configuration revisions. Resolver rows can be tested before save and may set `timeout=250ms..60s` and `weight=1..100`; the runtime view reports phase timing, resolved endpoints, TLS metadata, connection reuse, health streaks, and p50/p95/p99 latency. `BOOTSTRAP_DNS` supplies the initial list until the controller saves an explicit list in `/config`.
 
-The **Allowlists** panel accepts hosted Adblock, hosts-file, and plain-domain lists. Every valid entry becomes a DNS exception for the apex domain and its subdomains, so it takes precedence over matching blocklists and custom blocking rules. Lists can be enabled, disabled, edited, removed, or refreshed from the UI. Controller-managed allowlists are persisted with blocklists in one atomic configuration revision and synchronized to all agents. `ALLOWLIST_URLS` and `ALLOWLIST_FILE` remain available as first-boot/environment sources.
+The **DNS & cache** panel manages live resolver policy: selection mode, fallback and private-PTR resolvers, ECS, safe search, blocking responses, DNSSEC passthrough, AAAA/ANY policy, client ACLs, public and internal rate limits, subnet aggregation and bypass lists, reverse client-name lookup, and cache capacity/TTL/prefetch behavior. Changes are validated, written to `CONFIG_DIR/dns-settings.json`, applied without rebinding port 53, and included in the same content-addressed snapshot sent to agents. Environment variables provide first-start defaults; after the controller saves this panel, the managed file is authoritative. Listener addresses and ports, DoH/DoT listeners, TLS material, credentials, and storage paths remain restart-owned and are shown separately.
+
+The **Allowlists** panel accepts hosted Adblock, hosts-file, and plain-domain lists. Every valid entry becomes a DNS exception for the apex domain and its subdomains, so it takes precedence over matching blocklists and custom blocking rules. Blocklists and allowlists refresh every 24 hours by default, or once per day at an optional per-list `HH:MM` UTC time; they also refresh immediately after add or edit and when **Check for updates** is selected. Manual refresh requests are synchronized to all agents, and the last good rules remain active while an update is downloaded. Subscription bodies are parsed as a stream, with safety limits of 64 MiB inspected and 2,000,000 active rules per source; a source that reaches the rule limit is marked as truncated. The editor supports validation, source testing, import/export, bulk actions, clone, search/sort, checksums, update diagnostics, and three restart-safe rollback versions per node. Managed URL sources reject private/reserved destinations and redirect rebinding unless the source explicitly opts into private access. Controller-managed list definitions are persisted in the configuration revision and synchronized to all agents. `ALLOWLIST_URLS` and `ALLOWLIST_FILE` remain available as first-boot/environment sources.
 
 ### Node, web, and cluster
 
@@ -239,7 +244,8 @@ The **Allowlists** panel accepts hosted Adblock, hosts-file, and plain-domain li
 | `CONTROLLER_TLS_TRUST` | Agent trust mode: `system` or direct-IP `tofu-tailnet` | `system` |
 | `TLS_STATE_DIR` | Generated controller CA and agent pin directory | `/var/lib/resolix-tls` |
 | `CONTROLLER_TLS_PIN_FILE` | Persisted CA SPKI pin, relative to `TLS_STATE_DIR` unless absolute | `controller-ca-pin.json` |
-| `NODE_NAME` | Unique node label shown in the dashboard | OS hostname |
+| `NODE_NAME` | Human-readable node label; duplicate labels are warned but kept separate | OS hostname |
+| `NODE_ID` | Stable cluster identity; nodes persist `HISTORY_DIR/node-id` when unset | generated |
 | `TS_AUTHKEY` | Tailscale auth key used for first enrollment | unset |
 | `TS_AUTHKEY_FILE` | File containing the auth key; used when `TS_AUTHKEY` is empty | unset |
 | `INGEST_SECRET` | Bearer secret for agent ingestion, heartbeat, and configuration sync | unset |
@@ -262,12 +268,16 @@ The **Allowlists** panel accepts hosted Adblock, hosts-file, and plain-domain li
 | --- | --- | --- |
 | `DNS_LISTEN_ADDR` | DNS bind address; falls back to the Tailscale IP, while Compose binds all interfaces for host publication | automatic; Compose `0.0.0.0` |
 | `DNS_LISTEN_PORT` | UDP/TCP DNS port | `53` |
+| `DNS_TCP_IDLE_TIMEOUT` | Idle timeout for persistent TCP and DoT sessions | `8s` |
+| `DNS_TCP_MAX_QUERIES` | Maximum queries accepted on one TCP or DoT connection | `128` |
+| `DNS_TCP_MAX_CONNECTIONS` | Shared active TCP and DoT connection limit | `256` |
 | `DNS_PUBLISH_ADDR` | Docker host address used to publish UDP/TCP DNS | Compose `0.0.0.0` |
 | `DNS_PUBLISH_PORT` | Docker host UDP/TCP DNS port | Compose `53` |
 | `DNS_ALLOWED_CLIENTS` | IP/CIDR allow list; clients outside it are silently dropped | unset; Compose private/tailnet ranges |
 | `DNS_DISALLOWED_CLIENTS` | IP/CIDR deny list; denied queries are silently dropped | unset |
 | `RATE_LIMIT_QPS` | Per-public-client-IP QPS limit; excess queries are silently dropped; `0` disables | `80` |
 | `RATE_LIMIT_INTERNAL_QPS` | Per-IP QPS limit for loopback, LAN, link-local, and Tailscale sources; `0` disables | `1000` |
+| `RATE_LIMIT_EDE` | Opt in to a small REFUSED response with Extended DNS Error for EDNS over-limit queries; the safer default silently drops | `false` |
 | `PRIVATE_PTR` | Answer known private/tailnet client PTRs as `<name>.lan` | `true` |
 | `DNSSEC` | Forward the DO bit and pass DNSSEC records without local validation | `false` |
 | `DOH_ENABLED` | Serve DoH on the web listener | `false` |
@@ -292,6 +302,10 @@ The **Allowlists** panel accepts hosted Adblock, hosts-file, and plain-domain li
 | `UPSTREAM_LATENCY_THRESHOLD` | Slow-upstream threshold in milliseconds | `200` |
 | `CACHE_MIN_TTL` / `CACHE_MAX_TTL` | Positive and negative cache TTL bounds in seconds | `60` / `600` |
 | `CACHE_OPTIMISTIC` | Serve stale entries while refreshing in the background | `false` |
+| `CACHE_PREFETCH` | Refresh frequently used records shortly before expiry | `false` |
+| `CACHE_PREFETCH_WINDOW` | Remaining-TTL window that permits prefetch | `30s` |
+| `CACHE_PREFETCH_HITS` | Cache hits required before an entry is eligible for prefetch | `3` |
+| `CACHE_SERVFAIL_TTL` | Optional SERVFAIL micro-cache duration, clamped to at most one second | `0s` |
 | `DNS64` | Synthesize AAAA after empty AAAA responses | `false` |
 | `DNS64_PREFIXES` | Comma/space-separated IPv6 `/96` synthesis prefixes | `64:ff9b::/96` |
 
@@ -313,6 +327,13 @@ The **Allowlists** panel accepts hosted Adblock, hosts-file, and plain-domain li
 | `CLIENTS_FILE` | Per-client policy registry, relative to `CONFIG_DIR` unless absolute | `clients.json` |
 | `CLIENT_ALIASES` | Inline `IP:Alias` mappings | unset |
 | `CLIENT_ALIASES_FILE` | Hot-reloaded `IP=Alias` file | unset |
+| `MAGICDNS_ENABLED` | Import Tailscale MagicDNS records on the controller | `false` |
+| `MAGICDNS_TAILNET` | Tailnet ID used by the Tailscale devices API | unset |
+| `MAGICDNS_CLIENT_ID` | OAuth client ID with `devices:core:read` | unset |
+| `MAGICDNS_CLIENT_SECRET` | OAuth client secret; never synchronized to agents | unset |
+| `MAGICDNS_SYNC_INTERVAL` | Tailscale refresh and agent-record sync interval | `4h` |
+| `MAGICDNS_TTL` | TTL for imported A and AAAA answers | `60` |
+| `MAGICDNS_STATE_FILE` | Last-good imported record snapshot under `CONFIG_DIR` | `magicdns.json` |
 
 Rewrites created in `/config` can apply to every client, only Tailscale address space (`100.64.0.0/10` and `fd7a:115c:a1e0::/48`), or custom IPv4/IPv6 CIDRs. Queries from other sources skip the rewrite and continue through normal filtering, cache, and upstream resolution. These restrictions are included in controller snapshots and synchronized to agents.
 

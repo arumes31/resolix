@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sort"
 	"sync"
 	"time"
 
@@ -19,6 +20,15 @@ const (
 type bootEntry struct {
 	ips       []string
 	expiresAt time.Time
+}
+
+// BootstrapStatus exposes pinned endpoint addresses and cache expiry without
+// exposing mutable cache storage.
+type BootstrapStatus struct {
+	Hostname  string    `json:"hostname"`
+	Addresses []string  `json:"addresses"`
+	ExpiresAt time.Time `json:"expires_at"`
+	Stale     bool      `json:"stale"`
 }
 
 // bootstrapper resolves hostname-based upstreams via plain UDP bootstrap
@@ -95,14 +105,14 @@ func (b *bootstrapper) Lookup(host string) ([]string, error) {
 	b.mu.Unlock()
 
 	if fresh {
-		return cached.ips, nil
+		return append([]string(nil), cached.ips...), nil
 	}
 
 	ips, ttl, err := b.resolve(host)
 	if err != nil || len(ips) == 0 {
 		if ok {
 			log.Printf("[WARN] Bootstrap refresh for %s failed (%v); keeping last known IPs", host, err)
-			return cached.ips, nil
+			return append([]string(nil), cached.ips...), nil
 		}
 		if err == nil {
 			err = fmt.Errorf("no A/AAAA records")
@@ -114,7 +124,25 @@ func (b *bootstrapper) Lookup(host string) ([]string, error) {
 	b.mu.Lock()
 	b.cache[host] = &bootEntry{ips: ips, expiresAt: time.Now().Add(time.Duration(ttl) * time.Second)}
 	b.mu.Unlock()
-	return ips, nil
+	return append([]string(nil), ips...), nil
+}
+
+func (b *bootstrapper) snapshot() []BootstrapStatus {
+	if b == nil {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := time.Now()
+	status := make([]BootstrapStatus, 0, len(b.cache))
+	for hostname, entry := range b.cache {
+		status = append(status, BootstrapStatus{
+			Hostname: hostname, Addresses: append([]string(nil), entry.ips...),
+			ExpiresAt: entry.expiresAt, Stale: !now.Before(entry.expiresAt),
+		})
+	}
+	sort.Slice(status, func(i, j int) bool { return status[i].Hostname < status[j].Hostname })
+	return status
 }
 
 // resolve queries A records first and returns immediately when that family

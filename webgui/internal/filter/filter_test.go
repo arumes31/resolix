@@ -160,8 +160,18 @@ func TestEngineIndexPreservesRuleAndSourceOrder(t *testing.T) {
 	if !res.Blocked || res.Rule != "/^ads\\./" || res.Source != first.Name || res.Reason != ReasonRegex {
 		t.Fatalf("ordered indexed match = %+v", res)
 	}
-	if len(e.blockDomainIndex["ads.example.com"]) != 1 || len(e.blockRegexRules) != 1 {
+	if _, ok := e.blockDomainIndex["ads.example.com"]; !ok || len(e.blockRegexRules) != 1 {
 		t.Fatalf("indexes were not built: domains=%v regex=%d", e.blockDomainIndex, len(e.blockRegexRules))
+	}
+
+	duplicates := New()
+	firstDuplicate := duplicates.AddFileSource(writeTempList(t, "||duplicate.example^\n"), false)
+	duplicates.AddFileSource(writeTempList(t, "||duplicate.example^\n"), false)
+	if result := duplicates.Match("duplicate.example"); !result.Blocked || result.Source != firstDuplicate.Name {
+		t.Fatalf("duplicate index did not preserve first-source precedence: %+v", result)
+	}
+	if got := len(duplicates.blockDomainIndex); got != 1 {
+		t.Fatalf("duplicate index contains %d domains, want 1", got)
 	}
 }
 
@@ -183,5 +193,57 @@ func TestEnginePauseResume(t *testing.T) {
 	}
 	if !e.PausedUntil().IsZero() {
 		t.Error("PausedUntil must be zero after resume")
+	}
+}
+
+func TestValidateRuleTextReportsStableLineDiagnostics(t *testing.T) {
+	accepted, diagnostics := ValidateRuleText(strings.Join([]string{
+		"! comment",
+		`/^ads[0-9]+\./`,
+		"||ads.*.example^",
+		"example.test##.advert",
+		"valid.example",
+	}, "\n"))
+	if accepted != 2 {
+		t.Fatalf("accepted rules = %d, want 2", accepted)
+	}
+	if len(diagnostics) != 2 {
+		t.Fatalf("diagnostics = %+v, want two entries", diagnostics)
+	}
+	if diagnostics[0].Line != 3 || diagnostics[0].Severity != "error" ||
+		diagnostics[1].Line != 4 || diagnostics[1].Severity != "warning" {
+		t.Fatalf("diagnostics = %+v", diagnostics)
+	}
+}
+
+func TestValidateRuleTextBoundsDiagnostics(t *testing.T) {
+	_, diagnostics := ValidateRuleText(strings.Repeat("*invalid*\n", MaxRuleDiagnostics+50))
+	if len(diagnostics) != MaxRuleDiagnostics {
+		t.Fatalf("diagnostics = %d, want %d", len(diagnostics), MaxRuleDiagnostics)
+	}
+}
+
+func TestValidateRuleTextIgnoresWildcardsInOptions(t *testing.T) {
+	accepted, diagnostics := ValidateRuleText("||foo.example.com^$*")
+	if accepted != 1 || len(diagnostics) != 0 {
+		t.Fatalf("option wildcard validation = %d, %+v", accepted, diagnostics)
+	}
+}
+
+func TestEngineExplainReportsAllowlistOverride(t *testing.T) {
+	engine := New()
+	engine.AddFileSource(writeTempList(t, "||ads.example^\n"), false)
+	engine.AddFileSource(writeTempList(t, "@@||trusted.ads.example^\n"), false)
+
+	evaluation := engine.Explain("trusted.ads.example")
+	if !evaluation.Result.Allowed || evaluation.Result.Blocked || !evaluation.Override {
+		t.Fatalf("evaluation = %+v", evaluation)
+	}
+	if evaluation.AllowRule != "@@||trusted.ads.example^" || evaluation.BlockRule != "||ads.example^" {
+		t.Fatalf("matched rules = %+v", evaluation)
+	}
+	overrides := engine.AllowlistOverrides(10)
+	if len(overrides) != 1 || overrides[0].Domain != "trusted.ads.example" {
+		t.Fatalf("allowlist overrides = %+v", overrides)
 	}
 }

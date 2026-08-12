@@ -11,36 +11,31 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"html/template"
-	"io/fs"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/arumes31/resolix/webgui/internal/api"
 	"github.com/arumes31/resolix/webgui/internal/blocklist"
-	"github.com/arumes31/resolix/webgui/internal/clients"
 	"github.com/arumes31/resolix/webgui/internal/config"
 	"github.com/arumes31/resolix/webgui/internal/configsync"
 	"github.com/arumes31/resolix/webgui/internal/controllertls"
 	"github.com/arumes31/resolix/webgui/internal/dnsroutes"
 	"github.com/arumes31/resolix/webgui/internal/dnsserver"
-	"github.com/arumes31/resolix/webgui/internal/filter"
+	"github.com/arumes31/resolix/webgui/internal/dnssettings"
 	"github.com/arumes31/resolix/webgui/internal/forwarder"
 	"github.com/arumes31/resolix/webgui/internal/health"
 	"github.com/arumes31/resolix/webgui/internal/logger"
+	"github.com/arumes31/resolix/webgui/internal/magicdns"
 	"github.com/arumes31/resolix/webgui/internal/models"
 	"github.com/arumes31/resolix/webgui/internal/parser"
 	"github.com/arumes31/resolix/webgui/internal/policy"
 	"github.com/arumes31/resolix/webgui/internal/resolver"
-	"github.com/arumes31/resolix/webgui/internal/rewrites"
 	"github.com/arumes31/resolix/webgui/internal/storage"
-	"github.com/arumes31/resolix/webgui/internal/upstream"
 )
 
 // Version is injected for packaged builds and otherwise loaded from VERSION.
@@ -165,215 +160,6 @@ func migrateConfigState(cfg *config.Config) {
 // generateEnvFile creates a default .env file in the working directory if one does not exist.
 // It reads from .env.example if available, otherwise generates from hardcoded defaults.
 // It never overwrites an existing .env file.
-func generateEnvFile() {
-	envPath := ".env"
-	if _, err := os.Stat(envPath); err == nil {
-		logger.Debug(".env file already exists, skipping generation")
-		return
-	}
-
-	// Try to copy from .env.example
-	examplePath := ".env.example"
-	content := defaultEnvContent()
-
-	if exampleData, err := os.ReadFile(examplePath); err == nil {
-		content = string(exampleData)
-		logger.Info("Using .env.example as template for .env generation")
-	} else {
-		logger.Info(".env.example not found, generating .env from defaults")
-	}
-
-	if err := os.WriteFile(envPath, []byte(content), 0600); err != nil { // #nosec G703 -- path is the hardcoded constant ".env" in the working directory, never user input
-		logger.Warning("Failed to generate .env file: %v", err)
-	} else {
-		logger.Info("Generated default .env file at %s", envPath)
-	}
-}
-
-// defaultEnvContent returns the default .env file content with all supported variables.
-func defaultEnvContent() string {
-	return `# Tailscale Authentication Key
-TS_AUTHKEY=tskey-auth-xxxxx
-# Prefer a mounted secret file in containers; TS_AUTHKEY takes precedence.
-# TS_AUTHKEY_FILE=/run/secrets/tailscale_authkey
-
-# Space-separated upstream DNS servers
-UPSTREAM_DNS="8.8.8.8 8.8.4.4"
-
-# Comma-separated domain:ip mappings
-DOMAINS=.internal.net:100.1.2.3,app.example.com:100.4.5.6
-
-# Domain used for upstream health checks
-HEALTHCHECK_DOMAIN=google.com
-
-# Web GUI listening port
-PORT=35353
-# Web/API bind address
-WEB_LISTEN_ADDR=0.0.0.0
-# Direct controller HTTPS. Leave off behind a TLS-terminating reverse proxy.
-# Auto mode requires a Tailscale IPv4 address and manages its own CA/leaf.
-# WEB_TLS_MODE=off
-# WEB_TLS_IP falls back to TAILSCALE_IP from entrypoint.sh.
-# WEB_TLS_IP=100.64.0.10
-
-# Run mode (controller or agent)
-MODE=controller
-
-# HTTPS URL of the Controller node (required for agent mode).
-# Resolix rejects plain HTTP for controller/agent synchronization.
-# Example: CONTROLLER_URL=https://controller-node:35353
-# CONTROLLER_URL=https://controller-ip:35353
-# Agent trust: system for a public/reverse-proxy certificate, or tofu-tailnet
-# to pin the first CA seen at a direct 100.64.0.0/10 controller address.
-# Generated CA and agent pin state use a dedicated persistent directory.
-# TLS_STATE_DIR=/var/lib/resolix-tls
-# CONTROLLER_TLS_TRUST=system
-# CONTROLLER_TLS_PIN_FILE=controller-ca-pin.json
-# Legacy upgrades may still use MASTER_URL; CONTROLLER_URL takes precedence.
-
-# Unique identifier for this node
-NODE_NAME=resolix-1
-
-# Secret token to authenticate logs from agent nodes
-# INGEST_SECRET=your-secret-token
-
-# Web GUI authentication. Set both values together. INGEST_SECRET is required
-# when web authentication is disabled.
-# WEB_USERNAME=admin
-# WEB_PASSWORD=
-
-# Log level: DEBUG, INFO, WARNING, ERROR (default: INFO)
-LOG_LEVEL=INFO
-
-# Base URL for hosting behind a reverse proxy subpath (default: /)
-# Example: BASE_URL=/dashboard
-BASE_URL=/
-# Comma-separated proxy IPs/CIDRs allowed to supply Forwarded/X-Forwarded-*.
-# TRUSTED_PROXIES=127.0.0.1,10.0.0.0/8
-
-# Database file name or absolute path (default: dns.db)
-# Query history and managed DNS configuration use separate persistent mounts.
-# HISTORY_DIR=/var/lib/resolix
-# CONFIG_DIR=/var/lib/resolix-config
-# If relative, it is placed inside HISTORY_DIR
-DB_PATH=dns.db
-
-# Path to a file with client IP=Alias mappings (one per line, # comments supported)
-# CLIENT_ALIASES_FILE=/etc/resolix/aliases.txt
-
-# Comma-separated client IP:Alias mappings (alternative to file-based aliases)
-# CLIENT_ALIASES=192.168.1.1:Gateway,100.64.0.1:Router
-
-# Path to a hosts-format blocklist file (Item 61)
-# BLOCKLIST_FILE=/etc/resolix/blocklist.hosts
-
-# Managed upstream file, relative to CONFIG_DIR unless absolute (Item 62)
-# UPSTREAMS_FILE=upstreams.json
-
-# Managed domain-route file, relative to CONFIG_DIR unless absolute (Item 66)
-# DNS_ROUTES_FILE=dns-routes.json
-
-# DNS server listen address and port for the embedded DNS server (replaces dnsmasq)
-# DNS_LISTEN_ADDR defaults to TAILSCALE_IP (set by entrypoint.sh), then 0.0.0.0
-# DNS_LISTEN_ADDR=0.0.0.0
-# DNS_LISTEN_PORT=53
-
-# Filter engine (blocklists with adblock/hosts/domain-list/regex syntax)
-# Space- or comma-separated subscription URLs, auto-updated with ETag/Last-Modified
-# BLOCKLIST_URLS=https://example.com/blocklist.txt
-# ALLOWLIST_URLS=https://example.com/allowlist.txt
-# Local exceptions-only list (@@ semantics for every entry)
-# ALLOWLIST_FILE=/etc/resolix/allowlist.txt
-# FILTER_UPDATE_INTERVAL=24h
-
-# Blocking response mode: nxdomain (default), null_ip (0.0.0.0/::), refused,
-# or custom_ip (BLOCK_CUSTOM_IP4/BLOCK_CUSTOM_IP6)
-# BLOCKING_MODE=nxdomain
-# BLOCK_CUSTOM_IP4=0.0.0.0
-# BLOCK_CUSTOM_IP6=::
-
-# Typed DNS rewrites (A/AAAA/CNAME/PTR/MX/TXT/SRV + RCODE), managed via
-# /api/rewrites and persisted here. DOMAINS seeds it on first boot only.
-# REWRITES_FILE=rewrites.json
-
-# Policy features
-# SAFE_SEARCH=google,bing,ddg,youtube
-# BOGUS_NXDOMAIN=10.0.0.0/8,192.0.2.33 (answers fully inside these become NXDOMAIN)
-# AAAA_DISABLED=true (AAAA queries get NOERROR-empty answers)
-# REFUSE_ANY=true (default; QTYPE ANY is refused)
-
-# Upstream pool (Step 4): schemes udp:// tcp:// tls:// https:// (DoT/DoH)
-# UPSTREAM_MODE=load_balance (default) | parallel | strict
-# FALLBACK_DNS=9.9.9.9 (used only when all primary upstreams fail)
-# BOOTSTRAP_DNS="9.9.9.9 1.1.1.1" (initial plain UDP IP resolvers for hostname DoT/DoH; /config overrides)
-# ECS_CLIENT_SUBNET=192.0.2.0/24 (EDNS0 client subnet sent to upstreams)
-# DNS64=true (synthesize AAAA from A on empty AAAA answers)
-# DNS64_PREFIXES=64:ff9b::/96
-# CACHE_OPTIMISTIC=true (serve stale entries while refreshing in background)
-# CACHE_MIN_TTL=60
-# CACHE_MAX_TTL=600
-
-# Per-client policies (Step 5)
-# CLIENTS_FILE=clients.json (per-client registry: filtering, safe search,
-#   custom upstreams, and log/stat exclusions; hot-reloaded every 30s)
-
-# DNS access and encrypted serving (Step 6)
-# Comma/space-separated IPs or CIDRs. Deny-list matches, allow-list misses,
-# and rate-limit excess are dropped silently without a DNS response.
-# DNS_ALLOWED_CLIENTS=127.0.0.0/8,10.0.0.0/8,100.64.0.0/10,172.16.0.0/12,192.168.0.0/16
-# DNS_DISALLOWED_CLIENTS=100.64.0.5
-# RATE_LIMIT_QPS=80 (public clients, per IP; 0 disables)
-# RATE_LIMIT_INTERNAL_QPS=1000 (LAN/Tailscale clients, per IP; 0 disables)
-# PRIVATE_PTR=true (answer known RFC1918/CGNAT/ULA client PTRs as <name>.lan)
-# DNSSEC=false (pass the DNSSEC DO bit upstream; no local validation)
-# DOH_ENABLED=false
-# DOH_PATH=/dns-query
-# DOH_AUTH_TOKEN=change-me (Bearer token; when unset, only private/tailnet clients)
-# DOT_ENABLED=false
-# DOT_PORT=853
-# TLS_CERT_FILE=/etc/resolix/tls.crt
-# TLS_KEY_FILE=/etc/resolix/tls.key
-
-# Upstream latency alert threshold in milliseconds (Item 68, default: 200)
-# UPSTREAM_LATENCY_THRESHOLD=200
-
-# Configurable timeout values (Item 80)
-# SSE_KEEPALIVE_INTERVAL=30s
-# Maximum periodic interval; busy queues also archive at the trigger size.
-# BATCH_ARCHIVE_INTERVAL=30m
-# ARCHIVE_QUEUE_CAPACITY=1000000
-# ARCHIVE_TRIGGER_SIZE=20000
-# ARCHIVE_WRITE_BATCH_SIZE=20000
-# CLEANUP_INTERVAL=1h
-# FORWARDER_RETRY_INTERVAL=5s
-# HTTP_READ_TIMEOUT=10s
-# HTTP_WRITE_TIMEOUT=30s
-# HTTP_SHUTDOWN_TIMEOUT=10s
-# MAX_REQUEST_SIZE=1048576
-
-# Optional log file for file-based logging (default: empty = stderr only)
-# LOG_FILE=/var/log/resolix.log
-
-# ===== Distributed Architecture (Items 85-94) =====
-# Maximum retry attempts for forwarding with exponential backoff (default: 6)
-# MAX_RETRY_ATTEMPTS=6
-
-# Interval for agent heartbeats to controller (default: 30s)
-# HEARTBEAT_INTERVAL=30s
-
-# Interval for syncing client aliases from controller (default: 5m)
-# SYNC_ALIASES_INTERVAL=5m
-
-# Interval for syncing DNS routes from controller (default: 5m)
-# SYNC_DNSROUTES_INTERVAL=5m
-
-# Interval for syncing upstream health from controller (default: 1m)
-# SYNC_UPSTREAM_HEALTH_INTERVAL=1m
-
-# Time after which a node is considered offline without heartbeat (default: 90s)
-# NODE_OFFLINE_THRESHOLD=90s
-`
-}
 
 func main() {
 	// Generate .env file if missing (Item 52)
@@ -381,23 +167,20 @@ func main() {
 
 	// Load configuration
 	cfg := config.LoadConfig()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
+
+	runApplication(cfg, sigChan)
+}
+
+// runApplication initializes the application, waits for a shutdown request,
+// and releases all resources. The injected signal channel keeps the lifecycle
+// deterministic in tests while main retains ownership of OS signal handling.
+func runApplication(cfg *config.Config, sigChan <-chan os.Signal) {
 	migrateConfigState(cfg)
-
-	// Initialize the level-aware logger (Item 51)
-	logger.SetLevel(cfg.LogLevel)
-	logger.Info("Resolix v%s starting in %s mode", Version, cfg.Mode)
-	logger.Info("Log level set to %s", cfg.LogLevel)
-
-	// Enable file logging if configured (Item 84)
-	if cfg.LogFile != "" {
-		if err := logger.EnableFileLogging(cfg.LogFile); err != nil {
-			logger.Warning("Failed to enable file logging: %v", err)
-		}
-	}
-
-	if cfg.BaseURL != "/" {
-		logger.Info("Base URL set to %s", cfg.BaseURL)
-	}
+	configureLogging(cfg)
 
 	// Run startup configuration verification (Items 54 & 55)
 	verifyConfig(cfg)
@@ -416,6 +199,15 @@ func main() {
 	prs := parser.NewParser(store, cfg.Debug)
 	srv := api.NewServer(cfg, store, prs, tmpl)
 	srv.SetBuildInfo(Version, BuildInfo)
+	dnsSettingsStore, err := dnssettings.Load(cfg.FullDNSSettingsPath(), defaultDNSSettings(cfg))
+	if err != nil {
+		logger.Fatal("Failed to load managed DNS settings: %v", err)
+	}
+	srv.SetDNSSettingsStore(dnsSettingsStore)
+	managedDNS := dnsSettingsStore.Get()
+
+	magicDNSStore, magicDNSSyncer := setupMagicDNS(cfg)
+	srv.SetMagicDNS(magicDNSStore, magicDNSSyncer)
 
 	// Item 59: Initialize and start reverse DNS resolver
 	res := resolver.New()
@@ -454,6 +246,7 @@ func main() {
 	fwd.SetAliasesFn(func(aliases map[string]string) {
 		cfg.SetClientAliases(aliases)
 	})
+	fwd.SetMagicDNSFn(magicDNSStore.Apply)
 	fwd.SetUpstreamHealthFn(func(node string, health map[string]float64) {
 		store.SetUpstreamHealth(node, health)
 	})
@@ -505,7 +298,7 @@ func main() {
 	errChan := make(chan error, 2)
 
 	// Embedded DNS server (replaces dnsmasq). Pipeline: refuse-ANY/AAAA-disable
-	// → typed rewrites → private PTR → safe-search → filter
+	// → typed rewrites → MagicDNS → private PTR → safe-search → filter
 	// → cache → client upstreams → route → global pool → bogus-NXDOMAIN →
 	// cache store → respond.
 	// Each answered query becomes a QueryEvent fed into Store + SSE (and the
@@ -526,14 +319,24 @@ func main() {
 
 	// Policy (Step 3): safe search, bogus NXDOMAIN, AAAA disable, refuse ANY.
 	pol := policy.New(policy.Config{
-		SafeSearch:   splitListEnv(cfg.SafeSearch),
-		BogusNets:    splitListEnv(cfg.BogusNXDOMAIN),
-		AAAADisabled: cfg.AAAADisabled,
-		RefuseANY:    cfg.RefuseANY,
+		SafeSearch:   managedDNS.SafeSearch,
+		BogusNets:    managedDNS.BogusNXDOMAIN,
+		AAAADisabled: managedDNS.AAAADisabled,
+		RefuseANY:    managedDNS.RefuseANY,
 	})
 
 	// Upstream pool (Step 4): modes, fallback, bootstrap, ECS, DNS64.
-	pool := setupUpstreamPool(ctx, cfg, store, srv, checker, loadResolverSettings, upstreamSpecs, bootstrapServers)
+	pool := setupUpstreamPool(
+		ctx,
+		cfg,
+		managedDNS,
+		store,
+		srv,
+		checker,
+		loadResolverSettings,
+		upstreamSpecs,
+		bootstrapServers,
+	)
 	checker.SetProbeFunc(pool.Probe)
 	go checker.Start(ctx, func(_ []string, latencies map[string]float64) {
 		store.SetUpstreamHealth(cfg.NodeName, latencies)
@@ -542,49 +345,61 @@ func main() {
 		}
 		logger.Debug("Health status updated for node %s. Latencies: %v", cfg.NodeName, latencies)
 	})
-	dr.SetOnChange(pool.ClearRouteCache)
 	fwd.SetDNSConfigFn(func(snapshot configsync.Snapshot) error {
 		return srv.ApplyConfigSnapshot(snapshot)
 	})
 
 	// Start forwarding only after every config-sync target is initialized, so
 	// the initial agent sync cannot race application startup.
-	go func() {
-		if err := fwd.Start(); err != nil {
-			errChan <- err
-		}
-	}()
+	forwarderDone := make(chan error, 1)
 
 	dnsSrv := dnsserver.New(dnsserver.Config{
-		Addr:            cfg.DNSListenAddr,
-		Port:            cfg.DNSListenPort,
-		Upstreams:       upstreamSpecs,
-		Rewrites:        rwStore,
-		Policy:          pol,
-		Pool:            pool,
-		Routes:          dr,
-		Clients:         clientReg,
-		AliasFunc:       store.GetAlias,
-		CacheMinTTL:     cfg.CacheMinTTL,
-		CacheMaxTTL:     cfg.CacheMaxTTL,
-		CacheOptimistic: cfg.CacheOptimistic,
+		Addr:                cfg.DNSListenAddr,
+		Port:                cfg.DNSListenPort,
+		Upstreams:           upstreamSpecs,
+		Rewrites:            rwStore,
+		MagicDNS:            magicDNSStore,
+		MagicDNSTTL:         cfg.MagicDNSTTL,
+		Policy:              pol,
+		Pool:                pool,
+		Routes:              dr,
+		Clients:             clientReg,
+		AliasFunc:           store.GetAlias,
+		CacheSize:           managedDNS.CacheSize,
+		CacheMinTTL:         managedDNS.CacheMinTTL,
+		CacheMaxTTL:         managedDNS.CacheMaxTTL,
+		CacheOptimistic:     managedDNS.CacheOptimistic,
+		CachePrefetch:       managedDNS.CachePrefetch,
+		CachePrefetchWindow: time.Duration(managedDNS.CachePrefetchWindowMS) * time.Millisecond,
+		CachePrefetchHits:   managedDNS.CachePrefetchHits,
+		CacheSERVFAILTTL:    time.Duration(managedDNS.CacheSERVFAILTTLMS) * time.Millisecond,
 		// Step 6: ACL, rate limit, private PTR, DNSSEC, DoT.
-		AllowedClients:       cfg.DNSAllowedClients,
-		DisallowedClients:    cfg.DNSDisallowedClients,
-		RateLimitQPS:         cfg.RateLimitQPS,
-		InternalRateLimitQPS: cfg.InternalRateLimitQPS,
-		PrivatePTR:           cfg.PrivatePTR,
-		DNSSEC:               cfg.DNSSEC,
-		Resolver:             res,
-		DoTEnabled:           cfg.DoTEnabled,
-		DoTPort:              cfg.DoTPort,
-		TLSCertFile:          cfg.TLSCertFile,
-		TLSKeyFile:           cfg.TLSKeyFile,
-		NodeName:             cfg.NodeName,
-		Filter:               filterEng,
-		BlockingMode:         cfg.BlockingMode,
-		BlockCustomIP4:       cfg.BlockCustomIP4,
-		BlockCustomIP6:       cfg.BlockCustomIP6,
+		AllowedClients:         strings.Join(managedDNS.AllowedClients, " "),
+		DisallowedClients:      strings.Join(managedDNS.DisallowedClients, " "),
+		RateLimitQPS:           managedDNS.RateLimitQPS,
+		InternalRateLimitQPS:   managedDNS.InternalRateLimitQPS,
+		RateLimitEDE:           managedDNS.RateLimitEDE,
+		RateLimitIPv4Prefix:    managedDNS.RateLimitIPv4Prefix,
+		RateLimitIPv6Prefix:    managedDNS.RateLimitIPv6Prefix,
+		RateLimitAllowlist:     strings.Join(managedDNS.RateLimitAllowlist, " "),
+		PrivatePTR:             managedDNS.PrivatePTR,
+		PrivatePTRUpstreams:    managedDNS.PrivatePTRUpstreams,
+		ResolveClientHostnames: managedDNS.ResolveClientHostnames,
+		DNSSEC:                 managedDNS.DNSSEC,
+		Resolver:               res,
+		DoTEnabled:             cfg.DoTEnabled,
+		DoTPort:                cfg.DoTPort,
+		TLSCertFile:            cfg.TLSCertFile,
+		TLSKeyFile:             cfg.TLSKeyFile,
+		TCPIdleTimeout:         cfg.DNSTCPIdleTimeout,
+		TCPMaxQueries:          cfg.DNSTCPMaxQueries,
+		TCPMaxConnections:      cfg.DNSTCPMaxConnections,
+		NodeName:               cfg.NodeName,
+		Filter:                 filterEng,
+		BlockingMode:           managedDNS.BlockingMode,
+		BlockCustomIP4:         managedDNS.BlockCustomIPv4,
+		BlockCustomIP6:         managedDNS.BlockCustomIPv6,
+		BlockedResponseTTL:     managedDNS.BlockedResponseTTL,
 	}, func(ev models.QueryEvent, excludeFromStats bool) {
 		// exclude_from_stats clients emit to SSE only (no store/forwarder).
 		if !excludeFromStats {
@@ -597,6 +412,32 @@ func main() {
 	})
 	dnsDone := make(chan struct{})
 	srv.SetDNSServer(dnsSrv)
+	magicDNSStore.SetOnChange(func() { dnsSrv.ClearCache() })
+	if magicDNSSyncer != nil {
+		go magicDNSSyncer.Run(ctx, func(syncErr error) {
+			if syncErr != nil {
+				logger.Warning("MagicDNS synchronization failed; retaining last-good records: %v", syncErr)
+				return
+			}
+			snapshot := magicDNSStore.Snapshot()
+			logger.Info("MagicDNS synchronized %d records; next refresh in %s", len(snapshot.Records), cfg.MagicDNSSyncInterval)
+		})
+	}
+	srv.SetDNSSettingsApplyFunc(func(settings dnssettings.Settings) {
+		pool.SetRuntimeSettings(settings.UpstreamMode, settings.FallbackDNS, settings.ECSClientSubnet)
+		dnsSrv.ApplySettings(settings)
+	})
+	go func() {
+		err := fwd.Start()
+		forwarderDone <- err
+		if err != nil {
+			errChan <- err
+		}
+	}()
+	dr.SetOnChange(func() {
+		pool.ClearRouteCache()
+		dnsSrv.ClearCache()
+	})
 	go func() {
 		defer close(dnsDone)
 		protocols := "UDP+TCP"
@@ -615,10 +456,6 @@ func main() {
 	go func() {
 		serverDone <- srv.Start(ctx, staticHandler, cspMiddleware, nonceFromContext)
 	}()
-
-	// Graceful shutdown with signal handling (Item 56)
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	serverStopped := false
 	select {
@@ -640,6 +477,7 @@ func main() {
 	// Step 2: Stop the log forwarder
 	logger.Info("Shutdown step 2: Stopping log forwarder...")
 	fwd.Stop()
+	waitForForwarder(cfg, forwarderDone)
 
 	// Step 3: Stop DNS routes reload
 	logger.Info("Shutdown step 3: Stopping DNS routes reload...")
@@ -675,190 +513,63 @@ func main() {
 	logger.Info("Graceful shutdown complete")
 }
 
+func configureLogging(cfg *config.Config) {
+	// Initialize the level-aware logger (Item 51)
+	logger.SetLevel(cfg.LogLevel)
+	logger.Info("Resolix v%s starting in %s mode", Version, cfg.Mode)
+	logger.Info("Log level set to %s", cfg.LogLevel)
+
+	// Enable file logging if configured (Item 84)
+	if cfg.LogFile != "" {
+		if err := logger.EnableFileLogging(cfg.LogFile); err != nil {
+			logger.Warning("Failed to enable file logging: %v", err)
+		}
+	}
+
+	if cfg.BaseURL != "/" {
+		logger.Info("Base URL set to %s", cfg.BaseURL)
+	}
+}
+
+func setupMagicDNS(cfg *config.Config) (*magicdns.Store, *magicdns.Syncer) {
+	magicDNSStore := magicdns.NewStore(cfg.FullMagicDNSStatePath())
+	if cfg.Mode == config.ModeAgent || cfg.MagicDNSEnabled {
+		loadedStore, err := magicdns.Load(cfg.FullMagicDNSStatePath())
+		if err != nil {
+			logger.Fatal("Failed to load MagicDNS state: %v", err)
+		}
+		magicDNSStore = loadedStore
+	}
+	if cfg.Mode != config.ModeController || !cfg.MagicDNSEnabled {
+		return magicDNSStore, nil
+	}
+	if snapshot := magicDNSStore.Snapshot(); snapshot.Tailnet != "" && snapshot.Tailnet != cfg.MagicDNSTailnet {
+		if err := magicDNSStore.Replace(cfg.MagicDNSTailnet, []magicdns.Record{}, time.Time{}); err != nil {
+			logger.Fatal("Failed to reset MagicDNS state for the configured tailnet: %v", err)
+		}
+	}
+	magicDNSClient, err := magicdns.NewClient(
+		cfg.MagicDNSClientID,
+		cfg.MagicDNSClientSecret,
+		cfg.MagicDNSTailnet,
+	)
+	if err != nil {
+		logger.Fatal("Failed to configure MagicDNS client: %v", err)
+	}
+	magicDNSSyncer, err := magicdns.NewSyncer(
+		magicDNSClient,
+		magicDNSStore,
+		cfg.MagicDNSTailnet,
+		cfg.MagicDNSSyncInterval,
+	)
+	if err != nil {
+		logger.Fatal("Failed to configure MagicDNS synchronization: %v", err)
+	}
+	return magicDNSStore, magicDNSSyncer
+}
+
 // setupFilterEngine builds and starts the filter engine from configuration
 // and wires it into the API server.
-func setupFilterEngine(ctx context.Context, cfg *config.Config, srv *api.Server) (*filter.Engine, *filter.SubscriptionStore) {
-	eng := filter.New()
-
-	// User rules (query-log block/unblock actions) — a plain file source.
-	userRulesPath := cfg.FullUserRulesPath()
-	if _, err := os.Stat(userRulesPath); os.IsNotExist(err) {
-		if err := os.WriteFile(userRulesPath, []byte("! user rules (managed via /api/querylog)\n"), 0o600); err != nil {
-			logger.Warning("Failed to create user rules file: %v", err)
-		}
-	}
-	eng.AddFileSource(userRulesPath, false)
-
-	if p := cfg.FullBlocklistPath(); p != "" {
-		eng.AddFileSource(p, false)
-	}
-	if cfg.AllowlistFile != "" {
-		eng.AddFileSource(cfg.AllowlistFile, true)
-	}
-	seeds := make([]filter.Subscription, 0)
-	for _, u := range splitListEnv(cfg.BlocklistURLs) {
-		seeds = append(seeds, filter.Subscription{URL: u, Enabled: true})
-	}
-	for _, u := range splitListEnv(cfg.AllowlistURLs) {
-		seeds = append(seeds, filter.Subscription{URL: u, AllowOnly: true, Enabled: true})
-	}
-	subscriptionPath := cfg.FullFilterSubscriptionsPath()
-	subscriptions, err := filter.LoadSubscriptionStore(subscriptionPath, seeds)
-	if err != nil {
-		logger.Fatal("Failed to load filter subscriptions: %v", err)
-	}
-	eng.ReplaceURLSources(subscriptions.List())
-	eng.StartUpdateLoop(ctx, cfg.FilterUpdateInterval)
-	srv.SetFilter(eng)
-	srv.SetSubscriptionStore(subscriptions)
-	return eng, subscriptions
-}
-
-// parseTemplates parses the embedded HTML templates, exiting fatally on error.
-func parseTemplates() *template.Template {
-	tmpl, err := template.ParseFS(embedFS, "templates/*.html")
-	if err != nil {
-		logger.Fatal("Fatal error parsing templates: %v", err)
-	}
-	return tmpl
-}
-
-// newStaticHandler creates the static file server from the embedded FS,
-// exiting fatally on error.
-func newStaticHandler() http.Handler {
-	staticFS, err := fs.Sub(embedFS, "static")
-	if err != nil {
-		logger.Fatal("Fatal error creating static FS: %v", err)
-	}
-	return http.FileServer(http.FS(staticFS))
-}
-
-// setupClientsRegistry loads the per-client registry and starts hot-reload.
-func setupClientsRegistry(ctx context.Context, cfg *config.Config, srv *api.Server) *clients.Registry {
-	reg, err := clients.Load(cfg.FullClientsPath())
-	if err != nil {
-		logger.Warning("Failed to load clients registry: %v", err)
-		reg, err = clients.Load("") // in-memory fallback
-		if err != nil || reg == nil {
-			logger.Fatal("Failed to initialize fallback clients registry: %v", err)
-		}
-	}
-	if reg == nil {
-		logger.Fatal("Clients registry initialization returned nil")
-	}
-	reg.StartReload(ctx)
-	srv.SetClients(reg)
-	return reg
-}
-
-// loadRewritesStore loads the typed rewrites store, seeding from the DOMAINS
-// env on first boot; falls back to an in-memory store on load errors.
-func loadRewritesStore(cfg *config.Config) *rewrites.Store {
-	rwStore, err := rewrites.Load(cfg.FullRewritesPath(), cfg.Domains)
-	if err != nil {
-		logger.Warning("Failed to load rewrites store: %v", err)
-		rwStore, err = rewrites.Load("", cfg.Domains) // in-memory fallback
-		if err != nil || rwStore == nil {
-			logger.Fatal("Failed to initialize fallback rewrites store: %v", err)
-		}
-	}
-	if rwStore == nil {
-		logger.Fatal("Rewrites store initialization returned nil")
-	}
-	return rwStore
-}
-
-// setupUpstreamPool builds the upstream pool, wires health data and the API
-// reload callback, and starts the upstreams.json hot-reload poller.
-func setupUpstreamPool(
-	ctx context.Context,
-	cfg *config.Config,
-	store *storage.Store,
-	srv *api.Server,
-	checker *health.Checker,
-	loadSettings func() ([]string, []string),
-	currentSpecs []string,
-	currentBootstrap []string,
-) *upstream.Pool {
-	pool := upstream.NewPool(upstream.PoolConfig{
-		Mode:             cfg.UpstreamMode,
-		PrimarySpecs:     currentSpecs,
-		FallbackSpecs:    strings.Fields(cfg.FallbackDNS),
-		BootstrapServers: currentBootstrap,
-		ECSClientSubnet:  cfg.ECSClientSubnet,
-		DNS64:            cfg.DNS64,
-		DNS64Prefixes:    strings.Fields(cfg.DNS64Prefixes),
-		CacheMinTTL:      cfg.CacheMinTTL,
-		CacheMaxTTL:      cfg.CacheMaxTTL,
-	})
-	pool.SetHealthProvider(func() map[string]float64 {
-		return store.GetUpstreamHealth()[cfg.NodeName]
-	})
-	srv.SetUpstreamPool(pool)
-	var reloadMu sync.Mutex
-	reload := func() {
-		reloadMu.Lock()
-		defer reloadMu.Unlock()
-		specs, bootstrapServers := loadSettings()
-		if !equalStringSlices(bootstrapServers, currentBootstrap) {
-			pool.SetBootstrapServers(bootstrapServers)
-			checker.UpdateBootstrapServers(bootstrapServers)
-			currentBootstrap = append([]string(nil), bootstrapServers...)
-		}
-		pool.SetPrimarySpecs(specs)
-		checker.UpdateUpstreams(specs)
-		currentSpecs = append([]string(nil), specs...)
-	}
-	srv.SetUpstreamReloadFunc(func() {
-		reload()
-	})
-
-	// Hot-reload upstreams.json: poll for changes (covers external edits).
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				specs, bootstrapServers := loadSettings()
-				reloadMu.Lock()
-				changed := !equalStringSlices(specs, currentSpecs) ||
-					!equalStringSlices(bootstrapServers, currentBootstrap)
-				reloadMu.Unlock()
-				if changed {
-					logger.Info("Upstream list changed, reloading pool (%d upstreams)", len(specs))
-					reload()
-				}
-			}
-		}
-	}()
-	return pool
-}
-
-// splitListEnv splits a space/comma-separated env list into trimmed entries.
-func splitListEnv(v string) []string {
-	return strings.FieldsFunc(v, func(r rune) bool {
-		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
-	})
-}
-
-// equalStringSlices reports whether two string slices are equal.
-func equalStringSlices(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// waitForHTTPServer waits for the HTTP server goroutine to finish, giving up
-// after cfg.HTTPShutdownTimeout.
 func waitForHTTPServer(cfg *config.Config, serverDone chan error) {
 	timer := time.NewTimer(cfg.HTTPShutdownTimeout)
 	select {
@@ -889,6 +600,21 @@ func waitForDNSServer(cfg *config.Config, dnsDone <-chan struct{}) {
 		case <-timer.C:
 		default:
 		}
+	}
+}
+
+// waitForForwarder ensures Start has returned after its final durable backlog
+// flush before shutdown can proceed to close shared resources.
+func waitForForwarder(cfg *config.Config, forwarderDone <-chan error) {
+	timer := time.NewTimer(cfg.HTTPShutdownTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-forwarderDone:
+		if err != nil {
+			logger.Warning("Forwarder shutdown error: %v", err)
+		}
+	case <-timer.C:
+		logger.Warning("Forwarder did not stop within %s", cfg.HTTPShutdownTimeout)
 	}
 }
 

@@ -9,6 +9,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -29,6 +33,101 @@ func TestEmbeddedVersion(t *testing.T) {
 	if Version == "" {
 		t.Fatal("Version is empty")
 	}
+}
+
+func TestEnvironmentDefaultDocumentationConsistency(t *testing.T) {
+	_, sourceFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate main_test.go")
+	}
+	repositoryRoot := filepath.Dir(filepath.Dir(sourceFile))
+	readFile := func(name string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(repositoryRoot, name)) // #nosec G304 -- fixed repository documentation path
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		return string(data)
+	}
+
+	defaults := parseREADMEEnvironmentDefaults(readFile("README.md"))
+	if len(defaults) < 30 {
+		t.Fatalf("parsed only %d literal README environment defaults; table format may have changed", len(defaults))
+	}
+	sources := []struct {
+		name    string
+		content string
+	}{
+		{name: ".env.example", content: readFile(".env.example")},
+		{name: "defaultEnvContent()", content: defaultEnvContent()},
+	}
+
+	var mismatches []string
+	for _, source := range sources {
+		assignments := parseDocumentedEnvironmentAssignments(source.content)
+		for variable, want := range defaults {
+			values := assignments[variable]
+			if _, found := values[want]; found {
+				continue
+			}
+			mismatches = append(mismatches, fmt.Sprintf(
+				"%s: %s default is %q in README, documented values are %v",
+				source.name, variable, want, sortedEnvironmentValues(values),
+			))
+		}
+	}
+	if len(mismatches) > 0 {
+		sort.Strings(mismatches)
+		t.Fatalf("environment default documentation differs:\n  %s", strings.Join(mismatches, "\n  "))
+	}
+}
+
+func parseREADMEEnvironmentDefaults(content string) map[string]string {
+	rowPattern := regexp.MustCompile("^\\|\\s*`([A-Z][A-Z0-9_]*)`\\s*\\|.*\\|\\s*`([^`]*)`\\s*\\|\\s*$")
+	dynamic := map[string]bool{"unset": true, "automatic": true, "OS hostname": true}
+	defaults := make(map[string]string)
+	for _, line := range strings.Split(content, "\n") {
+		match := rowPattern.FindStringSubmatch(strings.TrimSpace(line))
+		if len(match) != 3 || dynamic[match[2]] {
+			continue
+		}
+		defaults[match[1]] = match[2]
+	}
+	return defaults
+}
+
+func parseDocumentedEnvironmentAssignments(content string) map[string]map[string]struct{} {
+	assignmentPattern := regexp.MustCompile("^([A-Z][A-Z0-9_]*)=(.*)$")
+	assignments := make(map[string]map[string]struct{})
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		line = strings.TrimSpace(strings.TrimPrefix(line, "#"))
+		match := assignmentPattern.FindStringSubmatch(line)
+		if len(match) != 3 {
+			continue
+		}
+		value := strings.TrimSpace(match[2])
+		if annotation := strings.Index(value, " ("); annotation >= 0 {
+			value = strings.TrimSpace(value[:annotation])
+		}
+		if unquoted, err := strconv.Unquote(value); err == nil {
+			value = unquoted
+		}
+		if assignments[match[1]] == nil {
+			assignments[match[1]] = make(map[string]struct{})
+		}
+		assignments[match[1]][value] = struct{}{}
+	}
+	return assignments
+}
+
+func sortedEnvironmentValues(values map[string]struct{}) []string {
+	result := make([]string, 0, len(values))
+	for value := range values {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func setupTest() (*config.Config, *storage.Store, *parser.Parser, *api.Server) {
@@ -62,6 +161,23 @@ func TestWaitForDNSServerIsBounded(t *testing.T) {
 	waitForDNSServer(cfg, done)
 	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
 		t.Fatalf("closed DNS shutdown wait took %s", elapsed)
+	}
+}
+
+func TestWaitForForwarderIsBoundedAndObservesCompletion(t *testing.T) {
+	cfg := &config.Config{HTTPShutdownTimeout: 20 * time.Millisecond}
+	started := time.Now()
+	waitForForwarder(cfg, make(chan error))
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("forwarder shutdown wait took %s", elapsed)
+	}
+
+	done := make(chan error, 1)
+	done <- nil
+	started = time.Now()
+	waitForForwarder(cfg, done)
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("completed forwarder wait took %s", elapsed)
 	}
 }
 

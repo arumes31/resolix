@@ -1,8 +1,10 @@
 package upstream
 
 import (
+	"context"
 	"fmt"
 	"net"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -71,6 +73,62 @@ func TestPoolStrictOrder(t *testing.T) {
 	if got := answerIP(t, resp); got != "2.2.2.2" || used != fast {
 		t.Errorf("strict failover: answer=%s used=%q", got, used)
 	}
+}
+
+func TestPoolChaosFailover(t *testing.T) {
+	const timeout = 250 * time.Millisecond
+	withTimeout := func(address string) string {
+		return "udp://" + address + "?timeout=" + timeout.String()
+	}
+	assertFailover := func(t *testing.T, primary string, primaryHits *atomic.Int32) {
+		t.Helper()
+		var fallbackHits atomic.Int32
+		fallback := startUDPUpstreamHandler(t, ipAnswerHandler(t, "9.9.9.9", 0, &fallbackHits))
+		pool := NewPool(PoolConfig{
+			Mode: ModeStrict, PrimarySpecs: []string{withTimeout(primary), fallback},
+		})
+
+		started := time.Now()
+		response, used, err := pool.Exchange(queryA())
+		if err != nil {
+			t.Fatalf("failover exchange: %v", err)
+		}
+		if elapsed := time.Since(started); elapsed > 2*time.Second {
+			t.Fatalf("failover exceeded bounded timeout: %s", elapsed)
+		}
+		if got := answerIP(t, response); got != "9.9.9.9" || used != fallback {
+			t.Fatalf("failover answer=%s used=%q, want fallback %q", got, used, fallback)
+		}
+		if primaryHits.Load() != 1 || fallbackHits.Load() != 1 {
+			t.Fatalf("upstream hits primary=%d fallback=%d, want 1/1", primaryHits.Load(), fallbackHits.Load())
+		}
+	}
+
+	t.Run("packet loss", func(t *testing.T) {
+		var hits atomic.Int32
+		primary := startUDPUpstreamHandler(t, func(dns.ResponseWriter, *dns.Msg) {
+			hits.Add(1) // Deliberately drop the datagram without replying.
+		})
+		assertFailover(t, primary, &hits)
+	})
+
+	t.Run("response delay", func(t *testing.T) {
+		var hits atomic.Int32
+		primary := startUDPUpstreamHandler(t, ipAnswerHandler(t, "1.1.1.1", 2*timeout, &hits))
+		assertFailover(t, primary, &hits)
+	})
+
+	t.Run("resolver protocol failure", func(t *testing.T) {
+		var hits atomic.Int32
+		primary := startUDPUpstreamHandler(t, func(w dns.ResponseWriter, request *dns.Msg) {
+			hits.Add(1)
+			response := new(dns.Msg)
+			response.SetReply(request)
+			response.Id++ // A mismatched transaction ID must be rejected.
+			_ = w.WriteMsg(response)
+		})
+		assertFailover(t, primary, &hits)
+	})
 }
 
 func TestPoolParallelFastestWins(t *testing.T) {
@@ -372,4 +430,145 @@ func TestHostnameUpstreamWithoutBootstrap(t *testing.T) {
 	if _, err := r.Exchange(queryA()); err == nil {
 		t.Error("expected error for hostname upstream without bootstrap")
 	}
+}
+
+func TestPoolRuntimeSettingsAndCaches(t *testing.T) {
+	var bootstrapHits atomic.Int32
+	bootstrap := startBootstrapServer(t, "resolver.test", &bootstrapHits)
+	primary := startUDPUpstream(t, nil)
+	fallback := startUDPUpstreamHandler(t, ipAnswerHandler(t, "9.9.9.9", 0, nil))
+	pool := NewPool(PoolConfig{Mode: ModeStrict, PrimarySpecs: []string{primary}})
+
+	if _, err := pool.routeResolver(primary); err != nil {
+		t.Fatal(err)
+	}
+	pool.groupResolvers([]string{primary})
+	pool.SetBootstrapServers([]string{bootstrap})
+	if !pool.boot.Enabled() || len(pool.routes) != 0 || len(pool.groups) != 0 {
+		t.Fatalf("bootstrap reload state: enabled=%v routes=%d groups=%d", pool.boot.Enabled(), len(pool.routes), len(pool.groups))
+	}
+
+	pool.SetRuntimeSettings("", []string{fallback}, "2001:db8::1")
+	if pool.cfg.Mode != ModeLoadBalance || pool.ecsFamily != 2 || pool.ecsBits != 128 || len(pool.fallback) != 1 {
+		t.Fatalf("runtime settings = mode=%q family=%d bits=%d fallback=%d", pool.cfg.Mode, pool.ecsFamily, pool.ecsBits, len(pool.fallback))
+	}
+	pool.SetRuntimeSettings(ModeParallel, nil, "not-a-subnet")
+	if pool.cfg.Mode != ModeParallel || pool.ecsIP != nil {
+		t.Fatalf("invalid ECS runtime settings = mode=%q ECS=%v", pool.cfg.Mode, pool.ecsIP)
+	}
+
+	if _, err := pool.routeResolver(primary); err != nil {
+		t.Fatal(err)
+	}
+	pool.ClearRouteCache()
+	if len(pool.routes) != 0 {
+		t.Fatalf("route cache entries = %d, want 0", len(pool.routes))
+	}
+}
+
+func TestPoolRouteAndSpecExchanges(t *testing.T) {
+	address := startUDPUpstream(t, nil)
+	pool := NewPool(PoolConfig{Mode: ModeStrict})
+
+	response, used, err := pool.ExchangeRoute(address, queryA())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := answerIP(t, response); got != testAnswerIP || used != address {
+		t.Fatalf("route exchange answer/used = %s/%q", got, used)
+	}
+	first := pool.routes[address]
+	if _, _, err := pool.ExchangeRoute(address, queryA()); err != nil || pool.routes[address] != first {
+		t.Fatalf("cached route exchange: err=%v cached=%v", err, pool.routes[address] == first)
+	}
+	if _, _, err := pool.ExchangeRoute("bad resolver", queryA()); err == nil {
+		t.Fatal("invalid route resolver was accepted")
+	}
+
+	response, used, err = pool.ExchangeSpecs([]string{address, address}, queryA())
+	if err != nil || used != address || answerIP(t, response) != testAnswerIP {
+		t.Fatalf("spec exchange answer/used/error = %v/%q/%v", response, used, err)
+	}
+	if _, _, err := pool.ExchangeSpecs([]string{"bad resolver"}, queryA()); err == nil {
+		t.Fatal("empty usable spec set was accepted")
+	}
+}
+
+func TestPoolStatsSnapshotAndBootstrapStatus(t *testing.T) {
+	const timeout = 250 * time.Millisecond
+	dead := "udp://" + deadAddr(t) + "?timeout=" + timeout.String() + "&weight=3"
+	good := startUDPUpstream(t, nil)
+	pool := NewPool(PoolConfig{Mode: ModeStrict, PrimarySpecs: []string{dead, good}})
+
+	for range circuitFailureThreshold {
+		if _, _, err := pool.Exchange(queryA()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pool.SetHealthProvider(func() map[string]float64 { return map[string]float64{good: -1} })
+	snapshots := pool.StatsSnapshot()
+	if len(snapshots) != 2 {
+		t.Fatalf("stats snapshots = %d, want 2", len(snapshots))
+	}
+	if snapshots[0].Failures != circuitFailureThreshold || snapshots[0].Healthy || snapshots[0].Weight != 3 || snapshots[0].CircuitOpenUntil.IsZero() {
+		t.Fatalf("failed upstream snapshot = %+v", snapshots[0])
+	}
+	if snapshots[1].Successes != circuitFailureThreshold || snapshots[1].Healthy || snapshots[1].P50ms < 0 {
+		t.Fatalf("successful upstream snapshot = %+v", snapshots[1])
+	}
+
+	var hits atomic.Int32
+	bootstrap := startBootstrapServer(t, "resolver.test", &hits)
+	pool.SetBootstrapServers([]string{bootstrap})
+	if _, err := pool.boot.Lookup("resolver.test"); err != nil {
+		t.Fatal(err)
+	}
+	status := pool.BootstrapStatus()
+	if len(status) != 1 || status[0].Hostname != "resolver.test" || !slices.Equal(status[0].Addresses, []string{"127.0.0.1"}) || status[0].Stale {
+		t.Fatalf("bootstrap status = %+v", status)
+	}
+	pool.boot.mu.Lock()
+	pool.boot.cache["resolver.test"].expiresAt = time.Now().Add(-time.Second)
+	pool.boot.mu.Unlock()
+	if status = pool.BootstrapStatus(); !status[0].Stale {
+		t.Fatalf("expired bootstrap status = %+v", status)
+	}
+}
+
+func TestPoolProbeAndHelpers(t *testing.T) {
+	primary := startUDPUpstream(t, nil)
+	fallback := startUDPUpstream(t, nil)
+	pool := NewPool(PoolConfig{PrimarySpecs: []string{primary}, FallbackSpecs: []string{fallback}})
+	if err := pool.Probe(context.Background(), primary, "health.test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.Probe(context.Background(), fallback, "health.test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.Probe(context.Background(), "not-configured", "health.test"); err == nil {
+		t.Fatal("unconfigured probe was accepted")
+	}
+
+	if got := latencyPercentile(nil, 0.95); got != 0 {
+		t.Fatalf("empty percentile = %v, want 0", got)
+	}
+	if got := latencyPercentile([]float64{1, 2, 3, 4, 5}, 0.95); got != 5 {
+		t.Fatalf("p95 = %v, want 5", got)
+	}
+	parsed := resolverSpec(stringResolver("tcp://192.0.2.1:5353"))
+	if parsed.Scheme != SchemeTCP || parsed.Port != "5353" {
+		t.Fatalf("parsed custom resolver spec = %+v", parsed)
+	}
+	fallbackSpec := resolverSpec(stringResolver("not a resolver"))
+	if fallbackSpec.Scheme != SchemeUDP || fallbackSpec.Host != "not a resolver" || fallbackSpec.Port != "53" {
+		t.Fatalf("fallback custom resolver spec = %+v", fallbackSpec)
+	}
+}
+
+type stringResolver string
+
+func (r stringResolver) String() string { return string(r) }
+
+func (stringResolver) Exchange(*dns.Msg) (*dns.Msg, error) {
+	return nil, fmt.Errorf("not implemented")
 }

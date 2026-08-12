@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -76,6 +78,39 @@ func TestCacheClearEndpoint(t *testing.T) {
 	}
 }
 
+func TestCacheStatusEndpoint(t *testing.T) {
+	s := testServer(&config.Config{BaseURL: "/", MaxRequestSize: 1 << 20})
+	s.SetDNSServer(dnsserver.New(dnsserver.Config{CacheSize: 17}, nil))
+	mux := s.SetupMux()
+
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/cache/status", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Stats dnsserver.CacheStats `json:"stats"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Stats.Capacity != 17 || response.Stats.Entries != 0 {
+		t.Fatalf("cache status = %+v", response.Stats)
+	}
+
+	recorder = httptest.NewRecorder()
+	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/cache/status?entries=invalid", nil))
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid entries status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+
+	recorder = httptest.NewRecorder()
+	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/cache/status", nil))
+	if recorder.Code != http.StatusMethodNotAllowed || recorder.Header().Get("Allow") != http.MethodGet {
+		t.Fatalf("POST status=%d Allow=%q", recorder.Code, recorder.Header().Get("Allow"))
+	}
+}
+
 func TestFilteringUpdateEndpoint(t *testing.T) {
 	controller := testServer(&config.Config{
 		Mode:        config.ModeController,
@@ -83,6 +118,21 @@ func TestFilteringUpdateEndpoint(t *testing.T) {
 		WebPassword: "password",
 	})
 	controller.SetFilter(filter.New())
+	subscriptions, err := filter.LoadSubscriptionStore(
+		filepath.Join(t.TempDir(), "filter-subscriptions.json"),
+		[]filter.Subscription{
+			{Name: "test", URL: "https://example.com/list.txt", Enabled: true},
+			{Name: "other", URL: "https://other.example/list.txt", Enabled: true},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.SetSubscriptionStore(subscriptions)
+	before, err := controller.currentConfigSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	recorder := httptest.NewRecorder()
 	controller.handleFilteringUpdate(recorder, httptest.NewRequest(http.MethodGet, "/api/filtering/update", nil))
@@ -105,6 +155,33 @@ func TestFilteringUpdateEndpoint(t *testing.T) {
 	controller.handleFilteringUpdate(recorder, request)
 	if recorder.Code != http.StatusAccepted || !strings.Contains(recorder.Body.String(), `"status":"scheduled"`) {
 		t.Fatalf("controller: status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	after, err := controller.currentConfigSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Revision == after.Revision || subscriptions.List()[0].RefreshGeneration == "" {
+		t.Fatalf("manual refresh did not change synchronized configuration revision: before=%q after=%q", before.Revision, after.Revision)
+	}
+	previous := subscriptions.List()
+	targetedRequest := httptest.NewRequest(
+		http.MethodPost,
+		"/api/filtering/update?id="+url.QueryEscape(previous[0].ID),
+		nil,
+	)
+	targetedRequest.AddCookie(&http.Cookie{
+		Name: csrfCookieName, Value: "token", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
+	})
+	targetedRequest.Header.Set("X-CSRF-Token", "token")
+	recorder = httptest.NewRecorder()
+	controller.handleFilteringUpdate(recorder, targetedRequest)
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("targeted refresh: status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	refreshed := subscriptions.List()
+	if refreshed[0].RefreshGeneration == previous[0].RefreshGeneration ||
+		refreshed[1].RefreshGeneration != previous[1].RefreshGeneration {
+		t.Fatalf("targeted refresh generations: before=%+v after=%+v", previous, refreshed)
 	}
 
 	agent := testServer(&config.Config{Mode: config.ModeAgent})

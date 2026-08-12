@@ -193,6 +193,21 @@ func TestBlockingModeNullIPAAAA(t *testing.T) {
 	}
 }
 
+func TestFilteredResponseCarriesEDE(t *testing.T) {
+	h := startFilteredServer(t, "nxdomain")
+	query := new(dns.Msg)
+	query.SetQuestion("ads.blocked.test.", dns.TypeA)
+	query.SetEdns0(1232, false)
+	response, drop := h.srv.Resolve(query, "192.0.2.1")
+	if drop || response == nil {
+		t.Fatalf("filtered response=%v drop=%t", response, drop)
+	}
+	if code, ok := extendedErrorCode(response); !ok || code != dns.ExtendedErrorCodeFiltered {
+		t.Fatalf("filtered EDE = %d/%t", code, ok)
+	}
+	_ = h.nextEvent(t)
+}
+
 func TestFilterExceptionFallsThroughToUpstream(t *testing.T) {
 	h := startFilteredServer(t, "nxdomain")
 

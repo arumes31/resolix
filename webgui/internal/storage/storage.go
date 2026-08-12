@@ -5,9 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,16 +39,18 @@ type Store struct {
 	idCounter uint64
 
 	// Database Batching
-	batchMu       sync.Mutex
-	batch         []models.QueryEvent
-	batchStart    int
-	batchDropped  atomic.Int64
-	batchInFlight atomic.Int64
-	archiveMu     sync.Mutex
-	archiveReady  chan struct{}
-	archiveMark   int
-	archiveLimit  int
-	archiveBatch  int
+	batchMu          sync.Mutex
+	batch            []models.QueryEvent
+	batchStart       int
+	batchBytes       int64
+	batchDropped     atomic.Int64
+	batchInFlight    atomic.Int64
+	batchFlightBytes atomic.Int64
+	archiveMu        sync.Mutex
+	archiveReady     chan struct{}
+	archiveMark      int
+	archiveLimit     int
+	archiveBatch     int
 
 	// Protected by batchMu.
 	batchDropLogAt      time.Time
@@ -75,8 +75,9 @@ type Store struct {
 	lastTopStats              map[string][]models.StatEntry
 
 	// Node status tracking (Items 89, 92, 93)
-	nodeStatuses map[string]*models.NodeStatus // node name -> status
-	nodeStatusMu sync.RWMutex
+	nodeStatuses   map[string]*models.NodeStatus // stable node ID -> status
+	nodeTombstones map[string]time.Time          // stable node ID -> decommission time
+	nodeStatusMu   sync.RWMutex
 
 	// UX Addons
 	typeCounts       map[string]int
@@ -89,7 +90,6 @@ type Store struct {
 	// Prepared statements for frequently-used queries (cached at init)
 	stmtGetTopDomains *sql.Stmt
 	stmtGetTopClients *sql.Stmt
-	stmtCleanup       *sql.Stmt
 
 	// Background maintenance context
 	ctx    context.Context
@@ -98,6 +98,11 @@ type Store struct {
 	// Configurable intervals for background maintenance
 	vacuumInterval     time.Duration
 	checkpointInterval time.Duration
+	maintenanceMu      sync.RWMutex
+	checkpointState    checkpointState
+	vacuumState        vacuumState
+	optimizeState      optimizeState
+	dbBusyErrors       atomic.Int64
 
 	// archiveInsert is overridden by tests that need to hold an archive write
 	// in flight. Production always uses insertArchiveBatch.
@@ -111,11 +116,12 @@ type pendingInfo struct {
 
 // ArchiveQueueMetrics describes current SQLite archive queue pressure and limits.
 type ArchiveQueueMetrics struct {
-	Pending    int
-	Dropped    int64
-	Capacity   int
-	Trigger    int
-	WriteBatch int
+	Pending      int   `json:"pending"`
+	PendingBytes int64 `json:"pending_bytes"`
+	Dropped      int64 `json:"dropped"`
+	Capacity     int   `json:"capacity"`
+	Trigger      int
+	WriteBatch   int
 }
 
 func archiveLimits(cfg *config.Config) (capacity, trigger, writeBatch int) {
@@ -149,6 +155,7 @@ func NewStore(cfg *config.Config) *Store {
 		nodeUpstreamHealthHistory: make(map[string]map[string][]float64),
 		lastTopStats:              make(map[string][]models.StatEntry),
 		nodeStatuses:              make(map[string]*models.NodeStatus),
+		nodeTombstones:            make(map[string]time.Time),
 		typeCounts:                make(map[string]int),
 		clientRPMBuckets:          make(map[string]*[60]int),
 		clientRPMTimes:            make(map[string]*[60]int64),
@@ -195,6 +202,7 @@ func (s *Store) Init() {
 		log.Fatalf("Failed to initialize SQLite DB: %v", err)
 	}
 	s.db = database
+	s.loadNodeTombstones()
 
 	// Prepare frequently-used SQL statements for caching (Task 20)
 	if err := s.prepareStatements(); err != nil {
@@ -203,6 +211,7 @@ func (s *Store) Init() {
 
 	// Create background maintenance context
 	s.ctx, s.cancel = context.WithCancel(context.Background())
+	s.optimizeDatabase(s.ctx)
 
 	// Start background maintenance goroutines
 	s.startVacuum(s.ctx)
@@ -232,21 +241,15 @@ func (s *Store) prepareStatements() error {
 	var err error
 
 	s.stmtGetTopDomains, err = s.db.Prepare(
-		"SELECT domain, COUNT(*) as c FROM queries WHERE unix_time >= ? GROUP BY domain")
+		"SELECT domain, SUM(count) AS c FROM query_hourly_domains WHERE hour >= ? GROUP BY domain ORDER BY c DESC LIMIT 50")
 	if err != nil {
 		return fmt.Errorf("prepare stmtGetTopDomains: %w", err)
 	}
 
 	s.stmtGetTopClients, err = s.db.Prepare(
-		"SELECT client_ip, COUNT(*) as c FROM queries WHERE unix_time >= ? GROUP BY client_ip")
+		"SELECT client_ip, SUM(count) AS c FROM query_hourly_clients WHERE hour >= ? GROUP BY client_ip ORDER BY c DESC LIMIT 50")
 	if err != nil {
 		return fmt.Errorf("prepare stmtGetTopClients: %w", err)
-	}
-
-	s.stmtCleanup, err = s.db.Prepare(
-		"DELETE FROM queries WHERE unix_time < ?")
-	if err != nil {
-		return fmt.Errorf("prepare stmtCleanup: %w", err)
 	}
 
 	log.Printf("Prepared SQL statements cached successfully")
@@ -276,11 +279,6 @@ func (s *Store) Close() {
 		_ = s.stmtGetTopClients.Close()
 		s.stmtGetTopClients = nil
 	}
-	if s.stmtCleanup != nil {
-		_ = s.stmtCleanup.Close()
-		s.stmtCleanup = nil
-	}
-
 	// Close database connection
 	if s.db != nil {
 		_ = s.db.Close()
@@ -378,6 +376,7 @@ func (s *Store) AddEvent(e models.QueryEvent) {
 	var droppedSinceWarning, droppedTotal int64
 	s.batchMu.Lock()
 	if s.pendingBatchLenLocked() >= s.archiveLimit {
+		s.batchBytes -= eventApproxBytes(s.batch[s.batchStart])
 		s.batch[s.batchStart] = models.QueryEvent{}
 		s.batchStart++
 		if s.batchStart >= max(1, s.archiveLimit/4) {
@@ -393,6 +392,7 @@ func (s *Store) AddEvent(e models.QueryEvent) {
 		}
 	}
 	s.batch = append(s.batch, e)
+	s.batchBytes += eventApproxBytes(e)
 	if s.pendingBatchLenLocked() >= s.archiveMark {
 		select {
 		case s.archiveReady <- struct{}{}:
@@ -434,6 +434,7 @@ func (s *Store) UpdateEvent(node, domain string, latency float64, upstream strin
 			s.batchMu.Lock()
 			for b := len(s.batch) - 1; b >= s.batchStart; b-- {
 				if s.batch[b].Domain == domain && s.batch[b].Node == node && !s.batch[b].Latency.Valid {
+					beforeBytes := eventApproxBytes(s.batch[b])
 					s.batch[b].Latency = sql.NullFloat64{Float64: latency, Valid: true}
 					s.batch[b].Upstream = upstream
 					// Propagate DNSSEC and ResponseCode from the in-memory event to the batch
@@ -442,6 +443,7 @@ func (s *Store) UpdateEvent(node, domain string, latency float64, upstream strin
 					s.batch[b].LatencyAlert = s.events[idx].LatencyAlert
 					s.batch[b].ClientHostname = s.events[idx].ClientHostname
 					s.batch[b].Blocked = s.events[idx].Blocked
+					s.batchBytes += eventApproxBytes(s.batch[b]) - beforeBytes
 					break
 				}
 			}
@@ -475,7 +477,9 @@ func (s *Store) SetBlocked(node, domain string) bool {
 			for b := len(s.batch) - 1; b >= s.batchStart; b-- {
 				if s.batch[b].Domain == domain && s.batch[b].Node == node {
 					if !s.batch[b].Blocked {
+						beforeBytes := eventApproxBytes(s.batch[b])
 						s.batch[b].Blocked = true
+						s.batchBytes += eventApproxBytes(s.batch[b]) - beforeBytes
 					}
 					break
 				}
@@ -508,7 +512,9 @@ func (s *Store) SetClientHostname(node, clientIP, hostname string) bool {
 			s.batchMu.Lock()
 			for b := len(s.batch) - 1; b >= s.batchStart; b-- {
 				if s.batch[b].ClientIP == clientIP && s.batch[b].Node == node {
+					beforeBytes := eventApproxBytes(s.batch[b])
 					s.batch[b].ClientHostname = hostname
+					s.batchBytes += eventApproxBytes(s.batch[b]) - beforeBytes
 					break
 				}
 			}
@@ -580,788 +586,4 @@ func (s *Store) GetEventsAfter(cursor string, since int64, limit int) []models.Q
 		}
 	}
 	return result
-}
-
-// GetStats returns aggregated traffic statistics using SQLite.
-//
-//nolint:gocyclo
-func (s *Store) GetStats() map[string]interface{} {
-	s.archiveMu.Lock()
-	defer s.archiveMu.Unlock()
-	s.batchMu.Lock()
-	pending := append([]models.QueryEvent(nil), s.pendingBatchLocked()...)
-	s.batchMu.Unlock()
-	s.dbMu.RLock()
-	defer s.dbMu.RUnlock()
-
-	now := time.Now().Unix()
-	cutoff24h := now - 86400
-
-	rpm := 0
-	rph := 0
-
-	s.statsMu.RLock()
-	for i := 0; i < 60; i++ {
-		if now-s.rpmTimes[i] < 60 {
-			rpm += s.rpmBuckets[i]
-		}
-		if now-s.rphTimes[i] < 3600 {
-			rph += s.rphBuckets[i]
-		}
-	}
-
-	nodeList := make(map[string]interface{})
-	for node, buckets := range s.nodeRPHBuckets {
-		nRPM := 0
-		nRPH := 0
-		rpmTs := s.nodeRPMTimes[node]
-		rphTs := s.nodeRPHTimes[node]
-		rpmB := s.nodeRPMBuckets[node]
-		for i := 0; i < 60; i++ {
-			if now-rpmTs[i] < 60 {
-				nRPM += rpmB[i]
-			}
-			if now-rphTs[i] < 3600 {
-				nRPH += buckets[i]
-			}
-		}
-		if nRPH > 0 {
-			nodeList[node] = map[string]int{
-				"rpm": nRPM,
-				"rph": nRPH,
-			}
-		}
-	}
-
-	typeCounts := make(map[string]int)
-	for k, v := range s.typeCounts {
-		typeCounts[k] = v
-	}
-	s.statsMu.RUnlock()
-
-	// Query SQLite for long-term aggregates
-	var totalEvents int64
-	var rpd int
-	var cacheHits, totalReplies int64
-	var queryErrors []string
-	domainCounts := make(map[string]int)
-	clientCounts := make(map[string]int)
-	heatmap := make(map[string]int)
-	if s.db != nil {
-		if err := s.db.QueryRow("SELECT COUNT(*) FROM queries").Scan(&totalEvents); err != nil && err != sql.ErrNoRows {
-			log.Printf("Error getting totalEvents: %v", err)
-			queryErrors = append(queryErrors, "total")
-		}
-		err := s.db.QueryRow(`SELECT COUNT(*),
-			COALESCE(SUM(CASE WHEN upstream = 'System Cache' THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN upstream != '' THEN 1 ELSE 0 END), 0)
-			FROM queries WHERE unix_time >= ?`, cutoff24h).Scan(&rpd, &cacheHits, &totalReplies)
-		if err != nil && err != sql.ErrNoRows {
-			log.Printf("Error getting daily aggregates: %v", err)
-			queryErrors = append(queryErrors, "rpd", "cache_hits", "total_replies")
-		}
-	}
-
-	totalEvents += int64(len(pending))
-	for _, event := range pending {
-		if event.UnixTime < cutoff24h {
-			continue
-		}
-		rpd++
-		if event.Upstream != "" {
-			totalReplies++
-		}
-		if event.Upstream == "System Cache" {
-			cacheHits++
-		}
-		domainCounts[event.Domain]++
-		clientCounts[event.ClientIP]++
-		hour := time.Unix(event.UnixTime, 0).Format("15:00")
-		heatmap[hour]++
-	}
-
-	cacheHitRatio := 0.0
-	if totalReplies > 0 {
-		cacheHitRatio = float64(cacheHits) / float64(totalReplies) * 100
-	}
-
-	// Item 67: Bandwidth savings estimate (100 bytes per cached query)
-	bandwidthSaved := cacheHits * 100
-
-	if s.db != nil {
-		// Domain candidates (the Top 10 are selected after pending counts are merged).
-		if s.stmtGetTopDomains != nil {
-			rowsDomains, err := s.stmtGetTopDomains.Query(cutoff24h)
-			if err == nil {
-				for rowsDomains.Next() {
-					var d string
-					var c int
-					if rowsDomains.Scan(&d, &c) == nil {
-						domainCounts[d] += c
-					}
-				}
-				if err := rowsDomains.Err(); err != nil {
-					log.Printf("Error iterating domain rows: %v", err)
-				}
-				_ = rowsDomains.Close()
-			}
-		}
-
-		// Client candidates (the Top 10 are selected after pending counts are merged).
-		if s.stmtGetTopClients != nil {
-			rowsClients, err := s.stmtGetTopClients.Query(cutoff24h)
-			if err == nil {
-				for rowsClients.Next() {
-					var ip string
-					var c int
-					if rowsClients.Scan(&ip, &c) == nil {
-						clientCounts[ip] += c
-					}
-				}
-				if err := rowsClients.Err(); err != nil {
-					log.Printf("Error iterating client rows: %v", err)
-				}
-				_ = rowsClients.Close()
-			}
-		}
-
-		// Hourly heatmap
-		currentHour := now / 3600
-		rowsHeatmap, err := s.db.Query("SELECT unix_time / 3600 as hr, COUNT(*) FROM queries WHERE unix_time >= ? GROUP BY hr", cutoff24h)
-		if err == nil {
-			for rowsHeatmap.Next() {
-				var hr int64
-				var c int
-				if rowsHeatmap.Scan(&hr, &c) == nil {
-					t := time.Unix(hr*3600, 0)
-					heatmap[t.Format("15:00")] += c
-				}
-			}
-			if err := rowsHeatmap.Err(); err != nil {
-				log.Printf("Error iterating heatmap rows: %v", err)
-			}
-			_ = rowsHeatmap.Close()
-		}
-
-		// Fill missing hours in heatmap
-		for h := currentHour - 23; h <= currentHour; h++ {
-			t := time.Unix(h*3600, 0)
-			k := t.Format("15:00")
-			if _, exists := heatmap[k]; !exists {
-				heatmap[k] = 0
-			}
-		}
-	}
-
-	s.healthMu.RLock()
-	nodeHealth := make(map[string]map[string]float64)
-	nodeHealthHist := make(map[string]map[string][]float64)
-	for node, upstreams := range s.nodeUpstreamHealth {
-		nodeHealth[node] = make(map[string]float64)
-		nodeHealthHist[node] = make(map[string][]float64)
-		for up, lat := range upstreams {
-			nodeHealth[node][up] = lat
-			if hist, ok := s.nodeUpstreamHealthHistory[node][up]; ok {
-				nodeHealthHist[node][up] = append([]float64(nil), hist...)
-			}
-		}
-	}
-	s.healthMu.RUnlock()
-
-	return map[string]interface{}{
-		"top_domains":      s.toStats(domainCounts, "domains"),
-		"top_clients":      s.toStats(clientCounts, "clients"),
-		"rpm":              rpm,
-		"rph":              rph,
-		"rpd":              rpd,
-		"total":            totalEvents,
-		"nodes":            nodeList,
-		"cache_hit_ratio":  cacheHitRatio,
-		"node_health":      nodeHealth,
-		"node_health_hist": nodeHealthHist,
-		"heatmap":          heatmap,
-		"type_counts":      typeCounts,
-		"bandwidth_saved":  bandwidthSaved,
-		"degraded":         len(queryErrors) > 0,
-		"errors":           queryErrors,
-	}
-}
-
-func (s *Store) toStats(m map[string]int, category string) []models.StatEntry {
-	st := make([]models.StatEntry, 0, len(m))
-	for k, v := range m {
-		entry := models.StatEntry{Key: k, Count: v}
-		if category == "clients" {
-			entry.Alias = s.cfg.GetClientAlias(k)
-		}
-		s.statsMu.RLock()
-		if last, ok := s.lastTopStats[category]; ok {
-			for _, le := range last {
-				if le.Key == k {
-					switch {
-					case v > le.Count:
-						entry.Trend = "up"
-					case v < le.Count:
-						entry.Trend = "down"
-					default:
-						entry.Trend = "stable"
-					}
-					break
-				}
-			}
-		}
-		s.statsMu.RUnlock()
-		st = append(st, entry)
-	}
-
-	sort.Slice(st, func(i, j int) bool {
-		return st[i].Count > st[j].Count
-	})
-
-	if len(st) > 10 {
-		st = st[:10]
-	}
-	return st
-}
-
-// GetClientStats returns the RPM/RPH stats for a specific client.
-func (s *Store) GetClientStats(ip string) map[string]interface{} {
-	s.statsMu.RLock()
-	defer s.statsMu.RUnlock()
-
-	now := time.Now().Unix()
-	rpm := 0
-	rph := 0
-	rpmHistory := make([]int, 60)
-
-	rpmBuckets := s.clientRPMBuckets[ip]
-	rpmTimes := s.clientRPMTimes[ip]
-	rphBuckets := s.clientRPHBuckets[ip]
-	rphTimes := s.clientRPHTimes[ip]
-
-	if rpmBuckets != nil && rpmTimes != nil {
-		for i := 0; i < 60; i++ {
-			if now-rpmTimes[i] < 60 {
-				rpm += rpmBuckets[i]
-			}
-		}
-		for i := 0; i < 60; i++ {
-			idx := (now - 59 + int64(i)) % 60
-			if now-rpmTimes[idx] < 60 {
-				rpmHistory[i] = rpmBuckets[idx]
-			}
-		}
-	}
-	if rphBuckets != nil && rphTimes != nil {
-		for i := 0; i < 60; i++ {
-			if now-rphTimes[i] < 3600 {
-				rph += rphBuckets[i]
-			}
-		}
-	}
-
-	return map[string]interface{}{
-		"ip":          ip,
-		"alias":       s.cfg.GetClientAlias(ip),
-		"rpm":         rpm,
-		"rph":         rph,
-		"rpm_history": rpmHistory,
-	}
-}
-
-// CleanupPending removes stale entries from the pending query map.
-func (s *Store) CleanupPending(now time.Time) {
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-	cutoff := now.Add(-30 * time.Second)
-	for node, domains := range s.pendingQueries {
-		for domain, infos := range domains {
-			newInfos := make([]pendingInfo, 0)
-			for _, info := range infos {
-				if info.startTime.After(cutoff) {
-					newInfos = append(newInfos, info)
-				}
-			}
-			if len(newInfos) == 0 {
-				delete(domains, domain)
-			} else {
-				domains[domain] = newInfos
-			}
-		}
-		if len(domains) == 0 {
-			delete(s.pendingQueries, node)
-		}
-	}
-
-	s.statsMu.Lock()
-	clientCutoff := now.Add(-time.Hour).Unix()
-	for client, lastSeen := range s.clientLastSeen {
-		if lastSeen >= clientCutoff {
-			continue
-		}
-		delete(s.clientLastSeen, client)
-		delete(s.clientRPMBuckets, client)
-		delete(s.clientRPMTimes, client)
-		delete(s.clientRPHBuckets, client)
-		delete(s.clientRPHTimes, client)
-	}
-	s.statsMu.Unlock()
-}
-
-// SetPending records the start time of a DNS query.
-func (s *Store) SetPending(node, domain string, t time.Time) {
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-	if s.pendingQueries[node] == nil {
-		s.pendingQueries[node] = make(map[string][]pendingInfo)
-	}
-	s.pendingQueries[node][domain] = append(s.pendingQueries[node][domain], pendingInfo{startTime: t})
-}
-
-// GetPending retrieves and removes the oldest pending DNS query for a domain.
-func (s *Store) GetPending(node, domain string) (time.Time, string, bool) {
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-
-	if s.pendingQueries[node] == nil {
-		return time.Time{}, "", false
-	}
-	infos := s.pendingQueries[node][domain]
-	if len(infos) == 0 {
-		return time.Time{}, "", false
-	}
-
-	info := infos[0]
-	if len(infos) == 1 {
-		delete(s.pendingQueries[node], domain)
-	} else {
-		s.pendingQueries[node][domain] = infos[1:]
-	}
-	return info.startTime, info.upstream, true
-}
-
-// SetUpstream records the upstream server used for the latest query of a domain.
-func (s *Store) SetUpstream(node, domain, upstream string) {
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-	if s.pendingQueries[node] == nil {
-		return
-	}
-	infos := s.pendingQueries[node][domain]
-	if len(infos) == 0 {
-		return
-	}
-	infos[len(infos)-1].upstream = upstream
-}
-
-// SetDNSSEC updates the DNSSEC validation status for the most recent query of a domain on a node.
-func (s *Store) SetDNSSEC(node, domain, result string) {
-	s.eventsMu.Lock()
-	defer s.eventsMu.Unlock()
-
-	scanLimit := s.count
-	if scanLimit > config.DefaultScanLimit {
-		scanLimit = config.DefaultScanLimit
-	}
-	for i := 0; i < scanLimit; i++ {
-		idx := (s.head - 1 - i + s.cfg.MaxEvents) % s.cfg.MaxEvents
-		if s.events[idx].Domain == domain && s.events[idx].Node == node {
-			s.events[idx].DNSSEC = result
-			// Also update in the pending batch
-			s.batchMu.Lock()
-			for b := len(s.batch) - 1; b >= s.batchStart; b-- {
-				if s.batch[b].Domain == domain && s.batch[b].Node == node {
-					s.batch[b].DNSSEC = result
-					break
-				}
-			}
-			s.batchMu.Unlock()
-			return
-		}
-	}
-}
-
-// RunArchiver persists queued events when the queue reaches its high-water mark
-// or the periodic interval expires. Failed writes retry with bounded backoff.
-func (s *Store) RunArchiver(ctx context.Context, interval time.Duration) {
-	if interval <= 0 {
-		interval = config.DefaultArchiveInterval
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		case <-s.archiveReady:
-		}
-
-		retryDelay := archiveRetryInitialDelay
-		for {
-			_, err := s.archiveStep(ctx, time.Now())
-			if err == nil {
-				break
-			}
-			if ctx.Err() != nil {
-				return
-			}
-			metrics := s.ArchiveMetrics()
-			log.Printf("SQLite archive failed; retaining %d events and retrying in %s: %v", metrics.Pending, retryDelay, err)
-
-			retryTimer := time.NewTimer(retryDelay)
-			select {
-			case <-ctx.Done():
-				if !retryTimer.Stop() {
-					<-retryTimer.C
-				}
-				return
-			case <-retryTimer.C:
-			}
-			retryDelay = min(retryDelay*2, archiveRetryMaxDelay)
-		}
-	}
-}
-
-// ArchiveStep performs a batch insert of recent queries into SQLite and deletes old ones.
-func (s *Store) ArchiveStep(now time.Time) int {
-	archived, err := s.archiveStep(context.Background(), now)
-	if err != nil {
-		metrics := s.ArchiveMetrics()
-		log.Printf("SQLite archive failed; retaining %d events: %v", metrics.Pending, err)
-	}
-	return archived
-}
-
-func (s *Store) archiveStep(ctx context.Context, now time.Time) (int, error) {
-	s.archiveMu.Lock()
-	defer s.archiveMu.Unlock()
-	s.dbMu.RLock()
-	defer s.dbMu.RUnlock()
-	if s.closed || s.db == nil {
-		return 0, nil
-	}
-
-	archived := 0
-	for {
-		toInsert := s.claimArchiveBatch()
-		if len(toInsert) == 0 {
-			break
-		}
-
-		insert := s.insertArchiveBatch
-		if s.archiveInsert != nil {
-			insert = s.archiveInsert
-		}
-		if err := insert(ctx, toInsert); err != nil {
-			s.restoreArchiveBatch(toInsert)
-			return archived, err
-		}
-		s.batchInFlight.Add(-int64(len(toInsert)))
-		archived += len(toInsert)
-	}
-
-	s.pruneOldEvents(ctx, now)
-	s.flushArchiveDropWarning()
-	return archived, nil
-}
-
-func (s *Store) claimArchiveBatch() []models.QueryEvent {
-	s.batchMu.Lock()
-	defer s.batchMu.Unlock()
-
-	pending := s.pendingBatchLocked()
-	chunkSize := min(len(pending), s.archiveBatch)
-	if chunkSize == 0 {
-		return nil
-	}
-	claimed := append([]models.QueryEvent(nil), pending[:chunkSize]...)
-	clear(s.batch[s.batchStart : s.batchStart+chunkSize])
-	s.batchStart += chunkSize
-	s.batchInFlight.Add(int64(chunkSize))
-	if s.pendingBatchLenLocked() == 0 || s.batchStart >= max(1, s.archiveLimit/4) {
-		s.compactBatchLocked()
-	}
-	return claimed
-}
-
-func (s *Store) restoreArchiveBatch(claimed []models.QueryEvent) {
-	s.batchMu.Lock()
-	pending := append([]models.QueryEvent(nil), s.pendingBatchLocked()...)
-	combined := make([]models.QueryEvent, 0, len(claimed)+len(pending))
-	combined = append(combined, claimed...)
-	combined = append(combined, pending...)
-
-	dropped := max(0, len(combined)-s.archiveLimit)
-	clear(s.batch)
-	s.batch = append(s.batch[:0], combined[dropped:]...)
-	s.batchStart = 0
-	s.batchInFlight.Add(-int64(len(claimed)))
-	if dropped > 0 {
-		s.batchDropped.Add(int64(dropped))
-		s.batchDropUnreported += int64(dropped)
-	}
-	s.batchMu.Unlock()
-
-	if dropped > 0 {
-		log.Printf("[WARN] SQLite archive retry queue full; dropped %d oldest uncommitted event(s) (%d total)", dropped, s.batchDropped.Load())
-	}
-}
-
-func (s *Store) insertArchiveBatch(ctx context.Context, events []models.QueryEvent) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin transaction for %d events: %w", len(events), err)
-	}
-
-	const insertPrefix = "INSERT INTO queries (unix_time, node, client_ip, domain, type, upstream, latency, dnssec, response_code, client_hostname, blocked, latency_alert, matched_rule, block_reason) VALUES "
-	const rowPlaceholders = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-	for start := 0; start < len(events); start += archiveInsertRows {
-		end := min(start+archiveInsertRows, len(events))
-		var query strings.Builder
-		query.Grow(len(insertPrefix) + (end-start)*(len(rowPlaceholders)+1))
-		query.WriteString(insertPrefix)
-		args := make([]any, 0, (end-start)*14)
-		for index, event := range events[start:end] {
-			if index > 0 {
-				query.WriteByte(',')
-			}
-			query.WriteString(rowPlaceholders)
-			blocked := 0
-			if event.Blocked {
-				blocked = 1
-			}
-			latencyAlert := 0
-			if event.LatencyAlert {
-				latencyAlert = 1
-			}
-			args = append(args, event.UnixTime, event.Node, event.ClientIP, event.Domain, event.Type, event.Upstream, event.Latency, event.DNSSEC, event.ResponseCode, event.ClientHostname, blocked, latencyAlert, event.MatchedRule, event.BlockReason)
-		}
-		if _, err = tx.ExecContext(ctx, query.String(), args...); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("insert batch of %d events: %w", len(events), err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit batch of %d events: %w", len(events), err)
-	}
-	return nil
-}
-
-// ArchiveMetrics returns current queue pressure, configured limits, and the
-// lifetime number of events dropped at the hard limit.
-func (s *Store) ArchiveMetrics() ArchiveQueueMetrics {
-	s.batchMu.Lock()
-	pending := s.pendingBatchLenLocked() + int(s.batchInFlight.Load())
-	s.batchMu.Unlock()
-	return ArchiveQueueMetrics{
-		Pending:    pending,
-		Dropped:    s.batchDropped.Load(),
-		Capacity:   s.archiveLimit,
-		Trigger:    s.archiveMark,
-		WriteBatch: s.archiveBatch,
-	}
-}
-
-func (s *Store) flushArchiveDropWarning() {
-	s.batchMu.Lock()
-	unreported := s.batchDropUnreported
-	s.batchDropUnreported = 0
-	if unreported > 0 {
-		s.batchDropLogAt = time.Now()
-	}
-	pending := s.pendingBatchLenLocked()
-	s.batchMu.Unlock()
-	if unreported > 0 {
-		log.Printf("[WARN] SQLite archive recovered after dropping %d additional event(s) (%d total); %d event(s) remain pending", unreported, s.batchDropped.Load(), pending)
-	}
-}
-
-func (s *Store) pruneOldEvents(ctx context.Context, now time.Time) {
-	cutoff := now.Add(-s.cfg.HistoryRetention).Unix()
-	var err error
-	if s.stmtCleanup != nil {
-		_, err = s.stmtCleanup.ExecContext(ctx, cutoff)
-	} else {
-		_, err = s.db.ExecContext(ctx, "DELETE FROM queries WHERE unix_time < ?", cutoff)
-	}
-	if err != nil {
-		log.Printf("Failed to prune old SQLite data: %v", err)
-	}
-}
-
-// SetUpstreamHealth updates the latency mapping and history for upstream DNS servers for a specific node.
-func (s *Store) SetUpstreamHealth(node string, health map[string]float64) {
-	if node == "" {
-		node = "local"
-	}
-	s.healthMu.Lock()
-	defer s.healthMu.Unlock()
-
-	if s.nodeUpstreamHealth[node] == nil {
-		s.nodeUpstreamHealth[node] = make(map[string]float64)
-		s.nodeUpstreamHealthHistory[node] = make(map[string][]float64)
-	}
-
-	s.nodeUpstreamHealth[node] = health
-	for ip, lat := range health {
-		hist := s.nodeUpstreamHealthHistory[node][ip]
-		hist = append(hist, lat)
-		if len(hist) > 20 {
-			hist = hist[1:]
-		}
-		s.nodeUpstreamHealthHistory[node][ip] = hist
-	}
-}
-
-// GetUpstreamHealth returns a deep copy of the current upstream health data (node -> upstream -> latency).
-// This is the exported accessor for the unexported nodeUpstreamHealth map.
-func (s *Store) GetUpstreamHealth() map[string]map[string]float64 {
-	s.healthMu.RLock()
-	defer s.healthMu.RUnlock()
-
-	result := make(map[string]map[string]float64, len(s.nodeUpstreamHealth))
-	for node, upstreams := range s.nodeUpstreamHealth {
-		result[node] = make(map[string]float64, len(upstreams))
-		for up, lat := range upstreams {
-			result[node][up] = lat
-		}
-	}
-	return result
-}
-
-// SetNodeStatus updates the status of a node (Items 89, 92, 93).
-// This is called when a heartbeat is received from a agent node.
-func (s *Store) SetNodeStatus(name string, status models.NodeStatus) {
-	if name == "" {
-		name = "unknown"
-	}
-	s.nodeStatusMu.Lock()
-	defer s.nodeStatusMu.Unlock()
-
-	status.Online = true
-	status.LastSeen = time.Now()
-	s.nodeStatuses[name] = &status
-}
-
-// GetNodeStatus returns the status of a single node by name.
-func (s *Store) GetNodeStatus(name string) *models.NodeStatus {
-	s.nodeStatusMu.RLock()
-	defer s.nodeStatusMu.RUnlock()
-
-	if ns, ok := s.nodeStatuses[name]; ok {
-		// Return a copy
-		result := *ns
-		result.Online = ns.IsOnline(s.cfg.NodeOfflineThreshold)
-		return &result
-	}
-	return nil
-}
-
-// GetNodeStatuses returns a copy of all node statuses with online state computed.
-func (s *Store) GetNodeStatuses() []models.NodeStatus {
-	s.nodeStatusMu.RLock()
-	defer s.nodeStatusMu.RUnlock()
-
-	result := make([]models.NodeStatus, 0, len(s.nodeStatuses))
-	for _, ns := range s.nodeStatuses {
-		copy := *ns
-		copy.Online = ns.IsOnline(s.cfg.NodeOfflineThreshold)
-		result = append(result, copy)
-	}
-	return result
-}
-
-// GetAlias returns the friendly name for a client IP if configured.
-func (s *Store) GetAlias(ip string) string {
-	return s.cfg.GetClientAlias(ip)
-}
-
-// StartStatsTrends begins periodic snapshots of top lists for trend analysis.
-func (s *Store) StartStatsTrends(ctx context.Context) {
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(5 * time.Minute):
-				s.updateTrends()
-			}
-		}
-	}()
-}
-
-func (s *Store) updateTrends() {
-	stats := s.GetStats()
-	s.statsMu.Lock()
-	if td, ok := stats["top_domains"].([]models.StatEntry); ok {
-		s.lastTopStats["domains"] = td
-	}
-	if tc, ok := stats["top_clients"].([]models.StatEntry); ok {
-		s.lastTopStats["clients"] = tc
-	}
-	s.statsMu.Unlock()
-}
-
-// startVacuum runs a background goroutine that periodically executes VACUUM
-// to reclaim disk space from deleted rows. Default interval: 24 hours.
-func (s *Store) startVacuum(ctx context.Context) {
-	go func() {
-		ticker := time.NewTicker(s.vacuumInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				s.dbMu.RLock()
-				if s.closed || s.db == nil {
-					s.dbMu.RUnlock()
-					return
-				}
-				log.Printf("Database VACUUM started")
-				start := time.Now()
-				_, err := s.db.ExecContext(ctx, "VACUUM;")
-				if err != nil {
-					log.Printf("Database VACUUM failed: %v", err)
-				} else {
-					log.Printf("Database VACUUM completed in %s", time.Since(start).Round(time.Millisecond))
-				}
-				s.dbMu.RUnlock()
-			}
-		}
-	}()
-	log.Printf("Periodic VACUUM started (interval: %s)", s.vacuumInterval)
-}
-
-// startWALCheckpoint runs a background goroutine that periodically executes
-// PRAGMA wal_checkpoint(TRUNCATE) to prevent the WAL file from growing too large.
-// Default interval: 5 minutes.
-func (s *Store) startWALCheckpoint(ctx context.Context) {
-	go func() {
-		ticker := time.NewTicker(s.checkpointInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				s.dbMu.RLock()
-				if s.closed || s.db == nil {
-					s.dbMu.RUnlock()
-					return
-				}
-				var busy, logFrames, checkpointed int
-				row := s.db.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE);")
-				if err := row.Scan(&busy, &logFrames, &checkpointed); err != nil {
-					log.Printf("WAL checkpoint failed: %v", err)
-				} else {
-					log.Printf("WAL checkpoint completed: busy=%d, logFrames=%d, checkpointed=%d", busy, logFrames, checkpointed)
-				}
-				s.dbMu.RUnlock()
-			}
-		}
-	}()
-	log.Printf("Periodic WAL checkpoint started (interval: %s)", s.checkpointInterval)
 }

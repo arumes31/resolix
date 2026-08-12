@@ -110,7 +110,7 @@ func (s *Server) ptrName(ip string) string {
 			return alias
 		}
 	}
-	if s.cfg.Resolver != nil {
+	if s.cfg.ResolveClientHostnames && s.cfg.Resolver != nil {
 		if host := s.cfg.Resolver.GetHostname(ip); host != "" {
 			return host
 		}

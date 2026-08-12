@@ -1,24 +1,18 @@
 // Package dnsserver implements the in-process DNS server that replaces
 // dnsmasq. It serves UDP and TCP listeners and answers queries through an
-// ordered pipeline: refuse-ANY/AAAA-disable → typed rewrites → private PTR →
-// safe-search → filter → cache → client upstreams →
+// ordered pipeline: refuse-ANY/AAAA-disable → typed rewrites → MagicDNS →
+// private PTR → safe-search → filter → cache → client upstreams →
 // domain route → global pool → bogus-NXDOMAIN → cache store → respond.
 // Every answered query is emitted as a models.QueryEvent into the existing
 // Store/SSE pipeline.
 package dnsserver
 
 import (
-	"context"
-	"crypto/tls"
-	"database/sql"
-	"errors"
-	"fmt"
 	"log"
 	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/miekg/dns"
@@ -26,6 +20,7 @@ import (
 	"github.com/arumes31/resolix/webgui/internal/clients"
 	"github.com/arumes31/resolix/webgui/internal/dnsroutes"
 	"github.com/arumes31/resolix/webgui/internal/filter"
+	"github.com/arumes31/resolix/webgui/internal/magicdns"
 	"github.com/arumes31/resolix/webgui/internal/models"
 	"github.com/arumes31/resolix/webgui/internal/policy"
 	"github.com/arumes31/resolix/webgui/internal/resolver"
@@ -47,6 +42,16 @@ const (
 	staticTTL = 60
 	// maxChainDepth caps CNAME/safe-search chase chains to avoid loops.
 	maxChainDepth = 8
+	// defaultEDNSUDPSize is the fragmentation-safe DNS payload size recommended
+	// by DNS Flag Day 2020. Larger client advertisements are clamped to it.
+	defaultEDNSUDPSize = 1232
+	// maxMissFlights bounds distinct concurrent cache-miss work so random-name
+	// floods cannot grow the coalescing map without limit.
+	maxMissFlights           = 1024
+	maxBackgroundRefreshes   = 64
+	defaultTCPIdleTimeout    = 8 * time.Second
+	defaultTCPMaxQueries     = 128
+	defaultTCPMaxConnections = 256
 )
 
 // Config holds the DNS server configuration.
@@ -72,8 +77,14 @@ type Config struct {
 	// BlockCustomIP4/IP6 are the answer addresses in custom_ip mode.
 	BlockCustomIP4 string
 	BlockCustomIP6 string
+	// BlockedResponseTTL is used for synthetic blocked A/AAAA answers.
+	BlockedResponseTTL uint32
 	// Rewrites is the typed-rewrite store (nil = fall back to StaticHosts).
 	Rewrites *rewrites.Store
+	// MagicDNS is the read-only, controller-synchronized Tailscale record store.
+	MagicDNS *magicdns.Store
+	// MagicDNSTTL is applied to generated MagicDNS A and AAAA answers.
+	MagicDNSTTL uint32
 	// Policy holds safe-search / bogus-NXDOMAIN / AAAA / ANY policy (nil = off).
 	Policy *policy.Policy
 	// Pool is the upstream pool (nil = legacy strict-order Upstreams path).
@@ -89,6 +100,13 @@ type Config struct {
 	CacheMinTTL     uint32
 	CacheMaxTTL     uint32
 	CacheOptimistic bool
+	// CachePrefetch refreshes frequently used entries shortly before expiry.
+	CachePrefetch       bool
+	CachePrefetchWindow time.Duration
+	CachePrefetchHits   uint32
+	// CacheSERVFAILTTL enables a bounded SERVFAIL micro-cache. Values above one
+	// second are clamped to one second; zero disables it.
+	CacheSERVFAILTTL time.Duration
 
 	// AllowedClients restricts service to these IPs/CIDRs when non-empty.
 	AllowedClients string
@@ -98,8 +116,20 @@ type Config struct {
 	RateLimitQPS int
 	// InternalRateLimitQPS limits LAN and Tailscale clients per IP (0 = disabled).
 	InternalRateLimitQPS int
+	// RateLimitEDE opts EDNS-capable clients into a small REFUSED response with
+	// EDE Prohibited. The default remains a silent drop to resist amplification.
+	RateLimitEDE bool
+	// RateLimitIPv4Prefix/IPv6Prefix aggregate clients into subnet buckets.
+	RateLimitIPv4Prefix int
+	RateLimitIPv6Prefix int
+	// RateLimitAllowlist bypasses query rate limiting for trusted IPs/CIDRs.
+	RateLimitAllowlist string
 	// PrivatePTR answers PTR for known private clients locally.
 	PrivatePTR bool
+	// PrivatePTRUpstreams route unknown private PTR queries to dedicated resolvers.
+	PrivatePTRUpstreams []string
+	// ResolveClientHostnames enriches events and local PTR answers from reverse DNS.
+	ResolveClientHostnames bool
 	// DNSSEC enables DO-bit passthrough to upstreams (no local validation).
 	DNSSEC bool
 	// Resolver is the reverse-DNS resolver used for private PTR fallback.
@@ -110,6 +140,11 @@ type Config struct {
 	DoTPort     int
 	TLSCertFile string
 	TLSKeyFile  string
+	// TCPIdleTimeout and TCPMaxQueries tune persistent DNS TCP/DoT sessions.
+	// TCPMaxConnections bounds active TCP and DoT connections across listeners.
+	TCPIdleTimeout    time.Duration
+	TCPMaxQueries     int
+	TCPMaxConnections int
 }
 
 // Server is the embedded DNS server.
@@ -127,6 +162,7 @@ type Server struct {
 	allowed             []*net.IPNet
 	allowedConfigured   bool
 	disallowed          []*net.IPNet
+	rateLimitAllowlist  []*net.IPNet
 	rateLimiter         *rateLimiter
 	rateLimitDropped    atomic.Int64
 	aclDropped          atomic.Int64
@@ -140,20 +176,76 @@ type Server struct {
 	// refreshInFlight tracks optimistic-cache background refreshes (single-flight).
 	refreshMu       sync.Mutex
 	refreshInFlight map[cacheKey]bool
+	refreshSlots    chan struct{}
+
+	missMu          sync.Mutex
+	missInFlight    map[cacheKey]*missFlight
+	cacheMutationMu sync.Mutex
+	cacheGeneration atomic.Uint64
+	tcpSlots        chan struct{}
+	// runtimeMu prevents live policy replacement from racing active queries.
+	// Listener and dependency fields in cfg remain immutable after startup.
+	runtimeMu sync.RWMutex
+}
+
+type missFlight struct {
+	done    chan struct{}
+	result  upstreamResult
+	waiters int
+}
+
+type upstreamResult struct {
+	upstream    string
+	msg         *dns.Msg
+	matchedRule string
+	blockReason string
 }
 
 // New creates a DNS server. emit is invoked synchronously for every answered
 // query with the event and whether the client is stats-excluded (typically
 // Store.AddEvent + Server.BroadcastEvent wiring from main).
 func New(cfg Config, emit func(models.QueryEvent, bool)) *Server {
+	if cfg.TCPIdleTimeout <= 0 {
+		cfg.TCPIdleTimeout = defaultTCPIdleTimeout
+	}
+	if cfg.TCPMaxQueries <= 0 {
+		cfg.TCPMaxQueries = defaultTCPMaxQueries
+	}
+	if cfg.TCPMaxConnections <= 0 {
+		cfg.TCPMaxConnections = defaultTCPMaxConnections
+	}
+	if cfg.RateLimitIPv4Prefix <= 0 {
+		cfg.RateLimitIPv4Prefix = 32
+	}
+	if cfg.RateLimitIPv6Prefix <= 0 {
+		cfg.RateLimitIPv6Prefix = 128
+	}
 	s := &Server{
 		cfg:             cfg,
 		cache:           newCache(cfg.CacheSize, cfg.CacheMinTTL, cfg.CacheMaxTTL),
 		emit:            emit,
 		refreshInFlight: make(map[cacheKey]bool),
+		refreshSlots:    make(chan struct{}, maxBackgroundRefreshes),
+		missInFlight:    make(map[cacheKey]*missFlight),
 		client: &dns.Client{
 			Timeout: upstreamTimeout,
+			UDPSize: defaultEDNSUDPSize,
 		},
+	}
+	if s.cfg.CachePrefetchWindow <= 0 {
+		s.cfg.CachePrefetchWindow = 30 * time.Second
+	}
+	if s.cfg.CachePrefetchHits == 0 {
+		s.cfg.CachePrefetchHits = 3
+	}
+	if s.cfg.CacheSERVFAILTTL > time.Second {
+		s.cfg.CacheSERVFAILTTL = time.Second
+	}
+	if s.cfg.CacheSERVFAILTTL < 0 {
+		s.cfg.CacheSERVFAILTTL = 0
+	}
+	if cfg.TCPMaxConnections > 0 {
+		s.tcpSlots = make(chan struct{}, cfg.TCPMaxConnections)
 	}
 	s.cache.optimistic = cfg.CacheOptimistic
 	for _, raw := range cfg.Upstreams {
@@ -169,819 +261,10 @@ func New(cfg Config, emit func(models.QueryEvent, bool)) *Server {
 	s.allowed = parseCIDRList(cfg.AllowedClients)
 	s.allowedConfigured = strings.TrimSpace(cfg.AllowedClients) != ""
 	s.disallowed = parseCIDRList(cfg.DisallowedClients)
-	if cfg.RateLimitQPS > 0 || cfg.InternalRateLimitQPS > 0 {
-		s.rateLimiter = newRateLimiter(cfg.RateLimitQPS)
-	}
+	s.rateLimitAllowlist = parseCIDRList(cfg.RateLimitAllowlist)
+	s.rateLimiter = newRateLimiter(cfg.RateLimitQPS)
 	handler := dns.HandlerFunc(s.ServeDNS)
-	s.udp = &dns.Server{Net: "udp", Handler: handler}
-	s.tcp = &dns.Server{Net: "tcp", Handler: handler}
+	s.udp = &dns.Server{Net: "udp", Handler: handler, UDPSize: defaultEDNSUDPSize}
+	s.tcp = newTCPServer("tcp", handler, cfg)
 	return s
-}
-
-// ListenAddr returns the host:port the server binds to.
-func (s *Server) ListenAddr() string {
-	return net.JoinHostPort(s.cfg.Addr, fmt.Sprintf("%d", s.cfg.Port))
-}
-
-// resetTolerantConn wraps a UDP socket to ignore spurious
-// "connection reset" read errors. On Windows, an ICMP port-unreachable
-// (e.g. from a client that already closed its socket) surfaces as
-// WSAECONNRESET on the next ReadFrom and would otherwise kill the listener.
-type resetTolerantConn struct {
-	net.PacketConn
-}
-
-func (c resetTolerantConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	const maxConsecutiveResets = 8
-	for resets := 0; ; resets++ {
-		n, addr, err := c.PacketConn.ReadFrom(p)
-		reset := errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.Errno(10054))
-		if reset && resets < maxConsecutiveResets {
-			continue
-		}
-		return n, addr, err
-	}
-}
-
-// Start binds the configured address and runs the listeners until ctx is
-// canceled or a listener fails, then shuts everything down gracefully. When
-// DoT is enabled, certificates are validated before anything is bound.
-func (s *Server) Start(ctx context.Context) error {
-	// DoT requires certificates — fail fast before binding anything.
-	var tlsConfig *tls.Config
-	if s.cfg.DoTEnabled {
-		if s.cfg.TLSCertFile == "" || s.cfg.TLSKeyFile == "" {
-			return fmt.Errorf("DOT_ENABLED requires TLS_CERT_FILE and TLS_KEY_FILE")
-		}
-		cert, err := tls.LoadX509KeyPair(s.cfg.TLSCertFile, s.cfg.TLSKeyFile)
-		if err != nil {
-			return fmt.Errorf("DoT TLS keypair: %w", err)
-		}
-		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
-	}
-
-	udpConn, err := net.ListenPacket("udp", s.ListenAddr())
-	if err != nil {
-		return fmt.Errorf("DNS UDP listener on %s: %w", s.ListenAddr(), err)
-	}
-	tcpLn, err := net.Listen("tcp", s.ListenAddr())
-	if err != nil {
-		_ = udpConn.Close()
-		return fmt.Errorf("DNS TCP listener on %s: %w", s.ListenAddr(), err)
-	}
-
-	var dotLn net.Listener
-	if tlsConfig != nil {
-		port := s.cfg.DoTPort
-		if port == 0 {
-			port = 853
-		}
-		dotAddr := net.JoinHostPort(s.cfg.Addr, fmt.Sprintf("%d", port))
-		raw, err := net.Listen("tcp", dotAddr)
-		if err != nil {
-			_ = udpConn.Close()
-			_ = tcpLn.Close()
-			return fmt.Errorf("DNS DoT listener on %s: %w", dotAddr, err)
-		}
-		dotLn = tls.NewListener(raw, tlsConfig)
-	}
-	return s.startOn(ctx, udpConn, tcpLn, dotLn)
-}
-
-// StartOn runs the UDP and TCP listeners on pre-bound sockets until ctx is
-// canceled or a listener fails. Tests use it with :0 sockets to avoid
-// port-reservation races.
-func (s *Server) StartOn(ctx context.Context, udpConn net.PacketConn, tcpLn net.Listener) error {
-	return s.startOn(ctx, udpConn, tcpLn, nil)
-}
-
-// startOn serves all bound listeners until ctx is canceled or one fails.
-func (s *Server) startOn(ctx context.Context, udpConn net.PacketConn, tcpLn, dotLn net.Listener) error {
-	serveCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	s.udp.PacketConn = resetTolerantConn{udpConn}
-	s.tcp.Listener = tcpLn
-	servers := []*dns.Server{s.udp, s.tcp}
-	if dotLn != nil {
-		s.dot = &dns.Server{Net: "tcp-tls", Listener: dotLn, Handler: dns.HandlerFunc(s.ServeDNS)}
-		servers = append(servers, s.dot)
-	}
-
-	if s.rateLimiter != nil {
-		go s.rateLimiter.rateLimitCleanupLoop(serveCtx.Done())
-	}
-
-	errCh := make(chan error, len(servers))
-	for _, srv := range servers {
-		go func(srv *dns.Server) { errCh <- srv.ActivateAndServe() }(srv)
-	}
-	s.ready.Store(true)
-	defer s.ready.Store(false)
-
-	shutdown := func() {
-		for _, srv := range servers {
-			_ = srv.Shutdown()
-		}
-	}
-	select {
-	case <-ctx.Done():
-		shutdown()
-		return nil
-	case err := <-errCh:
-		shutdown()
-		return fmt.Errorf("DNS listener on %s: %w", s.ListenAddr(), err)
-	}
-}
-
-// resolution describes how a query was answered, for event emission.
-type resolution struct {
-	upstream    string
-	cacheHit    bool
-	blocked     bool
-	matchedRule string
-	blockReason string
-}
-
-// Resolve answers a query message through the full pipeline and emits the
-// query event. It returns drop=true for deny-list matches, allow-list misses,
-// and rate-limit excess so DNS listeners emit no response. Shared by the
-// UDP/TCP/DoT listeners and the DoH endpoint.
-func (s *Server) Resolve(r *dns.Msg, clientIP string) (resp *dns.Msg, drop bool) {
-	start := time.Now()
-
-	resp = new(dns.Msg)
-	resp.SetReply(r)
-	resp.RecursionAvailable = true
-
-	// Stage 0a: ACL — disallowed clients are dropped silently.
-	if s.aclDrop(clientIP) {
-		s.aclDropped.Add(1)
-		return nil, true
-	}
-	// Stage 0b: ACL — outside a non-empty allowed list → silent drop.
-	if s.aclAllowlistDrop(clientIP) {
-		s.aclAllowlistDropped.Add(1)
-		return nil, true
-	}
-	// Stage 0c: per-IP rate limit → silent drop. LAN and Tailscale clients use
-	// the higher internal rate without relaxing the public-client limit.
-	rateLimitQPS := s.cfg.RateLimitQPS
-	if isInternalClientIP(clientIP) {
-		rateLimitQPS = s.cfg.InternalRateLimitQPS
-	}
-	if s.rateLimiter != nil && !s.rateLimiter.allowAtRate(clientIP, rateLimitQPS) {
-		s.rateLimitDropped.Add(1)
-		return nil, true
-	}
-
-	// Per-client resolution happens once at query start.
-	var cl *clients.Client
-	if s.cfg.Clients != nil {
-		cl = s.cfg.Clients.Find(clientIP)
-	}
-
-	res := s.resolve(r, resp, 0, cl, clientIP)
-	if s.cfg.Policy != nil && s.cfg.Policy.AAAADisabled && len(r.Question) > 0 &&
-		(r.Question[0].Qtype == dns.TypeHTTPS || r.Question[0].Qtype == dns.TypeSVCB) {
-		stripIPv6Hints(resp.Answer)
-	}
-
-	if s.emit == nil {
-		return resp, false
-	}
-	if cl != nil && cl.ExcludeFromLog {
-		return resp, false // exclude_from_log: skip event emission entirely
-	}
-	excludeFromStats := cl != nil && cl.ExcludeFromStats
-	s.emit(s.buildEvent(r, resp, clientIP, cl, res, start), excludeFromStats)
-	return resp, false
-}
-
-func stripIPv6Hints(records []dns.RR) {
-	for _, record := range records {
-		var values *[]dns.SVCBKeyValue
-		switch typed := record.(type) {
-		case *dns.SVCB:
-			values = &typed.Value
-		case *dns.HTTPS:
-			values = &typed.Value
-		}
-		if values == nil {
-			continue
-		}
-		filtered := (*values)[:0]
-		for _, value := range *values {
-			if _, ipv6Hint := value.(*dns.SVCBIPv6Hint); !ipv6Hint {
-				filtered = append(filtered, value)
-			}
-		}
-		*values = filtered
-	}
-}
-
-// ServeDNS implements the dns.Handler interface (UDP/TCP/DoT listeners).
-func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
-	resp, drop := s.Resolve(r, clientIPFromRemote(w.RemoteAddr()))
-	if drop || resp == nil {
-		return
-	}
-	_ = w.WriteMsg(resp)
-}
-
-// resolve runs the request pipeline and fills resp.
-//
-// Order: refuse-ANY / AAAA-disable short-circuits → typed rewrites → private
-// PTR → safe-search (per-client aware) → filter (unless the client disabled
-// filtering) → cache →
-// forward (client upstreams → per-domain route → global pool) →
-// bogus-NXDOMAIN conversion → cache store. depth bounds chase chains.
-func (s *Server) resolve(r *dns.Msg, resp *dns.Msg, depth int, cl *clients.Client, clientIP string) resolution {
-	if len(r.Question) == 0 {
-		resp.Rcode = dns.RcodeFormatError
-		return resolution{}
-	}
-	q := r.Question[0]
-	domain := normalizeName(q.Name)
-
-	// Early policy short-circuits (before rewrites).
-	if s.cfg.Policy != nil {
-		if s.cfg.Policy.RefuseANY && q.Qtype == dns.TypeANY {
-			resp.Rcode = dns.RcodeRefused
-			return resolution{upstream: "Policy", matchedRule: "REFUSE_ANY", blockReason: policy.ReasonRefusedANY}
-		}
-		if s.cfg.Policy.AAAADisabled && q.Qtype == dns.TypeAAAA {
-			// NODATA: NOERROR with an empty answer section.
-			return resolution{upstream: "Policy", matchedRule: "AAAA_DISABLED", blockReason: policy.ReasonAAAADisabled}
-		}
-	}
-
-	// Stage 1: typed rewrites (short-circuit, pre-cache).
-	if res, handled := s.stageRewrites(r, q, resp, depth, cl, clientIP); handled {
-		return res
-	}
-
-	// Stage 1b: automatic private PTR, below explicit user rewrites.
-	if res, handled := s.stagePrivatePTR(q, resp); handled {
-		return res
-	}
-
-	// Stage 2: safe search (global engines or per-client override).
-	if res, handled := s.stageSafeSearch(r, q, resp, depth, cl, clientIP); handled {
-		return res
-	}
-
-	// Stage 3: filter (skipped for clients with filtering disabled).
-	// Blocked responses are NOT cached (cheap to regenerate; must not poison
-	// the forwarded-answer cache).
-	if s.filteringEnabledFor(cl) && s.cfg.Filter != nil && !s.cfg.Filter.Paused() {
-		if f := s.cfg.Filter.Match(domain); f.Blocked && !f.Allowed {
-			blockedResp := s.blockedResponse(r, q)
-			resp.Rcode = blockedResp.Rcode
-			resp.Answer = blockedResp.Answer
-			return resolution{upstream: "Filtered", blocked: true, matchedRule: f.Rule, blockReason: f.Reason}
-		}
-	}
-
-	// Stage 4: cache → forward → bogus-NXDOMAIN → cache store. Clients with
-	// custom upstreams get a distinct cache group so their answers never
-	// pollute the shared global cache.
-	group, specs := clientUpstreamGroup(cl)
-	key := cacheKey{name: domain, qtype: q.Qtype, qclass: q.Qclass, group: group}
-	return s.resolveViaCacheOrUpstream(r, resp, key, specs)
-}
-
-// filteringEnabledFor reports whether the filter engine applies to a client.
-func (s *Server) filteringEnabledFor(cl *clients.Client) bool {
-	return cl == nil || cl.UseGlobalSettings || cl.FilteringEnabled
-}
-
-// clientUpstreamGroup returns the cache discriminator and custom upstream
-// specs for a client (empty when the client uses the global pool).
-func clientUpstreamGroup(cl *clients.Client) (group string, specs []string) {
-	if cl == nil || cl.UseGlobalSettings || len(cl.Upstreams) == 0 {
-		return "", nil
-	}
-	return "up:" + strings.Join(cl.Upstreams, ","), cl.Upstreams
-}
-
-// stageRewrites applies typed rewrites from the store (or the legacy
-// StaticHosts fallback). handled is true when a rewrite answered the query.
-func (s *Server) stageRewrites(
-	_ *dns.Msg,
-	q dns.Question,
-	resp *dns.Msg,
-	depth int,
-	cl *clients.Client,
-	clientIP string,
-) (resolution, bool) {
-	domain := normalizeName(q.Name)
-
-	if s.cfg.Rewrites == nil {
-		// Legacy fallback: StaticHosts map (used when no store is wired).
-		if q.Qtype == dns.TypeA {
-			if ip := matchStatic(s.staticHosts(), domain); ip != nil {
-				resp.Answer = []dns.RR{&dns.A{
-					Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: staticTTL},
-					A:   ip,
-				}}
-				return resolution{upstream: "Local Override"}, true
-			}
-		}
-		return resolution{}, false
-	}
-
-	entries := s.cfg.Rewrites.LookupForClient(domain, clientIP)
-	if len(entries) == 0 {
-		return resolution{}, false
-	}
-	s.rewriteHits.Add(1)
-
-	// RCODE rewrites take precedence over record rewrites.
-	for _, e := range entries {
-		switch e.Type {
-		case rewrites.TypeNXDOMAIN:
-			resp.Rcode = dns.RcodeNameError
-			return resolution{upstream: "Rewrite", matchedRule: e.String(), blockReason: "Rewrite"}, true
-		case rewrites.TypeREFUSED:
-			resp.Rcode = dns.RcodeRefused
-			return resolution{upstream: "Rewrite", matchedRule: e.String(), blockReason: "Rewrite"}, true
-		case rewrites.TypeNOERROR:
-			return resolution{upstream: "Rewrite", matchedRule: e.String(), blockReason: "Rewrite"}, true
-		}
-	}
-
-	// Records matching the question type. CNAME entries are handled by the
-	// chase below (except for explicit CNAME questions).
-	var answers []dns.RR
-	matched := ""
-	for _, e := range entries {
-		if e.Type == rewrites.TypeCNAME && q.Qtype != dns.TypeCNAME {
-			continue
-		}
-		if rr := e.BuildRR(q.Name, q.Qtype); rr != nil {
-			answers = append(answers, rr)
-			matched = e.String()
-		}
-	}
-	if len(answers) > 0 {
-		resp.Answer = answers
-		return resolution{upstream: "Rewrite", matchedRule: matched, blockReason: "Rewrite"}, true
-	}
-
-	// CNAME rewrites chase the target through the rest of the pipeline.
-	if q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA || q.Qtype == dns.TypeCNAME {
-		for _, e := range entries {
-			if e.Type != rewrites.TypeCNAME {
-				continue
-			}
-			return s.chaseCNAME(q, resp, e.Value, e.String(), "Rewrite", "Rewrite", depth, cl, clientIP), true
-		}
-	}
-
-	// The rewrite set covers this domain but not the qtype → NODATA.
-	return resolution{upstream: "Rewrite", matchedRule: entries[0].String(), blockReason: "Rewrite"}, true
-}
-
-// stageSafeSearch rewrites configured safe-search domains to their
-// restricted variants (pre-cache, like rewrites). Clients with global
-// settings disabled use their own engine list (or inherit the global set).
-func (s *Server) stageSafeSearch(
-	_ *dns.Msg,
-	q dns.Question,
-	resp *dns.Msg,
-	depth int,
-	cl *clients.Client,
-	clientIP string,
-) (resolution, bool) {
-	target := ""
-	switch {
-	case cl != nil && !cl.UseGlobalSettings:
-		if cl.SafeSearchEnabled {
-			engines := policy.ParseEngines(cl.SafeSearchEngines)
-			if len(engines) == 0 && s.cfg.Policy != nil {
-				engines = s.cfg.Policy.Engines()
-			}
-			target = policy.SafeSearchTargetFor(engines, normalizeName(q.Name))
-		}
-	case s.cfg.Policy != nil:
-		target = s.cfg.Policy.SafeSearchTarget(normalizeName(q.Name))
-	}
-	if target == "" {
-		return resolution{}, false
-	}
-	s.safeSearchHits.Add(1)
-
-	// Address-type queries chase the restricted target through the rest of
-	// the pipeline and return both the CNAME and the target's records.
-	if q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA || q.Qtype == dns.TypeCNAME {
-		return s.chaseCNAME(
-			q,
-			resp,
-			target,
-			"SafeSearch",
-			"SafeSearch",
-			policy.ReasonSafeSearch,
-			depth,
-			cl,
-			clientIP,
-		), true
-	}
-	// Other types get just the CNAME record.
-	resp.Answer = []dns.RR{&dns.CNAME{
-		Hdr:    dns.RR_Header{Name: q.Name, Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: staticTTL},
-		Target: dns.Fqdn(target),
-	}}
-	return resolution{upstream: "SafeSearch", matchedRule: "SafeSearch", blockReason: policy.ReasonSafeSearch}, true
-}
-
-// chaseCNAME appends the CNAME record and resolves the target through the
-// rest of the pipeline (filter/cache/forward), merging the answers.
-func (s *Server) chaseCNAME(
-	q dns.Question,
-	resp *dns.Msg,
-	target string,
-	rule string,
-	label string,
-	reason string,
-	depth int,
-	cl *clients.Client,
-	clientIP string,
-) resolution {
-	if depth >= maxChainDepth {
-		resp.Rcode = dns.RcodeServerFailure
-		return resolution{upstream: label, matchedRule: rule + " (chain depth exceeded)", blockReason: reason}
-	}
-	fqdn := dns.Fqdn(target)
-	cname := &dns.CNAME{
-		Hdr:    dns.RR_Header{Name: q.Name, Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: staticTTL},
-		Target: fqdn,
-	}
-	sub := new(dns.Msg)
-	sub.SetQuestion(fqdn, q.Qtype)
-	subResp := new(dns.Msg)
-	subResp.SetReply(sub)
-	subResp.RecursionAvailable = true
-	subResolution := s.resolve(sub, subResp, depth+1, cl, clientIP)
-
-	resp.Rcode = subResp.Rcode
-	resp.Answer = append([]dns.RR{cname}, subResp.Answer...)
-	resp.Ns = subResp.Ns
-	return resolution{upstream: label, blocked: subResolution.blocked, matchedRule: rule, blockReason: reason}
-}
-
-// blockedResponse builds the response for a filtered query according to the
-// configured blocking mode, with TTL 60 per existing conventions.
-func (s *Server) blockedResponse(r *dns.Msg, question dns.Question) *dns.Msg {
-	resp := new(dns.Msg)
-	resp.SetReply(r)
-	resp.RecursionAvailable = true
-
-	hdr := dns.RR_Header{
-		Name:   question.Name,
-		Class:  dns.ClassINET,
-		Ttl:    staticTTL,
-		Rrtype: question.Qtype,
-	}
-	switch s.cfg.BlockingMode {
-	case "refused":
-		resp.Rcode = dns.RcodeRefused
-	case "null_ip", "custom_ip":
-		v4, v6 := s.blockIPs()
-		switch question.Qtype {
-		case dns.TypeA:
-			if ip := net.ParseIP(v4); ip != nil {
-				resp.Answer = []dns.RR{&dns.A{Hdr: hdr, A: ip.To4()}}
-			}
-		case dns.TypeAAAA:
-			if ip := net.ParseIP(v6); ip != nil {
-				resp.Answer = []dns.RR{&dns.AAAA{Hdr: hdr, AAAA: ip}}
-			}
-		default:
-			// Other types get a NODATA (NOERROR, empty) answer.
-		}
-	default: // "nxdomain"
-		resp.Rcode = dns.RcodeNameError
-	}
-	return resp
-}
-
-// blockIPs returns the IPv4/IPv6 answers for null_ip and custom_ip modes.
-func (s *Server) blockIPs() (v4, v6 string) {
-	v4, v6 = "0.0.0.0", "::"
-	if s.cfg.BlockingMode == "custom_ip" {
-		if s.cfg.BlockCustomIP4 != "" {
-			v4 = s.cfg.BlockCustomIP4
-		}
-		if s.cfg.BlockCustomIP6 != "" {
-			v6 = s.cfg.BlockCustomIP6
-		}
-	}
-	return v4, v6
-}
-
-// staticHosts returns the configured static rewrite map (never nil).
-func (s *Server) staticHosts() map[string]net.IP {
-	return s.cfg.StaticHosts
-}
-
-// resolveViaCacheOrUpstream runs the cache → forward → bogus-NXDOMAIN →
-// cache-store stages. It fills resp on success. specs, when non-empty, are
-// per-client custom upstreams used instead of routes/global pool.
-func (s *Server) resolveViaCacheOrUpstream(r *dns.Msg, resp *dns.Msg, key cacheKey, specs []string) resolution {
-	// Stage: cache lookup.
-	if ent, remaining, ok := s.cache.get(key); ok {
-		resp.Rcode = ent.rcode
-		resp.AuthenticatedData = ent.authenticatedData
-		resp.Answer = withTTL(ent.answers, remaining)
-		resp.Ns = withTTL(ent.authority, remaining)
-		resp.Extra = responseExtra(r, nil)
-		return resolution{upstream: "System Cache", cacheHit: true}
-	}
-
-	// Optimistic caching: serve the stale entry with TTL 1 and refresh in
-	// the background (single-flight per key).
-	if s.cfg.CacheOptimistic {
-		if ent, ok := s.cache.getStale(key); ok {
-			resp.Rcode = ent.rcode
-			resp.AuthenticatedData = ent.authenticatedData
-			resp.Answer = withTTL(ent.answers, 1)
-			resp.Ns = withTTL(ent.authority, 1)
-			resp.Extra = responseExtra(r, nil)
-			s.refreshAsync(key, r, specs)
-			return resolution{upstream: "System Cache (stale)", cacheHit: true}
-		}
-	}
-
-	// Stage: forward (client upstreams → route → global pool).
-	usedUpstream, m := s.forward(r, specs)
-	if m == nil {
-		resp.Rcode = dns.RcodeServerFailure
-		return resolution{upstream: usedUpstream}
-	}
-
-	// Stage: bogus-NXDOMAIN conversion (anti-poisoning) — runs before the
-	// cache store so converted answers never poison the cache.
-	if s.cfg.Policy != nil && s.cfg.Policy.IsBogusAnswer(m.Answer) {
-		s.bogusNXHits.Add(1)
-		resp.Rcode = dns.RcodeNameError
-		return resolution{upstream: usedUpstream, matchedRule: "BOGUS_NXDOMAIN", blockReason: policy.ReasonBogusNX}
-	}
-
-	resp.Rcode = m.Rcode
-	resp.AuthenticatedData = m.AuthenticatedData
-	resp.Answer = m.Answer
-	resp.Ns = m.Ns
-	resp.Extra = responseExtra(r, m.Extra)
-
-	// Stage: cache store.
-	s.storeInCache(key, m)
-	return resolution{upstream: usedUpstream}
-}
-
-// responseExtra preserves non-OPT additional records from upstream and
-// creates an OPT record from the current client's EDNS request. Upstream OPT
-// records are hop-by-hop and must not be relayed or cached for another client.
-func responseExtra(request *dns.Msg, upstreamExtra []dns.RR) []dns.RR {
-	extra := make([]dns.RR, 0, len(upstreamExtra)+1)
-	for _, rr := range upstreamExtra {
-		if _, ok := rr.(*dns.OPT); !ok {
-			extra = append(extra, dns.Copy(rr))
-		}
-	}
-	requestOPT := request.IsEdns0()
-	if requestOPT == nil {
-		return extra
-	}
-	opt := new(dns.OPT)
-	opt.Hdr.Name = "."
-	opt.Hdr.Rrtype = dns.TypeOPT
-	opt.SetUDPSize(requestOPT.UDPSize())
-	opt.SetVersion(requestOPT.Version())
-	opt.SetDo(requestOPT.Do())
-	return append(extra, opt)
-}
-
-// refreshAsync repopulates a stale cache entry in the background,
-// single-flight per key. No event is emitted (not a client query).
-func (s *Server) refreshAsync(key cacheKey, r *dns.Msg, specs []string) {
-	s.refreshMu.Lock()
-	if s.refreshInFlight[key] {
-		s.refreshMu.Unlock()
-		return
-	}
-	s.refreshInFlight[key] = true
-	s.refreshMu.Unlock()
-
-	go func() {
-		defer func() {
-			s.refreshMu.Lock()
-			delete(s.refreshInFlight, key)
-			s.refreshMu.Unlock()
-		}()
-		if _, m := s.forward(r, specs); m != nil {
-			s.storeInCache(key, m)
-			s.cache.refreshes.Add(1)
-		}
-	}()
-}
-
-// forward resolves r through the upstream pool. Per-client custom upstreams
-// (specs) override per-domain routes and the global pool; per-domain DNS
-// routes take precedence over the global pool (route failure falls back).
-// When no pool is configured (legacy/tests), the plain strict-order path is
-// used.
-func (s *Server) forward(r *dns.Msg, specs []string) (string, *dns.Msg) {
-	// DNSSEC passthrough: set or clear the DO bit on a copy so the configured
-	// toggle applies even when the client supplied its own OPT record.
-	r = r.Copy()
-	if opt := r.IsEdns0(); opt != nil {
-		opt.SetDo(s.cfg.DNSSEC)
-	} else if s.cfg.DNSSEC {
-		r.SetEdns0(1232, true)
-	}
-	if s.cfg.Pool != nil {
-		if len(specs) > 0 {
-			if m, used, err := s.cfg.Pool.ExchangeSpecs(specs, r); err == nil && m != nil {
-				m.Id = r.Id
-				return used, m
-			}
-			// Client upstreams failed: fall through to routes/global pool.
-		}
-		if s.cfg.Routes != nil && len(r.Question) > 0 {
-			domain := normalizeName(r.Question[0].Name)
-			if spec := s.cfg.Routes.GetUpstreamForDomain(domain); spec != "" {
-				if m, used, err := s.cfg.Pool.ExchangeRoute(spec, r); err == nil && m != nil {
-					m.Id = r.Id
-					return used, m
-				}
-				// Route upstream failed: fall through to the general pool.
-			}
-		}
-		m, used, err := s.cfg.Pool.Exchange(r)
-		if err != nil || m == nil {
-			return "", nil
-		}
-		m.Id = r.Id
-		return used, m
-	}
-
-	for _, up := range s.upstreams {
-		m, _, err := s.client.Exchange(r, up)
-		if err != nil || m == nil {
-			log.Printf("[DEBUG] Upstream %s exchange failed: %v", up, err)
-			continue
-		}
-		if m.Truncated {
-			// Retry over TCP per DNS convention.
-			tcpClient := &dns.Client{Net: "tcp", Timeout: upstreamTimeout}
-			if tm, _, terr := tcpClient.Exchange(r, up); terr == nil && tm != nil {
-				m = tm
-			}
-		}
-		m.Id = r.Id
-		return up, m
-	}
-	return "", nil
-}
-
-// storeInCache caches a forwarded response with clamped TTLs, including
-// negative answers (NXDOMAIN/NODATA) keyed off the SOA TTL (max 600s).
-func (s *Server) storeInCache(key cacheKey, m *dns.Msg) {
-	ent := &cacheEntry{
-		answers:           copyRRs(m.Answer),
-		authority:         copyRRs(m.Ns),
-		rcode:             m.Rcode,
-		authenticatedData: m.AuthenticatedData,
-		storedAt:          time.Now(),
-	}
-
-	switch {
-	case m.Rcode == dns.RcodeSuccess && len(m.Answer) > 0:
-		// Positive answer: min answer TTL clamped to the configured bounds.
-		ent.ttl = s.cache.clamp(minAnswerTTL(m.Answer))
-	case m.Rcode == dns.RcodeNameError || (m.Rcode == dns.RcodeSuccess && len(m.Answer) == 0):
-		// Negative answer (NXDOMAIN/NODATA): SOA TTL clamped to the max.
-		ttl, ok := soaTTL(m.Ns)
-		if !ok {
-			return
-		}
-		if ttl > s.cache.maxTTL {
-			ttl = s.cache.maxTTL
-		}
-		if ttl == 0 {
-			return
-		}
-		ent.ttl = ttl
-	default:
-		// SERVFAIL and other rcodes are not cached.
-		return
-	}
-	s.cache.set(key, ent)
-}
-
-// withTTL returns copies of rrs with the given TTL applied (TTL decrement on
-// cache hits).
-func withTTL(rrs []dns.RR, ttl uint32) []dns.RR {
-	if len(rrs) == 0 {
-		return nil
-	}
-	out := make([]dns.RR, len(rrs))
-	for i, rr := range rrs {
-		c := dns.Copy(rr)
-		c.Header().Ttl = ttl
-		out[i] = c
-	}
-	return out
-}
-
-// buildEvent assembles the QueryEvent for an answered query. A matching
-// registry client's name wins over CLIENT_ALIASES for the Alias field.
-func (s *Server) buildEvent(r, resp *dns.Msg, clientIP string, cl *clients.Client, res resolution, start time.Time) models.QueryEvent {
-	ev := models.QueryEvent{
-		UnixTime:    time.Now().Unix(),
-		Node:        s.cfg.NodeName,
-		Upstream:    res.upstream,
-		Blocked:     res.blocked,
-		MatchedRule: res.matchedRule,
-		BlockReason: res.blockReason,
-	}
-	if len(r.Question) > 0 {
-		ev.Type = dns.TypeToString[r.Question[0].Qtype]
-		ev.Domain = normalizeName(r.Question[0].Name)
-	}
-	ev.ClientIP = clientIP
-	ev.ResponseCode = dns.RcodeToString[resp.Rcode]
-
-	// DNSSEC passthrough status (no local validation): only an upstream AD bit
-	// proves a secure response; all other responses remain indeterminate.
-	if s.cfg.DNSSEC {
-		if resp.AuthenticatedData {
-			ev.DNSSEC = "secure"
-		} else {
-			ev.DNSSEC = "indeterminate"
-		}
-	}
-
-	// Alias: registry client name wins; otherwise fall back to CLIENT_ALIASES.
-	switch {
-	case cl != nil:
-		ev.Alias = cl.Name
-	case s.cfg.AliasFunc != nil:
-		ev.Alias = s.cfg.AliasFunc(clientIP)
-	}
-
-	latencyMs := float64(time.Since(start).Microseconds()) / 1000.0
-	if res.cacheHit {
-		latencyMs = 0
-	}
-	ev.Latency = sql.NullFloat64{Float64: latencyMs, Valid: true}
-	return ev
-}
-
-// Stats returns the pipeline hit counters for metrics:
-// rewrites, safe-search, and bogus-NXDOMAIN conversions.
-func (s *Server) Stats() (rewriteHits, safeSearchHits, bogusNXHits int64) {
-	return s.rewriteHits.Load(), s.safeSearchHits.Load(), s.bogusNXHits.Load()
-}
-
-// RateLimitDropped returns the number of queries silently dropped by the rate limiter.
-func (s *Server) RateLimitDropped() int64 {
-	return s.rateLimitDropped.Load()
-}
-
-// Ready reports whether all configured DNS listeners have been started.
-func (s *Server) Ready() bool {
-	return s.ready.Load()
-}
-
-// ACLStats reports ACL drops and active rate-limit buckets.
-func (s *Server) ACLStats() (deniedDropped, allowlistDropped int64, buckets int) {
-	if s.rateLimiter != nil {
-		buckets = s.rateLimiter.bucketCount()
-	}
-	return s.aclDropped.Load(), s.aclAllowlistDropped.Load(), buckets
-}
-
-// CacheStats returns a snapshot of the in-process response cache.
-func (s *Server) CacheStats() CacheStats {
-	return s.cache.stats()
-}
-
-// ClearCache removes all in-process DNS response cache entries and returns
-// the number removed.
-func (s *Server) ClearCache() int {
-	return s.cache.clear()
-}
-
-// clientIPFromRemote extracts the IP part of a DNS client address.
-func clientIPFromRemote(addr net.Addr) string {
-	if addr == nil {
-		return ""
-	}
-	host, _, err := net.SplitHostPort(addr.String())
-	if err != nil {
-		return addr.String()
-	}
-	return host
 }

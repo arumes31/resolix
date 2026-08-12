@@ -73,7 +73,9 @@ func TestOptimisticCache(t *testing.T) {
 	}
 
 	// Force the entry to expire quickly for the test.
-	key := cacheKey{name: "example.org", qtype: dns.TypeA, qclass: dns.ClassINET}
+	keyRequest := new(dns.Msg)
+	keyRequest.SetQuestion("example.org.", dns.TypeA)
+	key := srv.makeCacheKey(keyRequest, keyRequest.Question[0], "example.org", "", nil)
 	srv.cache.mu.Lock()
 	el, ok := srv.cache.items[key]
 	if !ok {
@@ -143,6 +145,306 @@ func TestOptimisticCache(t *testing.T) {
 	if hits.Load() != 2 {
 		t.Errorf("post-refresh hits = %d, want 2 (cache was fresh)", hits.Load())
 	}
+}
+
+func TestConcurrentCacheMissesAreCoalesced(t *testing.T) {
+	var hits atomic.Int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	pc := mustListenPacket(t)
+	fake := &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		if hits.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		response := new(dns.Msg)
+		response.SetReply(r)
+		response.Answer = []dns.RR{aRecord(r.Question[0].Name, "192.0.2.25", 120)}
+		_ = w.WriteMsg(response)
+	})}
+	go func() { _ = fake.ActivateAndServe() }()
+	t.Cleanup(func() { _ = fake.Shutdown() })
+
+	server := New(Config{Upstreams: []string{pc.LocalAddr().String()}}, nil)
+	query := new(dns.Msg)
+	query.SetQuestion("singleflight.test.", dns.TypeA)
+	query.Id = 1
+
+	const callers = 8
+	responses := make(chan *dns.Msg, callers)
+	go func() {
+		response, _ := server.Resolve(query.Copy(), "192.0.2.1")
+		responses <- response
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("leader did not reach upstream")
+	}
+	for i := 1; i < callers; i++ {
+		go func(id uint16) {
+			request := query.Copy()
+			request.Id = id
+			response, _ := server.Resolve(request, "192.0.2.1")
+			responses <- response
+		}(uint16(i + 1))
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		server.missMu.Lock()
+		flight := server.missInFlight[server.makeCacheKey(query, query.Question[0], "singleflight.test", "", nil)]
+		waiters := 0
+		if flight != nil {
+			waiters = flight.waiters
+		}
+		server.missMu.Unlock()
+		if waiters == callers-1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("miss waiters = %d, want %d", waiters, callers-1)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(release)
+	seenIDs := make(map[uint16]bool, callers)
+	collected := make([]*dns.Msg, 0, callers)
+	for i := 0; i < callers; i++ {
+		select {
+		case response := <-responses:
+			if response == nil || len(response.Answer) != 1 {
+				t.Fatalf("coalesced response = %v", response)
+			}
+			seenIDs[response.Id] = true
+			collected = append(collected, response)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for coalesced response")
+		}
+	}
+	if len(seenIDs) != callers {
+		t.Fatalf("coalesced response IDs = %v, want %d unique IDs", seenIDs, callers)
+	}
+	collected[0].Answer[0].Header().Ttl = 1
+	if collected[1].Answer[0].Header().Ttl == 1 {
+		t.Fatal("coalesced responses share mutable answer records")
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("upstream hits = %d, want 1", got)
+	}
+	if got := server.CacheStats().Coalesced; got != callers-1 {
+		t.Fatalf("coalesced count = %d, want %d", got, callers-1)
+	}
+}
+
+func TestInvalidationPreventsInFlightRepopulation(t *testing.T) {
+	started := make(chan struct{})
+	var startedOnce sync.Once
+	release := make(chan struct{})
+	pc := mustListenPacket(t)
+	fake := &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		startedOnce.Do(func() { close(started) })
+		<-release
+		response := new(dns.Msg)
+		response.SetReply(r)
+		response.Answer = []dns.RR{aRecord(r.Question[0].Name, "192.0.2.44", 120)}
+		_ = w.WriteMsg(response)
+	})}
+	go func() { _ = fake.ActivateAndServe() }()
+	t.Cleanup(func() { _ = fake.Shutdown() })
+
+	server := New(Config{Upstreams: []string{pc.LocalAddr().String()}}, nil)
+	query := new(dns.Msg)
+	query.SetQuestion("generation.test.", dns.TypeA)
+	done := make(chan struct{})
+	go func() {
+		_, _ = server.Resolve(query, "192.0.2.1")
+		close(done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("query did not reach upstream")
+	}
+	server.ClearCache()
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("query did not finish")
+	}
+	if entries := server.CacheStats().Entries; entries != 0 {
+		t.Fatalf("cache repopulated after invalidation: %d entries", entries)
+	}
+}
+
+func TestCacheGenerationStoreIsLinearizableWithClear(t *testing.T) {
+	server := New(Config{}, nil)
+	query := new(dns.Msg)
+	query.SetQuestion("linearizable.test.", dns.TypeA)
+	response := new(dns.Msg)
+	response.SetReply(query)
+	response.Answer = []dns.RR{aRecord(query.Question[0].Name, "192.0.2.44", 120)}
+	key := server.makeCacheKey(query, query.Question[0], "linearizable.test", "", nil)
+
+	for range 500 {
+		generation := server.cacheGeneration.Load()
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			<-start
+			server.storeInCacheIfGeneration(key, response, false, generation)
+		})
+		wg.Go(func() {
+			<-start
+			server.ClearCache()
+		})
+		close(start)
+		wg.Wait()
+		if entries := server.CacheStats().Entries; entries != 0 {
+			t.Fatalf("iteration left %d stale cache entries", entries)
+		}
+	}
+}
+
+func TestMissFlightCapacityFailsClosed(t *testing.T) {
+	var upstreamHits atomic.Int32
+	server := New(Config{Upstreams: []string{startFakeUpstream(t, &upstreamHits)}}, nil)
+	server.missMu.Lock()
+	for index := range maxMissFlights {
+		key := cacheKey{name: fmt.Sprintf("occupied-%d.test", index), qtype: dns.TypeA, qclass: dns.ClassINET}
+		server.missInFlight[key] = &missFlight{done: make(chan struct{})}
+	}
+	server.missMu.Unlock()
+
+	query := new(dns.Msg)
+	query.SetQuestion("over-capacity.test.", dns.TypeA)
+	query.SetEdns0(1232, false)
+	response, drop := server.Resolve(query, "192.0.2.1")
+	if drop || response == nil || response.Rcode != dns.RcodeServerFailure {
+		t.Fatalf("over-capacity response=%v drop=%t, want SERVFAIL", response, drop)
+	}
+	if code, ok := extendedErrorCode(response); !ok || code != dns.ExtendedErrorCodeNetworkError {
+		t.Fatalf("over-capacity EDE=%d/%t, want Network Error", code, ok)
+	}
+	if got := upstreamHits.Load(); got != 0 {
+		t.Fatalf("over-capacity request reached upstream %d times", got)
+	}
+}
+
+func TestStaleResponseCarriesEDE(t *testing.T) {
+	server := New(Config{CacheOptimistic: true, CacheMinTTL: 1}, nil)
+	query := new(dns.Msg)
+	query.SetQuestion("stale-ede.test.", dns.TypeA)
+	query.SetEdns0(1232, false)
+	key := server.makeCacheKey(query, query.Question[0], "stale-ede.test", "", nil)
+	server.cache.set(key, &cacheEntry{
+		answers: []dns.RR{aRecord("stale-ede.test.", "192.0.2.1", 1)},
+		rcode:   dns.RcodeSuccess, storedAt: time.Now().Add(-2 * time.Second), ttl: 1,
+	})
+
+	response, drop := server.Resolve(query, "192.0.2.1")
+	if drop || response == nil || len(response.Answer) != 1 {
+		t.Fatalf("stale response=%v drop=%t", response, drop)
+	}
+	if code, ok := extendedErrorCode(response); !ok || code != dns.ExtendedErrorCodeStaleAnswer {
+		t.Fatalf("stale EDE = %d/%t", code, ok)
+	}
+}
+
+func TestHotEntryPrefetchesNearExpiry(t *testing.T) {
+	var hits atomic.Int32
+	upstreamAddr := startFakeUpstream(t, &hits)
+	events := make(chan models.QueryEvent, 4)
+	server := New(Config{
+		Upstreams: upstreamAddrList(upstreamAddr), CacheMinTTL: 1,
+		CachePrefetch: true, CachePrefetchHits: 1, CachePrefetchWindow: 30 * time.Second,
+	}, func(event models.QueryEvent, _ bool) { events <- event })
+	query := new(dns.Msg)
+	query.SetQuestion("example.org.", dns.TypeA)
+
+	if response, _ := server.Resolve(query.Copy(), "192.0.2.1"); response == nil || len(response.Answer) != 1 {
+		t.Fatalf("prime response = %v", response)
+	}
+	<-events
+	key := server.makeCacheKey(query, query.Question[0], "example.org", "", nil)
+	server.cache.mu.Lock()
+	el := server.cache.items[key]
+	if el == nil {
+		server.cache.mu.Unlock()
+		t.Fatal("primed cache entry is missing")
+	}
+	entry := el.Value.(entry).value
+	entry.storedAt = time.Now().Add(-100 * time.Second)
+	entry.ttl = 120
+	server.cache.mu.Unlock()
+
+	if response, _ := server.Resolve(query.Copy(), "192.0.2.1"); response == nil {
+		t.Fatal("near-expiry cache response is nil")
+	}
+	if event := <-events; event.CacheStatus != cacheStateFresh {
+		t.Fatalf("near-expiry event status = %q, want fresh", event.CacheStatus)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for server.CacheStats().Prefetches != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("prefetch did not complete: stats=%+v hits=%d", server.CacheStats(), hits.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if response, _ := server.Resolve(query.Copy(), "192.0.2.1"); response == nil {
+		t.Fatal("prefetched cache response is nil")
+	}
+	if event := <-events; event.CacheStatus != cacheStatePrefetched {
+		t.Fatalf("prefetched event status = %q", event.CacheStatus)
+	}
+	if hits.Load() != 2 {
+		t.Fatalf("upstream hits = %d, want prime + prefetch", hits.Load())
+	}
+}
+
+func TestOptionalSERVFAILMicroCache(t *testing.T) {
+	var hits atomic.Int32
+	pc := mustListenPacket(t)
+	fake := &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		hits.Add(1)
+		response := new(dns.Msg)
+		response.SetReply(r)
+		response.Rcode = dns.RcodeServerFailure
+		_ = w.WriteMsg(response)
+	})}
+	go func() { _ = fake.ActivateAndServe() }()
+	t.Cleanup(func() { _ = fake.Shutdown() })
+
+	events := make(chan models.QueryEvent, 2)
+	server := New(Config{
+		Upstreams: []string{pc.LocalAddr().String()}, CacheSERVFAILTTL: time.Second,
+	}, func(event models.QueryEvent, _ bool) { events <- event })
+	query := new(dns.Msg)
+	query.SetQuestion("failure.test.", dns.TypeA)
+	query.SetEdns0(1232, false)
+
+	first, _ := server.Resolve(query.Copy(), "192.0.2.1")
+	if first.Rcode != dns.RcodeServerFailure {
+		t.Fatalf("first rcode = %s", dns.RcodeToString[first.Rcode])
+	}
+	if code, ok := extendedErrorCode(first); !ok || code != dns.ExtendedErrorCodeNetworkError {
+		t.Fatalf("first EDE = %d/%t", code, ok)
+	}
+	<-events
+	second, _ := server.Resolve(query.Copy(), "192.0.2.1")
+	if code, ok := extendedErrorCode(second); !ok || code != dns.ExtendedErrorCodeCachedError {
+		t.Fatalf("cached EDE = %d/%t", code, ok)
+	}
+	if event := <-events; event.CacheStatus != cacheStateSERVFAIL {
+		t.Fatalf("cached event status = %q", event.CacheStatus)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("SERVFAIL upstream hits = %d, want 1", hits.Load())
+	}
+}
+
+func upstreamAddrList(address string) []string {
+	return []string{address}
 }
 
 // startGatedFakeUpstream blocks the first refresh response so concurrent stale

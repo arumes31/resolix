@@ -1,19 +1,10 @@
 package forwarder
 
 import (
-	"bytes"
-	"compress/gzip"
-	"crypto/rand"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"log"
-	"math/big"
 	"net/http"
 	"net/url"
-	"os"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +13,7 @@ import (
 	"github.com/arumes31/resolix/webgui/internal/config"
 	"github.com/arumes31/resolix/webgui/internal/configsync"
 	"github.com/arumes31/resolix/webgui/internal/controllertls"
+	"github.com/arumes31/resolix/webgui/internal/magicdns"
 	"github.com/arumes31/resolix/webgui/internal/models"
 )
 
@@ -29,8 +21,58 @@ import (
 var Version = "dev"
 
 type backlogItem struct {
-	event models.QueryEvent
-	size  int64
+	event    models.QueryEvent
+	size     int64
+	queuedAt time.Time
+}
+
+type persistedBacklogItem struct {
+	Event    models.QueryEvent `json:"event"`
+	QueuedAt time.Time         `json:"queued_at"`
+}
+
+type persistedBacklog struct {
+	Version int                    `json:"version"`
+	Items   []persistedBacklogItem `json:"items"`
+}
+
+const (
+	initialForwardBatchSize = 100
+	minForwardBatchSize     = 10
+	maxForwardBatchSize     = 500
+	maxRetryAfter           = 10 * time.Minute
+	backlogStateFile        = "forwarder-backlog.json"
+	backlogStateVersion     = 1
+	nodeIdentityFile        = "node-id"
+)
+
+// EndpointStatus describes the latest attempt made against one controller
+// endpoint without exposing credentials or response bodies.
+type EndpointStatus struct {
+	LastAttempt time.Time `json:"last_attempt,omitempty"`
+	LastSuccess time.Time `json:"last_success,omitempty"`
+	LastError   string    `json:"last_error,omitempty"`
+}
+
+// Status is a point-in-time view of forwarding and configuration-sync state.
+type Status struct {
+	BacklogDepth          int                       `json:"backlog_depth"`
+	BacklogBytes          int64                     `json:"backlog_bytes"`
+	BacklogOldestAge      time.Duration             `json:"backlog_oldest_age"`
+	Retries               int64                     `json:"retries"`
+	Dropped               int64                     `json:"dropped"`
+	Sent                  int64                     `json:"sent"`
+	AdaptiveBatchSize     int                       `json:"adaptive_batch_size"`
+	DesiredRevision       string                    `json:"desired_revision,omitempty"`
+	AppliedRevision       string                    `json:"applied_revision,omitempty"`
+	PreviousRevision      string                    `json:"previous_revision,omitempty"`
+	SchemaVersion         int                       `json:"schema_version,omitempty"`
+	SchemaCompatible      bool                      `json:"schema_compatible"`
+	LastApplyError        string                    `json:"last_apply_error,omitempty"`
+	LastApplyDuration     time.Duration             `json:"last_apply_duration"`
+	ControllerClockSkew   time.Duration             `json:"controller_clock_skew"`
+	PersistentBacklogPath string                    `json:"persistent_backlog_path,omitempty"`
+	Endpoints             map[string]EndpointStatus `json:"endpoints"`
 }
 
 // Forwarder handles sending batches of query events from agent to controller.
@@ -41,14 +83,19 @@ type Forwarder struct {
 	healthOnce       sync.Once
 	backlogMu        sync.Mutex
 	backlog          []backlogItem
+	inFlight         []backlogItem
 	backlogTotalSize int64
 	wakeChan         chan struct{}
+	persistWake      chan struct{}
+	persistMu        sync.Mutex
 	healthReports    chan map[string]float64
 	httpClient       *http.Client
 	transportErr     error
 	retries          atomic.Int64
 	dropped          atomic.Int64
 	sent             atomic.Int64
+	adaptiveBatch    atomic.Int64
+	clockSkewNanos   atomic.Int64
 
 	// Sync state (Items 90, 91, 94)
 	syncedAliases map[string]string
@@ -61,25 +108,44 @@ type Forwarder struct {
 	setAliasesFn        func(aliases map[string]string)
 	setUpstreamHealthFn func(node string, health map[string]float64)
 	setDNSConfigFn      func(snapshot configsync.Snapshot) error
+	setMagicDNSFn       func(snapshot magicdns.Snapshot) error
 	configRevision      string
+	desiredRevision     string
+	appliedSnapshot     *configsync.Snapshot
+	previousSnapshot    *configsync.Snapshot
+	configSchemaVersion int
+	configCompatible    bool
+	lastConfigApplyErr  string
+	lastConfigApplyTime time.Duration
+	endpointStatus      map[string]EndpointStatus
+	lastSyncGeneration  string
+	syncNow             chan struct{}
 }
 
 // NewForwarder creates a new log forwarder for agent nodes.
 func NewForwarder(cfg *config.Config) *Forwarder {
+	ensureNodeIdentity(cfg)
 	f := &Forwarder{
-		stopChan:      make(chan struct{}),
-		wakeChan:      make(chan struct{}, 1),
-		healthReports: make(chan map[string]float64, 1),
-		cfg:           cfg,
-		syncedAliases: make(map[string]string),
-		syncedRoutes:  make(map[string]string),
-		syncedHealth:  make(map[string]map[string]float64),
+		stopChan:       make(chan struct{}),
+		wakeChan:       make(chan struct{}, 1),
+		persistWake:    make(chan struct{}, 1),
+		healthReports:  make(chan map[string]float64, 1),
+		syncNow:        make(chan struct{}, 1),
+		cfg:            cfg,
+		syncedAliases:  make(map[string]string),
+		syncedRoutes:   make(map[string]string),
+		syncedHealth:   make(map[string]map[string]float64),
+		endpointStatus: make(map[string]EndpointStatus),
 	}
+	f.adaptiveBatch.Store(initialForwardBatchSize)
 	if cfg.Mode == config.ModeAgent && cfg.ControllerURL != "" {
 		_, f.transportErr = controllerEndpoint(cfg, "/api/sync/dns-config")
 	}
 	if f.transportErr == nil {
 		f.httpClient, f.transportErr = newControllerHTTPClient(cfg)
+	}
+	if f.enabled() {
+		f.loadBacklog()
 	}
 	return f
 }
@@ -181,11 +247,113 @@ func (f *Forwarder) SetDNSConfigFn(fn func(snapshot configsync.Snapshot) error) 
 	f.setDNSConfigFn = fn
 }
 
+// SetMagicDNSFn sets the callback that applies controller-generated MagicDNS records.
+func (f *Forwarder) SetMagicDNSFn(fn func(snapshot magicdns.Snapshot) error) {
+	f.syncMu.Lock()
+	defer f.syncMu.Unlock()
+	f.setMagicDNSFn = fn
+}
+
 // ConfigRevision returns the last successfully applied controller revision.
 func (f *Forwarder) ConfigRevision() string {
 	f.syncMu.RLock()
 	defer f.syncMu.RUnlock()
 	return f.configRevision
+}
+
+// SyncNow asks the running agent to immediately refresh every controller-owned
+// configuration endpoint. Repeated requests are coalesced.
+func (f *Forwarder) SyncNow() bool {
+	if !f.enabled() || f.transportErr != nil {
+		return false
+	}
+	select {
+	case f.syncNow <- struct{}{}:
+		return true
+	default:
+		return true
+	}
+}
+
+// PreviousConfigSnapshot returns the last working snapshot retained before a
+// newer revision was applied.
+func (f *Forwarder) PreviousConfigSnapshot() (configsync.Snapshot, bool) {
+	f.syncMu.RLock()
+	defer f.syncMu.RUnlock()
+	if f.previousSnapshot == nil {
+		return configsync.Snapshot{}, false
+	}
+	return f.previousSnapshot.Clone(), true
+}
+
+// SnapshotStatus returns forwarding and sync diagnostics for status APIs and
+// metrics collectors.
+func (f *Forwarder) SnapshotStatus(now time.Time) Status {
+	f.backlogMu.Lock()
+	depth := len(f.backlog) + len(f.inFlight)
+	backlogBytes := f.backlogTotalSize
+	oldest := time.Time{}
+	for _, items := range [][]backlogItem{f.inFlight, f.backlog} {
+		for _, item := range items {
+			if oldest.IsZero() || item.queuedAt.Before(oldest) {
+				oldest = item.queuedAt
+			}
+		}
+	}
+	f.backlogMu.Unlock()
+
+	f.syncMu.RLock()
+	endpoints := make(map[string]EndpointStatus, len(f.endpointStatus))
+	for endpoint, status := range f.endpointStatus {
+		endpoints[endpoint] = status
+	}
+	status := Status{
+		BacklogDepth:          depth,
+		BacklogBytes:          backlogBytes,
+		Retries:               f.retries.Load(),
+		Dropped:               f.dropped.Load(),
+		Sent:                  f.sent.Load(),
+		AdaptiveBatchSize:     int(f.adaptiveBatch.Load()),
+		DesiredRevision:       f.desiredRevision,
+		AppliedRevision:       f.configRevision,
+		SchemaVersion:         f.configSchemaVersion,
+		SchemaCompatible:      f.configCompatible,
+		LastApplyError:        f.lastConfigApplyErr,
+		LastApplyDuration:     f.lastConfigApplyTime,
+		ControllerClockSkew:   time.Duration(f.clockSkewNanos.Load()),
+		PersistentBacklogPath: f.backlogPath(),
+		Endpoints:             endpoints,
+	}
+	if f.previousSnapshot != nil {
+		status.PreviousRevision = f.previousSnapshot.Revision
+	}
+	f.syncMu.RUnlock()
+	if !oldest.IsZero() && now.After(oldest) {
+		status.BacklogOldestAge = now.Sub(oldest)
+	}
+	return status
+}
+
+func (f *Forwarder) recordEndpoint(endpoint string, started time.Time, err error) {
+	f.syncMu.Lock()
+	status := f.endpointStatus[endpoint]
+	status.LastAttempt = started
+	if err == nil {
+		status.LastSuccess = time.Now()
+		status.LastError = ""
+	} else {
+		status.LastError = sanitizeDiagnostic(err.Error(), f.cfg)
+	}
+	f.endpointStatus[endpoint] = status
+	f.syncMu.Unlock()
+}
+
+func (f *Forwarder) recordControllerDate(header http.Header, receivedAt time.Time) {
+	serverTime, err := http.ParseTime(header.Get("Date"))
+	if err != nil {
+		return
+	}
+	f.clockSkewNanos.Store(receivedAt.Sub(serverTime).Nanoseconds())
 }
 
 // GetSyncedAliases returns the latest aliases synced from controller (Item 90).
@@ -222,712 +390,4 @@ func (f *Forwarder) GetSyncedUpstreamHealth() map[string]map[string]float64 {
 		}
 	}
 	return result
-}
-
-// EnqueueEvent adds a query event to the forwarding queue.
-func (f *Forwarder) EnqueueEvent(ev models.QueryEvent) {
-	if f.cfg.Mode != config.ModeAgent || f.cfg.ControllerURL == "" {
-		return
-	}
-	if ev.Node == "" {
-		ev.Node = f.cfg.NodeName
-	}
-	item := backlogItem{event: ev, size: eventJSONSize(ev)}
-	f.backlogMu.Lock()
-	defer f.backlogMu.Unlock()
-
-	// Enforce a maximum backlog size in bytes to prevent OOM (only when limit is configured)
-	if f.cfg.MaxBacklogSize > 0 && f.backlogTotalSize+item.size > f.cfg.MaxBacklogSize {
-		f.dropped.Add(1)
-		return
-	}
-
-	f.backlog = append(f.backlog, item)
-	f.backlogTotalSize += item.size
-	select {
-	case f.wakeChan <- struct{}{}:
-	default:
-	}
-}
-
-type responseStatusError struct{ status int }
-
-func (e *responseStatusError) Error() string {
-	return fmt.Sprintf("unexpected status code: %d", e.status)
-}
-
-func (e *responseStatusError) permanent() bool {
-	return e.status >= 400 && e.status < 500 && e.status != http.StatusRequestTimeout && e.status != http.StatusTooManyRequests
-}
-
-// eventJSONSize approximates the serialized size of an event for backlog
-// byte accounting.
-func eventJSONSize(ev models.QueryEvent) int64 {
-	data, err := json.Marshal(ev)
-	if err != nil {
-		return int64(len(ev.Domain) + 64)
-	}
-	return int64(len(data))
-}
-
-// getResourceStats collects current resource usage statistics (Item 93).
-func getResourceStats() (memoryMB float64, goroutines int) {
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	memoryMB = float64(m.Alloc) / 1024 / 1024
-	goroutines = runtime.NumGoroutine()
-	return memoryMB, goroutines
-}
-
-// getDBSizeMB returns the size of the database file in megabytes.
-func getDBSizeMB(cfg *config.Config) float64 {
-	dbPath := cfg.FullDBPath()
-	if info, err := os.Stat(dbPath); err == nil {
-		return float64(info.Size()) / 1024 / 1024
-	}
-	return 0
-}
-
-// setVersionHeaders adds version information headers to the request (Item 88).
-func setVersionHeaders(req *http.Request) {
-	req.Header.Set("X-Node-Version", Version)
-	req.Header.Set("X-Go-Version", runtime.Version())
-	req.Header.Set("X-Node-Build", fmt.Sprintf("%s/%s", Version, runtime.Version()))
-}
-
-// gzipCompress compresses data with gzip. Returns the compressed data and true
-// if compression was beneficial (smaller than original), or nil and false if
-// compression failed or made the data larger.
-func gzipCompress(data []byte) ([]byte, bool) {
-	var buf bytes.Buffer
-	gzWriter := gzip.NewWriter(&buf)
-	if _, err := gzWriter.Write(data); err != nil {
-		return nil, false
-	}
-	if err := gzWriter.Close(); err != nil {
-		return nil, false
-	}
-	compressed := buf.Bytes()
-	if len(compressed) >= len(data) {
-		// Compression didn't help; send uncompressed
-		return nil, false
-	}
-	return compressed, true
-}
-
-// sendBatch sends a batch of query events to the controller with gzip
-// compression (Item 85). Events are sent as a top-level JSON array (the new
-// ingest format); health-only payloads keep the legacy object shape.
-func (f *Forwarder) sendBatch(client *http.Client, events []models.QueryEvent, health map[string]float64) error {
-	var data []byte
-	var err error
-	if len(events) > 0 {
-		data, err = json.Marshal(events)
-	} else {
-		payload := map[string]interface{}{"node": f.cfg.NodeName}
-		if len(health) > 0 {
-			payload["health"] = health
-		}
-		data, err = json.Marshal(payload)
-	}
-	if err != nil {
-		return err
-	}
-
-	// Item 85: Attempt gzip compression; fall back to uncompressed if not beneficial
-	var bodyReader io.Reader = bytes.NewBuffer(data)
-	compressed, useGzip := gzipCompress(data)
-	if useGzip {
-		bodyReader = bytes.NewBuffer(compressed)
-	}
-
-	requestURL, err := controllerEndpoint(f.cfg, "/api/ingest")
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequest("POST", requestURL, bodyReader)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	// Set Content-Encoding if we compressed
-	if useGzip {
-		req.Header.Set("Content-Encoding", "gzip")
-	}
-
-	// Item 88: Set version headers
-	setVersionHeaders(req)
-
-	if f.cfg.IngestSecret != "" {
-		req.Header.Set("Authorization", "Bearer "+f.cfg.IngestSecret)
-	}
-
-	resp, err := doControllerRequest(client, req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &responseStatusError{status: resp.StatusCode}
-	}
-	return nil
-}
-
-// sendHeartbeat sends a heartbeat to the controller node (Item 92).
-func (f *Forwarder) sendHeartbeat(client *http.Client, health map[string]float64) error {
-	memoryMB, goroutines := getResourceStats()
-	dbSizeMB := getDBSizeMB(f.cfg)
-
-	hb := models.HeartbeatPayload{
-		Node:           f.cfg.NodeName,
-		Version:        Version,
-		GoVersion:      runtime.Version(),
-		BuildInfo:      fmt.Sprintf("%s/%s", Version, runtime.Version()),
-		MemoryMB:       memoryMB,
-		Goroutines:     goroutines,
-		DBSizeMB:       dbSizeMB,
-		Health:         health,
-		ConfigRevision: f.ConfigRevision(),
-	}
-
-	data, err := json.Marshal(hb)
-	if err != nil {
-		return err
-	}
-
-	// Item 85: Attempt gzip compression; fall back to uncompressed if not beneficial
-	var bodyReader io.Reader = bytes.NewBuffer(data)
-	compressed, useGzip := gzipCompress(data)
-	if useGzip {
-		bodyReader = bytes.NewBuffer(compressed)
-	}
-
-	requestURL, err := controllerEndpoint(f.cfg, "/api/heartbeat")
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequest("POST", requestURL, bodyReader)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if useGzip {
-		req.Header.Set("Content-Encoding", "gzip")
-	}
-
-	// Item 88: Set version headers
-	setVersionHeaders(req)
-
-	if f.cfg.IngestSecret != "" {
-		req.Header.Set("Authorization", "Bearer "+f.cfg.IngestSecret)
-	}
-
-	resp, err := doControllerRequest(client, req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("heartbeat unexpected status code: %d", resp.StatusCode)
-	}
-	return nil
-}
-
-// syncFromController fetches configuration data from the controller (Items 90, 91, 94).
-func (f *Forwarder) syncFromController(client *http.Client, endpoint string) ([]byte, error) {
-	requestURL, err := controllerEndpoint(f.cfg, endpoint)
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequest("GET", requestURL, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	// Item 88: Set version headers
-	setVersionHeaders(req)
-
-	if f.cfg.IngestSecret != "" {
-		req.Header.Set("Authorization", "Bearer "+f.cfg.IngestSecret)
-	}
-	req.Header.Set("Accept-Encoding", "gzip")
-
-	resp, err := doControllerRequest(client, req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("sync %s: unexpected status code %d", endpoint, resp.StatusCode)
-	}
-
-	var reader io.Reader = resp.Body
-	if resp.Header.Get("Content-Encoding") == "gzip" {
-		gzReader, err := gzip.NewReader(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("gzip decompress error: %w", err)
-		}
-		defer func() { _ = gzReader.Close() }()
-		reader = gzReader
-	}
-
-	maxResponseSize := f.cfg.MaxRequestSize
-	if maxResponseSize <= 0 {
-		maxResponseSize = config.DefaultMaxRequestSize
-	}
-	data, err := io.ReadAll(io.LimitReader(reader, maxResponseSize+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(data)) > maxResponseSize {
-		return nil, fmt.Errorf("sync %s: response exceeds %d bytes", endpoint, maxResponseSize)
-	}
-	return data, nil
-}
-
-// syncAliases fetches and applies client aliases from controller (Item 90).
-func (f *Forwarder) syncAliases(client *http.Client) {
-	data, err := f.syncFromController(client, "/api/sync/aliases")
-	if err != nil {
-		log.Printf("[WARN] Failed to sync aliases from controller: %v", err)
-		return
-	}
-
-	var result map[string]string
-	if err := json.Unmarshal(data, &result); err != nil {
-		log.Printf("[WARN] Failed to parse aliases sync response: %v", err)
-		return
-	}
-
-	f.syncMu.Lock()
-	f.syncedAliases = result
-	fn := f.setAliasesFn
-	f.syncMu.Unlock()
-
-	if fn != nil {
-		fn(result)
-	}
-
-	log.Printf("[INFO] Synced %d client aliases from controller", len(result))
-}
-
-// syncDNSRoutes fetches and applies DNS routes from controller (Item 91).
-func (f *Forwarder) syncDNSRoutes(client *http.Client) {
-	data, err := f.syncFromController(client, "/api/sync/dns-routes")
-	if err != nil {
-		log.Printf("[WARN] Failed to sync DNS routes from controller: %v", err)
-		return
-	}
-
-	var result struct {
-		Routes map[string]string `json:"routes"`
-	}
-	if err := json.Unmarshal(data, &result); err != nil {
-		log.Printf("[WARN] Failed to parse DNS routes sync response: %v", err)
-		return
-	}
-
-	f.syncMu.Lock()
-	f.syncedRoutes = result.Routes
-	fn := f.setDNSRoutesFn
-	f.syncMu.Unlock()
-
-	if fn != nil {
-		fn(result.Routes)
-	}
-
-	log.Printf("[INFO] Synced %d DNS routes from controller", len(result.Routes))
-}
-
-// syncUpstreamHealth fetches and applies upstream health from controller (Item 94).
-func (f *Forwarder) syncUpstreamHealth(client *http.Client) {
-	data, err := f.syncFromController(client, "/api/sync/upstream-health")
-	if err != nil {
-		log.Printf("[WARN] Failed to sync upstream health from controller: %v", err)
-		return
-	}
-
-	var result map[string]map[string]float64
-	if err := json.Unmarshal(data, &result); err != nil {
-		log.Printf("[WARN] Failed to parse upstream health sync response: %v", err)
-		return
-	}
-
-	f.syncMu.Lock()
-	f.syncedHealth = result
-	fn := f.setUpstreamHealthFn
-	f.syncMu.Unlock()
-
-	if fn != nil {
-		for node, health := range result {
-			fn(node, health)
-		}
-	}
-
-	totalUpstreams := 0
-	for _, health := range result {
-		totalUpstreams += len(health)
-	}
-	log.Printf("[INFO] Synced upstream health for %d nodes (%d upstreams) from controller", len(result), totalUpstreams)
-}
-
-func (f *Forwarder) syncDNSConfig(client *http.Client) {
-	data, err := f.syncFromController(client, "/api/sync/dns-config")
-	if err != nil {
-		log.Printf("[WARN] Failed to sync DNS configuration from controller: %v", err)
-		return
-	}
-	var snapshot configsync.Snapshot
-	if err := json.Unmarshal(data, &snapshot); err != nil {
-		log.Printf("[WARN] Failed to parse DNS configuration snapshot: %v", err)
-		return
-	}
-	validRevision, err := snapshot.ValidRevision()
-	if err != nil {
-		log.Printf("[WARN] Failed to validate DNS configuration snapshot revision: %v", err)
-		return
-	}
-	if !validRevision {
-		log.Printf("[WARN] Rejected DNS configuration snapshot with invalid revision")
-		return
-	}
-	f.syncMu.RLock()
-	currentRevision := f.configRevision
-	apply := f.setDNSConfigFn
-	f.syncMu.RUnlock()
-	if snapshot.Revision == currentRevision {
-		return
-	}
-	if apply == nil {
-		log.Printf("[WARN] DNS configuration sync callback is not configured")
-		return
-	}
-	if err := apply(snapshot); err != nil {
-		log.Printf("[WARN] Failed to apply DNS configuration revision: %v", err)
-		return
-	}
-	f.syncMu.Lock()
-	f.configRevision = snapshot.Revision
-	f.syncMu.Unlock()
-	log.Printf("[INFO] Applied DNS configuration revision %.12s", snapshot.Revision)
-}
-
-// calculateBackoff computes the backoff duration with exponential growth and jitter (Item 86).
-// Sequence: initial, 2x, 4x, 8x, 16x, 30s (capped) with 0-500ms random jitter.
-// A non-positive initial interval falls back to 1s, preserving the original progression.
-func calculateBackoff(attempt int, initial time.Duration) time.Duration {
-	if initial <= 0 {
-		initial = 1 * time.Second
-	}
-	if attempt <= 0 {
-		return initial
-	}
-	if attempt > 6 {
-		attempt = 6
-	}
-	backoff := initial * (1 << uint(attempt-1)) // initial * 2^(attempt-1)
-	if backoff > 30*time.Second {
-		backoff = 30 * time.Second
-	}
-	// Add jitter: 0-500ms (crypto/rand; falls back to no jitter on error)
-	jitter := time.Duration(0)
-	if n, err := rand.Int(rand.Reader, big.NewInt(500)); err == nil {
-		jitter = time.Duration(n.Int64()) * time.Millisecond
-	}
-	return backoff + jitter
-}
-
-// safeInterval returns the duration if positive, otherwise the fallback.
-func safeInterval(d, fallback time.Duration) time.Duration {
-	if d > 0 {
-		return d
-	}
-	return fallback
-}
-
-// Start begins the forwarding worker loop with heartbeat and sync goroutines.
-func (f *Forwarder) Start() error {
-	if !f.enabled() {
-		return nil
-	}
-	if f.transportErr != nil {
-		return fmt.Errorf("configure controller transport: %w", f.transportErr)
-	}
-	client := f.httpClient
-	backoffAttempt := 0
-
-	var draining bool
-	var drainEnd time.Time
-
-	// Item 92: Start heartbeat goroutine
-	go f.startHeartbeat(client)
-
-	// Items 90, 91, 94: Start sync goroutines
-	go f.startSyncLoops(client)
-	f.ensureHealthReporter(client)
-
-	for {
-		if !draining {
-			select {
-			case <-f.stopChan:
-				draining = true
-				drainEnd = time.Now().Add(5 * time.Second)
-			default:
-			}
-		}
-
-		if draining && time.Now().After(drainEnd) {
-			return nil
-		}
-
-		f.backlogMu.Lock()
-		if len(f.backlog) == 0 {
-			f.backlogMu.Unlock()
-			if draining {
-				return nil
-			}
-			select {
-			case <-f.wakeChan:
-			case <-f.stopChan:
-				draining = true
-				drainEnd = time.Now().Add(5 * time.Second)
-			}
-			continue
-		}
-		batchSize := 100
-		if len(f.backlog) < batchSize {
-			batchSize = len(f.backlog)
-		}
-		items := append([]backlogItem(nil), f.backlog[:batchSize]...)
-		events := make([]models.QueryEvent, len(items))
-		for i, item := range items {
-			events[i] = item.event
-			f.backlogTotalSize -= item.size
-		}
-		f.backlog = f.backlog[batchSize:]
-		f.backlogMu.Unlock()
-
-		err := f.sendBatch(client, events, nil)
-		if err == nil {
-			log.Printf("Successfully sent batch of %d events to controller", len(events))
-			backoffAttempt = 0 // Reset on success (Item 86)
-			f.sent.Add(int64(len(events)))
-		} else {
-			log.Printf("Error sending batch to controller: %v", err)
-
-			var statusErr *responseStatusError
-			if errors.As(err, &statusErr) && statusErr.permanent() {
-				log.Printf("[WARN] Controller rejected batch permanently with HTTP %d; dropping %d events", statusErr.status, len(events))
-				f.dropped.Add(int64(len(events)))
-				backoffAttempt = 0
-				continue
-			}
-
-			// Item 86: Check max retry attempts
-			if f.cfg.MaxRetryAttempts > 0 && backoffAttempt >= f.cfg.MaxRetryAttempts {
-				log.Printf("[WARN] Max retry attempts (%d) reached, dropping batch of %d events", f.cfg.MaxRetryAttempts, len(events))
-				backoffAttempt = 0
-				f.dropped.Add(int64(len(events)))
-				continue
-			}
-
-			f.requeueBatch(items)
-
-			backoffAttempt++
-			f.retries.Add(1)
-			// Item 80: use the configured initial retry interval (falls back to 1s when unset/invalid)
-			waitDur := calculateBackoff(backoffAttempt, safeInterval(f.cfg.ForwarderRetryInterval, time.Second))
-
-			if draining {
-				rem := time.Until(drainEnd)
-				if rem <= 0 {
-					return nil
-				}
-				if rem < waitDur {
-					waitDur = rem
-				}
-			}
-
-			if draining {
-				time.Sleep(waitDur)
-			} else {
-				select {
-				case <-time.After(waitDur):
-				case <-f.stopChan:
-					draining = true
-					drainEnd = time.Now().Add(5 * time.Second)
-				}
-			}
-		}
-	}
-}
-
-// requeueBatch prepends a failed batch back onto the backlog, honoring the
-// configured byte limit (the newest overflow events are dropped).
-func (f *Forwarder) requeueBatch(items []backlogItem) {
-	f.backlogMu.Lock()
-	defer f.backlogMu.Unlock()
-
-	if f.cfg.MaxBacklogSize <= 0 {
-		f.backlog = append(items, f.backlog...)
-		for _, item := range items {
-			f.backlogTotalSize += item.size
-		}
-		return
-	}
-
-	// Re-queue only what fits within the byte limit; drop the oldest overflow
-	kept := 0
-	for _, item := range items {
-		if f.backlogTotalSize+item.size > f.cfg.MaxBacklogSize {
-			break
-		}
-		kept++
-		f.backlogTotalSize += item.size
-	}
-	if kept < len(items) {
-		log.Printf("[WARN] Backlog byte limit (%d) reached, dropping %d newest events of failed batch", f.cfg.MaxBacklogSize, len(items)-kept)
-	}
-	f.dropped.Add(int64(len(items) - kept))
-	f.backlog = append(items[:kept:kept], f.backlog...)
-}
-
-// startHeartbeat sends periodic heartbeats to the controller (Item 92).
-func (f *Forwarder) startHeartbeat(client *http.Client) {
-	interval := safeInterval(f.cfg.HeartbeatInterval, config.DefaultHeartbeatInterval)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	// Send initial heartbeat immediately
-	memoryMB, goroutines := getResourceStats()
-	dbSizeMB := getDBSizeMB(f.cfg)
-	hb := models.HeartbeatPayload{
-		Node:           f.cfg.NodeName,
-		Version:        Version,
-		GoVersion:      runtime.Version(),
-		BuildInfo:      fmt.Sprintf("%s/%s", Version, runtime.Version()),
-		MemoryMB:       memoryMB,
-		Goroutines:     goroutines,
-		DBSizeMB:       dbSizeMB,
-		ConfigRevision: f.ConfigRevision(),
-	}
-	if err := f.sendHeartbeat(client, hb.Health); err != nil {
-		log.Printf("[WARN] Initial heartbeat failed: %v", err)
-	} else {
-		log.Printf("[INFO] Initial heartbeat sent to controller")
-	}
-
-	for {
-		select {
-		case <-f.stopChan:
-			return
-		case <-ticker.C:
-			if err := f.sendHeartbeat(client, nil); err != nil {
-				log.Printf("[WARN] Heartbeat failed: %v", err)
-			}
-		}
-	}
-}
-
-// startSyncLoops runs periodic sync operations for aliases, DNS routes,
-// controller-owned DNS configuration, and upstream health.
-func (f *Forwarder) startSyncLoops(client *http.Client) {
-	// Item 90: Sync client aliases
-	aliasesInterval := safeInterval(f.cfg.SyncAliasesInterval, config.DefaultSyncAliasesInterval)
-	aliasesTicker := time.NewTicker(aliasesInterval)
-	defer aliasesTicker.Stop()
-
-	// Item 91: Sync DNS routes
-	routesInterval := safeInterval(f.cfg.SyncDNSRoutesInterval, config.DefaultSyncDNSRoutesInterval)
-	routesTicker := time.NewTicker(routesInterval)
-	defer routesTicker.Stop()
-
-	// Item 94: Sync upstream health
-	healthInterval := safeInterval(f.cfg.SyncUpstreamHealthInterval, config.DefaultSyncUpstreamHealthInterval)
-	healthTicker := time.NewTicker(healthInterval)
-	defer healthTicker.Stop()
-
-	// Initial sync
-	f.syncAliases(client)
-	f.syncDNSRoutes(client)
-	f.syncUpstreamHealth(client)
-	f.syncDNSConfig(client)
-
-	for {
-		select {
-		case <-f.stopChan:
-			return
-		case <-aliasesTicker.C:
-			f.syncAliases(client)
-		case <-routesTicker.C:
-			f.syncDNSRoutes(client)
-			f.syncDNSConfig(client)
-		case <-healthTicker.C:
-			f.syncUpstreamHealth(client)
-		}
-	}
-}
-
-// ReportHealth sends a health update to the controller.
-func (f *Forwarder) ReportHealth(health map[string]float64) {
-	if !f.enabled() || f.transportErr != nil {
-		return
-	}
-	f.ensureHealthReporter(f.httpClient)
-	copyHealth := make(map[string]float64, len(health))
-	for key, value := range health {
-		copyHealth[key] = value
-	}
-	select {
-	case f.healthReports <- copyHealth:
-	default:
-		select {
-		case <-f.healthReports:
-		default:
-		}
-		select {
-		case f.healthReports <- copyHealth:
-		default:
-		}
-	}
-}
-
-func (f *Forwarder) ensureHealthReporter(client *http.Client) {
-	f.healthOnce.Do(func() { go f.startHealthReporter(client) })
-}
-
-func (f *Forwarder) startHealthReporter(client *http.Client) {
-	for {
-		select {
-		case <-f.stopChan:
-			return
-		case health := <-f.healthReports:
-			if err := f.sendBatch(client, nil, health); err != nil {
-				log.Printf("Error reporting health to controller: %v", err)
-			}
-		}
-	}
-}
-
-// Stats returns the current forwarding queue and delivery counters.
-func (f *Forwarder) Stats() (backlog int, backlogBytes, retries, dropped, sent int64) {
-	f.backlogMu.Lock()
-	backlog = len(f.backlog)
-	backlogBytes = f.backlogTotalSize
-	f.backlogMu.Unlock()
-	return backlog, backlogBytes, f.retries.Load(), f.dropped.Load(), f.sent.Load()
-}
-
-// Stop cleanly shuts down the forwarder
-func (f *Forwarder) Stop() {
-	f.stopOnce.Do(func() {
-		close(f.stopChan)
-		if f.httpClient != nil {
-			f.httpClient.CloseIdleConnections()
-		}
-	})
 }

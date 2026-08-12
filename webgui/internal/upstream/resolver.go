@@ -6,10 +6,14 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -49,14 +53,16 @@ func tlsConfigFor(host string) *tls.Config {
 
 // dnsResolver handles udp/tcp/tls specs via miekg/dns clients.
 type dnsResolver struct {
-	spec Spec
-	boot *bootstrapper
+	spec      Spec
+	boot      *bootstrapper
+	runtimeMu sync.RWMutex
+	endpoint  string
 }
 
 func (r *dnsResolver) String() string { return r.spec.Raw }
 
 func (r *dnsResolver) Exchange(m *dns.Msg) (*dns.Msg, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), exchangeTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), r.spec.TimeoutDuration())
 	defer cancel()
 	return r.ExchangeContext(ctx, m)
 }
@@ -70,6 +76,9 @@ func (r *dnsResolver) ExchangeContext(ctx context.Context, m *dns.Msg) (*dns.Msg
 	for _, addr := range addrs {
 		resp, err := r.exchange(ctx, addr, m)
 		if err == nil && resp != nil {
+			r.runtimeMu.Lock()
+			r.endpoint = addr
+			r.runtimeMu.Unlock()
 			return resp, nil
 		}
 		lastErr = err
@@ -82,7 +91,7 @@ func (r *dnsResolver) ExchangeContext(ctx context.Context, m *dns.Msg) (*dns.Msg
 
 // exchange performs one exchange against a concrete dial address.
 func (r *dnsResolver) exchange(ctx context.Context, addr string, m *dns.Msg) (*dns.Msg, error) {
-	client := &dns.Client{Timeout: exchangeTimeout}
+	client := &dns.Client{Timeout: r.spec.TimeoutDuration()}
 	switch r.spec.Scheme {
 	case SchemeTCP:
 		client.Net = "tcp"
@@ -97,7 +106,7 @@ func (r *dnsResolver) exchange(ctx context.Context, addr string, m *dns.Msg) (*d
 		return nil, err
 	}
 	if resp != nil && resp.Truncated && client.Net == "udp" {
-		tcpClient := &dns.Client{Net: "tcp", Timeout: exchangeTimeout}
+		tcpClient := &dns.Client{Net: "tcp", Timeout: r.spec.TimeoutDuration()}
 		if tm, _, terr := tcpClient.ExchangeContext(ctx, m, addr); terr == nil && tm != nil {
 			return tm, nil
 		}
@@ -113,12 +122,18 @@ type dohResolver struct {
 	boot       *bootstrapper
 	clientOnce sync.Once
 	client     *http.Client
+	reused     atomic.Int64
+	fresh      atomic.Int64
+	runtimeMu  sync.RWMutex
+	endpoint   string
+	tlsIssuer  string
+	tlsExpiry  time.Time
 }
 
 func (r *dohResolver) String() string { return r.spec.Raw }
 
 func (r *dohResolver) Exchange(m *dns.Msg) (*dns.Msg, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), dohTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), r.spec.TimeoutDuration())
 	defer cancel()
 	return r.ExchangeContext(ctx, m)
 }
@@ -129,13 +144,25 @@ func (r *dohResolver) ExchangeContext(ctx context.Context, m *dns.Msg) (*dns.Msg
 		return nil, err
 	}
 
-	u := url.URL{Scheme: "https", Host: net.JoinHostPort(r.spec.Host, r.spec.Port), Path: r.spec.Path}
+	u := url.URL{Scheme: "https", Host: net.JoinHostPort(r.spec.Host, r.spec.Port), Path: r.spec.Path, RawQuery: r.spec.Query}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(wire))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/dns-message")
 	req.Header.Set("Accept", "application/dns-message")
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			if info.Reused {
+				r.reused.Add(1)
+			} else {
+				r.fresh.Add(1)
+			}
+			r.runtimeMu.Lock()
+			r.endpoint = info.Conn.RemoteAddr().String()
+			r.runtimeMu.Unlock()
+		},
+	}))
 
 	resp, err := r.httpClient().Do(req)
 	if err != nil {
@@ -146,6 +173,17 @@ func (r *dohResolver) ExchangeContext(ctx context.Context, m *dns.Msg) (*dns.Msg
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("DoH %s: status %d", r.spec.Raw, resp.StatusCode)
 	}
+	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil || !strings.EqualFold(mediaType, "application/dns-message") {
+		return nil, fmt.Errorf("DoH %s: invalid content type %q", r.spec.Raw, resp.Header.Get("Content-Type"))
+	}
+	if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
+		certificate := resp.TLS.PeerCertificates[0]
+		r.runtimeMu.Lock()
+		r.tlsIssuer = certificate.Issuer.String()
+		r.tlsExpiry = certificate.NotAfter
+		r.runtimeMu.Unlock()
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if err != nil {
 		return nil, err
@@ -154,7 +192,12 @@ func (r *dohResolver) ExchangeContext(ctx context.Context, m *dns.Msg) (*dns.Msg
 	if err := out.Unpack(body); err != nil {
 		return nil, fmt.Errorf("DoH %s: invalid response: %w", r.spec.Raw, err)
 	}
-	out.Id = m.Id
+	if !out.Response {
+		return nil, fmt.Errorf("DoH %s: message is not a DNS response", r.spec.Raw)
+	}
+	if out.Id != m.Id {
+		return nil, fmt.Errorf("DoH %s: response message ID mismatch", r.spec.Raw)
+	}
 	return out, nil
 }
 
@@ -185,8 +228,32 @@ func (r *dohResolver) httpClient() *http.Client {
 			},
 		}
 		r.client = &http.Client{Timeout: dohTimeout, Transport: transport}
+		r.client.Timeout = r.spec.TimeoutDuration()
 	})
 	return r.client
+}
+
+type resolverRuntime struct {
+	Endpoint  string
+	Reused    int64
+	Fresh     int64
+	TLSIssuer string
+	TLSExpiry time.Time
+}
+
+func (r *dnsResolver) runtimeInfo() resolverRuntime {
+	r.runtimeMu.RLock()
+	defer r.runtimeMu.RUnlock()
+	return resolverRuntime{Endpoint: r.endpoint}
+}
+
+func (r *dohResolver) runtimeInfo() resolverRuntime {
+	r.runtimeMu.RLock()
+	defer r.runtimeMu.RUnlock()
+	return resolverRuntime{
+		Endpoint: r.endpoint, Reused: r.reused.Load(), Fresh: r.fresh.Load(),
+		TLSIssuer: r.tlsIssuer, TLSExpiry: r.tlsExpiry,
+	}
 }
 
 func (r *dohResolver) closeIdleConnections() {

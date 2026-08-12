@@ -9,9 +9,13 @@
     <title>DNS Configuration · Resolix</title>
     <link rel="icon" type="image/svg+xml" href="static/favicon.svg">
     <link rel="stylesheet" href="static/css/style.css">
+    <link rel="stylesheet" href="static/css/querylog.css">
+    <link rel="stylesheet" href="static/css/control_plane.css">
+    <link rel="stylesheet" href="static/css/operations.css">
+    <link rel="stylesheet" href="static/css/querylog_workbench.css">
 </head>
 
-<body class="app-page config-page compact" data-base-url="{{.BaseURL}}" data-csrf-token="{{.CSRFToken}}" data-mode="{{.Mode}}">
+<body class="app-page config-page compact" data-page="config" data-base-url="{{.BaseURL}}" data-csrf-token="{{.CSRFToken}}" data-mode="{{.Mode}}">
     <div id="sidebarScrim" class="sidebar-scrim" aria-hidden="true"></div>
     <aside id="appSidebar" class="app-sidebar" aria-label="Primary navigation">
         <div class="sidebar-brand">
@@ -77,6 +81,16 @@
             <span id="configRevision" class="revision-label">revision —</span>
         </div>
         <div id="settingsNotice" class="settings-notice is-hidden" role="status" aria-live="polite"></div>
+		{{if eq .Mode "controller"}}
+		<section id="configSyncProgress" class="config-sync-progress" aria-labelledby="configSyncProgressTitle" hidden>
+			<div class="config-sync-progress-heading">
+				<div><span class="config-sync-kicker">Cluster rollout</span><strong id="configSyncProgressTitle">Applying configuration</strong></div>
+				<span id="configSyncProgressCount" class="state-pill">0 / 0 current</span>
+			</div>
+			<progress id="configSyncProgressMeter" max="1" value="0">0%</progress>
+			<div id="configSyncProgressNodes" class="config-sync-nodes"></div>
+		</section>
+		{{end}}
 
         <nav class="settings-tabs top-settings-menu config-tabs" aria-label="Configuration sections">
             <button type="button" class="settings-tab active" data-settings-tab="upstreams">Upstreams</button>
@@ -87,6 +101,7 @@
 			<button type="button" class="settings-tab" data-settings-tab="rewrites">Rewrites</button>
 			<button type="button" class="settings-tab" data-settings-tab="clients">Clients</button>
 			<button type="button" class="settings-tab" data-settings-tab="runtime">DNS & cache</button>
+			<button type="button" class="settings-tab" data-settings-tab="magicdns">MagicDNS</button>
             <button type="button" class="settings-tab" data-settings-tab="cluster">Cluster</button>
         </nav>
 
@@ -103,8 +118,22 @@
                     <label>Bootstrap resolver list<textarea id="bootstrapList" rows="4" spellcheck="false"
                         placeholder="9.9.9.9&#10;1.1.1.1"></textarea></label>
                     <p class="panel-copy">Bootstrap resolvers must be plain UDP IP addresses, optionally with a port. They resolve DoT and DoH hostnames without depending on the system DNS resolver.</p>
-                    <div class="inline-actions"><button type="submit" class="btn btn-primary">Save upstreams</button></div>
+                    <details id="structuredUpstreamEditor" class="field-wide">
+                        <summary>Structured resolver editor</summary>
+                        <div class="settings-form compact-form">
+                            <label>Protocol<select id="upstreamScheme"><option value="udp">Plain DNS (UDP)</option><option value="tcp">Plain DNS (TCP)</option><option value="tls">DNS-over-TLS</option><option value="https">DNS-over-HTTPS</option></select></label>
+                            <label>Host<input id="upstreamHost" type="text" placeholder="dns.example or 1.1.1.1"></label>
+                            <label>Port<input id="upstreamPort" type="number" min="1" max="65535" placeholder="Default"></label>
+                            <label>DoH path<input id="upstreamPath" type="text" value="/dns-query"></label>
+                            <label>Timeout<input id="upstreamTimeout" type="text" value="5s" placeholder="5s"></label>
+                            <label>Weight<input id="upstreamWeight" type="number" min="1" max="100" value="1"></label>
+                            <div class="inline-actions field-wide"><button type="button" id="addStructuredUpstreamBtn" class="btn btn-secondary">Add to resolver list</button><button type="button" id="testStructuredUpstreamBtn" class="btn btn-secondary">Test draft</button></div>
+                        </div>
+                    </details>
+                    <div class="inline-actions"><button type="button" id="testAllUpstreamsBtn" class="btn btn-secondary">Test before save</button><button type="submit" class="btn btn-primary">Save upstreams</button></div>
                 </form>
+                <div id="upstreamTestResult" class="runtime-grid" aria-live="polite"></div>
+                <div id="upstreamRuntime" class="settings-list"></div>
             </section>
 
             <section id="settings-routes" class="settings-panel" data-panel="routes" hidden>
@@ -120,6 +149,11 @@
                         <button type="submit" class="btn btn-primary">Add or replace route</button>
                     </div>
                 </form>
+                <form id="routeTestForm" class="settings-form single-column-form">
+                    <label>Preview route precedence<input id="routeTestDomain" type="text" placeholder="host.corp.internal" required></label>
+                    <div class="inline-actions"><button type="submit" class="btn btn-secondary">Test route</button></div>
+                </form>
+                <div id="routeTestResult" class="runtime-grid" aria-live="polite"></div>
                 <div id="routeList" class="settings-list"></div>
             </section>
 
@@ -128,18 +162,28 @@
                     <div><span class="panel-index">03</span><h2>DNS blocklists</h2></div>
                     <span id="blocklistCount" class="state-pill">0 lists</span>
                 </div>
-                <p class="panel-copy">Block matching domains from hosted Adblock, hosts-file, or plain-domain lists. Allowlist matches always take precedence.</p>
+                <p class="panel-copy">Block matching domains from hosted Adblock, hosts-file, or plain-domain lists. Allowlist matches always take precedence. Lists refresh every 24 hours, after add or edit, and on manual update checks.</p>
                 <form id="blocklistForm" class="settings-form subscription-form controller-edit">
                     <input id="blocklistID" type="hidden">
                     <label>Name<input id="blocklistName" type="text" maxlength="120" placeholder="StevenBlack hosts"></label>
                     <label class="field-wide">List URL<input id="blocklistURL" type="url" placeholder="https://example.com/blocklist.txt" required></label>
+                    <div id="blocklistURLWarning" class="field-wide subscription-url-warning" role="status" hidden></div>
+                    <label>Fetch timeout (seconds)<input id="blocklistTimeout" type="number" min="1" max="120" value="30" required></label>
+                    <label>Redirect limit<input id="blocklistRedirectLimit" type="number" min="1" max="10" value="5" required></label>
+					<label>Daily refresh (UTC)<input id="blocklistRefreshAt" type="time" step="60" aria-describedby="blocklistRefreshHelp"><small id="blocklistRefreshHelp">Optional; otherwise uses the global interval.</small></label>
                     <label class="check-field"><input id="blocklistEnabled" type="checkbox" checked> Enabled</label>
+                    <label class="check-field field-wide"><input id="blocklistAllowPrivate" type="checkbox"> Allow private/internal download targets</label>
                     <div class="inline-actions field-wide">
                         <button type="submit" id="blocklistSaveBtn" class="btn btn-primary">Add blocklist</button>
                         <button type="button" id="blocklistCancelBtn" class="btn btn-secondary is-hidden">Cancel edit</button>
                         <button type="button" id="refreshBlocklistsBtn" class="btn btn-secondary">Check for updates</button>
                     </div>
                 </form>
+                <div class="subscription-toolbar">
+                    <label>Search<input id="blocklistSearch" type="search" placeholder="Name or URL"></label>
+                    <label>Sort<select id="blocklistSort"><option value="name">Name</option><option value="status">Status</option><option value="size">Size</option><option value="updated">Update time</option></select></label>
+                    <div class="inline-actions controller-edit"><button type="button" class="mini-action subscription-bulk" data-prefix="blocklist" data-action="enable">Enable</button><button type="button" class="mini-action subscription-bulk" data-prefix="blocklist" data-action="disable">Disable</button><button type="button" class="mini-action subscription-bulk" data-prefix="blocklist" data-action="refresh">Refresh</button><button type="button" class="mini-action danger subscription-bulk" data-prefix="blocklist" data-action="delete">Delete</button><button type="button" id="exportSubscriptionsBtn" class="mini-action">Export JSON</button><button type="button" id="importSubscriptionsBtn" class="mini-action">Import JSON</button><input id="importSubscriptionsFile" type="file" accept="application/json,.json" hidden></div>
+                </div>
                 <div id="blocklistList" class="settings-list"></div>
             </section>
 
@@ -148,18 +192,29 @@
                     <div><span class="panel-index">04</span><h2>DNS allowlists</h2></div>
                     <span id="allowlistCount" class="state-pill">0 lists</span>
                 </div>
-                <p class="panel-copy">Domains from these lists are allowed even when a blocklist or custom blocking rule also matches. Apex domains and their subdomains are covered.</p>
+                <p class="panel-copy">Domains from these lists are allowed even when a blocklist or custom blocking rule also matches. Apex domains and their subdomains are covered. Lists refresh every 24 hours, after add or edit, and on manual update checks.</p>
                 <form id="allowlistForm" class="settings-form subscription-form controller-edit">
                     <input id="allowlistID" type="hidden">
                     <label>Name<input id="allowlistName" type="text" maxlength="120" placeholder="Trusted domains"></label>
                     <label class="field-wide">List URL<input id="allowlistURL" type="url" placeholder="https://example.com/allowlist.txt" required></label>
+                    <div id="allowlistURLWarning" class="field-wide subscription-url-warning" role="status" hidden></div>
+                    <label>Fetch timeout (seconds)<input id="allowlistTimeout" type="number" min="1" max="120" value="30" required></label>
+                    <label>Redirect limit<input id="allowlistRedirectLimit" type="number" min="1" max="10" value="5" required></label>
+					<label>Daily refresh (UTC)<input id="allowlistRefreshAt" type="time" step="60" aria-describedby="allowlistRefreshHelp"><small id="allowlistRefreshHelp">Optional; otherwise uses the global interval.</small></label>
                     <label class="check-field"><input id="allowlistEnabled" type="checkbox" checked> Enabled</label>
+                    <label class="check-field field-wide"><input id="allowlistAllowPrivate" type="checkbox"> Allow private/internal download targets</label>
                     <div class="inline-actions field-wide">
                         <button type="submit" id="allowlistSaveBtn" class="btn btn-primary">Add allowlist</button>
                         <button type="button" id="allowlistCancelBtn" class="btn btn-secondary is-hidden">Cancel edit</button>
                         <button type="button" id="refreshAllowlistsBtn" class="btn btn-secondary">Check for updates</button>
                     </div>
                 </form>
+                <div class="subscription-toolbar">
+                    <label>Search<input id="allowlistSearch" type="search" placeholder="Name or URL"></label>
+                    <label>Sort<select id="allowlistSort"><option value="name">Name</option><option value="status">Status</option><option value="size">Size</option><option value="updated">Update time</option></select></label>
+                    <div class="inline-actions controller-edit"><button type="button" class="mini-action subscription-bulk" data-prefix="allowlist" data-action="enable">Enable</button><button type="button" class="mini-action subscription-bulk" data-prefix="allowlist" data-action="disable">Disable</button><button type="button" class="mini-action subscription-bulk" data-prefix="allowlist" data-action="refresh">Refresh</button><button type="button" class="mini-action danger subscription-bulk" data-prefix="allowlist" data-action="delete">Delete</button></div>
+                </div>
+                <div id="allowlistOverrideReport" class="runtime-grid" aria-live="polite"></div>
                 <div id="allowlistList" class="settings-list"></div>
             </section>
 
@@ -171,8 +226,20 @@
                 <p class="panel-copy">Adblock rules, exceptions (<code>@@</code>), hosts entries, plain domains, and <code>/RE2/</code> expressions.</p>
                 <form id="userRulesForm" class="settings-form single-column-form controller-edit">
                     <label>Rules<textarea id="userRules" rows="16" spellcheck="false" placeholder="||ads.example^&#10;@@||allowed.example^"></textarea></label>
-                    <div class="inline-actions"><button type="submit" class="btn btn-primary">Save custom rules</button></div>
+                    <div class="inline-actions"><button type="button" id="validateRulesBtn" class="btn btn-secondary">Validate syntax</button><button type="submit" class="btn btn-primary">Save custom rules</button></div>
                 </form>
+                <div id="ruleDiagnostics" class="settings-list" aria-live="polite"></div>
+                <form id="filterTestForm" class="settings-form filter-diagnostic-form">
+                    <label>Hostname or domain<input id="filterTestDomain" type="text" placeholder="ads.example.com" autocomplete="off" required></label>
+                    <label>Client identifier<input id="filterTestClient" type="text" placeholder="IP address or client name" autocomplete="off" aria-describedby="filterTestClientHelp"><small id="filterTestClientHelp">Optional; applies the matching client policy and source-scoped rewrites.</small></label>
+                    <label>DNS record type<select id="filterTestType">
+                        <option>A</option><option>AAAA</option><option>CNAME</option><option>HTTPS</option>
+                        <option>MX</option><option>PTR</option><option>SRV</option><option>SVCB</option>
+                        <option>TXT</option><option>ANY</option>
+                    </select></label>
+                    <div class="inline-actions filter-diagnostic-action"><button type="submit" class="btn btn-secondary">Check policy</button></div>
+                </form>
+                <div id="filterTestResult" class="filter-diagnostic-result is-hidden" aria-live="polite"></div>
             </section>
 
             <section id="settings-rewrites" class="settings-panel" data-panel="rewrites" hidden>
@@ -231,18 +298,90 @@
             </section>
 
 			<section id="settings-runtime" class="settings-panel" data-panel="runtime" hidden>
-                <div class="panel-heading"><div><span class="panel-index">08</span><h2>DNS, cache & protocols</h2></div><span class="state-pill paused">Restart required</span></div>
-                <p class="panel-copy">These runtime values are visible here but remain environment-owned because changing listeners, ACLs, or protocol behavior safely requires a process restart.</p>
-                <div id="runtimeSettings" class="runtime-grid"></div>
-                <div class="inline-actions"><button type="button" id="pause5Btn" class="btn btn-secondary controller-edit">Pause filtering 5m</button><button type="button" id="resumeBtn" class="btn btn-primary controller-edit">Resume filtering</button></div>
-            </section>
+				<div class="panel-heading"><div><span class="panel-index">08</span><h2>DNS server policy</h2></div><span class="state-pill online">Live apply</span></div>
+				<p class="panel-copy">These controller-owned settings apply immediately and synchronize to every agent. Listener ports, TLS certificates, credentials, and storage paths remain environment-owned because they require a restart.</p>
+				<form id="dnsSettingsForm" class="settings-form dns-settings-form controller-edit">
+					<fieldset class="settings-group field-wide">
+						<legend>Resolver behavior</legend>
+						<label>Upstream strategy<select id="dnsUpstreamMode"><option value="load_balance">Load balance</option><option value="parallel">Parallel — first response wins</option><option value="strict">Strict order</option></select></label>
+						<label>EDNS client subnet<input id="dnsECSSubnet" type="text" placeholder="Disabled (privacy default)"></label>
+						<label class="field-wide">Fallback resolvers<textarea id="dnsFallbacks" rows="4" spellcheck="false" placeholder="9.9.9.9&#10;https://doh.opendns.com/dns-query"></textarea></label>
+						<p class="panel-copy field-wide">Fallback syntax matches the upstream list. Resolver-specific timeout and weight are configured in the structured upstream editor.</p>
+					</fieldset>
+					<fieldset class="settings-group field-wide">
+						<legend>Filtering responses</legend>
+						<label>Blocking mode<select id="dnsBlockingMode"><option value="nxdomain">NXDOMAIN</option><option value="null_ip">Null IP</option><option value="refused">REFUSED</option><option value="custom_ip">Custom IP</option></select></label>
+						<label>Blocked response TTL<input id="dnsBlockedTTL" type="number" min="1" max="86400"></label>
+						<label>Custom IPv4<input id="dnsBlockIPv4" type="text" placeholder="0.0.0.0"></label>
+						<label>Custom IPv6<input id="dnsBlockIPv6" type="text" placeholder="::"></label>
+						<div class="settings-check-grid field-wide">
+							<label class="check-field"><input id="dnsDisableAAAA" type="checkbox"> Disable AAAA and IPv6 hints</label>
+							<label class="check-field"><input id="dnsRefuseANY" type="checkbox"> Refuse ANY queries</label>
+							<label class="check-field"><input id="dnsDNSSEC" type="checkbox"> Pass DNSSEC DO bit upstream</label>
+							<label class="check-field"><input id="dnsPrivatePTR" type="checkbox"> Answer known private PTR records</label>
+							<label class="check-field"><input id="dnsResolveClientHostnames" type="checkbox"> Reverse-resolve client hostnames</label>
+						</div>
+						<label class="field-wide">Private reverse DNS resolvers<textarea id="dnsPrivatePTRUpstreams" rows="3" spellcheck="false" placeholder="192.168.1.1&#10;tls://resolver.internal:853"></textarea></label>
+						<div class="field-wide settings-check-grid" role="group" aria-label="Safe search providers">
+							<label class="check-field"><input class="dns-safe-search" value="google" type="checkbox"> Google SafeSearch</label>
+							<label class="check-field"><input class="dns-safe-search" value="bing" type="checkbox"> Bing SafeSearch</label>
+							<label class="check-field"><input class="dns-safe-search" value="ddg" type="checkbox"> DuckDuckGo Safe Search</label>
+							<label class="check-field"><input class="dns-safe-search" value="youtube" type="checkbox"> YouTube restricted mode</label>
+						</div>
+						<label class="field-wide">Bogus-answer IPs or CIDRs<textarea id="dnsBogusNXDOMAIN" rows="3" spellcheck="false" placeholder="192.0.2.0/24"></textarea></label>
+					</fieldset>
+					<fieldset class="settings-group field-wide">
+						<legend>Access and rate limits</legend>
+						<label>Public queries per second<input id="dnsRateLimit" type="number" min="0" max="1000000"></label>
+						<label>LAN / Tailscale queries per second<input id="dnsInternalRateLimit" type="number" min="0" max="1000000"></label>
+						<label>IPv4 rate-limit subnet<input id="dnsRateLimitIPv4Prefix" type="number" min="1" max="32"></label>
+						<label>IPv6 rate-limit subnet<input id="dnsRateLimitIPv6Prefix" type="number" min="1" max="128"></label>
+						<label class="check-field field-wide"><input id="dnsRateLimitEDE" type="checkbox"> Return REFUSED with EDE to EDNS clients instead of silently dropping excess queries</label>
+						<label class="field-wide">Rate-limit allowlist<textarea id="dnsRateLimitAllowlist" rows="3" spellcheck="false" placeholder="Trusted IPs or CIDRs"></textarea></label>
+						<label>Allowed clients<textarea id="dnsAllowedClients" rows="5" spellcheck="false" placeholder="Empty allows all clients&#10;100.64.0.0/10"></textarea></label>
+						<label>Disallowed clients<textarea id="dnsDisallowedClients" rows="5" spellcheck="false" placeholder="One IP or CIDR per line"></textarea></label>
+						<p class="panel-copy field-wide">When the allowlist is non-empty, every other client is silently dropped. Denied and rate-limited traffic is silent by default to reduce amplification risk.</p>
+					</fieldset>
+					<fieldset class="settings-group field-wide">
+						<legend>DNS cache</legend>
+						<label>Capacity (entries)<input id="dnsCacheSize" type="number" min="1" max="1000000"></label>
+						<label>Minimum TTL (seconds)<input id="dnsCacheMinTTL" type="number" min="1" max="86400"></label>
+						<label>Maximum TTL (seconds)<input id="dnsCacheMaxTTL" type="number" min="1" max="86400"></label>
+						<label>SERVFAIL cache (milliseconds)<input id="dnsCacheSERVFAIL" type="number" min="0" max="1000"></label>
+						<label class="check-field"><input id="dnsCacheOptimistic" type="checkbox"> Serve stale answers while refreshing</label>
+						<label class="check-field"><input id="dnsCachePrefetch" type="checkbox"> Prefetch frequently used entries</label>
+						<label>Prefetch window (milliseconds)<input id="dnsCachePrefetchWindow" type="number" min="1" max="86400000"></label>
+						<label>Prefetch hit threshold<input id="dnsCachePrefetchHits" type="number" min="1" max="1000000"></label>
+					</fieldset>
+					<div class="inline-actions field-wide"><button type="submit" class="btn btn-primary">Save DNS policy</button><button type="button" id="pause5Btn" class="btn btn-secondary">Pause filtering 5m</button><button type="button" id="resumeBtn" class="btn btn-secondary">Resume filtering</button></div>
+				</form>
+				<details class="runtime-details field-wide"><summary>Restart-owned listener and protocol settings</summary><div id="runtimeSettings" class="runtime-grid"></div></details>
+			</section>
+
+			<section id="settings-magicdns" class="settings-panel" data-panel="magicdns" hidden>
+				<div class="panel-heading"><div><span class="panel-index">09</span><h2>Tailscale MagicDNS</h2></div><span id="magicDNSState" class="state-pill">Loading</span></div>
+				<p class="panel-copy">Resolix imports exact MagicDNS FQDN records from the controller's read-only Tailscale device inventory. Credentials remain restart-owned environment secrets and are never sent to agents or returned by this page.</p>
+				<div class="inline-actions"><button type="button" id="syncMagicDNSBtn" class="btn btn-primary controller-edit">Sync from Tailscale now</button></div>
+				<div id="magicDNSSummary" class="runtime-grid" aria-live="polite"></div>
+				<details class="runtime-details field-wide" open><summary>Imported address records</summary><div id="magicDNSRecords" class="runtime-grid"></div></details>
+			</section>
 
 			<section id="settings-cluster" class="settings-panel" data-panel="cluster" hidden>
-                <div class="panel-heading"><div><span class="panel-index">09</span><h2>Cluster synchronization</h2></div><span id="clusterMode" class="state-pill">Loading</span></div>
+                <div class="panel-heading"><div><span class="panel-index">10</span><h2>Cluster synchronization</h2></div><span id="clusterMode" class="state-pill">Loading</span></div>
                 <p class="panel-copy">The controller is authoritative. Agent nodes verify and apply content-addressed snapshots containing upstreams, routes, subscriptions, custom rules, rewrites, and clients.</p>
+				<div class="inline-actions"><button type="button" id="syncAllNodesBtn" class="btn btn-primary controller-edit">Sync all agents now</button></div>
                 <div id="clusterSummary" class="runtime-grid"></div>
             </section>
         </div>
+		{{if eq .Mode "controller"}}
+		<aside id="configEditBar" class="config-edit-bar" aria-live="polite" hidden>
+			<div class="config-edit-summary"><span>Unsaved draft</span><strong id="configEditSection">Configuration changes</strong></div>
+			<div class="config-edit-actions">
+				<button id="configRevertBtn" type="button" class="btn btn-secondary">Revert</button>
+				<button id="configSaveBtn" type="button" class="btn btn-primary">Save changes</button>
+			</div>
+		</aside>
+		{{end}}
         </main>
     </div>
     <dialog id="rewriteDeleteDialog" class="confirm-dialog" aria-labelledby="rewriteDeleteTitle" aria-describedby="rewriteDeleteMessage">
@@ -261,6 +400,11 @@
     </dialog>
     <script nonce="{{.Nonce}}" src="static/js/shell.js"></script>
     <script nonce="{{.Nonce}}" src="static/js/config.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/config_upstreams.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/config_subscriptions.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/config_rules.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/config_clients.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/config_bootstrap.js"></script>
 </body>
 
 </html>

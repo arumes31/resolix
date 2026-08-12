@@ -4,6 +4,18 @@
     const toggle = document.getElementById('sidebarToggle');
     const scrim = document.getElementById('sidebarScrim');
 
+    const liveRegion = document.createElement('div');
+    liveRegion.id = 'globalLiveRegion';
+    liveRegion.className = 'sr-only';
+    liveRegion.setAttribute('role', 'status');
+    liveRegion.setAttribute('aria-live', 'polite');
+    liveRegion.setAttribute('aria-atomic', 'true');
+    body.appendChild(liveRegion);
+    window.resolixAnnounce = (message) => {
+        liveRegion.textContent = '';
+        window.setTimeout(() => { liveRegion.textContent = String(message || ''); }, 20);
+    };
+
     if (!sidebar || !toggle || !scrim) return;
 
     const drawerLayout = window.matchMedia('(max-width: 900px)');
@@ -47,6 +59,16 @@
     }
     setSidebarOpen(false, false);
 
+    const page = body.dataset.page || 'dashboard';
+    sidebar.querySelectorAll('.app-nav-link[href]').forEach(link => {
+        const href = (link.getAttribute('href') || '').replace(/^\.\//, '').replace(/\/$/, '');
+        const targetPage = href === '' || href === '.' ? 'dashboard' : href.split('/').pop();
+        const active = targetPage === page;
+        link.classList.toggle('is-active', active);
+        if (active) link.setAttribute('aria-current', 'page');
+        else link.removeAttribute('aria-current');
+    });
+
     const syncDashboardSection = () => {
         const section = location.hash === '#query-log' || location.hash === '#cluster-nodes'
             ? location.hash.slice(1)
@@ -63,4 +85,44 @@
         syncDashboardSection();
         window.addEventListener('hashchange', syncDashboardSection);
     }
+
+    document.addEventListener('keydown', event => {
+        const dialog = document.querySelector('[role="dialog"][aria-hidden="false"]');
+        if (event.key === 'Tab' && dialog) {
+            const focusable = Array.from(dialog.querySelectorAll(focusableSelector)).filter(element => !element.inert);
+            if (focusable.length > 0) {
+                const first = focusable[0];
+                const last = focusable[focusable.length - 1];
+                if (event.shiftKey && document.activeElement === first) {
+                    event.preventDefault();
+                    last.focus();
+                } else if (!event.shiftKey && document.activeElement === last) {
+                    event.preventDefault();
+                    first.focus();
+                }
+            }
+        }
+
+        const target = event.target;
+        const isEditing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || target?.isContentEditable;
+        if (!isEditing && event.key === '/') {
+            const search = document.getElementById('searchInput') || document.getElementById('simDomain');
+            if (search) {
+                event.preventDefault();
+                search.focus();
+            }
+        }
+        if (!isEditing && event.key.toLowerCase() === 'r' && !event.ctrlKey && !event.metaKey && !event.altKey) {
+            const refresh = document.getElementById('refreshNodesBtn') || document.getElementById('refreshConfigBtn');
+            if (refresh) {
+                event.preventDefault();
+                refresh.click();
+                window.resolixAnnounce('Refresh requested');
+            } else if (typeof window.resolixRefreshPage === 'function') {
+                event.preventDefault();
+                window.resolixRefreshPage();
+                window.resolixAnnounce('Refresh requested');
+            }
+        }
+    });
 })();

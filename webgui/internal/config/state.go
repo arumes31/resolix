@@ -59,10 +59,11 @@ func MigrateLegacyState(cfg *Config) (int, error) {
 }
 
 func managedConfigFiles(cfg *Config) ([]string, error) {
-	names := []string{"filter-subscriptions.json", "user_rules.txt"}
+	names := []string{"filter-subscriptions.json", "user_rules.txt", "dns-settings.json"}
 	seen := map[string]struct{}{
 		"filter-subscriptions.json": {},
 		"user_rules.txt":            {},
+		"dns-settings.json":         {},
 	}
 	for _, configured := range []string{
 		cfg.UpstreamsFile,
@@ -70,6 +71,7 @@ func managedConfigFiles(cfg *Config) ([]string, error) {
 		cfg.RewritesFile,
 		cfg.ClientsFile,
 		cfg.BlocklistFile,
+		cfg.MagicDNSStateFile,
 	} {
 		configured = strings.TrimSpace(configured)
 		if configured == "" || filepath.IsAbs(configured) {

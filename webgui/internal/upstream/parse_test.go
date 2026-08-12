@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"testing"
+	"time"
 )
 
 func TestParse(t *testing.T) {
@@ -96,5 +97,43 @@ func TestValidateBootstrapServers(t *testing.T) {
 				t.Fatalf("ValidateBootstrapServers() error = %v, wantErr %v", err, test.wantErr)
 			}
 		})
+	}
+}
+
+func TestParseResolverOptionsAndNormalizedKey(t *testing.T) {
+	spec, err := Parse("HTTPS://DNS.Example.:443/dns-query?foo=bar&timeout=750ms&weight=7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Timeout != 750*time.Millisecond || spec.SelectionWeight() != 7 || spec.Query != "foo=bar" {
+		t.Fatalf("resolver options = %+v", spec)
+	}
+	if got, want := spec.NormalizedKey(), "https://dns.example:443/dns-query?foo=bar"; got != want {
+		t.Fatalf("normalized key = %q, want %q", got, want)
+	}
+
+	first, err := Normalize("tls://DNS.Example.:853?timeout=1s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := Normalize("tls://dns.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatalf("normalized equivalents differ: %q != %q", first, second)
+	}
+}
+
+func TestParseRejectsInvalidResolverOptions(t *testing.T) {
+	for _, raw := range []string{
+		"udp://1.1.1.1?timeout=100ms",
+		"tls://dns.example?timeout=61s",
+		"https://dns.example/dns-query?weight=0",
+		"https://dns.example/dns-query?weight=101",
+	} {
+		if _, err := Parse(raw); err == nil {
+			t.Errorf("Parse(%q) accepted invalid resolver option", raw)
+		}
 	}
 }

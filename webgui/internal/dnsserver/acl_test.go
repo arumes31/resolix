@@ -129,6 +129,20 @@ func TestRateLimiter(t *testing.T) {
 	}
 }
 
+func TestRateLimiterAggregatesConfiguredSubnets(t *testing.T) {
+	t.Parallel()
+	limiter := newRateLimiter(1)
+	if !limiter.allowAtRate("192.0.2.1", 1, 24, 56) {
+		t.Fatal("first subnet request was rejected")
+	}
+	if limiter.allowAtRate("192.0.2.200", 1, 24, 56) {
+		t.Fatal("second address in the same /24 bypassed the shared bucket")
+	}
+	if !limiter.allowAtRate("192.0.3.1", 1, 24, 56) {
+		t.Fatal("different /24 did not receive its own bucket")
+	}
+}
+
 func TestRateLimiterBucketBound(t *testing.T) {
 	rl := newRateLimiter(1)
 	rl.maxBuckets = 1
@@ -143,6 +157,36 @@ func TestRateLimiterBucketBound(t *testing.T) {
 	}
 	if _, ok := rl.buckets["192.0.2.1"]; ok {
 		t.Fatal("least-recently-used bucket was not evicted")
+	}
+}
+
+func TestRateLimiterEvictsLeastRecentlyUsedBucket(t *testing.T) {
+	rl := newRateLimiter(1)
+	rl.maxBuckets = 2
+	if !rl.allow("192.0.2.1") || !rl.allow("198.51.100.1") {
+		t.Fatal("initial clients were unexpectedly limited")
+	}
+	// A limited request still makes the first client the most recently seen.
+	if rl.allow("192.0.2.1") {
+		t.Fatal("second immediate request was unexpectedly allowed")
+	}
+	if !rl.allow("203.0.113.1") {
+		t.Fatal("new client was unexpectedly limited")
+	}
+	rl.mu.Lock()
+	_, firstPresent := rl.buckets["192.0.2.1"]
+	_, secondPresent := rl.buckets["198.51.100.1"]
+	_, thirdPresent := rl.buckets["203.0.113.1"]
+	orderLength := rl.order.Len()
+	rl.mu.Unlock()
+	if !firstPresent || secondPresent || !thirdPresent || orderLength != 2 {
+		t.Fatalf(
+			"LRU buckets first=%t second=%t third=%t order=%d",
+			firstPresent,
+			secondPresent,
+			thirdPresent,
+			orderLength,
+		)
 	}
 }
 
@@ -218,6 +262,26 @@ func TestRateLimitEndToEnd(t *testing.T) {
 	}
 	if got := h.srv.RateLimitDropped(); got != 2 {
 		t.Errorf("dropped = %d, want 2", got)
+	}
+}
+
+func TestRateLimitEDEIsOptIn(t *testing.T) {
+	server := New(Config{RateLimitQPS: 1, RateLimitEDE: true}, nil)
+	query := func() *dns.Msg {
+		message := new(dns.Msg)
+		message.SetQuestion("rate-limit.test.", dns.TypeA)
+		message.SetEdns0(1232, false)
+		return message
+	}
+	if _, drop := server.Resolve(query(), "192.0.2.1"); drop {
+		t.Fatal("first query was rate limited")
+	}
+	response, drop := server.Resolve(query(), "192.0.2.1")
+	if drop || response == nil || response.Rcode != dns.RcodeRefused {
+		t.Fatalf("rate-limit response=%v drop=%t", response, drop)
+	}
+	if code, ok := extendedErrorCode(response); !ok || code != dns.ExtendedErrorCodeProhibited {
+		t.Fatalf("rate-limit EDE = %d/%t", code, ok)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Scheme identifiers for upstream specs.
@@ -21,11 +22,14 @@ const (
 
 // Spec is a parsed upstream address.
 type Spec struct {
-	Scheme string // udp | tcp | tls | https
-	Host   string // IP or hostname
-	Port   string // always populated (53/853/443 defaults)
-	Path   string // DoH path (default /dns-query)
-	Raw    string // original spec string
+	Scheme  string        // udp | tcp | tls | https
+	Host    string        // IP or hostname
+	Port    string        // always populated (53/853/443 defaults)
+	Path    string        // DoH path (default /dns-query)
+	Query   string        // DoH endpoint query, excluding resolver options
+	Timeout time.Duration // zero means the protocol default
+	Weight  int           // zero means 1
+	Raw     string        // original spec string
 }
 
 // Hostname reports whether the spec's host is a DNS name (not an IP literal)
@@ -43,8 +47,57 @@ func (s Spec) String() string {
 	result := s.Scheme + "://" + net.JoinHostPort(s.Host, s.Port)
 	if s.Scheme == SchemeHTTPS {
 		result += s.Path
+		if s.Query != "" {
+			result += "?" + s.Query
+		}
+	}
+	options := url.Values{}
+	if s.Timeout > 0 {
+		options.Set("timeout", s.Timeout.String())
+	}
+	if s.Weight > 1 {
+		options.Set("weight", strconv.Itoa(s.Weight))
+	}
+	if encoded := options.Encode(); encoded != "" {
+		separator := "?"
+		if strings.Contains(result, "?") {
+			separator = "&"
+		}
+		result += separator + encoded
 	}
 	return result
+}
+
+// TimeoutDuration returns the configured timeout or the protocol default.
+func (s Spec) TimeoutDuration() time.Duration {
+	if s.Timeout > 0 {
+		return s.Timeout
+	}
+	if s.Scheme == SchemeHTTPS {
+		return 20 * time.Second
+	}
+	return 5 * time.Second
+}
+
+// SelectionWeight returns the configured load-balancing weight.
+func (s Spec) SelectionWeight() int {
+	if s.Weight <= 0 {
+		return 1
+	}
+	return s.Weight
+}
+
+// NormalizedKey identifies an endpoint independently of spelling and
+// selection options. It is used to reject duplicate resolver entries.
+func (s Spec) NormalizedKey() string {
+	key := s.Scheme + "://" + net.JoinHostPort(strings.ToLower(strings.TrimSuffix(s.Host, ".")), s.Port)
+	if s.Scheme == SchemeHTTPS {
+		key += s.Path
+		if s.Query != "" {
+			key += "?" + s.Query
+		}
+	}
+	return key
 }
 
 // Parse parses an upstream spec:
@@ -64,41 +117,86 @@ func Parse(raw string) (Spec, error) {
 	}
 
 	if strings.Contains(raw, "://") {
-		u, err := url.Parse(raw)
-		if err != nil {
-			return Spec{}, fmt.Errorf("invalid upstream %q: %w", raw, err)
-		}
-		spec := Spec{Scheme: strings.ToLower(u.Scheme), Host: u.Hostname(), Port: u.Port(), Raw: raw}
-		switch spec.Scheme {
-		case SchemeUDP, SchemeTCP:
-			if spec.Port == "" {
-				spec.Port = "53"
-			}
-		case SchemeTLS:
-			if spec.Port == "" {
-				spec.Port = "853"
-			}
-		case SchemeHTTPS:
-			if spec.Port == "" {
-				spec.Port = "443"
-			}
-			spec.Path = u.Path
-			if spec.Path == "" {
-				spec.Path = "/dns-query"
-			}
-		default:
-			return Spec{}, fmt.Errorf("unsupported upstream scheme %q in %q", u.Scheme, raw)
-		}
-		if spec.Host == "" {
-			return Spec{}, fmt.Errorf("missing host in upstream %q", raw)
-		}
-		portNumber, err := strconv.Atoi(spec.Port)
-		if err != nil || portNumber < 1 || portNumber > 65535 {
-			return Spec{}, fmt.Errorf("upstream %q has an invalid port", raw)
-		}
-		return spec, nil
+		return parseExplicitSpec(raw)
 	}
+	return parsePlainSpec(raw)
+}
 
+func parseExplicitSpec(raw string) (Spec, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return Spec{}, fmt.Errorf("invalid upstream %q: %w", raw, err)
+	}
+	spec := Spec{Scheme: strings.ToLower(u.Scheme), Host: strings.ToLower(strings.TrimSuffix(u.Hostname(), ".")), Port: u.Port(), Raw: raw}
+	options := u.Query()
+	if err := applyResolverOptions(raw, options, &spec); err != nil {
+		return Spec{}, err
+	}
+	if err := applyResolverTransport(raw, u, options, &spec); err != nil {
+		return Spec{}, err
+	}
+	if spec.Host == "" {
+		return Spec{}, fmt.Errorf("missing host in upstream %q", raw)
+	}
+	portNumber, err := strconv.Atoi(spec.Port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return Spec{}, fmt.Errorf("upstream %q has an invalid port", raw)
+	}
+	return spec, nil
+}
+
+func applyResolverOptions(raw string, options url.Values, spec *Spec) error {
+	if timeoutValue := options.Get("timeout"); timeoutValue != "" {
+		timeout, err := time.ParseDuration(timeoutValue)
+		if err != nil || timeout < 250*time.Millisecond || timeout > 60*time.Second {
+			return fmt.Errorf("upstream %q timeout must be between 250ms and 60s", raw)
+		}
+		spec.Timeout = timeout
+		options.Del("timeout")
+	}
+	if weightValue := options.Get("weight"); weightValue != "" {
+		weight, err := strconv.Atoi(weightValue)
+		if err != nil || weight < 1 || weight > 100 {
+			return fmt.Errorf("upstream %q weight must be between 1 and 100", raw)
+		}
+		spec.Weight = weight
+		options.Del("weight")
+	}
+	return nil
+}
+
+func applyResolverTransport(raw string, parsed *url.URL, options url.Values, spec *Spec) error {
+	switch spec.Scheme {
+	case SchemeUDP, SchemeTCP:
+		if len(options) > 0 {
+			return fmt.Errorf("upstream %q has unsupported query options", raw)
+		}
+		if spec.Port == "" {
+			spec.Port = "53"
+		}
+	case SchemeTLS:
+		if len(options) > 0 {
+			return fmt.Errorf("upstream %q has unsupported query options", raw)
+		}
+		if spec.Port == "" {
+			spec.Port = "853"
+		}
+	case SchemeHTTPS:
+		if spec.Port == "" {
+			spec.Port = "443"
+		}
+		spec.Path = parsed.Path
+		if spec.Path == "" {
+			spec.Path = "/dns-query"
+		}
+		spec.Query = options.Encode()
+	default:
+		return fmt.Errorf("unsupported upstream scheme %q in %q", parsed.Scheme, raw)
+	}
+	return nil
+}
+
+func parsePlainSpec(raw string) (Spec, error) {
 	// Plain formats: ip, ip:port, ip#port (dnsmasq style).
 	normalized := raw
 	if host, port, ok := strings.Cut(raw, "#"); ok {
@@ -122,6 +220,15 @@ func Parse(raw string) (Spec, error) {
 		return Spec{}, fmt.Errorf("plain upstream %q has an invalid port", raw)
 	}
 	return Spec{Scheme: SchemeUDP, Host: host, Port: port, Raw: raw}, nil
+}
+
+// Normalize returns the canonical endpoint key for a resolver specification.
+func Normalize(raw string) (string, error) {
+	spec, err := Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	return spec.NormalizedKey(), nil
 }
 
 // ValidateBootstrapServers requires plain UDP IP-literal resolvers. Allowing a

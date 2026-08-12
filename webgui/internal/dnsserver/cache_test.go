@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+
+	"github.com/arumes31/resolix/webgui/internal/dnssettings"
 )
 
 func aRecord(name, ip string, ttl uint32) dns.RR {
@@ -172,7 +174,7 @@ func TestStoreInCacheNegative(t *testing.T) {
 	s := New(Config{Addr: "127.0.0.1", Port: 0}, nil)
 	key := cacheKey{name: "nx.example.org", qtype: dns.TypeA}
 
-	// NXDOMAIN with SOA → cached with SOA TTL clamped to max 600.
+	// RFC 2308 uses min(SOA RR TTL, SOA.MINIMUM), which is 60 here.
 	nx := new(dns.Msg)
 	nx.Rcode = dns.RcodeNameError
 	nx.Ns = []dns.RR{soaRecord("example.org.", 1200)}
@@ -182,8 +184,8 @@ func TestStoreInCacheNegative(t *testing.T) {
 	if !ok {
 		t.Fatal("expected NXDOMAIN to be cached")
 	}
-	if ent.ttl != maxCacheTTL {
-		t.Errorf("negative TTL = %d, want clamped %d", ent.ttl, maxCacheTTL)
+	if ent.ttl != 60 {
+		t.Errorf("negative TTL = %d, want RFC 2308 minimum 60", ent.ttl)
 	}
 	if ent.rcode != dns.RcodeNameError {
 		t.Errorf("cached rcode = %d, want NXDOMAIN", ent.rcode)
@@ -208,8 +210,8 @@ func TestStoreInCacheNegative(t *testing.T) {
 	if !ok {
 		t.Fatal("expected NODATA to be cached")
 	}
-	if ent3.ttl != 300 {
-		t.Errorf("NODATA TTL = %d, want 300", ent3.ttl)
+	if ent3.ttl != 60 {
+		t.Errorf("NODATA TTL = %d, want RFC 2308 minimum 60", ent3.ttl)
 	}
 
 	// SERVFAIL → not cached.
@@ -246,5 +248,127 @@ func TestStoreInCachePositiveTTLClamp(t *testing.T) {
 		if ent.ttl != tt.wantTTL {
 			t.Errorf("%s: cached TTL = %d, want %d", tt.name, ent.ttl, tt.wantTTL)
 		}
+	}
+}
+
+func TestSERVFAILCacheUsesConfiguredLifetime(t *testing.T) {
+	server := New(Config{CacheSERVFAILTTL: 20 * time.Millisecond}, nil)
+	key := cacheKey{name: "servfail.test", qtype: dns.TypeA}
+	response := new(dns.Msg)
+	response.Rcode = dns.RcodeServerFailure
+	server.storeInCache(key, response)
+	if _, _, ok := server.cache.get(key); !ok {
+		t.Fatal("configured SERVFAIL entry was not cached")
+	}
+	time.Sleep(30 * time.Millisecond)
+	if _, _, ok := server.cache.get(key); ok {
+		t.Fatal("SERVFAIL entry outlived its configured duration")
+	}
+}
+
+func TestApplySettingsInvalidatesEarlierCacheGeneration(t *testing.T) {
+	server := New(Config{}, nil)
+	generation := server.cacheGeneration.Load()
+	server.ApplySettings(dnssettings.Settings{
+		CacheSize: 10, CacheMinTTL: 1, CacheMaxTTL: 60,
+	})
+	if server.cacheGeneration.Load() == generation {
+		t.Fatal("cache settings did not advance the generation")
+	}
+
+	query := new(dns.Msg)
+	query.SetQuestion("stale-generation.test.", dns.TypeA)
+	response := new(dns.Msg)
+	response.SetReply(query)
+	response.Answer = []dns.RR{aRecord(query.Question[0].Name, "192.0.2.20", 60)}
+	key := server.makeCacheKey(query, query.Question[0], "stale-generation.test", "", nil)
+	if server.storeInCacheIfGeneration(key, response, false, generation) {
+		t.Fatal("response from the previous cache generation was published")
+	}
+}
+
+func TestCacheStatsByQTypeAndUtilization(t *testing.T) {
+	c := newCache(3, 1, 600)
+	aKey := cacheKey{name: "a.test", qtype: dns.TypeA}
+	aaaaKey := cacheKey{name: "aaaa.test", qtype: dns.TypeAAAA}
+
+	if _, _, ok := c.get(aKey); ok {
+		t.Fatal("empty cache unexpectedly hit")
+	}
+	c.set(aKey, &cacheEntry{storedAt: time.Now(), ttl: 60})
+	if _, _, ok := c.get(aKey); !ok {
+		t.Fatal("seeded A entry missed")
+	}
+	c.set(aaaaKey, &cacheEntry{storedAt: time.Now().Add(-2 * time.Second), ttl: 1})
+	if _, _, ok := c.get(aaaaKey); ok {
+		t.Fatal("expired AAAA entry unexpectedly hit")
+	}
+
+	stats := c.stats()
+	if stats.Entries != 1 || stats.Capacity != 3 || stats.Utilization != 1.0/3.0 {
+		t.Fatalf("capacity stats = %+v", stats)
+	}
+	if stats.ByQType["A"].Hits != 1 || stats.ByQType["A"].Misses != 1 {
+		t.Fatalf("A counters = %+v", stats.ByQType["A"])
+	}
+	if stats.ByQType["AAAA"].Expirations != 1 {
+		t.Fatalf("AAAA counters = %+v", stats.ByQType["AAAA"])
+	}
+}
+
+func TestTargetedCacheInvalidation(t *testing.T) {
+	s := New(Config{CacheSize: 10}, nil)
+	put := func(key cacheKey) {
+		s.cache.set(key, &cacheEntry{storedAt: time.Now(), ttl: 60})
+	}
+	put(cacheKey{name: "example.test", qtype: dns.TypeA})
+	put(cacheKey{name: "www.example.test", qtype: dns.TypeAAAA})
+	put(cacheKey{name: "route.test", qtype: dns.TypeA, route: "tls://route:853"})
+	put(cacheKey{name: "client.test", qtype: dns.TypeA, group: "up:client"})
+
+	if removed := s.InvalidateCacheDomains("*.example.test"); removed != 2 {
+		t.Fatalf("domain invalidation removed %d entries, want 2", removed)
+	}
+	if removed := s.InvalidateCacheRoutes("tls://route:853"); removed != 1 {
+		t.Fatalf("route invalidation removed %d entries, want 1", removed)
+	}
+	if removed := s.InvalidateCacheGroups("up:client"); removed != 1 {
+		t.Fatalf("group invalidation removed %d entries, want 1", removed)
+	}
+	if stats := s.CacheStats(); stats.Entries != 0 || stats.Invalidated != 4 {
+		t.Fatalf("post-invalidation stats = %+v", stats)
+	}
+}
+
+func TestTruncatedResponsesAreNotCached(t *testing.T) {
+	s := New(Config{}, nil)
+	message := new(dns.Msg)
+	message.Rcode = dns.RcodeSuccess
+	message.Truncated = true
+	message.Answer = []dns.RR{aRecord("truncated.test.", "192.0.2.10", 120)}
+	s.storeInCache(cacheKey{name: "truncated.test", qtype: dns.TypeA}, message)
+	if got := s.cache.len(); got != 0 {
+		t.Fatalf("truncated response cache length = %d, want 0", got)
+	}
+}
+
+func TestNegativeCacheStatusExposesTTLAndSOA(t *testing.T) {
+	s := New(Config{CacheMinTTL: 1}, nil)
+	message := new(dns.Msg)
+	message.Rcode = dns.RcodeNameError
+	message.Ns = []dns.RR{soaRecord("example.test.", 120)}
+	s.storeInCache(cacheKey{name: "missing.example.test", qtype: dns.TypeA}, message)
+
+	entries := s.CacheEntries()
+	if len(entries) != 1 {
+		t.Fatalf("CacheEntries() = %+v", entries)
+	}
+	entry := entries[0]
+	if !entry.Negative || entry.RemainingTTL == 0 || entry.SOA != "example.test." {
+		t.Fatalf("negative cache status = %+v", entry)
+	}
+	stats := s.CacheStats()
+	if stats.NegativeEntries != 1 {
+		t.Fatalf("negative entries = %d, want 1", stats.NegativeEntries)
 	}
 }

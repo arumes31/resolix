@@ -2,7 +2,6 @@ package filter
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -19,10 +18,10 @@ import (
 )
 
 const (
-	// maxFetchBytes caps the size of a downloaded subscription (20MB).
-	maxFetchBytes = 20 << 20
+	// maxFetchBytes caps the bytes inspected from a downloaded subscription.
+	maxFetchBytes = 64 << 20
 	// maxRulesPerSource caps parsed rules per source to bound memory.
-	maxRulesPerSource = 500000
+	maxRulesPerSource = 2000000
 	// fetchTimeout bounds a single subscription download.
 	fetchTimeout = time.Duration(defaultSubscriptionTimeout) * time.Second
 )
@@ -132,6 +131,8 @@ func (e *Engine) loadFileSource(src *Source) {
 
 // LoadLocal reloads all local file sources.
 func (e *Engine) LoadLocal() {
+	e.beginRuleUpdateBatch()
+	defer e.endRuleUpdateBatch()
 	for _, src := range e.Sources() {
 		if src.Kind == "file" {
 			e.loadFileSource(e.findSource(src.Name))
@@ -183,6 +184,11 @@ func (e *Engine) updateMatchingSources(ctx context.Context, selected func(*Sourc
 }
 
 func (e *Engine) updateSourceList(ctx context.Context, urls []*Source) {
+	if len(urls) == 0 {
+		return
+	}
+	e.beginRuleUpdateBatch()
+	defer e.endRuleUpdateBatch()
 	var wg sync.WaitGroup
 	semaphore := make(chan struct{}, 4)
 	for _, src := range urls {
@@ -328,19 +334,13 @@ func (e *Engine) fetchSource(ctx context.Context, src *Source) {
 	}
 
 	counter := &countingReader{r: io.LimitReader(resp.Body, int64(maxFetchBytes)+1)}
-	body, readErr := io.ReadAll(counter)
-	if readErr != nil {
-		e.setSourceError(src, readErr.Error())
-		log.Printf("[WARN] filter: parse failed for %s (keeping last good): %v", logName, readErr)
-		return
-	}
+	block, allow, ignored, truncated, readErr := parseRulesCapped(counter, src.AllowOnly)
 	if counter.n > maxFetchBytes {
 		readErr = fmt.Errorf("subscription exceeds %d-byte limit", maxFetchBytes)
 		e.setSourceError(src, readErr.Error())
 		log.Printf("[WARN] filter: update failed for %s (keeping last good): %v", logName, readErr)
 		return
 	}
-	block, allow, ignored, truncated, readErr := parseRulesCapped(bytes.NewReader(body), src.AllowOnly)
 	if readErr != nil {
 		e.setSourceError(src, readErr.Error())
 		log.Printf("[WARN] filter: parse failed for %s (keeping last good): %v", logName, readErr)

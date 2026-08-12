@@ -3016,6 +3016,94 @@ tr:hover .test-domain-btn {
   grid-template-columns: 1fr;
 }
 
+.filter-diagnostic-form {
+  grid-template-columns: minmax(220px, 1.5fr) minmax(220px, 1.2fr) minmax(130px, 0.55fr) auto;
+  align-items: end;
+  margin-top: 1rem;
+}
+
+.filter-diagnostic-form small {
+  display: block;
+  margin-top: 0.38rem;
+  color: var(--text-secondary);
+  font-size: 0.63rem;
+  font-weight: 400;
+  line-height: 1.45;
+}
+
+.filter-diagnostic-action {
+  padding-bottom: 0.05rem;
+}
+
+.filter-diagnostic-result {
+  --decision-color: var(--accent);
+  margin-top: 0.85rem;
+  padding: 1rem;
+  border: 1px solid color-mix(in srgb, var(--decision-color) 38%, var(--border-color));
+  border-left: 4px solid var(--decision-color);
+  border-radius: 0.85rem;
+  background: linear-gradient(120deg, color-mix(in srgb, var(--decision-color) 8%, var(--card-inner-bg)), var(--card-inner-bg));
+}
+
+.filter-diagnostic-result[data-decision='blocked'],
+.filter-diagnostic-result[data-decision='refused'] {
+  --decision-color: var(--status-error);
+}
+
+.filter-diagnostic-result[data-decision='allowed'],
+.filter-diagnostic-result[data-decision='forwarded'] {
+  --decision-color: var(--status-online);
+}
+
+.filter-diagnostic-result[data-decision='nodata'],
+.filter-diagnostic-result[data-decision='filtering_disabled'],
+.filter-diagnostic-result[data-decision='protection_paused'] {
+  --decision-color: var(--status-warning);
+}
+
+.filter-diagnostic-summary {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.85rem;
+}
+
+.filter-decision-mark {
+  flex: 0 0 auto;
+  width: 0.75rem;
+  height: 0.75rem;
+  margin-top: 0.3rem;
+  border: 2px solid color-mix(in srgb, var(--decision-color) 65%, white);
+  border-radius: 50%;
+  background: var(--decision-color);
+  box-shadow: 0 0 0 0.28rem color-mix(in srgb, var(--decision-color) 14%, transparent);
+}
+
+.filter-diagnostic-kicker {
+  display: block;
+  margin-bottom: 0.18rem;
+  color: var(--decision-color);
+  font-size: 0.61rem;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.filter-diagnostic-summary strong {
+  color: var(--text-primary);
+  font-size: 0.92rem;
+}
+
+.filter-diagnostic-summary p {
+  margin: 0.32rem 0 0;
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+
+.filter-diagnostic-result .runtime-grid {
+  margin-bottom: 0;
+}
+
 .subscription-form {
   grid-template-columns: minmax(180px, 0.8fr) minmax(280px, 2fr);
 }
@@ -3062,6 +3150,10 @@ tr:hover .test-domain-btn {
     grid-template-columns: 1fr 1fr;
   }
 
+  .filter-diagnostic-form {
+    grid-template-columns: 1fr 1fr;
+  }
+
   .compact-form .btn {
     grid-column: 1 / -1;
   }
@@ -3078,6 +3170,14 @@ tr:hover .test-domain-btn {
 }
 
 @media (max-width: 680px) {
+  .filter-diagnostic-form {
+    grid-template-columns: 1fr;
+  }
+
+  .filter-diagnostic-action .btn {
+    width: 100%;
+  }
+
   .console-header,
   .settings-list-row {
     align-items: stretch;

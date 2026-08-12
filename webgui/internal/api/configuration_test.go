@@ -44,6 +44,8 @@ func TestDedicatedPagesAndRootRejectsUnknownPaths(t *testing.T) {
 		!strings.Contains(body, `id="bootstrapList"`) ||
 		!strings.Contains(body, `id="allowlistForm"`) ||
 		!strings.Contains(body, `id="allowlistList"`) ||
+		!strings.Contains(body, `id="filterTestClient"`) ||
+		!strings.Contains(body, `id="filterTestType"`) ||
 		!strings.Contains(body, `id="dnsSettingsForm"`) ||
 		!strings.Contains(body, `id="syncAllNodesBtn"`) ||
 		!strings.Contains(body, `id="rewriteDeleteDialog"`) {
@@ -138,6 +140,72 @@ func TestControllerRejectsEmptyUpstreamList(t *testing.T) {
 	server.handlePostUpstreams(recorder, request)
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("response = %d %q", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestFilteringTestEvaluatesTypeRewriteAndClientPolicy(t *testing.T) {
+	dir := t.TempDir()
+	server := testServer(&config.Config{
+		Mode:         config.ModeController,
+		AAAADisabled: true,
+		RefuseANY:    true,
+	})
+	engine := filter.New()
+	listPath := filepath.Join(dir, "rules.txt")
+	if err := os.WriteFile(listPath, []byte("||blocked.example^\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	engine.AddFileSource(listPath, false)
+	server.SetFilter(engine)
+
+	registry, err := clients.Load(filepath.Join(dir, "clients.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Replace([]clients.Client{{
+		Name: "unfiltered-laptop", IDs: []string{"100.64.0.12"},
+		UseGlobalSettings: false, FilteringEnabled: false,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	server.SetClients(registry)
+
+	rewriteStore, err := rewrites.Load(filepath.Join(dir, "rewrites.json"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rewriteStore.Replace([]rewrites.Rewrite{{
+		Domain: "printer.internal", Type: rewrites.TypeA, Value: "192.0.2.10",
+		SourceCIDRs: []string{"100.64.0.0/10"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	server.SetRewritesStore(rewriteStore)
+
+	tests := []struct {
+		name         string
+		target       string
+		wantStatus   int
+		wantDecision string
+	}{
+		{name: "block rule", target: "/api/filtering/test?domain=blocked.example&type=A", wantStatus: http.StatusOK, wantDecision: "blocked"},
+		{name: "client bypass", target: "/api/filtering/test?domain=blocked.example&type=A&client=unfiltered-laptop", wantStatus: http.StatusOK, wantDecision: "filtering_disabled"},
+		{name: "source scoped rewrite", target: "/api/filtering/test?domain=printer.internal&type=A&client=100.64.0.12", wantStatus: http.StatusOK, wantDecision: "rewrite"},
+		{name: "AAAA policy", target: "/api/filtering/test?domain=example.com&type=AAAA", wantStatus: http.StatusOK, wantDecision: "nodata"},
+		{name: "invalid type", target: "/api/filtering/test?domain=example.com&type=AXFR", wantStatus: http.StatusBadRequest},
+		{name: "unknown client", target: "/api/filtering/test?domain=example.com&type=A&client=missing", wantStatus: http.StatusBadRequest},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			server.handleFilteringTest(recorder, httptest.NewRequest(http.MethodGet, test.target, nil))
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%q", recorder.Code, test.wantStatus, recorder.Body.String())
+			}
+			if test.wantDecision != "" && !strings.Contains(recorder.Body.String(), `"decision":"`+test.wantDecision+`"`) {
+				t.Fatalf("body = %q, want decision %q", recorder.Body.String(), test.wantDecision)
+			}
+		})
 	}
 }
 

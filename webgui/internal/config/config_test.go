@@ -1,6 +1,8 @@
 package config
 
 import (
+	"context"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -138,6 +140,122 @@ func TestClientAliasesAreCopied(t *testing.T) {
 	snapshot["192.0.2.1"] = "snapshot-mutated"
 	if got := cfg.GetClientAlias("192.0.2.1"); got != "router" {
 		t.Fatalf("alias after snapshot mutation = %q; want router", got)
+	}
+}
+
+func TestClientAliasesProviderLoadsAndOverridesEnvironment(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "aliases.txt")
+	contents := "# comment\n192.0.2.1 = file-router\ninvalid\n=empty\n192.0.2.2= workstation \n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	provider := newClientAliasesProvider(path)
+	if got := provider.GetAlias("192.0.2.1"); got != "file-router" {
+		t.Fatalf("provider alias = %q", got)
+	}
+	aliases := provider.GetAllAliases()
+	aliases["192.0.2.1"] = "mutated"
+	if provider.GetAlias("192.0.2.1") != "file-router" {
+		t.Fatal("GetAllAliases returned mutable provider storage")
+	}
+
+	cfg := &Config{
+		aliasesProvider: provider,
+		clientAliases:   map[string]string{"192.0.2.1": "environment", "192.0.2.3": "env-only"},
+	}
+	if got := cfg.GetClientAlias("192.0.2.1"); got != "file-router" {
+		t.Fatalf("file alias did not override environment: %q", got)
+	}
+	if got := cfg.GetClientAlias("192.0.2.3"); got != "env-only" {
+		t.Fatalf("environment fallback = %q", got)
+	}
+	merged := cfg.GetAllClientAliases()
+	if merged["192.0.2.1"] != "file-router" || merged["192.0.2.3"] != "env-only" {
+		t.Fatalf("merged aliases = %#v", merged)
+	}
+
+	if err := os.WriteFile(path, []byte("192.0.2.4=reloaded\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	provider.load()
+	if provider.GetAlias("192.0.2.4") != "reloaded" || provider.GetAlias("192.0.2.1") != "" {
+		t.Fatalf("reloaded aliases = %#v", provider.GetAllAliases())
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cfg.StartClientAliasesReload(ctx)
+	cancel()
+}
+
+func TestClientAliasesProviderMissingFileAndNilConfiguration(t *testing.T) {
+	provider := newClientAliasesProvider(filepath.Join(t.TempDir(), "missing.txt"))
+	if got := provider.GetAllAliases(); len(got) != 0 {
+		t.Fatalf("missing file aliases = %#v", got)
+	}
+	cfg := &Config{}
+	cfg.SetClientAliases(nil)
+	cfg.StartClientAliasesReload(t.Context())
+	if cfg.GetClientAlias("192.0.2.1") != "" || len(cfg.GetAllClientAliases()) != 0 {
+		t.Fatal("empty config unexpectedly returned aliases")
+	}
+}
+
+func TestEnvironmentParsingHelpers(t *testing.T) {
+	t.Setenv("CLIENT_ALIASES", "192.0.2.1:router, bad, :empty,192.0.2.2: workstation ")
+	aliases := loadEnvAliases()
+	if aliases["192.0.2.1"] != "router" || aliases["192.0.2.2"] != "workstation" || len(aliases) != 2 {
+		t.Fatalf("loadEnvAliases() = %#v", aliases)
+	}
+	t.Setenv("TRUSTED_PROXIES", " 192.0.2.1, , 2001:db8::/32 ")
+	if got := parseTrustedProxies(); !slices.Equal(got, []string{"192.0.2.1", "2001:db8::/32"}) {
+		t.Fatalf("parseTrustedProxies() = %#v", got)
+	}
+
+	t.Setenv("TEST_INT64", "")
+	if got := parseInt64Env("TEST_INT64", 7); got != 7 {
+		t.Fatalf("empty parseInt64Env() = %d", got)
+	}
+	for _, value := range []string{"-1", "invalid"} {
+		t.Setenv("TEST_INT64", value)
+		if got := parseInt64Env("TEST_INT64", 7); got != 7 {
+			t.Fatalf("parseInt64Env(%q) = %d", value, got)
+		}
+	}
+	t.Setenv("TEST_INT64", "42")
+	if got := parseInt64Env("TEST_INT64", 7); got != 42 {
+		t.Fatalf("valid parseInt64Env() = %d", got)
+	}
+
+	t.Setenv("TEST_INT", "")
+	if got := parseIntEnv("TEST_INT", 8); got != 8 {
+		t.Fatalf("empty parseIntEnv() = %d", got)
+	}
+	t.Setenv("TEST_INT", "-1")
+	if got := parseIntEnv("TEST_INT", 8); got != 8 {
+		t.Fatalf("negative parseIntEnv() = %d", got)
+	}
+
+	for _, test := range []struct {
+		value string
+		want  string
+	}{{value: "", want: DefaultPort}, {value: "0", want: DefaultPort}, {value: "65536", want: DefaultPort}, {value: "invalid", want: DefaultPort}, {value: "8080", want: "8080"}} {
+		t.Setenv("PORT", test.value)
+		if got := resolvePort(); got != test.want {
+			t.Fatalf("resolvePort(%q) = %q, want %q", test.value, got, test.want)
+		}
+	}
+	t.Setenv("NODE_NAME", "configured-node")
+	if got := resolveNodeName(); got != "configured-node" {
+		t.Fatalf("resolveNodeName() = %q", got)
+	}
+	for _, test := range []struct {
+		value string
+		want  int
+	}{{value: "", want: DefaultUpstreamLatencyThreshold}, {value: "0", want: DefaultUpstreamLatencyThreshold}, {value: "bad", want: DefaultUpstreamLatencyThreshold}, {value: "250", want: 250}} {
+		t.Setenv("UPSTREAM_LATENCY_THRESHOLD", test.value)
+		if got := resolveLatencyThreshold(); got != test.want {
+			t.Fatalf("resolveLatencyThreshold(%q) = %d, want %d", test.value, got, test.want)
+		}
 	}
 }
 
@@ -365,6 +483,71 @@ func TestControllerTLSPinPathUsesTLSStateDirectory(t *testing.T) {
 	}
 	if got, want := legacyConfig.FullControllerTLSPinPath(), filepath.Join(cfg.HistoryDir, "tls", "controller-ca-pin.json"); got != want {
 		t.Fatalf("legacy FullControllerTLSPinPath() = %q, want %q", got, want)
+	}
+}
+
+func TestManagedPathResolution(t *testing.T) {
+	configDir := t.TempDir()
+	historyDir := t.TempDir()
+	absolute := filepath.Join(t.TempDir(), "absolute.json")
+	tests := []struct {
+		name string
+		set  func(*Config, string)
+		get  func(*Config) string
+	}{
+		{name: "upstreams", set: func(c *Config, value string) { c.UpstreamsFile = value }, get: (*Config).FullUpstreamsPath},
+		{name: "dns routes", set: func(c *Config, value string) { c.DNSRoutesFile = value }, get: (*Config).FullDNSRoutesPath},
+		{name: "rewrites", set: func(c *Config, value string) { c.RewritesFile = value }, get: (*Config).FullRewritesPath},
+		{name: "clients", set: func(c *Config, value string) { c.ClientsFile = value }, get: (*Config).FullClientsPath},
+		{name: "blocklist", set: func(c *Config, value string) { c.BlocklistFile = value }, get: (*Config).FullBlocklistPath},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := &Config{ConfigDir: configDir, HistoryDir: historyDir}
+			if got := test.get(cfg); got != "" {
+				t.Fatalf("empty path = %q", got)
+			}
+			test.set(cfg, "managed.json")
+			if got := test.get(cfg); got != filepath.Join(configDir, "managed.json") {
+				t.Fatalf("relative path = %q", got)
+			}
+			test.set(cfg, absolute)
+			if got := test.get(cfg); got != absolute {
+				t.Fatalf("absolute path = %q", got)
+			}
+		})
+	}
+
+	cfg := &Config{HistoryDir: historyDir, DBPath: "resolix.db"}
+	if cfg.FullConfigDir() != historyDir || cfg.FullDBPath() != filepath.Join(historyDir, "resolix.db") {
+		t.Fatalf("legacy path fallbacks: config=%q db=%q", cfg.FullConfigDir(), cfg.FullDBPath())
+	}
+	cfg.DBPath = absolute
+	if cfg.FullDBPath() != absolute {
+		t.Fatalf("absolute database path = %q", cfg.FullDBPath())
+	}
+	if got := cfg.FullTLSStateDir(); got != filepath.Join(historyDir, "tls") {
+		t.Fatalf("legacy TLS state directory = %q", got)
+	}
+}
+
+func TestVerifyConfigReportsMissingOptionalFiles(t *testing.T) {
+	t.Setenv("DNSMASQ_PID_FILE", "/deprecated.pid")
+	cfg := &Config{
+		Mode: ModeController, Port: DefaultPort, WebListenAddr: DefaultWebListenAddr,
+		HistoryDir: t.TempDir(), ConfigDir: t.TempDir(), DBPath: DefaultDBPath,
+		IngestSecret: "test-secret", ClientAliasesFile: filepath.Join(t.TempDir(), "aliases.txt"),
+		BlocklistFile: "blocklist.txt", DNSRoutesFile: "routes.json",
+	}
+	errs, warnings := cfg.VerifyConfig()
+	if len(errs) != 0 {
+		t.Fatalf("VerifyConfig errors = %v", errs)
+	}
+	joined := strings.Join(warnings, "\n")
+	for _, want := range []string{"DNSMASQ_PID_FILE is deprecated", "CLIENT_ALIASES_FILE", "BLOCKLIST_FILE", "DNS_ROUTES_FILE"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("warning %q missing from %v", want, warnings)
+		}
 	}
 }
 

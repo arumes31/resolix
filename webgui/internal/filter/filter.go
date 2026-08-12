@@ -83,10 +83,14 @@ type Engine struct {
 	sources          []*Source
 	blockRules       map[*Source][]Rule
 	allowRules       map[*Source][]Rule
-	blockDomainIndex map[string][]indexedRule
-	allowDomainIndex map[string][]indexedRule
+	blockDomainIndex map[string]indexedRule
+	allowDomainIndex map[string]indexedRule
 	blockRegexRules  []indexedRule
 	allowRegexRules  []indexedRule
+	updateBatchDepth int
+	hasDirtyIndexes  bool
+	hasBatchChanges  bool
+	ruleGeneration   uint64
 
 	pausedUntil    atomic.Int64 // unix seconds; 0 = protection enabled
 	blockedTotal   atomic.Int64
@@ -108,7 +112,7 @@ func (e *Engine) SetRulesChangedCallback(callback func()) {
 }
 
 type indexedRule struct {
-	rule   Rule
+	rule   *Rule
 	source *Source
 	order  int
 }
@@ -118,8 +122,8 @@ func New() *Engine {
 	return &Engine{
 		blockRules:       make(map[*Source][]Rule),
 		allowRules:       make(map[*Source][]Rule),
-		blockDomainIndex: make(map[string][]indexedRule),
-		allowDomainIndex: make(map[string][]indexedRule),
+		blockDomainIndex: make(map[string]indexedRule),
+		allowDomainIndex: make(map[string]indexedRule),
 		updateRequests:   make(chan struct{}, 1),
 		updateIDs:        make(map[string]struct{}),
 	}
@@ -214,14 +218,12 @@ func (e *Engine) AllowlistOverrides(limit int) []Evaluation {
 	return result
 }
 
-func firstIndexedMatch(domain string, domains map[string][]indexedRule, regex []indexedRule) (indexedRule, bool) {
+func firstIndexedMatch(domain string, domains map[string]indexedRule, regex []indexedRule) (indexedRule, bool) {
 	var first indexedRule
 	found := false
 	for candidate := domain; candidate != ""; {
-		for _, match := range domains[candidate] {
-			if !found || match.order < first.order {
-				first, found = match, true
-			}
+		if match, ok := domains[candidate]; ok && (!found || match.order < first.order) {
+			first, found = match, true
 		}
 		dot := strings.IndexByte(candidate, '.')
 		if dot < 0 {
@@ -324,6 +326,7 @@ func (e *Engine) ReplaceURLSources(subscriptions []Subscription) {
 		}
 	}
 	e.sources = kept
+	e.ruleGeneration++
 	e.rebuildIndexesLocked()
 	e.mu.Unlock()
 	for _, id := range historyIDs {
@@ -367,6 +370,10 @@ func (e *Engine) setRulesStatus(
 	finalHostname string,
 	redirectCount int,
 ) {
+	checksum := ""
+	if loadErr == "" {
+		checksum = activeRulesChecksum(block, allow)
+	}
 	e.mu.Lock()
 	active := false
 	for _, current := range e.sources {
@@ -383,7 +390,11 @@ func (e *Engine) setRulesStatus(
 	src.LastChecked = time.Now()
 	if loadErr == "" {
 		previousCount := src.RuleCount + src.AllowRuleCount
-		changed = !rulesEqual(e.blockRules[src], block) || !rulesEqual(e.allowRules[src], allow)
+		if src.Checksum == "" {
+			changed = len(block)+len(allow) > 0
+		} else {
+			changed = src.Checksum != checksum
+		}
 		if changed && previousCount > 0 {
 			src.history = append(src.history, ruleSnapshot{
 				block: slices.Clone(e.blockRules[src]), allow: slices.Clone(e.allowRules[src]), checksum: src.Checksum,
@@ -392,9 +403,16 @@ func (e *Engine) setRulesStatus(
 				src.history = slices.Clone(src.history[len(src.history)-3:])
 			}
 		}
-		e.blockRules[src] = block
-		e.allowRules[src] = allow
-		e.rebuildIndexesLocked()
+		if changed {
+			e.blockRules[src] = block
+			e.allowRules[src] = allow
+			e.ruleGeneration++
+			if e.updateBatchDepth > 0 {
+				e.hasDirtyIndexes = true
+			} else {
+				e.rebuildIndexesLocked()
+			}
+		}
 		src.RuleCount = len(block)
 		src.AllowRuleCount = len(allow)
 		src.RuleCountDelta = len(block) + len(allow) - previousCount
@@ -416,19 +434,62 @@ func (e *Engine) setRulesStatus(
 		src.FinalURL = finalURL
 		src.FinalHostname = finalHostname
 		src.RedirectCount = redirectCount
-		src.Checksum = activeRulesChecksum(block, allow)
+		src.Checksum = checksum
 		src.RollbackCount = len(src.history)
 	}
 	src.LastError = loadErr
 	callback := e.onRulesChanged
 	sourceID := src.ID
 	notify := changed && src.Kind == "url"
+	if notify && e.updateBatchDepth > 0 {
+		e.hasBatchChanges = true
+	}
+	notifyNow := notify && e.updateBatchDepth == 0
 	e.mu.Unlock()
 	if notify {
 		e.persistSourceHistory(sourceID)
-		if callback != nil {
-			callback()
+	}
+	if notifyNow && callback != nil {
+		callback()
+	}
+}
+
+func (e *Engine) beginRuleUpdateBatch() {
+	e.mu.Lock()
+	e.updateBatchDepth++
+	e.mu.Unlock()
+}
+
+func (e *Engine) endRuleUpdateBatch() {
+	e.mu.Lock()
+	if e.updateBatchDepth == 0 {
+		e.mu.Unlock()
+		return
+	}
+	e.updateBatchDepth--
+	if e.updateBatchDepth > 0 {
+		e.mu.Unlock()
+		return
+	}
+	hasDirtyIndexes := e.hasDirtyIndexes
+	e.hasDirtyIndexes = false
+	notify := e.hasBatchChanges
+	e.hasBatchChanges = false
+	callback := e.onRulesChanged
+	generation := e.ruleGeneration
+	sources, blockRules, allowRules := e.ruleSnapshotLocked()
+	e.mu.Unlock()
+
+	if hasDirtyIndexes {
+		indexes := buildRuleIndexes(sources, blockRules, allowRules)
+		e.mu.Lock()
+		if e.ruleGeneration == generation {
+			e.applyRuleIndexesLocked(indexes)
 		}
+		e.mu.Unlock()
+	}
+	if notify && callback != nil {
+		callback()
 	}
 }
 
@@ -450,6 +511,7 @@ func (e *Engine) RollbackSource(id string) error {
 		previousCount := src.RuleCount + src.AllowRuleCount
 		e.blockRules[src] = slices.Clone(snapshot.block)
 		e.allowRules[src] = slices.Clone(snapshot.allow)
+		e.ruleGeneration++
 		src.RuleCount = len(snapshot.block)
 		src.AllowRuleCount = len(snapshot.allow)
 		src.RuleCountDelta = src.RuleCount + src.AllowRuleCount - previousCount
@@ -483,54 +545,72 @@ func activeRulesChecksum(block, allow []Rule) string {
 	return hex.EncodeToString(hash.Sum(nil))
 }
 
-func rulesEqual(a, b []Rule) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i].Raw != b[i].Raw || a[i].kind != b[i].kind || a[i].domain != b[i].domain {
-			return false
-		}
-		aPattern, bPattern := "", ""
-		if a[i].re != nil {
-			aPattern = a[i].re.String()
-		}
-		if b[i].re != nil {
-			bPattern = b[i].re.String()
-		}
-		if aPattern != bPattern {
-			return false
-		}
-	}
-	return true
+func (e *Engine) rebuildIndexesLocked() {
+	e.applyRuleIndexesLocked(buildRuleIndexes(e.sources, e.blockRules, e.allowRules))
 }
 
-func (e *Engine) rebuildIndexesLocked() {
-	e.blockDomainIndex = make(map[string][]indexedRule)
-	e.allowDomainIndex = make(map[string][]indexedRule)
-	e.blockRegexRules = nil
-	e.allowRegexRules = nil
+type ruleIndexes struct {
+	blockDomains map[string]indexedRule
+	allowDomains map[string]indexedRule
+	blockRegex   []indexedRule
+	allowRegex   []indexedRule
+}
+
+func (e *Engine) ruleSnapshotLocked() ([]*Source, map[*Source][]Rule, map[*Source][]Rule) {
+	sources := slices.Clone(e.sources)
+	blockRules := make(map[*Source][]Rule, len(e.blockRules))
+	allowRules := make(map[*Source][]Rule, len(e.allowRules))
+	for source, rules := range e.blockRules {
+		blockRules[source] = rules
+	}
+	for source, rules := range e.allowRules {
+		allowRules[source] = rules
+	}
+	return sources, blockRules, allowRules
+}
+
+func buildRuleIndexes(
+	sources []*Source,
+	blockRules map[*Source][]Rule,
+	allowRules map[*Source][]Rule,
+) ruleIndexes {
+	indexes := ruleIndexes{
+		blockDomains: make(map[string]indexedRule),
+		allowDomains: make(map[string]indexedRule),
+	}
 	blockOrder, allowOrder := 0, 0
-	for _, src := range e.sources {
-		for _, rule := range e.allowRules[src] {
+	for _, src := range sources {
+		rules := allowRules[src]
+		for index := range rules {
+			rule := &rules[index]
 			match := indexedRule{rule: rule, source: src, order: allowOrder}
 			allowOrder++
 			if rule.kind == kindRegex {
-				e.allowRegexRules = append(e.allowRegexRules, match)
-			} else {
-				e.allowDomainIndex[rule.domain] = append(e.allowDomainIndex[rule.domain], match)
+				indexes.allowRegex = append(indexes.allowRegex, match)
+			} else if _, exists := indexes.allowDomains[rule.domain]; !exists {
+				indexes.allowDomains[rule.domain] = match
 			}
 		}
-		for _, rule := range e.blockRules[src] {
+		rules = blockRules[src]
+		for index := range rules {
+			rule := &rules[index]
 			match := indexedRule{rule: rule, source: src, order: blockOrder}
 			blockOrder++
 			if rule.kind == kindRegex {
-				e.blockRegexRules = append(e.blockRegexRules, match)
-			} else {
-				e.blockDomainIndex[rule.domain] = append(e.blockDomainIndex[rule.domain], match)
+				indexes.blockRegex = append(indexes.blockRegex, match)
+			} else if _, exists := indexes.blockDomains[rule.domain]; !exists {
+				indexes.blockDomains[rule.domain] = match
 			}
 		}
 	}
+	return indexes
+}
+
+func (e *Engine) applyRuleIndexesLocked(indexes ruleIndexes) {
+	e.blockDomainIndex = indexes.blockDomains
+	e.allowDomainIndex = indexes.allowDomains
+	e.blockRegexRules = indexes.blockRegex
+	e.allowRegexRules = indexes.allowRegex
 }
 
 func (e *Engine) setSourceError(src *Source, loadErr string) {

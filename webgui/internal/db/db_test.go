@@ -8,6 +8,19 @@ import (
 	_ "github.com/glebarez/go-sqlite"
 )
 
+func TestIsCacheHitStatus(t *testing.T) {
+	for _, status := range []string{"fresh", "stale", "prefetched", "negative", "servfail"} {
+		if !IsCacheHitStatus(status) {
+			t.Errorf("IsCacheHitStatus(%q) = false", status)
+		}
+	}
+	for _, status := range []string{"", "miss", "coalesced", "FRESH"} {
+		if IsCacheHitStatus(status) {
+			t.Errorf("IsCacheHitStatus(%q) = true", status)
+		}
+	}
+}
+
 // TestInitDBMigratesOldSchema creates a queries table with the original
 // column set and verifies InitDB adds all later columns while keeping inserts
 // and reads working.

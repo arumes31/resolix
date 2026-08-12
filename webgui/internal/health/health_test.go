@@ -105,6 +105,48 @@ func TestUpdateBootstrapServersDefensivelyCopies(t *testing.T) {
 	}
 }
 
+func TestStatusReportsHealthStateAndReturnsCopy(t *testing.T) {
+	checker := &Checker{
+		upstreams: []string{"healthy", "failed"},
+		healthy:   []string{"healthy"},
+		latencies: map[string]float64{"healthy": 1.5, "failed": -1},
+		states: map[string]*probeState{
+			"failed": {consecutiveFailures: 3, consecutiveSuccesses: 1, lastFailure: "timeout"},
+		},
+	}
+	status := checker.Status()
+	if !status["healthy"].Healthy || status["healthy"].LatencyMS != 1.5 {
+		t.Fatalf("healthy status = %+v", status["healthy"])
+	}
+	failed := status["failed"]
+	if failed.Healthy || failed.ConsecutiveFailures != 3 || failed.ConsecutiveSuccesses != 1 || failed.LastFailure != "timeout" {
+		t.Fatalf("failed status = %+v", failed)
+	}
+	status["healthy"] = UpstreamStatus{}
+	if !checker.Status()["healthy"].Healthy {
+		t.Fatal("Status returned mutable internal state")
+	}
+}
+
+func TestStartStopsWithCanceledContextAndIntervalBounds(t *testing.T) {
+	checker := &Checker{
+		cfg:       &config.Config{HealthDomain: "health.test"},
+		latencies: make(map[string]float64),
+		states:    make(map[string]*probeState),
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	callbacks := 0
+	checker.Start(ctx, func([]string, map[string]float64) { callbacks++ })
+	if callbacks != 0 {
+		t.Fatalf("canceled health loop callbacks = %d, want 0", callbacks)
+	}
+	interval := nextHealthInterval()
+	if interval < 13*time.Second || interval > 17*time.Second {
+		t.Fatalf("nextHealthInterval() = %s", interval)
+	}
+}
+
 func TestCheckerUsesInstalledPoolProbe(t *testing.T) {
 	checker := &Checker{
 		cfg:              &config.Config{HealthDomain: "health.test"},

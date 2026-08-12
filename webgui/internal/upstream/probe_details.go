@@ -190,7 +190,7 @@ func validateProbeResponse(raw string, response *dns.Msg) error {
 		return errors.New("empty DNS response")
 	}
 	if response.Rcode != dns.RcodeSuccess && response.Rcode != dns.RcodeNameError {
-		return fmt.Errorf("DNS health probe for %q returned %s", raw, dns.RcodeToString[response.Rcode])
+		return fmt.Errorf("DNS health probe for %q returned DNS rcode %s", raw, dns.RcodeToString[response.Rcode])
 	}
 	return nil
 }

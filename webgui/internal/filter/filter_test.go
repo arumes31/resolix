@@ -160,8 +160,18 @@ func TestEngineIndexPreservesRuleAndSourceOrder(t *testing.T) {
 	if !res.Blocked || res.Rule != "/^ads\\./" || res.Source != first.Name || res.Reason != ReasonRegex {
 		t.Fatalf("ordered indexed match = %+v", res)
 	}
-	if len(e.blockDomainIndex["ads.example.com"]) != 1 || len(e.blockRegexRules) != 1 {
+	if _, ok := e.blockDomainIndex["ads.example.com"]; !ok || len(e.blockRegexRules) != 1 {
 		t.Fatalf("indexes were not built: domains=%v regex=%d", e.blockDomainIndex, len(e.blockRegexRules))
+	}
+
+	duplicates := New()
+	firstDuplicate := duplicates.AddFileSource(writeTempList(t, "||duplicate.example^\n"), false)
+	duplicates.AddFileSource(writeTempList(t, "||duplicate.example^\n"), false)
+	if result := duplicates.Match("duplicate.example"); !result.Blocked || result.Source != firstDuplicate.Name {
+		t.Fatalf("duplicate index did not preserve first-source precedence: %+v", result)
+	}
+	if got := len(duplicates.blockDomainIndex); got != 1 {
+		t.Fatalf("duplicate index contains %d domains, want 1", got)
 	}
 }
 

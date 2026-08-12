@@ -78,3 +78,31 @@ func TestHandleStorageStatus(t *testing.T) {
 		t.Fatalf("metrics = %+v", metrics)
 	}
 }
+
+func TestHistoryAndStorageStatusValidation(t *testing.T) {
+	server, cleanup := newHistoryTestServer(t)
+	defer cleanup()
+
+	tests := []struct {
+		name    string
+		handler http.HandlerFunc
+		method  string
+		target  string
+		want    int
+	}{
+		{name: "history method", handler: server.handleHistory, method: http.MethodPost, target: "/api/history", want: http.StatusMethodNotAllowed},
+		{name: "zero cursor", handler: server.handleHistory, method: http.MethodGet, target: "/api/history?cursor=0", want: http.StatusBadRequest},
+		{name: "invalid limit", handler: server.handleHistory, method: http.MethodGet, target: "/api/history?limit=0", want: http.StatusBadRequest},
+		{name: "invalid status", handler: server.handleHistory, method: http.MethodGet, target: "/api/history?status=bad%20status", want: http.StatusBadRequest},
+		{name: "storage method", handler: server.handleStorageStatus, method: http.MethodPost, target: "/api/storage/status", want: http.StatusMethodNotAllowed},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			test.handler(recorder, httptest.NewRequest(test.method, test.target, nil))
+			if recorder.Code != test.want {
+				t.Fatalf("status = %d, want %d; body=%q", recorder.Code, test.want, recorder.Body.String())
+			}
+		})
+	}
+}

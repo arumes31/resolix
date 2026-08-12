@@ -160,6 +160,39 @@ func TestManagedSubscriptionReportsRedirectAndContentMetadata(t *testing.T) {
 	}
 }
 
+func TestUpdateAllPublishesOneRuleBatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var rule string
+		switch r.URL.Path {
+		case "/first":
+			rule = "||first.example^\n"
+		case "/second":
+			rule = "||second.example^\n"
+		default:
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = fmt.Fprint(w, rule)
+	}))
+	t.Cleanup(server.Close)
+
+	engine := New()
+	engine.AddURLSource(server.URL+"/first", false)
+	engine.AddURLSource(server.URL+"/second", false)
+	var publications atomic.Int32
+	engine.SetRulesChangedCallback(func() { publications.Add(1) })
+	engine.UpdateAll(context.Background())
+
+	if got := publications.Load(); got != 1 {
+		t.Fatalf("rules-changed publications = %d, want 1", got)
+	}
+	for _, domain := range []string{"first.example", "second.example"} {
+		if result := engine.Match(domain); !result.Blocked {
+			t.Fatalf("%s was not active after batch publication: %+v", domain, result)
+		}
+	}
+}
+
 func TestSubscriptionFailureKeepsLastGood(t *testing.T) {
 	var fail atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

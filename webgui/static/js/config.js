@@ -766,19 +766,30 @@ async function saveRules(event) {
 async function testFilterDomain(event) {
 	event.preventDefault();
 	const domain = document.getElementById('filterTestDomain').value.trim();
-	const data = await apiJSON(`/api/filtering/test?domain=${encodeURIComponent(domain)}`);
-	const evaluation = data.evaluation || {};
-	const result = evaluation.result || {};
-	const allowed = result.allowed ?? result.Allowed ?? false;
-	const blocked = result.blocked ?? result.Blocked ?? false;
-	const decision = allowed ? 'Allowed' : blocked ? 'Blocked' : 'No matching rule';
-	const rule = result.rule ?? result.Rule ?? evaluation.block_rule ?? evaluation.allow_rule ?? '';
-	const source = result.source ?? result.Source ?? evaluation.block_source ?? evaluation.allow_source ?? '';
-	document.getElementById('filterTestResult').innerHTML = [
-		['Decision', `${decision}${evaluation.allowlist_override ? ' · allowlist override' : ''}`],
-		['Matched rule', rule || 'None'],
-		['Source', source || 'None']
-	].map(([key, value]) => `<div class="runtime-item"><span>${escapeHtml(key)}</span><strong>${escapeHtml(value)}</strong></div>`).join('');
+	const client = document.getElementById('filterTestClient').value.trim();
+	const queryType = document.getElementById('filterTestType').value;
+	const parameters = new URLSearchParams({ domain, type: queryType });
+	if (client) parameters.set('client', client);
+	const data = await apiJSON(`/api/filtering/test?${parameters}`);
+	const diagnostic = data.diagnostic || {};
+	const resultElement = document.getElementById('filterTestResult');
+	const clientPolicy = diagnostic.client_name
+		? `${diagnostic.client_name}${diagnostic.client_ip ? ` · ${diagnostic.client_ip}` : ''}`
+		: diagnostic.client_identifier || 'Global defaults';
+	const details = [
+		['Question', `${diagnostic.domain || domain} · ${diagnostic.query_type || queryType}`],
+		['Client policy', clientPolicy],
+		['Matched rule', diagnostic.matched_rule || 'None'],
+		['Source', diagnostic.source || 'None']
+	];
+	resultElement.dataset.decision = diagnostic.decision || 'forwarded';
+	resultElement.innerHTML = `
+		<div class="filter-diagnostic-summary">
+			<span class="filter-decision-mark" aria-hidden="true"></span>
+			<div><span class="filter-diagnostic-kicker">Effective decision</span><strong>${escapeHtml(diagnostic.title || 'Policy evaluated')}</strong><p>${escapeHtml(diagnostic.detail || '')}</p></div>
+		</div>
+		<div class="runtime-grid">${details.map(([key, value]) => `<div class="runtime-item"><span>${escapeHtml(key)}</span><strong>${escapeHtml(value)}</strong></div>`).join('')}</div>`;
+	resultElement.classList.remove('is-hidden');
 }
 
 function rewriteValueState() {

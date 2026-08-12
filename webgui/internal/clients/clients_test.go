@@ -1,11 +1,62 @@
 package clients
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestRegistryReplaceIsAtomicAndDefensive(t *testing.T) {
+	registry, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := []Client{
+		{Name: "one", IDs: []string{"192.0.2.1"}, Tags: []string{"original"}},
+		{Name: "two", IDs: []string{"198.51.100.0/24"}},
+	}
+	if err := registry.Replace(items); err != nil {
+		t.Fatal(err)
+	}
+	items[0].Tags[0] = "mutated"
+	if got := registry.Find("192.0.2.1"); got == nil || got.Tags[0] != "original" {
+		t.Fatalf("Replace retained caller-owned data: %+v", got)
+	}
+	if err := registry.Replace([]Client{{Name: "duplicate", IDs: []string{"192.0.2.1"}}, {Name: "duplicate", IDs: []string{"198.51.100.1"}}}); err == nil {
+		t.Fatal("Replace accepted duplicate names")
+	}
+	if err := registry.Replace([]Client{{Name: "bad", IDs: []string{"invalid"}}}); err == nil {
+		t.Fatal("Replace accepted an invalid client")
+	}
+	if err := registry.Replace([]Client{{Name: "one", IDs: []string{"192.0.2.0/24"}}, {Name: "two", IDs: []string{"192.0.2.0/24"}}}); err == nil {
+		t.Fatal("Replace accepted conflicting client networks")
+	}
+	if got := registry.Find("192.0.2.1"); got == nil || got.Name != "one" {
+		t.Fatalf("failed Replace mutated registry: %+v", got)
+	}
+}
+
+func TestRegistryStartReloadLifecycle(t *testing.T) {
+	inMemory, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inMemory.StartReload(t.Context())
+
+	path := filepath.Join(t.TempDir(), "clients.json")
+	if err := os.WriteFile(path, []byte("[]"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	registry.StartReload(ctx)
+}
 
 func TestRegistryCRUDAndPersistence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "clients.json")

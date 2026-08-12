@@ -393,6 +393,18 @@ func main() {
 
 	// Load configuration
 	cfg := config.LoadConfig()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
+
+	runApplication(cfg, sigChan)
+}
+
+// runApplication initializes the application, waits for a shutdown request,
+// and releases all resources. The injected signal channel keeps the lifecycle
+// deterministic in tests while main retains ownership of OS signal handling.
+func runApplication(cfg *config.Config, sigChan <-chan os.Signal) {
 	migrateConfigState(cfg)
 
 	// Initialize the level-aware logger (Item 51)
@@ -668,10 +680,6 @@ func main() {
 	go func() {
 		serverDone <- srv.Start(ctx, staticHandler, cspMiddleware, nonceFromContext)
 	}()
-
-	// Graceful shutdown with signal handling (Item 56)
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	serverStopped := false
 	select {

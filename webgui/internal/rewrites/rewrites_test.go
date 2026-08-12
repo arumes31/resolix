@@ -428,6 +428,8 @@ func TestValidate(t *testing.T) {
 
 	invalid := []struct{ domain, typ, value string }{
 		{"", TypeA, "192.0.2.1"},
+		{".example.com", TypeA, "192.0.2.1"},
+		{".*.example.com", TypeA, "192.0.2.1"},
 		{"*example.com", TypeA, "192.0.2.1"},
 		{"*..example.com", TypeA, "192.0.2.1"},
 		{"foo.*.example.com", TypeA, "192.0.2.1"},
@@ -443,6 +445,18 @@ func TestValidate(t *testing.T) {
 	for _, v := range invalid {
 		if err := Validate(v.domain, v.typ, v.value); err == nil {
 			t.Errorf("Validate(%+v) expected error", v)
+		}
+	}
+}
+
+func TestAddRejectsLeadingDotDomains(t *testing.T) {
+	s, err := Load("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, domain := range []string{".example.com", ".*.example.com"} {
+		if _, err := s.Add(domain, TypeA, "192.0.2.1"); err == nil {
+			t.Errorf("Add(%q) expected error", domain)
 		}
 	}
 }

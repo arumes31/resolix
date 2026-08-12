@@ -207,7 +207,11 @@ func parseSRVValue(value string) (prio, weight, port uint16, target string, ok b
 
 // Validate checks a rewrite for well-formedness (used by the API).
 func Validate(domain, typ, value string) error {
-	domain = NormalizeDomain(domain)
+	rawDomain := strings.TrimSpace(domain)
+	if strings.HasPrefix(rawDomain, ".") {
+		return fmt.Errorf("invalid domain %q", rawDomain)
+	}
+	domain = NormalizeDomain(rawDomain)
 	base := strings.TrimPrefix(domain, "*.")
 	if base == "" ||
 		strings.Contains(base, "*") ||
@@ -261,12 +265,12 @@ func NormalizeDomain(d string) string {
 }
 
 func prepareRewrite(item Rewrite) (Rewrite, error) {
-	item.Domain = NormalizeDomain(item.Domain)
 	item.Type = strings.ToUpper(strings.TrimSpace(item.Type))
 	item.Value = strings.TrimSpace(item.Value)
 	if err := Validate(item.Domain, item.Type, item.Value); err != nil {
 		return Rewrite{}, err
 	}
+	item.Domain = NormalizeDomain(item.Domain)
 
 	const maxSourceCIDRs = 64
 	if len(item.SourceCIDRs) > maxSourceCIDRs {

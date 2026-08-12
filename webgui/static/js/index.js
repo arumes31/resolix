@@ -62,7 +62,6 @@ function replaceHTMLIfChanged(element, html) {
 
 let allEvents = [];
 const eventsByID = new Map();
-let rpmHistory = Array(20).fill(0);
 let lastEventTimestamp = 0;
 let lastEventID = '';
 let isTabVisible = true;

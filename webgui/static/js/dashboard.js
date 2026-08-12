@@ -1,115 +1,228 @@
+const dashboardRanges = new Set(['15m', '1h', '6h', '24h', '7d', '30d']);
+let dashboardGeneratedAt = 0;
+
+function selectedDashboardRange() {
+    return document.getElementById('dashboardRange')?.value || '24h';
+}
+
 function fetchStats() {
-    return coalesceRequest('stats', async () => {
+    const range = selectedDashboardRange();
+    return coalesceRequest(`stats:${range}`, async () => {
         try {
-        const response = await fetch(apiPath('/api/stats'));
-        if (!response.ok) throw new Error(`Stats API failed (${response.status})`);
-        const stats = await response.json();
-        renderTopList('topDomains', stats.top_domains);
-        renderTopList('topClients', stats.top_clients);
-
-        // Update counters
-        document.getElementById('rpm_val').textContent = formatNumber(stats.rpm) + ' RPM';
-        document.getElementById('rph_val').textContent = formatNumber(stats.rph);
-        document.getElementById('rpd_val').textContent = formatNumber(stats.rpd);
-        document.getElementById('total_val').textContent = formatNumber(stats.total);
-        document.getElementById('cache_ratio').textContent = (stats.cache_hit_ratio || 0).toFixed(1) + '%';
-
-        // Update health list with sparklines (Per Node)
-        const healthEl = document.getElementById('upstreamHealth');
-        if (stats.node_health) {
-            const healthHTML = Object.entries(stats.node_health).map(([node, upstreams]) => {
-                const nodeHtml = Object.entries(upstreams).map(([ip, lat]) => {
-                    const hist = (stats.node_health_hist && stats.node_health_hist[node]) ? stats.node_health_hist[node][ip] || [] : [];
-                    const maxLat = Math.max(...hist.filter(l => l > 0), 1);
-                    const sparkline = `<div class="sparkline">${hist.map(l => {
-                        const h = l === -1 ? 100 : (l / maxLat) * 100;
-                        return `<div class="spark-bar height-pct-${percentStep(h)} ${l === -1 ? 'fail' : ''}"></div>`;
-                    }).join('')}</div>`;
-
-                    return `
-                        <div class="health-row">
-                            <div class="health-label">
-                                <span class="health-ip">${escapeHtml(ip)}</span>
-                                ${sparkline}
-                            </div>
-                            <span class="top-count health-status ${lat === -1 ? 'down' : 'up'}">${lat === -1 ? 'DOWN' : lat.toFixed(1) + 'ms'}</span>
-                        </div>
-                    `;
-                }).join('');
-
-                return `
-                    <li class="health-node">
-                        <div class="health-node-title">Node: ${escapeHtml(node)}</div>
-                        ${nodeHtml}
-                    </li>
-                `;
-            }).join('');
-            replaceHTMLIfChanged(healthEl, healthHTML);
-        }
-
-        // Update type breakdown bars
-        const typeEl = document.getElementById('typeBreakdown');
-        if (stats.type_counts) {
-            const total = Object.values(stats.type_counts).reduce((a, b) => a + b, 0);
-            if (total === 0) {
-                replaceHTMLIfChanged(typeEl, '<div class="empty-small">No data</div>');
-            } else {
-                const sortedTypes = Object.entries(stats.type_counts).sort((a, b) => b[1] - a[1]).slice(0, 5);
-                const typeHTML = sortedTypes.map(([type, count]) => {
-                    const pct = (count / total) * 100;
-                    return `
-                        <div class="type-item">
-                            <div class="type-row">
-                                <span>${escapeHtml(type)}</span>
-                                <span class="type-meta">${count} (${pct.toFixed(1)}%)</span>
-                            </div>
-                            <div class="type-track">
-                                <div class="type-bar width-pct-${percentStep(pct)}"></div>
-                            </div>
-                        </div>
-                    `;
-                }).join('');
-                replaceHTMLIfChanged(typeEl, typeHTML);
-            }
-        }
-
-        // Update heatmap
-        const heatmapEl = document.getElementById('trafficHeatmap');
-        if (stats.heatmap) {
-            const sortedHours = Object.entries(stats.heatmap).sort();
-            const maxCount = Math.max(...sortedHours.map(h => h[1]), 1);
-            const heatmapHTML = sortedHours.map(([hour, count]) => {
-                const level = count === 0 ? 0 : Math.max(1, Math.ceil((count / maxCount) * 10));
-                return `<div class="heatmap-box heatmap-level-${level}" title="${escapeHtml(hour)}: ${count} queries">${escapeHtml(hour.split(':')[0])}</div>`;
-            }).join('');
-            replaceHTMLIfChanged(heatmapEl, heatmapHTML);
-        }
-
-        // Update node list
-        const nodeStats = document.getElementById('nodeStats');
-        if (stats.nodes) {
-            const nodeHTML = Object.entries(stats.nodes).map(([name, s]) => `
-                <li class="top-item">
-                    <span>${escapeHtml(name)}</span>
-                    <span><span class="top-count">${formatNumber(s.rpm)}</span> <span class="top-count node-rph">${formatNumber(s.rph)}</span></span>
-                </li>
-            `).join('');
-            replaceHTMLIfChanged(nodeStats, nodeHTML);
-        } else {
-            replaceHTMLIfChanged(nodeStats, '');
-        }
-
-        // Update chart locally
-        rpmHistory.push(stats.rpm);
-        rpmHistory.shift();
-        renderMiniChart();
-        document.querySelectorAll('.skeleton-card').forEach(card => card.classList.remove('skeleton-card'));
-        setPollingStatus(true);
-        } catch (e) {
-            console.error(e);
+            const response = await fetch(apiPath(`/api/dashboard/v1/stats?range=${encodeURIComponent(range)}`));
+            if (!response.ok) throw new Error(`Dashboard API failed (${response.status})`);
+            const stats = await response.json();
+            if (stats.schema_version !== 1) throw new Error(`Unsupported dashboard schema ${stats.schema_version}`);
+            renderDashboardStats(stats);
+            document.querySelectorAll('.skeleton-card').forEach(card => card.classList.remove('skeleton-card'));
+            setPollingStatus(true);
+        } catch (error) {
+            console.error(error);
+            refreshDashboardFreshness(true);
             setPollingStatus(false);
         }
     });
+}
+
+function renderDashboardStats(stats) {
+    const summary = stats.summary || {};
+    const range = stats.range || {};
+    const breakdowns = stats.breakdowns || {};
+    document.getElementById('windowQueries').textContent = formatNumber(summary.queries || 0);
+    document.getElementById('averageRPM').textContent = `${Number(summary.queries_per_minute || 0).toFixed(1)} RPM`;
+    document.getElementById('blockedRatio').textContent = `${Number(summary.blocked_ratio || 0).toFixed(1)}%`;
+    document.getElementById('blockedCount').textContent = formatNumber(summary.blocked || 0);
+    document.getElementById('errorRatio').textContent = `${Number(summary.error_ratio || 0).toFixed(1)}%`;
+    document.getElementById('errorCount').textContent = formatNumber(summary.errors || 0);
+    document.getElementById('cacheRatio').textContent = `${Number(summary.cache_hit_ratio || 0).toFixed(1)}%`;
+    document.getElementById('cacheHitCount').textContent = formatNumber(summary.cache_hits || 0);
+    document.getElementById('bandwidthSaved').textContent = formatBytes(summary.bandwidth_saved_bytes || 0);
+    document.getElementById('windowLabel').textContent = range.label || 'Selected window';
+    document.getElementById('trafficBucketLabel').textContent = formatBucketDuration(range.bucket_seconds || 0);
+
+    renderTopList('topDomains', breakdowns.top_domains);
+    renderTopList('topClients', breakdowns.top_clients);
+    renderTopList('topBlockedDomains', breakdowns.top_blocked_domains);
+    renderTrafficSeries(stats.series || [], range);
+    renderOutcomeSeries(stats.series || []);
+    renderNodeComparison(stats.series || [], breakdowns.node_totals || {});
+    renderTypeBreakdown(breakdowns.type_counts || {});
+    renderTrafficHeatmap(stats.series || [], range.bucket_seconds || 0);
+    renderUpstreamHealth(stats.upstream_health || {}, stats.upstream_health_history || {});
+    renderFilteringStatus(stats.filtering || {});
+    renderDashboardDegraded(stats);
+
+    dashboardGeneratedAt = Date.parse(stats.generated_at || '') || Date.now();
+    refreshDashboardFreshness(false);
+}
+
+function renderTrafficSeries(series, range) {
+    const chart = document.getElementById('trafficSeries');
+    const maxQueries = Math.max(...series.map(point => point.queries || 0), 1);
+    const html = series.map(point => {
+        const height = percentStep((point.queries / maxQueries) * 100);
+        const label = formatBucketTime(point.start, range.bucket_seconds);
+        return `<span class="timeline-column" title="${escapeHtml(label)}: ${formatNumber(point.queries)} queries"><i class="timeline-bar height-pct-${height}"></i></span>`;
+    }).join('');
+    replaceHTMLIfChanged(chart, html || '<span class="empty-small">No traffic in this window</span>');
+    chart.setAttribute('aria-label', `Query volume for ${range.label || 'the selected window'}`);
+    document.getElementById('trafficStartLabel').textContent = series.length ? formatBucketTime(series[0].start, range.bucket_seconds) : '—';
+    document.getElementById('trafficEndLabel').textContent = series.length ? formatBucketTime(series[series.length - 1].start, range.bucket_seconds) : 'Now';
+}
+
+function renderOutcomeSeries(series) {
+    const chart = document.getElementById('outcomeSeries');
+    const maxQueries = Math.max(...series.map(point => point.queries || 0), 1);
+    const html = series.map(point => {
+        const title = `Answered ${point.forwarded || 0}, cached ${point.cached || 0}, blocked ${point.blocked || 0}, failed ${point.errors || 0}`;
+        const segment = (kind, count) => `<i class="outcome-segment ${kind} height-pct-${percentStep((count / maxQueries) * 100)}"></i>`;
+        return `<span class="timeline-column outcome-column" title="${title}">${segment('forwarded', point.forwarded || 0)}${segment('cached', point.cached || 0)}${segment('blocked', point.blocked || 0)}${segment('errors', point.errors || 0)}</span>`;
+    }).join('');
+    replaceHTMLIfChanged(chart, html || '<span class="empty-small">No outcomes in this window</span>');
+}
+
+function renderNodeComparison(series, totals) {
+    const container = document.getElementById('nodeComparison');
+    const nodes = Object.entries(totals).sort((a, b) => b[1] - a[1]);
+    if (nodes.length === 0) {
+        replaceHTMLIfChanged(container, '<div class="empty-small">No node traffic</div>');
+        return;
+    }
+    const maxTotal = Math.max(...nodes.map(([, total]) => total), 1);
+    const html = nodes.slice(0, 8).map(([node, total]) => {
+        const samples = series.map(point => point.nodes?.[node] || 0);
+        const sampleMax = Math.max(...samples, 1);
+        const sparkline = samples.map(value => `<i class="node-spark-bar height-pct-${percentStep((value / sampleMax) * 100)}"></i>`).join('');
+        return `<div class="node-comparison-row"><div class="node-comparison-title"><span>${escapeHtml(node)}</span><strong>${formatNumber(total)}</strong></div><div class="node-share-track"><i class="node-share-fill width-pct-${percentStep((total / maxTotal) * 100)}"></i></div><div class="node-series" aria-label="${escapeHtml(node)} traffic trend">${sparkline}</div></div>`;
+    }).join('');
+    replaceHTMLIfChanged(container, html);
+}
+
+function renderTypeBreakdown(typeCounts) {
+    const element = document.getElementById('typeBreakdown');
+    const total = Object.values(typeCounts).reduce((sum, value) => sum + value, 0);
+    if (total === 0) {
+        replaceHTMLIfChanged(element, '<div class="empty-small">No data</div>');
+        return;
+    }
+    const html = Object.entries(typeCounts).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([type, count]) => {
+        const percentage = (count / total) * 100;
+        return `<div class="type-item"><div class="type-row"><span>${escapeHtml(type || 'Unknown')}</span><span class="type-meta">${formatNumber(count)} (${percentage.toFixed(1)}%)</span></div><div class="type-track"><div class="type-bar width-pct-${percentStep(percentage)}"></div></div></div>`;
+    }).join('');
+    replaceHTMLIfChanged(element, html);
+}
+
+function renderTrafficHeatmap(series, bucketSeconds) {
+    const element = document.getElementById('trafficHeatmap');
+    const maxQueries = Math.max(...series.map(point => point.queries || 0), 1);
+    const html = series.map(point => {
+        const level = point.queries === 0 ? 0 : Math.max(1, Math.ceil((point.queries / maxQueries) * 10));
+        const label = formatBucketTime(point.start, bucketSeconds);
+        return `<div class="heatmap-box heatmap-level-${level}" title="${escapeHtml(label)}: ${formatNumber(point.queries)} queries">${escapeHtml(shortBucketLabel(point.start, bucketSeconds))}</div>`;
+    }).join('');
+    replaceHTMLIfChanged(element, html || '<div class="empty-small">No data</div>');
+}
+
+function renderUpstreamHealth(health, history) {
+    const element = document.getElementById('upstreamHealth');
+    const nodes = Object.entries(health);
+    if (nodes.length === 0) {
+        replaceHTMLIfChanged(element, '<li class="top-item"><span>No health samples</span></li>');
+        return;
+    }
+    const html = nodes.map(([node, upstreams]) => {
+        const rows = Object.entries(upstreams).map(([upstream, latency]) => {
+            const samples = history[node]?.[upstream] || [];
+            const maxLatency = Math.max(...samples.filter(value => value > 0), 1);
+            const sparkline = samples.map(value => {
+                const height = value === -1 ? 100 : (value / maxLatency) * 100;
+                return `<i class="spark-bar height-pct-${percentStep(height)} ${value === -1 ? 'fail' : ''}"></i>`;
+            }).join('');
+            const isDown = latency === -1;
+            return `<div class="health-row"><div class="health-label"><span class="health-ip">${escapeHtml(upstream)}</span><div class="sparkline">${sparkline}</div></div><span class="top-count health-status ${isDown ? 'down' : 'up'}">${isDown ? 'DOWN' : Number(latency).toFixed(1) + 'ms'}</span></div>`;
+        }).join('');
+        return `<li class="health-node"><div class="health-node-title">Node: ${escapeHtml(node)}</div>${rows}</li>`;
+    }).join('');
+    replaceHTMLIfChanged(element, html);
+}
+
+function renderFilteringStatus(filtering) {
+    const state = filtering.state || 'unconfigured';
+    const stateLabels = { active: 'Protection active', paused: 'Protection paused', degraded: 'Sources degraded', unconfigured: 'No filter engine' };
+    document.getElementById('filteringState').textContent = stateLabels[state] || 'Filter status unknown';
+    document.getElementById('filteringDetail').textContent = filtering.configured ? `${formatNumber(filtering.blocked_total || 0)} blocked · ${formatNumber(filtering.allowed_total || 0)} exceptions` : 'DNS traffic is not using configured filter sources';
+    document.getElementById('filterBlockRules').textContent = formatNumber(filtering.block_rules || 0);
+    document.getElementById('filterAllowRules').textContent = formatNumber(filtering.allow_rules || 0);
+    document.getElementById('filterHealthySources').textContent = `${filtering.healthy_sources || 0} / ${filtering.source_count || 0}`;
+    document.getElementById('filterLastUpdated').textContent = filtering.last_updated ? `Rules updated ${getRelativeTime(Date.parse(filtering.last_updated) / 1000)}` : 'No filter update reported';
+    const beacon = document.getElementById('filteringBeacon');
+    beacon.className = `filtering-beacon is-${state}`;
+    const chip = document.getElementById('filteringChip');
+    chip.className = `section-chip ${state === 'active' ? 'healthy' : 'alert-chip'}`;
+    chip.textContent = state;
+}
+
+function renderDashboardDegraded(stats) {
+    const banner = document.getElementById('dashboardDegraded');
+    const messages = [];
+    const labels = { events: 'Historical event aggregation is incomplete.', filtering_paused: 'Filtering protection is paused.', filter_sources: 'One or more filter sources failed to update.' };
+    (stats.errors || []).forEach(error => messages.push(labels[error] || `Data source ${error} is unavailable.`));
+    if (stats.range?.retention_limited) {
+        messages.push(`The selected window exceeds ${formatDuration(stats.range.available_seconds)} retention; showing available data.`);
+    }
+    banner.hidden = messages.length === 0;
+    banner.classList.toggle('is-info', !stats.degraded && stats.range?.retention_limited);
+    document.getElementById('dashboardDegradedMessage').textContent = messages.join(' ');
+}
+
+function formatBucketDuration(seconds) {
+    if (seconds >= 86400) return `${seconds / 86400}d buckets`;
+    if (seconds >= 3600) return `${seconds / 3600}h buckets`;
+    return `${Math.max(1, seconds / 60)}m buckets`;
+}
+
+function formatDuration(seconds) {
+    if (seconds >= 86400) return `${Math.round(seconds / 86400)}d`;
+    if (seconds >= 3600) return `${Math.round(seconds / 3600)}h`;
+    return `${Math.round(seconds / 60)}m`;
+}
+
+function formatBucketTime(timestamp, bucketSeconds) {
+    const date = new Date(timestamp * 1000);
+    if (bucketSeconds >= 86400) return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    if (bucketSeconds >= 21600) return date.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit' });
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function shortBucketLabel(timestamp, bucketSeconds) {
+    const date = new Date(timestamp * 1000);
+    if (bucketSeconds >= 86400) return date.toLocaleDateString([], { day: '2-digit' });
+    if (bucketSeconds >= 21600) return date.toLocaleDateString([], { weekday: 'short' }).slice(0, 2);
+    return date.toLocaleTimeString([], { hour: '2-digit', hour12: false });
+}
+
+function refreshDashboardFreshness(failed) {
+    const element = document.getElementById('dashboardFreshness');
+    if (!element) return;
+    if (!dashboardGeneratedAt) {
+        element.textContent = failed ? 'Update failed' : 'Waiting for data';
+        element.classList.toggle('is-stale', failed);
+        return;
+    }
+    const ageSeconds = Math.max(0, Math.floor((Date.now() - dashboardGeneratedAt) / 1000));
+    element.textContent = failed ? `Update failed · last good ${ageSeconds}s ago` : `Updated ${ageSeconds}s ago`;
+    element.classList.toggle('is-stale', failed || ageSeconds > 30);
+}
+
+const dashboardRangeElement = document.getElementById('dashboardRange');
+if (dashboardRangeElement) {
+    const savedRange = localStorage.getItem('resolix.dashboardRange');
+    if (dashboardRanges.has(savedRange)) dashboardRangeElement.value = savedRange;
+    dashboardRangeElement.addEventListener('change', () => {
+        localStorage.setItem('resolix.dashboardRange', dashboardRangeElement.value);
+        void fetchStats();
+    });
+    setInterval(() => refreshDashboardFreshness(false), 5000);
 }
 function fetchNodeStatus() {
     return coalesceRequest('nodes', async () => {
@@ -184,4 +297,3 @@ function prefillSimulator(domain) {
 }
 
 // Item 99: Clear Dashboard View
-

@@ -59,6 +59,7 @@ func (s *Server) SetupMux() http.Handler {
 	mux.Handle("/api/events", s.authMiddleware(http.HandlerFunc(s.handleEvents)))
 	mux.Handle("/api/history", s.authMiddleware(http.HandlerFunc(s.handleHistory)))
 	mux.Handle("/api/stats", s.authMiddleware(http.HandlerFunc(s.handleStats)))
+	mux.Handle("/api/dashboard/v1/stats", s.authMiddleware(http.HandlerFunc(s.handleDashboardV1Stats)))
 	mux.Handle("/api/storage/status", s.authMiddleware(http.HandlerFunc(s.handleStorageStatus)))
 	mux.Handle("/api/client_stats", s.authMiddleware(http.HandlerFunc(s.handleClientStats)))
 	mux.Handle("/api/simulate", s.authMiddleware(http.HandlerFunc(s.handleSimulate)))

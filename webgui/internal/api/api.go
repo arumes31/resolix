@@ -118,6 +118,7 @@ type Server struct {
 	statsCacheMu   sync.Mutex
 	statsCacheBody []byte
 	statsCacheAt   time.Time
+	dashboardCache map[string]statsCacheEntry
 
 	// Prometheus metrics (Item 77)
 	metrics   *Metrics
@@ -152,6 +153,7 @@ func NewServer(cfg *config.Config, store *storage.Store, prs *parser.Parser, tmp
 		sessions:            make(map[string]time.Time),
 		metrics:             &Metrics{StartTime: time.Now()},
 		nodeSyncGenerations: make(map[string]uint64),
+		dashboardCache:      make(map[string]statsCacheEntry),
 	}
 
 	// Hash the configured password at startup if auth is enabled

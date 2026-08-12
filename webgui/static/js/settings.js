@@ -25,15 +25,6 @@ function updateMainStats() {
     // This function is kept for any immediate local UI feedback if needed
 }
 
-function renderMiniChart() {
-    const chart = document.getElementById('miniChart');
-    const max = Math.max(...rpmHistory, 1);
-    chart.innerHTML = rpmHistory.map(h => {
-        const height = (h / max) * 100;
-        return `<div class="chart-bar height-pct-${percentStep(height)}"></div>`;
-    }).join('');
-}
-
 async function showClientStats(ip) {
     const modal = document.getElementById('clientModal');
     document.getElementById('modalTitle').textContent = `Stats for ${ip}`;
@@ -319,4 +310,3 @@ async function clearDNSCache() {
     const data = await apiJSON('/api/cache/clear', { method: 'POST' });
     showSettingsNotice(`DNS cache cleared (${data.cleared || 0} entries removed)`);
 }
-

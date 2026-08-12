@@ -57,9 +57,9 @@ func TestDedicatedPagesAndRootRejectsUnknownPaths(t *testing.T) {
 		marker     string
 		notPresent []string
 	}{
-		{path: "/", marker: `id="rpm_val"`, notPresent: []string{`id="eventTable"`, `id="nodeCards"`}},
-		{path: "/querylog", marker: `id="eventTable"`, notPresent: []string{`id="rpm_val"`, `id="nodeCards"`}},
-		{path: "/cluster", marker: `id="nodeCards"`, notPresent: []string{`id="rpm_val"`, `id="eventTable"`}},
+		{path: "/", marker: `id="dashboardRange"`, notPresent: []string{`id="eventTable"`, `id="nodeCards"`}},
+		{path: "/querylog", marker: `id="eventTable"`, notPresent: []string{`id="dashboardRange"`, `id="nodeCards"`}},
+		{path: "/cluster", marker: `id="nodeCards"`, notPresent: []string{`id="dashboardRange"`, `id="eventTable"`}},
 	}
 	for _, test := range pageTests {
 		t.Run(test.path, func(t *testing.T) {

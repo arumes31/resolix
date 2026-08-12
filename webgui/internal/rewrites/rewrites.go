@@ -71,11 +71,6 @@ func (rw Rewrite) domainSpecificity(domain string) (int, bool) {
 	return len(base), strings.HasSuffix(domain, "."+base)
 }
 
-func (rw Rewrite) allowsSource(addr netip.Addr) bool {
-	_, allowed := rw.sourceSpecificity(addr)
-	return allowed
-}
-
 // sourceSpecificity returns the longest matching source prefix. Unrestricted
 // rules have specificity zero, so any matching subnet with a non-zero prefix
 // takes precedence while an explicit /0 remains tied with "all clients".

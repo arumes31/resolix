@@ -24,7 +24,11 @@ func TestClient_ListDevices(t *testing.T) {
 			if r.Form.Get("client_id") != "client" || r.Form.Get("client_secret") != "secret" {
 				t.Fatal("OAuth credentials were not submitted")
 			}
-			_ = json.NewEncoder(w).Encode(tokenResponse{AccessToken: "access", TokenType: "Bearer", ExpiresIn: 3600})
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"access_token": "access",
+				"token_type":   "Bearer",
+				"expires_in":   3600,
+			})
 		case "/api/v2/tailnet/tailnet-id/devices":
 			if r.Header.Get("Authorization") != "Bearer access" {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -80,7 +84,10 @@ func TestClient_RejectsRedirects(t *testing.T) {
 func TestClient_RepeatedUnauthorizedFails(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v2/oauth/token" {
-			_ = json.NewEncoder(w).Encode(tokenResponse{AccessToken: "access", ExpiresIn: 3600})
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"access_token": "access",
+				"expires_in":   3600,
+			})
 			return
 		}
 		http.Error(w, "unauthorized", http.StatusUnauthorized)

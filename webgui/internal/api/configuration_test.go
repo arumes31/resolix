@@ -34,27 +34,23 @@ func TestDedicatedPagesAndRootRejectsUnknownPaths(t *testing.T) {
 	server.tmpl = tmpl
 	mux := server.SetupMux()
 
-	recorder := httptest.NewRecorder()
-	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config", nil))
-	body := recorder.Body.String()
-	if recorder.Code != http.StatusOK ||
-		!strings.Contains(body, `class="app-page config-page compact"`) ||
-		!strings.Contains(body, `data-page="config"`) ||
-		!strings.Contains(body, `id="configAuthority"`) ||
-		!strings.Contains(body, `id="bootstrapList"`) ||
-		!strings.Contains(body, `id="allowlistForm"`) ||
-		!strings.Contains(body, `id="allowlistList"`) ||
-		!strings.Contains(body, `id="filterTestClient"`) ||
-		!strings.Contains(body, `id="filterTestType"`) ||
-		!strings.Contains(body, `id="dnsSettingsForm"`) ||
-		!strings.Contains(body, `id="magicDNSSummary"`) ||
-		!strings.Contains(body, `id="syncMagicDNSBtn"`) ||
-		!strings.Contains(body, `id="syncAllNodesBtn"`) ||
-		!strings.Contains(body, `id="configSyncProgress"`) ||
-		!strings.Contains(body, `id="configEditBar"`) ||
-		!strings.Contains(body, `id="rewriteDeleteDialog"`) {
-		t.Fatalf("config response = %d %q", recorder.Code, recorder.Body.String())
-	}
+	assertPage(t, mux, "/config", http.StatusOK, []string{
+		`class="app-page config-page compact"`,
+		`data-page="config"`,
+		`id="configAuthority"`,
+		`id="bootstrapList"`,
+		`id="allowlistForm"`,
+		`id="allowlistList"`,
+		`id="filterTestClient"`,
+		`id="filterTestType"`,
+		`id="dnsSettingsForm"`,
+		`id="magicDNSSummary"`,
+		`id="syncMagicDNSBtn"`,
+		`id="syncAllNodesBtn"`,
+		`id="configSyncProgress"`,
+		`id="configEditBar"`,
+		`id="rewriteDeleteDialog"`,
+	}, nil)
 
 	pageTests := []struct {
 		path       string
@@ -67,50 +63,47 @@ func TestDedicatedPagesAndRootRejectsUnknownPaths(t *testing.T) {
 	}
 	for _, test := range pageTests {
 		t.Run(test.path, func(t *testing.T) {
-			recorder := httptest.NewRecorder()
-			mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, test.path, nil))
-			if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), test.marker) {
-				t.Fatalf("response = %d %q", recorder.Code, recorder.Body.String())
-			}
-			for _, absent := range test.notPresent {
-				if strings.Contains(recorder.Body.String(), absent) {
-					t.Fatalf("response for %s unexpectedly contains %s", test.path, absent)
-				}
-			}
+			assertPage(t, mux, test.path, http.StatusOK, []string{test.marker}, test.notPresent)
 		})
 	}
-	recorder = httptest.NewRecorder()
-	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
-	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `id="dashboardSyncAllBtn"`) {
-		t.Fatalf("controller dashboard is missing sync-all action: %d %q", recorder.Code, recorder.Body.String())
-	}
+	assertPage(t, mux, "/", http.StatusOK, []string{`id="dashboardSyncAllBtn"`}, nil)
 
 	agent := testServer(&config.Config{BaseURL: "/", Mode: config.ModeAgent, MaxRequestSize: 1 << 20})
 	agent.tmpl = tmpl
-	recorder = httptest.NewRecorder()
-	agent.SetupMux().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config", nil))
-	if recorder.Code != http.StatusOK ||
-		strings.Contains(recorder.Body.String(), `id="configSyncProgress"`) ||
-		strings.Contains(recorder.Body.String(), `id="configEditBar"`) {
-		t.Fatalf("agent config edit controls = %d %q", recorder.Code, recorder.Body.String())
-	}
+	agentMux := agent.SetupMux()
+	assertPage(t, agentMux, "/config", http.StatusOK, nil, []string{
+		`id="configSyncProgress"`,
+		`id="configEditBar"`,
+	})
+	assertPage(t, agentMux, "/", http.StatusOK, nil, []string{`id="dashboardSyncAllBtn"`})
+	assertPage(t, agentMux, "/cluster", http.StatusNotFound, nil, nil)
+	assertPage(t, mux, "/not-a-route", http.StatusNotFound, nil, nil)
+}
 
-	recorder = httptest.NewRecorder()
-	agent.SetupMux().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
-	if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), `id="dashboardSyncAllBtn"`) {
-		t.Fatalf("agent dashboard sync-all visibility = %d %q", recorder.Code, recorder.Body.String())
+func assertPage(
+	t *testing.T,
+	handler http.Handler,
+	path string,
+	wantStatus int,
+	present []string,
+	absent []string,
+) {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+	if recorder.Code != wantStatus {
+		t.Fatalf("response for %s = %d %q, want status %d", path, recorder.Code, recorder.Body.String(), wantStatus)
 	}
-
-	recorder = httptest.NewRecorder()
-	agent.SetupMux().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/cluster", nil))
-	if recorder.Code != http.StatusNotFound {
-		t.Fatalf("agent cluster status = %d", recorder.Code)
+	body := recorder.Body.String()
+	for _, marker := range present {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("response for %s is missing %s: %q", path, marker, body)
+		}
 	}
-
-	recorder = httptest.NewRecorder()
-	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/not-a-route", nil))
-	if recorder.Code != http.StatusNotFound {
-		t.Fatalf("unknown route status = %d", recorder.Code)
+	for _, marker := range absent {
+		if strings.Contains(body, marker) {
+			t.Fatalf("response for %s unexpectedly contains %s", path, marker)
+		}
 	}
 }
 

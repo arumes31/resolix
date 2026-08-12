@@ -180,22 +180,7 @@ func main() {
 // deterministic in tests while main retains ownership of OS signal handling.
 func runApplication(cfg *config.Config, sigChan <-chan os.Signal) {
 	migrateConfigState(cfg)
-
-	// Initialize the level-aware logger (Item 51)
-	logger.SetLevel(cfg.LogLevel)
-	logger.Info("Resolix v%s starting in %s mode", Version, cfg.Mode)
-	logger.Info("Log level set to %s", cfg.LogLevel)
-
-	// Enable file logging if configured (Item 84)
-	if cfg.LogFile != "" {
-		if err := logger.EnableFileLogging(cfg.LogFile); err != nil {
-			logger.Warning("Failed to enable file logging: %v", err)
-		}
-	}
-
-	if cfg.BaseURL != "/" {
-		logger.Info("Base URL set to %s", cfg.BaseURL)
-	}
+	configureLogging(cfg)
 
 	// Run startup configuration verification (Items 54 & 55)
 	verifyConfig(cfg)
@@ -221,38 +206,7 @@ func runApplication(cfg *config.Config, sigChan <-chan os.Signal) {
 	srv.SetDNSSettingsStore(dnsSettingsStore)
 	managedDNS := dnsSettingsStore.Get()
 
-	magicDNSStore := magicdns.NewStore(cfg.FullMagicDNSStatePath())
-	if cfg.Mode == config.ModeAgent || cfg.MagicDNSEnabled {
-		magicDNSStore, err = magicdns.Load(cfg.FullMagicDNSStatePath())
-		if err != nil {
-			logger.Fatal("Failed to load MagicDNS state: %v", err)
-		}
-	}
-	var magicDNSSyncer *magicdns.Syncer
-	if cfg.Mode == config.ModeController && cfg.MagicDNSEnabled {
-		if snapshot := magicDNSStore.Snapshot(); snapshot.Tailnet != "" && snapshot.Tailnet != cfg.MagicDNSTailnet {
-			if err := magicDNSStore.Replace(cfg.MagicDNSTailnet, []magicdns.Record{}, time.Time{}); err != nil {
-				logger.Fatal("Failed to reset MagicDNS state for the configured tailnet: %v", err)
-			}
-		}
-		magicDNSClient, clientErr := magicdns.NewClient(
-			cfg.MagicDNSClientID,
-			cfg.MagicDNSClientSecret,
-			cfg.MagicDNSTailnet,
-		)
-		if clientErr != nil {
-			logger.Fatal("Failed to configure MagicDNS client: %v", clientErr)
-		}
-		magicDNSSyncer, err = magicdns.NewSyncer(
-			magicDNSClient,
-			magicDNSStore,
-			cfg.MagicDNSTailnet,
-			cfg.MagicDNSSyncInterval,
-		)
-		if err != nil {
-			logger.Fatal("Failed to configure MagicDNS synchronization: %v", err)
-		}
-	}
+	magicDNSStore, magicDNSSyncer := setupMagicDNS(cfg)
 	srv.SetMagicDNS(magicDNSStore, magicDNSSyncer)
 
 	// Item 59: Initialize and start reverse DNS resolver
@@ -557,6 +511,61 @@ func runApplication(cfg *config.Config, sigChan <-chan os.Signal) {
 	logger.CloseFile()
 
 	logger.Info("Graceful shutdown complete")
+}
+
+func configureLogging(cfg *config.Config) {
+	// Initialize the level-aware logger (Item 51)
+	logger.SetLevel(cfg.LogLevel)
+	logger.Info("Resolix v%s starting in %s mode", Version, cfg.Mode)
+	logger.Info("Log level set to %s", cfg.LogLevel)
+
+	// Enable file logging if configured (Item 84)
+	if cfg.LogFile != "" {
+		if err := logger.EnableFileLogging(cfg.LogFile); err != nil {
+			logger.Warning("Failed to enable file logging: %v", err)
+		}
+	}
+
+	if cfg.BaseURL != "/" {
+		logger.Info("Base URL set to %s", cfg.BaseURL)
+	}
+}
+
+func setupMagicDNS(cfg *config.Config) (*magicdns.Store, *magicdns.Syncer) {
+	magicDNSStore := magicdns.NewStore(cfg.FullMagicDNSStatePath())
+	if cfg.Mode == config.ModeAgent || cfg.MagicDNSEnabled {
+		loadedStore, err := magicdns.Load(cfg.FullMagicDNSStatePath())
+		if err != nil {
+			logger.Fatal("Failed to load MagicDNS state: %v", err)
+		}
+		magicDNSStore = loadedStore
+	}
+	if cfg.Mode != config.ModeController || !cfg.MagicDNSEnabled {
+		return magicDNSStore, nil
+	}
+	if snapshot := magicDNSStore.Snapshot(); snapshot.Tailnet != "" && snapshot.Tailnet != cfg.MagicDNSTailnet {
+		if err := magicDNSStore.Replace(cfg.MagicDNSTailnet, []magicdns.Record{}, time.Time{}); err != nil {
+			logger.Fatal("Failed to reset MagicDNS state for the configured tailnet: %v", err)
+		}
+	}
+	magicDNSClient, err := magicdns.NewClient(
+		cfg.MagicDNSClientID,
+		cfg.MagicDNSClientSecret,
+		cfg.MagicDNSTailnet,
+	)
+	if err != nil {
+		logger.Fatal("Failed to configure MagicDNS client: %v", err)
+	}
+	magicDNSSyncer, err := magicdns.NewSyncer(
+		magicDNSClient,
+		magicDNSStore,
+		cfg.MagicDNSTailnet,
+		cfg.MagicDNSSyncInterval,
+	)
+	if err != nil {
+		logger.Fatal("Failed to configure MagicDNS synchronization: %v", err)
+	}
+	return magicDNSStore, magicDNSSyncer
 }
 
 // setupFilterEngine builds and starts the filter engine from configuration

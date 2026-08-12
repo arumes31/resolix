@@ -60,6 +60,11 @@ func TestHandleDashboardV1Stats(t *testing.T) {
 	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
+	assertDashboardV1Response(t, response)
+}
+
+func assertDashboardV1Response(t *testing.T, response dashboardV1Response) {
+	t.Helper()
 	if response.SchemaVersion != dashboardSchemaVersion {
 		t.Fatalf("schema version = %d", response.SchemaVersion)
 	}

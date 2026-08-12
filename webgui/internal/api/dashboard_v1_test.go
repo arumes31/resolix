@@ -33,7 +33,18 @@ func TestHandleDashboardV1Stats(t *testing.T) {
 		Upstream:     "1.1.1.1",
 		ResponseCode: "SERVFAIL",
 	})
+	server.store.AddEvent(models.QueryEvent{
+		UnixTime:     now - int64((90 * time.Minute).Seconds()),
+		Domain:       "previous.example",
+		ClientIP:     "192.0.2.3",
+		Type:         "A",
+		Upstream:     "9.9.9.9",
+		ResponseCode: "NOERROR",
+	})
 	server.SetFilter(filter.New())
+	server.SetBuildInfo("2.5.0", "test")
+	server.store.SetNodeStatus("edge-a", models.NodeStatus{ID: "edge-a", Version: "2.5.0"})
+	server.store.SetNodeStatus("edge-b", models.NodeStatus{ID: "edge-b", Version: "2.4.9"})
 
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/api/dashboard/v1/stats?range=1h", nil)
@@ -57,6 +68,15 @@ func TestHandleDashboardV1Stats(t *testing.T) {
 	}
 	if response.Summary.Queries != 2 || response.Summary.Blocked != 1 || response.Summary.Errors != 1 {
 		t.Fatalf("summary = %+v", response.Summary)
+	}
+	if !response.Comparison.Available || response.Comparison.Summary == nil || response.Comparison.Summary.Queries != 1 {
+		t.Fatalf("comparison = %+v", response.Comparison)
+	}
+	if response.Runtime.Version != "2.5.0" || response.Runtime.Role != config.ModeController || response.Runtime.OnlineNodes != 2 || response.Runtime.TotalNodes != 2 {
+		t.Fatalf("runtime = %+v", response.Runtime)
+	}
+	if !response.Runtime.VersionSkew || len(response.Runtime.SkewedNodes) != 1 || response.Runtime.SkewedNodes[0] != "edge-b" {
+		t.Fatalf("version skew = %+v", response.Runtime)
 	}
 	if len(response.Breakdowns.TopBlockedDomains) != 1 || response.Breakdowns.TopBlockedDomains[0].Key != "blocked.example" {
 		t.Fatalf("top blocked domains = %+v", response.Breakdowns.TopBlockedDomains)
@@ -144,19 +164,46 @@ func TestDashboardV1MarksRetentionLimitedRanges(t *testing.T) {
 	if !response.Range.RetentionLimited {
 		t.Fatal("7d range was not marked as limited by the default 72h retention")
 	}
+	if response.Comparison.Available || !response.Comparison.RetentionLimited || response.Comparison.Summary != nil {
+		t.Fatalf("comparison should be unavailable for retained 7d range: %+v", response.Comparison)
+	}
 	if response.Range.AvailableSeconds != int64(config.DefaultHistoryRetention.Seconds()) {
 		t.Fatalf("available seconds = %d", response.Range.AvailableSeconds)
+	}
+}
+
+func TestVersionsDiffer(t *testing.T) {
+	tests := []struct {
+		name   string
+		local  string
+		remote string
+		want   bool
+	}{
+		{name: "same", local: "2.5.0", remote: "2.5.0"},
+		{name: "leading v is normalized", local: "v2.5.0", remote: "2.5.0"},
+		{name: "different", local: "2.5.0", remote: "2.4.9", want: true},
+		{name: "unknown local", remote: "2.4.9"},
+		{name: "unknown remote", local: "2.5.0"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := versionsDiffer(test.local, test.remote); got != test.want {
+				t.Fatalf("versionsDiffer(%q, %q) = %t, want %t", test.local, test.remote, got, test.want)
+			}
+		})
 	}
 }
 
 func newDashboardTestServer(t *testing.T) *Server {
 	t.Helper()
 	cfg := &config.Config{
-		BaseURL:          "/",
-		MaxEvents:        100,
-		HistoryDir:       t.TempDir(),
-		DBPath:           "dashboard.db",
-		HistoryRetention: config.DefaultHistoryRetention,
+		BaseURL:              "/",
+		Mode:                 config.ModeController,
+		MaxEvents:            100,
+		HistoryDir:           t.TempDir(),
+		DBPath:               "dashboard.db",
+		HistoryRetention:     config.DefaultHistoryRetention,
+		NodeOfflineThreshold: config.DefaultNodeOfflineThreshold,
 	}
 	store := storage.NewStore(cfg)
 	store.Init()

@@ -90,6 +90,7 @@ func (s *Server) handleFilteringPause(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	eng.Pause(req.Minutes)
+	s.invalidateDashboardStatsCache()
 
 	resp := map[string]interface{}{"status": "ok", "enabled": !eng.Paused()}
 	if until := eng.PausedUntil(); !until.IsZero() {

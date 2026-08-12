@@ -44,6 +44,7 @@
             <a class="app-nav-link" href="cluster">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a4 4 0 0 1 4 4c0 .7-.18 1.36-.5 1.93L19.57 13A4 4 0 1 1 18 14.5l-4.07-4.07A4 4 0 0 1 12 11a4 4 0 0 1-1.93-.5L6 14.57A4 4 0 1 1 4.43 13l4.07-4.07A4 4 0 1 1 12 3Z"/></svg>
                 <span>Cluster nodes</span>
+                <span id="clusterNodeCount" class="nav-count" aria-label="Node status">—</span>
             </a>
             {{end}}
             <span class="nav-section-label">Manage</span>
@@ -54,6 +55,7 @@
         </nav>
         <div class="sidebar-footer">
             <div class="sidebar-footnote"><span>Mode</span><strong>{{.Mode}}</strong></div>
+            <div class="sidebar-footnote"><span>Version</span><strong id="runtimeVersion">—</strong></div>
             <form method="post" action="logout" class="logout-form sidebar-logout">
                 <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
                 <button type="submit" class="app-nav-link sidebar-button" aria-label="Sign out">
@@ -73,6 +75,8 @@
                 <div><span class="page-kicker">Network operations</span><h1>Operations dashboard</h1></div>
             </div>
             <div class="topbar-actions">
+                <span id="runtimeRole" class="runtime-pill">{{if eq .Mode "controller"}}Controller{{else}}Agent{{end}}</span>
+                <span id="versionSkew" class="runtime-pill runtime-pill-warning" hidden>Version skew</span>
                 <label class="dashboard-range-control" for="dashboardRange">
                     <span>Window</span>
                     <select id="dashboardRange" aria-label="Dashboard time range">
@@ -95,30 +99,32 @@
             </section>
 
             <section class="metric-grid dashboard-metric-grid" aria-label="Traffic summary">
-                <article class="metric-card"><span>Queries in window</span><strong id="windowQueries">0</strong><small><i class="metric-dot blue"></i><span id="windowLabel">Last 24 hours</span></small></article>
-                <article class="metric-card"><span>Average request rate</span><strong id="averageRPM">0 RPM</strong><small>Server-derived across selected window</small></article>
-                <article class="metric-card metric-card-protection"><span>Blocked queries</span><strong id="blockedRatio">0%</strong><small><i class="metric-dot green"></i><b id="blockedCount">0</b> policy decisions</small></article>
-                <article class="metric-card metric-card-errors"><span>DNS error rate</span><strong id="errorRatio">0%</strong><small><i class="metric-dot red"></i><b id="errorCount">0</b> operational failures</small></article>
-                <article class="metric-card"><span>Cache hit rate</span><strong id="cacheRatio" class="stat-cache">0%</strong><small><i class="metric-dot amber"></i><b id="cacheHitCount">0</b> cached answers</small></article>
-                <article class="metric-card"><span>Bandwidth avoided</span><strong id="bandwidthSaved">0 B</strong><small>Estimated from cached responses</small></article>
+                <article class="metric-card"><span>Queries in window</span><strong id="windowQueries">0</strong><small><i class="metric-dot blue"></i><span id="windowLabel">Last 24 hours</span></small><small id="queriesDelta" class="metric-delta">Awaiting comparison</small></article>
+                <article class="metric-card"><span>Average request rate</span><strong id="averageRPM">0 RPM</strong><small>Server-derived across selected window</small><small id="rpmDelta" class="metric-delta">Awaiting comparison</small></article>
+                <article class="metric-card metric-card-protection"><span>Blocked queries</span><strong id="blockedRatio">0%</strong><small><i class="metric-dot green"></i><b id="blockedCount">0</b> policy decisions</small><small id="blockedDelta" class="metric-delta">Awaiting comparison</small></article>
+                <article class="metric-card metric-card-errors"><span>DNS error rate</span><strong id="errorRatio">0%</strong><small><i class="metric-dot red"></i><b id="errorCount">0</b> operational failures</small><small id="errorDelta" class="metric-delta">Awaiting comparison</small></article>
+                <article class="metric-card"><span>Cache hit rate</span><strong id="cacheRatio" class="stat-cache">0%</strong><small><i class="metric-dot amber"></i><b id="cacheHitCount">0</b> cached answers</small><small id="cacheDelta" class="metric-delta">Awaiting comparison</small></article>
+                <article class="metric-card"><span>Bandwidth avoided</span><strong id="bandwidthSaved">0 B</strong><small>Estimated from cached responses</small><small id="bandwidthDelta" class="metric-delta">Awaiting comparison</small></article>
             </section>
 
             <div class="dashboard-grid ops-grid">
                 <div class="card traffic-card wide-card skeleton-card">
-                    <div class="stat-header"><span>Query activity</span><span id="trafficBucketLabel" class="section-chip">Server timeline</span></div>
-                    <div class="dashboard-timeline" id="trafficSeries" role="img" aria-label="Query volume over time"></div>
+                    <div class="stat-header"><span>Query activity</span><div class="chart-actions"><button id="dashboardZoomReset" type="button" class="chart-action" hidden>Reset zoom</button><span id="trafficBucketLabel" class="section-chip">Server timeline</span></div></div>
+                    <div id="trafficInspect" class="chart-inspect" aria-live="polite">Hover or focus a bucket · drag across buckets to zoom</div>
+                    <div class="dashboard-timeline" id="trafficSeries" role="group" aria-label="Query volume over time"></div>
                     <div class="chart-axis"><span id="trafficStartLabel">—</span><span id="trafficEndLabel">Now</span></div>
                 </div>
                 <div class="card outcome-card skeleton-card">
-                    <div class="stat-header"><span>Query outcomes</span><span class="section-chip">Mutually exclusive</span></div>
+                    <div class="stat-header"><span>Query outcomes</span><div class="chart-actions"><div class="chart-mode" role="group" aria-label="Outcome chart scale"><button type="button" class="chart-mode-btn is-active" data-outcome-mode="count" aria-pressed="true">Count</button><button type="button" class="chart-mode-btn" data-outcome-mode="percentage" aria-pressed="false">%</button></div><span class="section-chip">Mutually exclusive</span></div></div>
                     <div class="outcome-legend" aria-hidden="true"><span><i class="legend-swatch forwarded"></i>Answered</span><span><i class="legend-swatch cached"></i>Cached</span><span><i class="legend-swatch blocked"></i>Blocked</span><span><i class="legend-swatch errors"></i>Failed</span></div>
-                    <div class="dashboard-timeline outcome-timeline" id="outcomeSeries" role="img" aria-label="Query outcomes over time"></div>
+                    <div id="outcomeInspect" class="chart-inspect" aria-live="polite">Showing absolute counts</div>
+                    <div class="dashboard-timeline outcome-timeline" id="outcomeSeries" role="group" aria-label="Query outcomes over time"></div>
                 </div>
                 <div class="card node-comparison-card skeleton-card"><div class="stat-header"><span>Node comparison</span><span class="section-chip">Selected window</span></div><div id="nodeComparison" class="node-comparison"></div></div>
                 <div class="card filtering-card skeleton-card">
                     <div class="stat-header"><span>Filtering protection</span><span id="filteringChip" class="section-chip">Loading</span></div>
                     <div class="filtering-overview">
-                        <div class="filtering-state-row"><span id="filteringBeacon" class="filtering-beacon"></span><div><strong id="filteringState">Checking protection</strong><span id="filteringDetail">Waiting for filter engine status</span></div></div>
+                        <div class="filtering-state-row"><span id="filteringBeacon" class="filtering-beacon"></span><div><strong id="filteringState">Checking protection</strong><span id="filteringDetail">Waiting for filter engine status</span></div><button id="filterResumeBtn" type="button" class="chart-action filter-resume" hidden>Resume</button></div>
                         <div class="filtering-metrics"><div><span>Block rules</span><strong id="filterBlockRules">0</strong></div><div><span>Allow rules</span><strong id="filterAllowRules">0</strong></div><div><span>Healthy sources</span><strong id="filterHealthySources">0 / 0</strong></div></div>
                         <small id="filterLastUpdated">No filter update reported</small>
                     </div>

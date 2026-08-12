@@ -15,6 +15,7 @@ import (
 // DashboardStats is the ranged analytics snapshot consumed by the dashboard API.
 type DashboardStats struct {
 	Summary           DashboardSummary       `json:"summary"`
+	PreviousSummary   *DashboardSummary      `json:"previous_summary,omitempty"`
 	Series            []DashboardSeriesPoint `json:"series"`
 	TopDomains        []models.StatEntry     `json:"top_domains"`
 	TopClients        []models.StatEntry     `json:"top_clients"`
@@ -51,15 +52,18 @@ type DashboardSeriesPoint struct {
 }
 
 type dashboardAccumulator struct {
-	start          int64
-	end            int64
-	bucketSeconds  int64
-	stats          DashboardStats
-	domainCounts   map[string]int
-	clientCounts   map[string]int
-	blockedDomains map[string]int
-	pointIndexes   map[int64]int
-	replies        int
+	start           int64
+	end             int64
+	previousStart   int64
+	previous        *DashboardSummary
+	previousReplies int
+	bucketSeconds   int64
+	stats           DashboardStats
+	domainCounts    map[string]int
+	clientCounts    map[string]int
+	blockedDomains  map[string]int
+	pointIndexes    map[int64]int
+	replies         int
 }
 
 // GetDashboardStats returns a bounded, server-generated dashboard time series.
@@ -69,14 +73,31 @@ func (s *Store) GetDashboardStats(
 	end time.Time,
 	bucket time.Duration,
 ) (DashboardStats, error) {
+	return s.GetDashboardStatsWithComparison(ctx, start, end, bucket, nil)
+}
+
+// GetDashboardStatsWithComparison returns the current dashboard snapshot and,
+// when previousStart is provided, a headline summary for the immediately
+// preceding non-overlapping window. Both windows share one pending-event
+// snapshot and one database scan.
+func (s *Store) GetDashboardStatsWithComparison(
+	ctx context.Context,
+	start time.Time,
+	end time.Time,
+	bucket time.Duration,
+	previousStart *time.Time,
+) (DashboardStats, error) {
 	if ctx == nil {
 		return DashboardStats{}, fmt.Errorf("dashboard stats: nil context")
 	}
 	if !start.Before(end) || bucket <= 0 {
 		return DashboardStats{}, fmt.Errorf("invalid dashboard time range")
 	}
+	if previousStart != nil && !previousStart.Before(start) {
+		return DashboardStats{}, fmt.Errorf("invalid dashboard comparison range")
+	}
 
-	accumulator := newDashboardAccumulator(start.Unix(), end.Unix(), int64(bucket.Seconds()))
+	accumulator := newDashboardAccumulator(start.Unix(), end.Unix(), int64(bucket.Seconds()), previousStart)
 
 	s.archiveMu.Lock()
 	defer s.archiveMu.Unlock()
@@ -127,7 +148,7 @@ func (s *Store) UpstreamHealthSnapshot() (
 	return health, history
 }
 
-func newDashboardAccumulator(start, end, bucketSeconds int64) *dashboardAccumulator {
+func newDashboardAccumulator(start, end, bucketSeconds int64, previousStart *time.Time) *dashboardAccumulator {
 	firstBucket := start - start%bucketSeconds
 	series := make([]DashboardSeriesPoint, 0, int((end-firstBucket)/bucketSeconds)+1)
 	pointIndexes := make(map[int64]int)
@@ -139,7 +160,7 @@ func newDashboardAccumulator(start, end, bucketSeconds int64) *dashboardAccumula
 		})
 	}
 
-	return &dashboardAccumulator{
+	accumulator := &dashboardAccumulator{
 		start:         start,
 		end:           end,
 		bucketSeconds: bucketSeconds,
@@ -155,6 +176,11 @@ func newDashboardAccumulator(start, end, bucketSeconds int64) *dashboardAccumula
 		blockedDomains: make(map[string]int),
 		pointIndexes:   pointIndexes,
 	}
+	if previousStart != nil {
+		accumulator.previousStart = previousStart.Unix()
+		accumulator.previous = &DashboardSummary{}
+	}
+	return accumulator
 }
 
 func (a *dashboardAccumulator) mergeStoredEvents(ctx context.Context, database *sql.DB) error {
@@ -165,7 +191,7 @@ func (a *dashboardAccumulator) mergeStoredEvents(ctx context.Context, database *
 		 FROM queries
 		 WHERE unix_time >= ? AND unix_time <= ?
 		 ORDER BY unix_time`,
-		a.start,
+		a.queryStart(),
 		a.end,
 	)
 	if err != nil {
@@ -210,6 +236,10 @@ func (a *dashboardAccumulator) mergeStoredEvents(ctx context.Context, database *
 }
 
 func (a *dashboardAccumulator) mergeEvent(event models.QueryEvent) {
+	if a.previous != nil && event.UnixTime >= a.previousStart && event.UnixTime < a.start {
+		mergeDashboardSummary(a.previous, &a.previousReplies, event)
+		return
+	}
 	if event.UnixTime < a.start || event.UnixTime > a.end {
 		return
 	}
@@ -222,7 +252,7 @@ func (a *dashboardAccumulator) mergeEvent(event models.QueryEvent) {
 	isError := !event.Blocked && dashboardResponseIsError(responseCode)
 	isCached := isCacheHit(event)
 
-	a.stats.Summary.Queries++
+	mergeDashboardSummary(&a.stats.Summary, &a.replies, event)
 	a.domainCounts[event.Domain]++
 	a.clientCounts[event.ClientIP]++
 	a.stats.TypeCounts[event.Type]++
@@ -230,18 +260,8 @@ func (a *dashboardAccumulator) mergeEvent(event models.QueryEvent) {
 	if responseCode != "" {
 		a.stats.ResponseCodes[responseCode]++
 	}
-	if event.Upstream != "" {
-		a.replies++
-	}
 	if event.Blocked {
-		a.stats.Summary.Blocked++
 		a.blockedDomains[event.Domain]++
-	}
-	if isError {
-		a.stats.Summary.Errors++
-	}
-	if isCached {
-		a.stats.Summary.CacheHits++
 	}
 
 	bucketStart := event.UnixTime - event.UnixTime%a.bucketSeconds
@@ -265,22 +285,54 @@ func (a *dashboardAccumulator) mergeEvent(event models.QueryEvent) {
 }
 
 func (a *dashboardAccumulator) finish(store *Store) DashboardStats {
-	windowMinutes := float64(a.end-a.start) / 60
-	if windowMinutes > 0 {
-		a.stats.Summary.QueriesPerMinute = float64(a.stats.Summary.Queries) / windowMinutes
+	finishDashboardSummary(&a.stats.Summary, a.replies, a.end-a.start)
+	if a.previous != nil {
+		finishDashboardSummary(a.previous, a.previousReplies, a.start-a.previousStart)
+		a.stats.PreviousSummary = a.previous
 	}
-	if a.stats.Summary.Queries > 0 {
-		a.stats.Summary.BlockedRatio = float64(a.stats.Summary.Blocked) / float64(a.stats.Summary.Queries) * 100
-		a.stats.Summary.ErrorRatio = float64(a.stats.Summary.Errors) / float64(a.stats.Summary.Queries) * 100
-	}
-	if a.replies > 0 {
-		a.stats.Summary.CacheHitRatio = float64(a.stats.Summary.CacheHits) / float64(a.replies) * 100
-	}
-	a.stats.Summary.BandwidthSaved = int64(a.stats.Summary.CacheHits) * 100
 	a.stats.TopDomains = store.toStats(a.domainCounts, "domains")
 	a.stats.TopClients = store.toStats(a.clientCounts, "clients")
 	a.stats.TopBlockedDomains = topDashboardEntries(a.blockedDomains, 10)
 	return a.stats
+}
+
+func (a *dashboardAccumulator) queryStart() int64 {
+	if a.previous != nil {
+		return a.previousStart
+	}
+	return a.start
+}
+
+func mergeDashboardSummary(summary *DashboardSummary, replies *int, event models.QueryEvent) {
+	responseCode := strings.ToUpper(strings.TrimSpace(event.ResponseCode))
+	summary.Queries++
+	if event.Upstream != "" {
+		(*replies)++
+	}
+	if event.Blocked {
+		summary.Blocked++
+	}
+	if !event.Blocked && dashboardResponseIsError(responseCode) {
+		summary.Errors++
+	}
+	if isCacheHit(event) {
+		summary.CacheHits++
+	}
+}
+
+func finishDashboardSummary(summary *DashboardSummary, replies int, windowSeconds int64) {
+	windowMinutes := float64(windowSeconds) / 60
+	if windowMinutes > 0 {
+		summary.QueriesPerMinute = float64(summary.Queries) / windowMinutes
+	}
+	if summary.Queries > 0 {
+		summary.BlockedRatio = float64(summary.Blocked) / float64(summary.Queries) * 100
+		summary.ErrorRatio = float64(summary.Errors) / float64(summary.Queries) * 100
+	}
+	if replies > 0 {
+		summary.CacheHitRatio = float64(summary.CacheHits) / float64(replies) * 100
+	}
+	summary.BandwidthSaved = int64(summary.CacheHits) * 100
 }
 
 func (a *dashboardAccumulator) markDegraded(name string) {

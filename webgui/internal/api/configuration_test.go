@@ -187,6 +187,43 @@ func TestFrontendStatusAndVirtualizationMarkers(t *testing.T) {
 	}
 }
 
+func TestDashboardQuickWinMarkers(t *testing.T) {
+	templateContent, err := os.ReadFile("../../templates/index.html") // #nosec G304 -- fixed test fixture
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{
+		`id="runtimeVersion"`,
+		`id="runtimeRole"`,
+		`id="clusterNodeCount"`,
+		`id="versionSkew"`,
+		`id="queriesDelta"`,
+		`id="dashboardZoomReset"`,
+		`data-outcome-mode="percentage"`,
+		`id="filterResumeBtn"`,
+	} {
+		if !bytes.Contains(templateContent, []byte(marker)) {
+			t.Fatalf("dashboard template is missing quick-win marker %q", marker)
+		}
+	}
+
+	scriptContent, err := os.ReadFile("../../static/js/dashboard.js") // #nosec G304 -- fixed test fixture
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{
+		"renderDashboardComparison",
+		"renderDashboardRuntime",
+		"inspectDashboardBucket",
+		"startDashboardZoom",
+		"resumeDashboardFiltering",
+	} {
+		if !bytes.Contains(scriptContent, []byte(marker)) {
+			t.Fatalf("dashboard script is missing quick-win behavior %q", marker)
+		}
+	}
+}
+
 func TestFrontendAssetsKeepDependencyOrder(t *testing.T) {
 	styleAssets := []string{
 		"static/css/style.css",

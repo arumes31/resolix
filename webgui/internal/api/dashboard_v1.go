@@ -51,6 +51,23 @@ type dashboardFilteringStatus struct {
 	PausedUntil    *time.Time `json:"paused_until,omitempty"`
 }
 
+type dashboardComparison struct {
+	Available        bool                      `json:"available"`
+	RetentionLimited bool                      `json:"retention_limited"`
+	Start            time.Time                 `json:"start"`
+	End              time.Time                 `json:"end"`
+	Summary          *storage.DashboardSummary `json:"summary,omitempty"`
+}
+
+type dashboardRuntime struct {
+	Version     string   `json:"version"`
+	Role        string   `json:"role"`
+	OnlineNodes int      `json:"online_nodes"`
+	TotalNodes  int      `json:"total_nodes"`
+	VersionSkew bool     `json:"version_skew"`
+	SkewedNodes []string `json:"skewed_nodes"`
+}
+
 type dashboardBreakdowns struct {
 	TopDomains        []models.StatEntry `json:"top_domains"`
 	TopClients        []models.StatEntry `json:"top_clients"`
@@ -65,6 +82,8 @@ type dashboardV1Response struct {
 	GeneratedAt     time.Time                       `json:"generated_at"`
 	Range           dashboardRangeMetadata          `json:"range"`
 	Summary         storage.DashboardSummary        `json:"summary"`
+	Comparison      dashboardComparison             `json:"comparison"`
+	Runtime         dashboardRuntime                `json:"runtime"`
 	Series          []storage.DashboardSeriesPoint  `json:"series"`
 	Breakdowns      dashboardBreakdowns             `json:"breakdowns"`
 	Filtering       dashboardFilteringStatus        `json:"filtering"`
@@ -148,7 +167,13 @@ func (s *Server) dashboardV1Response(
 		start = availableStart
 	}
 
-	stats, err := s.store.GetDashboardStats(ctx, start, now, preset.bucket)
+	comparisonStart := requestedStart.Add(-preset.duration)
+	comparisonAvailable := !comparisonStart.Before(availableStart) && !retentionLimited
+	var previousStart *time.Time
+	if comparisonAvailable {
+		previousStart = &comparisonStart
+	}
+	stats, err := s.store.GetDashboardStatsWithComparison(ctx, start, now, preset.bucket, previousStart)
 	if err != nil {
 		return nil, fmt.Errorf("collect dashboard stats: %w", err)
 	}
@@ -178,6 +203,13 @@ func (s *Server) dashboardV1Response(
 			RetentionLimited: retentionLimited,
 		},
 		Summary: stats.Summary,
+		Comparison: dashboardComparison{
+			Available:        comparisonAvailable && !stats.Degraded,
+			RetentionLimited: !comparisonAvailable,
+			Start:            comparisonStart.UTC(),
+			End:              requestedStart.UTC(),
+		},
+		Runtime: s.dashboardRuntime(),
 		Series:  stats.Series,
 		Breakdowns: dashboardBreakdowns{
 			TopDomains:        stats.TopDomains,
@@ -193,12 +225,49 @@ func (s *Server) dashboardV1Response(
 		Degraded:        stats.Degraded || !filtering.Enabled || filtering.SourceErrors > 0,
 		Errors:          errorsList,
 	}
+	if response.Comparison.Available {
+		response.Comparison.Summary = stats.PreviousSummary
+	}
 	body, err := json.Marshal(response)
 	if err != nil {
 		return nil, fmt.Errorf("encode dashboard v1 response: %w", err)
 	}
 	s.dashboardCache[preset.key] = statsCacheEntry{body: body, at: now}
 	return body, nil
+}
+
+func (s *Server) dashboardRuntime() dashboardRuntime {
+	version, _ := s.buildMetadata()
+	role := strings.TrimSpace(s.cfg.Mode)
+	if role == "" {
+		role = config.ModeController
+	}
+	runtime := dashboardRuntime{
+		Version:     version,
+		Role:        role,
+		SkewedNodes: []string{},
+	}
+	if s.store == nil {
+		return runtime
+	}
+	for _, node := range s.store.GetNodeStatuses() {
+		runtime.TotalNodes++
+		if node.Online {
+			runtime.OnlineNodes++
+		}
+		if node.Online && versionsDiffer(version, node.Version) {
+			runtime.SkewedNodes = append(runtime.SkewedNodes, node.Name)
+		}
+	}
+	sort.Strings(runtime.SkewedNodes)
+	runtime.VersionSkew = len(runtime.SkewedNodes) > 0
+	return runtime
+}
+
+func versionsDiffer(local, remote string) bool {
+	local = strings.TrimPrefix(strings.TrimSpace(local), "v")
+	remote = strings.TrimPrefix(strings.TrimSpace(remote), "v")
+	return local != "" && remote != "" && local != remote
 }
 
 func (s *Server) dashboardFilteringStatus() dashboardFilteringStatus {
@@ -245,4 +314,12 @@ func appendUniqueString(values []string, target string) []string {
 		}
 	}
 	return append(values, target)
+}
+
+func (s *Server) invalidateDashboardStatsCache() {
+	s.statsCacheMu.Lock()
+	s.dashboardCache = make(map[string]statsCacheEntry)
+	s.statsCacheBody = nil
+	s.statsCacheAt = time.Time{}
+	s.statsCacheMu.Unlock()
 }

@@ -1,5 +1,6 @@
 function renderTopList(id, list) {
     const el = document.getElementById(id);
+    if (!el) return;
     const html = (list || []).map(item => {
         let trendIcon = '';
         if (item.trend === 'up') trendIcon = '<span class="trend-up">↑</span>';
@@ -10,14 +11,15 @@ function renderTopList(id, list) {
 
         return `
             <li class="top-item">
-                <span class="truncate-label">
-                    ${escapeHtml(item.key)} ${trendIcon} ${aliasTag}
+                <span class="top-item-copy-target">
+                    <span class="truncate-label">${escapeHtml(item.key)} ${trendIcon} ${aliasTag}</span>
+                    ${copyControl(item.key, id === 'topClients' ? 'client' : 'domain')}
                 </span>
                 <span class="top-count">${formatNumber(item.count)}</span>
             </li>
         `;
     }).join('');
-    replaceHTMLIfChanged(el, html);
+    replaceHTMLIfChanged(el, html || '<li class="top-item"><span>No data</span></li>');
 }
 
 function updateMainStats() {

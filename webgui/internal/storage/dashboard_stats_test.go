@@ -141,6 +141,95 @@ func TestGetDashboardStatsUsesExactBoundariesAndZeroFills(t *testing.T) {
 	}
 }
 
+func TestGetDashboardStatsWithComparisonUsesOneNonOverlappingSnapshot(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+
+	now := time.Now().UTC().Truncate(time.Minute)
+	currentStart := now.Add(-time.Hour)
+	previousStart := currentStart.Add(-time.Hour)
+	store.AddEvent(models.QueryEvent{
+		UnixTime:     previousStart.Add(10 * time.Minute).Unix(),
+		Domain:       "archived-previous.example",
+		Type:         "A",
+		Upstream:     "1.1.1.1",
+		ResponseCode: "NOERROR",
+	})
+	if archived := store.ArchiveStep(now); archived != 1 {
+		t.Fatalf("archived = %d, want 1", archived)
+	}
+	store.AddEvent(models.QueryEvent{
+		UnixTime:     previousStart.Add(20 * time.Minute).Unix(),
+		Domain:       "pending-previous.example",
+		Type:         "AAAA",
+		Upstream:     "System Cache",
+		CacheStatus:  "fresh",
+		ResponseCode: "NOERROR",
+	})
+	store.AddEvent(models.QueryEvent{
+		UnixTime:     currentStart.Unix(),
+		Domain:       "current-boundary.example",
+		Type:         "A",
+		Blocked:      true,
+		ResponseCode: "NXDOMAIN",
+	})
+	store.AddEvent(models.QueryEvent{
+		UnixTime:     now.Add(-time.Minute).Unix(),
+		Domain:       "current-failure.example",
+		Type:         "A",
+		Upstream:     "1.1.1.1",
+		ResponseCode: "SERVFAIL",
+	})
+
+	stats, err := store.GetDashboardStatsWithComparison(
+		t.Context(),
+		currentStart,
+		now,
+		15*time.Minute,
+		&previousStart,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Summary.Queries != 2 || stats.Summary.Blocked != 1 || stats.Summary.Errors != 1 {
+		t.Fatalf("current summary = %+v", stats.Summary)
+	}
+	if stats.PreviousSummary == nil {
+		t.Fatal("previous summary is nil")
+	}
+	if stats.PreviousSummary.Queries != 2 || stats.PreviousSummary.CacheHits != 1 || stats.PreviousSummary.CacheHitRatio != 50 {
+		t.Fatalf("previous summary = %+v", *stats.PreviousSummary)
+	}
+	if len(stats.TopDomains) != 2 || stats.TopDomains[0].Key == "archived-previous.example" || stats.TopDomains[1].Key == "pending-previous.example" {
+		t.Fatalf("current breakdown contains previous events: %+v", stats.TopDomains)
+	}
+	var seriesQueries int
+	for _, point := range stats.Series {
+		seriesQueries += point.Queries
+	}
+	if seriesQueries != stats.Summary.Queries {
+		t.Fatalf("series queries = %d, current queries = %d", seriesQueries, stats.Summary.Queries)
+	}
+}
+
+func TestGetDashboardStatsWithComparisonReturnsAvailableZeroSummary(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+
+	now := time.Now().UTC().Truncate(time.Minute)
+	start := now.Add(-time.Hour)
+	previousStart := start.Add(-time.Hour)
+	store.AddEvent(models.QueryEvent{UnixTime: now.Add(-time.Minute).Unix(), Domain: "current.example", Type: "A"})
+
+	stats, err := store.GetDashboardStatsWithComparison(t.Context(), start, now, 15*time.Minute, &previousStart)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.PreviousSummary == nil || stats.PreviousSummary.Queries != 0 {
+		t.Fatalf("previous summary = %+v, want available zero summary", stats.PreviousSummary)
+	}
+}
+
 func TestGetDashboardStatsRejectsInvalidInput(t *testing.T) {
 	store, cleanup := newTestStore(t)
 	defer cleanup()
@@ -156,10 +245,17 @@ func TestGetDashboardStatsRejectsInvalidInput(t *testing.T) {
 		{name: "nil context", start: now.Add(-time.Hour), end: now, bucket: time.Minute},
 		{name: "reversed range", ctx: t.Context(), start: now, end: now.Add(-time.Hour), bucket: time.Minute},
 		{name: "zero bucket", ctx: t.Context(), start: now.Add(-time.Hour), end: now},
+		{name: "comparison overlaps current", ctx: t.Context(), start: now.Add(-time.Hour), end: now, bucket: time.Minute},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := store.GetDashboardStats(test.ctx, test.start, test.end, test.bucket)
+			var err error
+			if test.name == "comparison overlaps current" {
+				comparisonStart := test.start
+				_, err = store.GetDashboardStatsWithComparison(test.ctx, test.start, test.end, test.bucket, &comparisonStart)
+			} else {
+				_, err = store.GetDashboardStats(test.ctx, test.start, test.end, test.bucket)
+			}
 			if err == nil {
 				t.Fatal("expected validation error")
 			}

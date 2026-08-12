@@ -1,5 +1,9 @@
 const dashboardRanges = new Set(['15m', '1h', '6h', '24h', '7d', '30d']);
 let dashboardGeneratedAt = 0;
+let currentDashboardStats = null;
+let dashboardZoom = null;
+let dashboardZoomDrag = null;
+let dashboardOutcomeMode = localStorage.getItem('resolix.dashboardOutcomeMode') === 'percentage' ? 'percentage' : 'count';
 
 function selectedDashboardRange() {
     return document.getElementById('dashboardRange')?.value || '24h';
@@ -28,6 +32,8 @@ function renderDashboardStats(stats) {
     const summary = stats.summary || {};
     const range = stats.range || {};
     const breakdowns = stats.breakdowns || {};
+    currentDashboardStats = stats;
+    if (dashboardZoom?.range !== range.key) dashboardZoom = null;
     document.getElementById('windowQueries').textContent = formatNumber(summary.queries || 0);
     document.getElementById('averageRPM').textContent = `${Number(summary.queries_per_minute || 0).toFixed(1)} RPM`;
     document.getElementById('blockedRatio').textContent = `${Number(summary.blocked_ratio || 0).toFixed(1)}%`;
@@ -39,12 +45,13 @@ function renderDashboardStats(stats) {
     document.getElementById('bandwidthSaved').textContent = formatBytes(summary.bandwidth_saved_bytes || 0);
     document.getElementById('windowLabel').textContent = range.label || 'Selected window';
     document.getElementById('trafficBucketLabel').textContent = formatBucketDuration(range.bucket_seconds || 0);
+    renderDashboardComparison(summary, stats.comparison || {});
+    renderDashboardRuntime(stats.runtime || {});
 
     renderTopList('topDomains', breakdowns.top_domains);
     renderTopList('topClients', breakdowns.top_clients);
     renderTopList('topBlockedDomains', breakdowns.top_blocked_domains);
-    renderTrafficSeries(stats.series || [], range);
-    renderOutcomeSeries(stats.series || []);
+    renderDashboardTimelines();
     renderNodeComparison(stats.series || [], breakdowns.node_totals || {});
     renderTypeBreakdown(breakdowns.type_counts || {});
     renderTrafficHeatmap(stats.series || [], range.bucket_seconds || 0);
@@ -56,13 +63,87 @@ function renderDashboardStats(stats) {
     refreshDashboardFreshness(false);
 }
 
+function renderDashboardComparison(summary, comparison) {
+    const previous = comparison.available ? comparison.summary : null;
+    const unavailable = comparison.retention_limited ? 'Previous period exceeds retention' : 'Previous period unavailable';
+    renderMetricDelta('queriesDelta', summary.queries, previous?.queries, false, unavailable);
+    renderMetricDelta('rpmDelta', summary.queries_per_minute, previous?.queries_per_minute, false, unavailable);
+    renderMetricDelta('blockedDelta', summary.blocked_ratio, previous?.blocked_ratio, true, unavailable);
+    renderMetricDelta('errorDelta', summary.error_ratio, previous?.error_ratio, true, unavailable);
+    renderMetricDelta('cacheDelta', summary.cache_hit_ratio, previous?.cache_hit_ratio, true, unavailable);
+    renderMetricDelta('bandwidthDelta', summary.bandwidth_saved_bytes, previous?.bandwidth_saved_bytes, false, unavailable);
+}
+
+function renderMetricDelta(id, current, previous, percentagePoints, unavailable) {
+    const element = document.getElementById(id);
+    element.classList.remove('is-up', 'is-down');
+    if (previous === undefined || previous === null) {
+        element.textContent = unavailable;
+        return;
+    }
+    const difference = Number(current || 0) - Number(previous || 0);
+    if (difference === 0) {
+        element.textContent = 'No change vs previous';
+        return;
+    }
+    element.classList.add(difference > 0 ? 'is-up' : 'is-down');
+    const direction = difference > 0 ? '↑' : '↓';
+    if (percentagePoints) {
+        element.textContent = `${direction} ${Math.abs(difference).toFixed(1)} pp vs previous`;
+        return;
+    }
+    if (Number(previous) === 0) {
+        element.textContent = `${direction} — vs zero baseline`;
+        return;
+    }
+    element.textContent = `${direction} ${Math.abs((difference / Number(previous)) * 100).toFixed(1)}% vs previous`;
+}
+
+function renderDashboardRuntime(runtime) {
+    const version = String(runtime.version || '').trim() || 'development';
+    const role = String(runtime.role || document.body.dataset.mode || 'controller');
+    document.getElementById('runtimeVersion').textContent = version;
+    document.getElementById('runtimeRole').textContent = `${role.charAt(0).toUpperCase()}${role.slice(1)} node`;
+
+    const count = document.getElementById('clusterNodeCount');
+    if (count) {
+        count.textContent = `${runtime.online_nodes || 0}/${runtime.total_nodes || 0}`;
+        count.title = `${runtime.online_nodes || 0} of ${runtime.total_nodes || 0} agent nodes online`;
+        count.classList.toggle('has-warning', Boolean(runtime.version_skew));
+    }
+    const skew = document.getElementById('versionSkew');
+    const skewedNodes = runtime.skewed_nodes || [];
+    skew.hidden = !runtime.version_skew;
+    skew.textContent = `Version skew · ${skewedNodes.length}`;
+    skew.title = skewedNodes.length ? `Different version: ${skewedNodes.join(', ')}` : '';
+}
+
+function visibleDashboardSeries() {
+    const series = currentDashboardStats?.series || [];
+    if (!dashboardZoom) return series;
+    return series.filter(point => point.start >= dashboardZoom.start && point.start <= dashboardZoom.end);
+}
+
+function renderDashboardTimelines() {
+    if (!currentDashboardStats) return;
+    const series = visibleDashboardSeries();
+    const range = currentDashboardStats.range || {};
+    renderTrafficSeries(series, range);
+    renderOutcomeSeries(series, range);
+    const reset = document.getElementById('dashboardZoomReset');
+    reset.hidden = !dashboardZoom;
+    document.getElementById('trafficBucketLabel').textContent = dashboardZoom
+        ? `${formatBucketDuration(range.bucket_seconds || 0)} · zoomed`
+        : formatBucketDuration(range.bucket_seconds || 0);
+}
+
 function renderTrafficSeries(series, range) {
     const chart = document.getElementById('trafficSeries');
     const maxQueries = Math.max(...series.map(point => point.queries || 0), 1);
     const html = series.map(point => {
         const height = percentStep((point.queries / maxQueries) * 100);
         const label = formatBucketTime(point.start, range.bucket_seconds);
-        return `<span class="timeline-column" title="${escapeHtml(label)}: ${formatNumber(point.queries)} queries"><i class="timeline-bar height-pct-${height}"></i></span>`;
+        return `<button type="button" class="timeline-column" data-bucket="${point.start}" title="${escapeHtml(label)}: ${formatNumber(point.queries)} queries" aria-label="${escapeHtml(label)}: ${formatNumber(point.queries)} queries"><i class="timeline-bar height-pct-${height}"></i></button>`;
     }).join('');
     replaceHTMLIfChanged(chart, html || '<span class="empty-small">No traffic in this window</span>');
     chart.setAttribute('aria-label', `Query volume for ${range.label || 'the selected window'}`);
@@ -70,15 +151,92 @@ function renderTrafficSeries(series, range) {
     document.getElementById('trafficEndLabel').textContent = series.length ? formatBucketTime(series[series.length - 1].start, range.bucket_seconds) : 'Now';
 }
 
-function renderOutcomeSeries(series) {
+function renderOutcomeSeries(series, range) {
     const chart = document.getElementById('outcomeSeries');
     const maxQueries = Math.max(...series.map(point => point.queries || 0), 1);
     const html = series.map(point => {
         const title = `Answered ${point.forwarded || 0}, cached ${point.cached || 0}, blocked ${point.blocked || 0}, failed ${point.errors || 0}`;
-        const segment = (kind, count) => `<i class="outcome-segment ${kind} height-pct-${percentStep((count / maxQueries) * 100)}"></i>`;
-        return `<span class="timeline-column outcome-column" title="${title}">${segment('forwarded', point.forwarded || 0)}${segment('cached', point.cached || 0)}${segment('blocked', point.blocked || 0)}${segment('errors', point.errors || 0)}</span>`;
+        const denominator = dashboardOutcomeMode === 'percentage' ? Math.max(point.queries || 0, 1) : maxQueries;
+        const segment = (kind, count) => `<i class="outcome-segment ${kind} height-pct-${percentStep((count / denominator) * 100)}"></i>`;
+        const label = formatBucketTime(point.start, range.bucket_seconds);
+        return `<button type="button" class="timeline-column outcome-column" data-bucket="${point.start}" title="${escapeHtml(label)}: ${title}" aria-label="${escapeHtml(label)}: ${title}">${segment('forwarded', point.forwarded || 0)}${segment('cached', point.cached || 0)}${segment('blocked', point.blocked || 0)}${segment('errors', point.errors || 0)}</button>`;
     }).join('');
     replaceHTMLIfChanged(chart, html || '<span class="empty-small">No outcomes in this window</span>');
+    document.getElementById('outcomeInspect').textContent = dashboardOutcomeMode === 'percentage' ? 'Showing percentage composition' : 'Showing absolute counts';
+    document.querySelectorAll('[data-outcome-mode]').forEach(button => {
+        const active = button.dataset.outcomeMode === dashboardOutcomeMode;
+        button.classList.toggle('is-active', active);
+        button.setAttribute('aria-pressed', String(active));
+    });
+}
+
+function inspectDashboardBucket(bucket) {
+    const point = (currentDashboardStats?.series || []).find(candidate => candidate.start === Number(bucket));
+    if (!point) return;
+    const label = formatBucketTime(point.start, currentDashboardStats.range?.bucket_seconds || 0);
+    const message = `${label} · ${formatNumber(point.queries || 0)} queries · ${formatNumber(point.forwarded || 0)} answered · ${formatNumber(point.cached || 0)} cached · ${formatNumber(point.blocked || 0)} blocked · ${formatNumber(point.errors || 0)} failed`;
+    document.getElementById('trafficInspect').textContent = message;
+    document.getElementById('outcomeInspect').textContent = message;
+    document.querySelectorAll('[data-bucket]').forEach(column => column.classList.toggle('is-inspected', Number(column.dataset.bucket) === Number(bucket)));
+}
+
+function resetDashboardInspector() {
+    document.querySelectorAll('[data-bucket]').forEach(column => column.classList.remove('is-inspected'));
+    document.getElementById('trafficInspect').textContent = dashboardZoom ? 'Zoomed view · drag again to refine' : 'Hover or focus a bucket · drag across buckets to zoom';
+    document.getElementById('outcomeInspect').textContent = dashboardOutcomeMode === 'percentage' ? 'Showing percentage composition' : 'Showing absolute counts';
+}
+
+function dashboardBucketAtPointer(chart, clientX) {
+    const columns = Array.from(chart.querySelectorAll('[data-bucket]'));
+    if (!columns.length) return null;
+    const bounds = chart.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(0.999999, (clientX - bounds.left) / Math.max(bounds.width, 1)));
+    return Number(columns[Math.floor(ratio * columns.length)].dataset.bucket);
+}
+
+function markDashboardZoomSelection(start, end) {
+    const low = Math.min(start, end);
+    const high = Math.max(start, end);
+    document.querySelectorAll('[data-bucket]').forEach(column => {
+        const bucket = Number(column.dataset.bucket);
+        column.classList.toggle('is-selection-candidate', bucket >= low && bucket <= high);
+    });
+}
+
+function clearDashboardZoomSelection() {
+    document.querySelectorAll('[data-bucket]').forEach(column => column.classList.remove('is-selection-candidate'));
+}
+
+function startDashboardZoom(event) {
+    if (event.button !== 0) return;
+    const bucket = dashboardBucketAtPointer(event.currentTarget, event.clientX);
+    if (bucket === null) return;
+    event.preventDefault();
+    dashboardZoomDrag = { chart: event.currentTarget, pointerId: event.pointerId, start: bucket, end: bucket };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    markDashboardZoomSelection(bucket, bucket);
+}
+
+function moveDashboardZoom(event) {
+    if (!dashboardZoomDrag || dashboardZoomDrag.chart !== event.currentTarget) return;
+    const bucket = dashboardBucketAtPointer(event.currentTarget, event.clientX);
+    if (bucket === null) return;
+    dashboardZoomDrag.end = bucket;
+    markDashboardZoomSelection(dashboardZoomDrag.start, bucket);
+}
+
+function finishDashboardZoom(event) {
+    if (!dashboardZoomDrag || dashboardZoomDrag.chart !== event.currentTarget) return;
+    const { start, end } = dashboardZoomDrag;
+    dashboardZoomDrag = null;
+    clearDashboardZoomSelection();
+    if (start === end) {
+        inspectDashboardBucket(start);
+        return;
+    }
+    dashboardZoom = { range: currentDashboardStats?.range?.key, start: Math.min(start, end), end: Math.max(start, end) };
+    renderDashboardTimelines();
+    announce(`Dashboard timeline zoomed to ${visibleDashboardSeries().length} buckets`);
 }
 
 function renderNodeComparison(series, totals) {
@@ -160,6 +318,27 @@ function renderFilteringStatus(filtering) {
     const chip = document.getElementById('filteringChip');
     chip.className = `section-chip ${state === 'active' ? 'healthy' : 'alert-chip'}`;
     chip.textContent = state;
+    const resume = document.getElementById('filterResumeBtn');
+    resume.hidden = state !== 'paused' || configReadOnly;
+}
+
+async function resumeDashboardFiltering() {
+    const button = document.getElementById('filterResumeBtn');
+    button.disabled = true;
+    try {
+        await apiJSON('/api/filtering/pause', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ minutes: 0 })
+        });
+        announce('Filtering protection resumed');
+        await fetchStats();
+    } catch (error) {
+        console.error(error);
+        announce('Filtering could not be resumed');
+    } finally {
+        button.disabled = false;
+    }
 }
 
 function renderDashboardDegraded(stats) {
@@ -224,6 +403,39 @@ if (dashboardRangeElement) {
     });
     setInterval(() => refreshDashboardFreshness(false), 5000);
 }
+
+['trafficSeries', 'outcomeSeries'].forEach(id => {
+    const chart = document.getElementById(id);
+    if (!chart) return;
+    chart.addEventListener('pointerdown', startDashboardZoom);
+    chart.addEventListener('pointermove', moveDashboardZoom);
+    chart.addEventListener('pointerup', finishDashboardZoom);
+    chart.addEventListener('pointercancel', () => { dashboardZoomDrag = null; clearDashboardZoomSelection(); });
+    chart.addEventListener('mouseover', event => {
+        const column = event.target.closest('[data-bucket]');
+        if (column) inspectDashboardBucket(column.dataset.bucket);
+    });
+    chart.addEventListener('focusin', event => {
+        const column = event.target.closest('[data-bucket]');
+        if (column) inspectDashboardBucket(column.dataset.bucket);
+    });
+    chart.addEventListener('mouseleave', () => { if (!dashboardZoomDrag) resetDashboardInspector(); });
+});
+
+document.getElementById('dashboardZoomReset')?.addEventListener('click', () => {
+    dashboardZoom = null;
+    renderDashboardTimelines();
+    resetDashboardInspector();
+    announce('Dashboard timeline zoom reset');
+});
+
+document.querySelectorAll('[data-outcome-mode]').forEach(button => button.addEventListener('click', () => {
+    dashboardOutcomeMode = button.dataset.outcomeMode;
+    localStorage.setItem('resolix.dashboardOutcomeMode', dashboardOutcomeMode);
+    renderDashboardTimelines();
+}));
+
+document.getElementById('filterResumeBtn')?.addEventListener('click', () => { void resumeDashboardFiltering(); });
 function fetchNodeStatus() {
     return coalesceRequest('nodes', async () => {
         try {

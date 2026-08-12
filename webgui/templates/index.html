@@ -13,6 +13,7 @@
     <link rel="stylesheet" href="static/css/querylog.css">
     <link rel="stylesheet" href="static/css/control_plane.css">
     <link rel="stylesheet" href="static/css/operations.css">
+    <link rel="stylesheet" href="static/css/traffic_intensity.css">
     <link rel="stylesheet" href="static/css/querylog_workbench.css">
 </head>
 
@@ -143,14 +144,31 @@
                     <div class="stat-header">Query type breakdown</div>
                     <div id="typeBreakdown" class="type-breakdown"></div>
                 </div>
-                <div class="card skeleton-card"><div class="stat-header"><span>Upstream health</span><span class="section-chip healthy">Monitoring</span></div><ul class="top-list" id="upstreamHealth"><li class="top-item"><span>Loading…</span></li></ul></div>
-                <div class="card wide-card heatmap-card skeleton-card"><div class="stat-header"><span>Traffic intensity</span><span class="section-chip">Selected window</span></div><div class="heatmap-container" id="trafficHeatmap"></div></div>
+                <div class="card upstream-health-card skeleton-card"><div class="stat-header"><span>Upstream health</span><span class="section-chip healthy">Monitoring</span></div><ul class="top-list" id="upstreamHealth"><li class="top-item"><span>Loading…</span></li></ul></div>
+                <div class="card wide-card heatmap-card traffic-intensity-card skeleton-card" data-layout="strip">
+                    <div class="stat-header"><span>Traffic intensity</span><span id="trafficIntensityPeak" class="traffic-intensity-peak">Waiting for data</span></div>
+                    <div class="traffic-intensity-body">
+                        <div class="traffic-intensity-meta">
+                            <span id="trafficIntensityScale" class="section-chip">Loading buckets</span>
+                            <div class="traffic-intensity-legend" role="img" aria-label="Relative traffic intensity from low to high">
+                                <span>Low</span><i class="heatmap-level-1"></i><i class="heatmap-level-4"></i><i class="heatmap-level-7"></i><i class="heatmap-level-10"></i><span>High</span>
+                            </div>
+                        </div>
+                        <div id="trafficIntensityInspect" class="traffic-intensity-inspect" aria-live="polite">Focus or select a bucket to inspect traffic.</div>
+                        <div class="traffic-intensity-scroll">
+                            <div class="heatmap-container traffic-intensity-visual" id="trafficHeatmap" role="group" aria-label="Traffic intensity by time bucket" aria-describedby="trafficIntensityInspect"></div>
+                            <div id="trafficIntensityAxis" class="traffic-intensity-axis" aria-hidden="true" hidden></div>
+                        </div>
+                    </div>
+                </div>
             </div>
 
         </main>
     </div>
     <script nonce="{{.Nonce}}" src="static/js/shell.js"></script>
     <script nonce="{{.Nonce}}" src="static/js/index.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/traffic_intensity.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/traffic_intensity_ui.js"></script>
     <script nonce="{{.Nonce}}" src="static/js/dashboard.js"></script>
     <script nonce="{{.Nonce}}" src="static/js/querylog.js"></script>
     <script nonce="{{.Nonce}}" src="static/js/settings.js"></script>

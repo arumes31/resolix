@@ -5,6 +5,14 @@ let currentDashboardStats = null;
 let dashboardZoom = null;
 let dashboardZoomDrag = null;
 let dashboardOutcomeMode = localStorage.getItem('resolix.dashboardOutcomeMode') === 'percentage' ? 'percentage' : 'count';
+const trafficIntensityDashboard = globalThis.ResolixTrafficIntensityUI.create({
+    announce,
+    escapeHtml,
+    formatBucketDuration,
+    formatBucketTime,
+    formatNumber,
+    replaceHTMLIfChanged
+});
 
 function selectedDashboardRange() {
     return document.getElementById('dashboardRange')?.value || '24h';
@@ -56,7 +64,7 @@ function renderDashboardStats(stats) {
     renderDashboardTimelines();
     renderNodeComparison(stats.series || [], breakdowns.node_totals || {});
     renderTypeBreakdown(breakdowns.type_counts || {});
-    renderTrafficHeatmap(stats.series || [], range.bucket_seconds || 0);
+    trafficIntensityDashboard.render(stats.series || [], range.bucket_seconds || 0, range.key || selectedDashboardRange());
     renderUpstreamHealth(stats.upstream_health || {}, stats.upstream_health_history || {}, stats.upstream_node_names || {});
     renderFilteringStatus(stats.filtering || {});
     renderDashboardDegraded(stats);
@@ -273,17 +281,6 @@ function renderTypeBreakdown(typeCounts) {
     replaceHTMLIfChanged(element, html);
 }
 
-function renderTrafficHeatmap(series, bucketSeconds) {
-    const element = document.getElementById('trafficHeatmap');
-    const maxQueries = Math.max(...series.map(point => point.queries || 0), 1);
-    const html = series.map(point => {
-        const level = point.queries === 0 ? 0 : Math.max(1, Math.ceil((point.queries / maxQueries) * 10));
-        const label = formatBucketTime(point.start, bucketSeconds);
-        return `<div class="heatmap-box heatmap-level-${level}" title="${escapeHtml(label)}: ${formatNumber(point.queries)} queries">${escapeHtml(shortBucketLabel(point.start, bucketSeconds))}</div>`;
-    }).join('');
-    replaceHTMLIfChanged(element, html || '<div class="empty-small">No data</div>');
-}
-
 function renderUpstreamHealth(health, history, nodeNames) {
     const element = document.getElementById('upstreamHealth');
     const nodes = Object.entries(health);
@@ -438,13 +435,6 @@ function formatBucketTime(timestamp, bucketSeconds) {
     if (bucketSeconds >= 86400) return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
     if (bucketSeconds >= 21600) return date.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit' });
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
-
-function shortBucketLabel(timestamp, bucketSeconds) {
-    const date = new Date(timestamp * 1000);
-    if (bucketSeconds >= 86400) return date.toLocaleDateString([], { day: '2-digit' });
-    if (bucketSeconds >= 21600) return date.toLocaleDateString([], { weekday: 'short' }).slice(0, 2);
-    return date.toLocaleTimeString([], { hour: '2-digit', hour12: false });
 }
 
 function refreshDashboardFreshness(failed) {

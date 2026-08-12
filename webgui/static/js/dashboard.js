@@ -1,4 +1,5 @@
 const dashboardRanges = new Set(['15m', '1h', '6h', '24h', '7d', '30d']);
+const dashboardBaseTitle = document.title || 'Resolix';
 let dashboardGeneratedAt = 0;
 let currentDashboardStats = null;
 let dashboardZoom = null;
@@ -23,6 +24,7 @@ function fetchStats() {
         } catch (error) {
             console.error(error);
             refreshDashboardFreshness(true);
+            updateDashboardAttention(currentDashboardStats, true);
             setPollingStatus(false);
         }
     });
@@ -58,6 +60,7 @@ function renderDashboardStats(stats) {
     renderUpstreamHealth(stats.upstream_health || {}, stats.upstream_health_history || {});
     renderFilteringStatus(stats.filtering || {});
     renderDashboardDegraded(stats);
+    updateDashboardAttention(stats, false);
 
     dashboardGeneratedAt = Date.parse(stats.generated_at || '') || Date.now();
     refreshDashboardFreshness(false);
@@ -354,6 +357,69 @@ function renderDashboardDegraded(stats) {
     document.getElementById('dashboardDegradedMessage').textContent = messages.join(' ');
 }
 
+function dashboardWarningCount(stats, refreshFailed = false) {
+    const errors = new Set((stats?.errors || []).filter(Boolean));
+    const runtime = stats?.runtime || {};
+    const totalNodes = Math.max(0, Number(runtime.total_nodes) || 0);
+    const onlineNodes = Math.max(0, Number(runtime.online_nodes) || 0);
+    const offlineNodes = Math.max(0, totalNodes - onlineNodes);
+    const skewedNodes = new Set((runtime.skewed_nodes || []).filter(Boolean)).size;
+    return errors.size + offlineNodes + skewedNodes + (refreshFailed ? 1 : 0);
+}
+
+function updateDashboardAttention(stats, refreshFailed = false) {
+    const warningCount = dashboardWarningCount(stats, refreshFailed);
+    document.title = warningCount ? `(${warningCount}) ${dashboardBaseTitle}` : dashboardBaseTitle;
+
+    const favicon = document.getElementById('appFavicon');
+    if (!favicon) return;
+    const degraded = Boolean(stats?.degraded) || warningCount > 0;
+    const nextHref = degraded ? favicon.dataset.alertHref : favicon.dataset.defaultHref;
+    if (nextHref && favicon.getAttribute('href') !== nextHref) favicon.setAttribute('href', nextHref);
+}
+
+function resetDashboardSyncAction(button, label = 'Sync all') {
+    button.dataset.confirmed = 'false';
+    button.classList.remove('is-confirming', 'is-success');
+    button.querySelector('span').textContent = label;
+    button.setAttribute('aria-label', 'Synchronize configuration to all nodes');
+}
+
+async function syncAllDashboardNodes() {
+    const button = document.getElementById('dashboardSyncAllBtn');
+    if (!button) return;
+    if (button.dataset.confirmed !== 'true') {
+        button.dataset.confirmed = 'true';
+        button.classList.add('is-confirming');
+        button.querySelector('span').textContent = 'Confirm sync';
+        button.setAttribute('aria-label', 'Confirm synchronizing configuration to all nodes');
+        announce('Press confirm sync to synchronize configuration to all nodes');
+        setTimeout(() => {
+            if (button.isConnected && !button.disabled && button.dataset.confirmed === 'true') resetDashboardSyncAction(button);
+        }, 6000);
+        return;
+    }
+
+    button.disabled = true;
+    button.querySelector('span').textContent = 'Scheduling';
+    try {
+        await apiJSON('/api/config/sync-now', { method: 'POST' });
+        button.classList.remove('is-confirming');
+        button.classList.add('is-success');
+        button.querySelector('span').textContent = 'Scheduled';
+        announce('Configuration synchronization scheduled for all nodes');
+        setTimeout(() => {
+            if (!button.isConnected) return;
+            button.disabled = false;
+            resetDashboardSyncAction(button);
+        }, 1800);
+    } catch (error) {
+        button.disabled = false;
+        resetDashboardSyncAction(button);
+        showSettingsNotice(error.message || 'Configuration synchronization could not be scheduled', true);
+    }
+}
+
 function formatBucketDuration(seconds) {
     if (seconds >= 86400) return `${seconds / 86400}d buckets`;
     if (seconds >= 3600) return `${seconds / 3600}h buckets`;
@@ -436,6 +502,7 @@ document.querySelectorAll('[data-outcome-mode]').forEach(button => button.addEve
 }));
 
 document.getElementById('filterResumeBtn')?.addEventListener('click', () => { void resumeDashboardFiltering(); });
+document.getElementById('dashboardSyncAllBtn')?.addEventListener('click', () => { void syncAllDashboardNodes(); });
 function fetchNodeStatus() {
     return coalesceRequest('nodes', async () => {
         try {

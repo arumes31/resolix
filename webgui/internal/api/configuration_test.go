@@ -75,9 +75,20 @@ func TestDedicatedPagesAndRootRejectsUnknownPaths(t *testing.T) {
 			}
 		})
 	}
+	recorder = httptest.NewRecorder()
+	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `id="dashboardSyncAllBtn"`) {
+		t.Fatalf("controller dashboard is missing sync-all action: %d %q", recorder.Code, recorder.Body.String())
+	}
 
 	agent := testServer(&config.Config{BaseURL: "/", Mode: config.ModeAgent, MaxRequestSize: 1 << 20})
 	agent.tmpl = tmpl
+	recorder = httptest.NewRecorder()
+	agent.SetupMux().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), `id="dashboardSyncAllBtn"`) {
+		t.Fatalf("agent dashboard sync-all visibility = %d %q", recorder.Code, recorder.Body.String())
+	}
+
 	recorder = httptest.NewRecorder()
 	agent.SetupMux().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/cluster", nil))
 	if recorder.Code != http.StatusNotFound {
@@ -193,6 +204,8 @@ func TestDashboardQuickWinMarkers(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, marker := range []string{
+		`id="appFavicon"`,
+		`data-alert-href="static/favicon-alert.svg"`,
 		`id="runtimeVersion"`,
 		`id="runtimeRole"`,
 		`id="clusterNodeCount"`,
@@ -201,6 +214,7 @@ func TestDashboardQuickWinMarkers(t *testing.T) {
 		`id="dashboardZoomReset"`,
 		`data-outcome-mode="percentage"`,
 		`id="filterResumeBtn"`,
+		`id="dashboardSyncAllBtn"`,
 	} {
 		if !bytes.Contains(templateContent, []byte(marker)) {
 			t.Fatalf("dashboard template is missing quick-win marker %q", marker)
@@ -217,10 +231,21 @@ func TestDashboardQuickWinMarkers(t *testing.T) {
 		"inspectDashboardBucket",
 		"startDashboardZoom",
 		"resumeDashboardFiltering",
+		"dashboardWarningCount",
+		"updateDashboardAttention",
+		"syncAllDashboardNodes",
 	} {
 		if !bytes.Contains(scriptContent, []byte(marker)) {
 			t.Fatalf("dashboard script is missing quick-win behavior %q", marker)
 		}
+	}
+
+	alertFavicon, err := os.ReadFile("../../static/favicon-alert.svg") // #nosec G304 -- fixed test fixture
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(alertFavicon, []byte(`<svg`)) || !bytes.Contains(alertFavicon, []byte(`aria-label="System warning"`)) {
+		t.Fatal("alert favicon is missing its SVG or warning marker")
 	}
 }
 

@@ -7,7 +7,8 @@
     <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; script-src 'nonce-{{.Nonce}}'; style-src 'self' 'nonce-{{.Nonce}}'; font-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';">
     <title>Resolix</title>
-    <link rel="icon" type="image/svg+xml" href="static/favicon.svg">
+    <link id="appFavicon" rel="icon" type="image/svg+xml" href="static/favicon.svg"
+        data-default-href="static/favicon.svg" data-alert-href="static/favicon-alert.svg">
     <link rel="stylesheet" href="static/css/style.css">
     <link rel="stylesheet" href="static/css/querylog.css">
     <link rel="stylesheet" href="static/css/control_plane.css">
@@ -77,6 +78,12 @@
             <div class="topbar-actions">
                 <span id="runtimeRole" class="runtime-pill">{{if eq .Mode "controller"}}Controller{{else}}Agent{{end}}</span>
                 <span id="versionSkew" class="runtime-pill runtime-pill-warning" hidden>Version skew</span>
+                {{if eq .Mode "controller"}}
+                <button id="dashboardSyncAllBtn" type="button" class="dashboard-sync-action" data-confirmed="false" aria-label="Synchronize configuration to all nodes">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.65 6.35A7.95 7.95 0 0 0 12 4a8 8 0 0 0-7.75 6H2l3 3 3-3H6.31A6 6 0 0 1 12 6c1.66 0 3.14.69 4.22 1.78L14 10h8V2l-4.35 4.35ZM16 14h1.69A6 6 0 0 1 12 18a5.98 5.98 0 0 1-4.22-1.78L10 14H2v8l4.35-4.35A7.95 7.95 0 0 0 12 20a8 8 0 0 0 7.75-6H22l-3-3-3 3Z"/></svg>
+                    <span>Sync all</span>
+                </button>
+                {{end}}
                 <label class="dashboard-range-control" for="dashboardRange">
                     <span>Window</span>
                     <select id="dashboardRange" aria-label="Dashboard time range">

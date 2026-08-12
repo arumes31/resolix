@@ -326,6 +326,32 @@ body.app-page textarea {
 .runtime-pill-warning { color: #f5b4b4; border-color: rgba(242, 105, 105, 0.3); background: rgba(242, 105, 105, 0.08); }
 .runtime-pill[hidden] { display: none; }
 
+.dashboard-sync-action {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 9px;
+  border: 1px solid rgba(85, 214, 190, 0.3);
+  border-radius: 5px;
+  color: #9de6d8;
+  background: rgba(41, 191, 164, 0.08);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.58rem;
+  font-weight: 650;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: border-color 150ms ease, color 150ms ease, background 150ms ease;
+}
+
+.dashboard-sync-action svg { width: 13px; height: 13px; fill: currentColor; }
+.dashboard-sync-action:hover { color: #d3fff7; border-color: rgba(85, 214, 190, 0.58); }
+.dashboard-sync-action:focus-visible { outline: 2px solid #75a7ff; outline-offset: 2px; }
+.dashboard-sync-action.is-confirming { color: #ffd2ad; border-color: rgba(255, 158, 87, 0.48); background: rgba(255, 158, 87, 0.12); }
+.dashboard-sync-action.is-success { color: #b9f7cd; border-color: rgba(78, 218, 124, 0.42); background: rgba(78, 218, 124, 0.1); }
+.dashboard-sync-action:disabled { cursor: wait; opacity: 0.72; }
+
 .page-kicker {
   color: #6f89aa;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;

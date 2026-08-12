@@ -48,6 +48,8 @@ func TestDedicatedPagesAndRootRejectsUnknownPaths(t *testing.T) {
 		!strings.Contains(body, `id="filterTestType"`) ||
 		!strings.Contains(body, `id="dnsSettingsForm"`) ||
 		!strings.Contains(body, `id="syncAllNodesBtn"`) ||
+		!strings.Contains(body, `id="configSyncProgress"`) ||
+		!strings.Contains(body, `id="configEditBar"`) ||
 		!strings.Contains(body, `id="rewriteDeleteDialog"`) {
 		t.Fatalf("config response = %d %q", recorder.Code, recorder.Body.String())
 	}
@@ -83,6 +85,14 @@ func TestDedicatedPagesAndRootRejectsUnknownPaths(t *testing.T) {
 
 	agent := testServer(&config.Config{BaseURL: "/", Mode: config.ModeAgent, MaxRequestSize: 1 << 20})
 	agent.tmpl = tmpl
+	recorder = httptest.NewRecorder()
+	agent.SetupMux().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/config", nil))
+	if recorder.Code != http.StatusOK ||
+		strings.Contains(recorder.Body.String(), `id="configSyncProgress"`) ||
+		strings.Contains(recorder.Body.String(), `id="configEditBar"`) {
+		t.Fatalf("agent config edit controls = %d %q", recorder.Code, recorder.Body.String())
+	}
+
 	recorder = httptest.NewRecorder()
 	agent.SetupMux().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
 	if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), `id="dashboardSyncAllBtn"`) {
@@ -246,6 +256,49 @@ func TestDashboardQuickWinMarkers(t *testing.T) {
 	}
 	if !bytes.Contains(alertFavicon, []byte(`<svg`)) || !bytes.Contains(alertFavicon, []byte(`aria-label="System warning"`)) {
 		t.Fatal("alert favicon is missing its SVG or warning marker")
+	}
+}
+
+func TestConfigurationQuickWinMarkers(t *testing.T) {
+	templateContent, err := os.ReadFile("../../templates/config.html") // #nosec G304 -- fixed test fixture
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{
+		`id="configSyncProgress"`,
+		`id="configSyncProgressMeter"`,
+		`id="configEditBar"`,
+		`id="configRevertBtn"`,
+		`id="configSaveBtn"`,
+	} {
+		if !bytes.Contains(templateContent, []byte(marker)) {
+			t.Fatalf("configuration template is missing quick-win marker %q", marker)
+		}
+	}
+
+	var scripts bytes.Buffer
+	for _, path := range []string{
+		"../../static/js/config.js",
+		"../../static/js/config_upstreams.js",
+		"../../static/js/config_clients.js",
+		"../../static/js/config_bootstrap.js",
+	} {
+		content, readErr := os.ReadFile(path) // #nosec G304 -- fixed test fixtures listed above
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		scripts.Write(content)
+	}
+	for _, marker := range []string{
+		"updateConfigDirtyUI",
+		"restoreCleanForm",
+		"upstream-protocol-badge",
+		"configSyncState",
+		"startConfigSyncMonitor",
+	} {
+		if !bytes.Contains(scripts.Bytes(), []byte(marker)) {
+			t.Fatalf("configuration scripts are missing quick-win behavior %q", marker)
+		}
 	}
 }
 

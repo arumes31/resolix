@@ -46,10 +46,11 @@ function renderUpstreamRuntime(bootstrapStatus) {
 		const circuit = runtime.circuit_open_until && !runtime.circuit_open_until.startsWith('0001-') ? `Circuit open until ${new Date(runtime.circuit_open_until).toLocaleString()}` : 'Circuit closed';
 		const streaks = `${runtime.consecutive_successes || 0} success / ${runtime.consecutive_failures || 0} failure streak`;
 		const tls = runtime.tls_issuer ? `TLS issuer ${runtime.tls_issuer}${runtime.tls_expires_at && !runtime.tls_expires_at.startsWith('0001-') ? ` · expires ${new Date(runtime.tls_expires_at).toLocaleString()}` : ''}` : '';
-		return `<div class="settings-list-row"><div class="settings-list-main"><div class="settings-list-title">${escapeHtml(detail.spec)}</div><div class="settings-list-meta">${escapeHtml(detail.normalized_spec)} · ${escapeHtml(health)} · timeout ${escapeHtml(detail.timeout_ms)} ms · weight ${escapeHtml(runtime.weight || detail.weight)}${runtime.resolved_endpoint ? ` · endpoint ${escapeHtml(runtime.resolved_endpoint)}` : ''}</div><div class="settings-list-meta">${escapeHtml(latency)} · ${escapeHtml(streaks)} · ${escapeHtml(circuit)}${connection ? ` · ${escapeHtml(connection)}` : ''}${tls ? ` · ${escapeHtml(tls)}` : ''}</div></div><div class="row-actions"><button type="button" class="mini-action upstream-test" data-spec="${escapeHtml(detail.spec)}">Test</button></div></div>`;
+		const protocol = { udp: 'UDP', tcp: 'TCP', tls: 'DoT', https: 'DoH' }[detail.scheme] || String(detail.scheme || 'DNS').toUpperCase();
+		return `<div class="settings-list-row"><div class="settings-list-main"><div class="settings-list-title upstream-title-line"><span>${escapeHtml(detail.spec)}</span><span class="upstream-protocol-badge" data-protocol="${escapeHtml(detail.scheme)}">${escapeHtml(protocol)}</span></div><div class="settings-list-meta">${escapeHtml(detail.normalized_spec)} · ${escapeHtml(health)} · timeout ${escapeHtml(detail.timeout_ms)} ms · weight ${escapeHtml(runtime.weight || detail.weight)}${runtime.resolved_endpoint ? ` · endpoint ${escapeHtml(runtime.resolved_endpoint)}` : ''}</div><div class="settings-list-meta">${escapeHtml(latency)} · ${escapeHtml(streaks)} · ${escapeHtml(circuit)}${connection ? ` · ${escapeHtml(connection)}` : ''}${tls ? ` · ${escapeHtml(tls)}` : ''}</div></div><div class="row-actions"><button type="button" class="mini-action upstream-test" data-spec="${escapeHtml(detail.spec)}">Test</button></div></div>`;
 	});
 	if (bootstrapStatus.length) {
-		rows.push(...bootstrapStatus.map(entry => `<div class="settings-list-row"><div class="settings-list-main"><div class="settings-list-title">Bootstrap cache · ${escapeHtml(entry.hostname)}</div><div class="settings-list-meta">${escapeHtml((entry.addresses || []).join(', '))} · ${entry.stale ? 'stale' : `expires ${new Date(entry.expires_at).toLocaleString()}`}</div></div></div>`));
+		rows.push(...bootstrapStatus.map(entry => `<div class="settings-list-row"><div class="settings-list-main"><div class="settings-list-title upstream-title-line"><span>Bootstrap cache · ${escapeHtml(entry.hostname)}</span><span class="upstream-protocol-badge" data-protocol="bootstrap">Bootstrap</span></div><div class="settings-list-meta">${escapeHtml((entry.addresses || []).join(', '))} · ${entry.stale ? 'stale' : `expires ${new Date(entry.expires_at).toLocaleString()}`}</div></div></div>`));
 	}
 	document.getElementById('upstreamRuntime').innerHTML = rows.join('') || emptyState('No upstream runtime observations yet');
 }
@@ -160,4 +161,3 @@ async function deleteRoute(pattern) {
     const routes = { ...state.routes }; delete routes[pattern];
 	if (await persistRoutes(routes)) notice('DNS route deleted');
 }
-

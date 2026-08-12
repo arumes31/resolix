@@ -9,7 +9,10 @@ async function activatePanel(name, updateHash = true) {
 	if (validName) loader = loaders[name];
 	else name = 'upstreams';
 	const currentPanel = document.querySelector('.settings-panel.active');
-	if (currentPanel?.dataset.panel !== name && !confirmDiscardChanges(currentPanel)) return false;
+	if (currentPanel?.dataset.panel !== name && hasUnsavedChanges(currentPanel)) {
+		if (!confirmDiscardChanges(currentPanel)) return false;
+		currentPanel.querySelectorAll('form[data-dirty="true"]').forEach(form => restoreCleanForm(form, false));
+	}
 	if (currentPanel?.dataset.panel === name && updateHash) return true;
     document.querySelectorAll('.settings-tab').forEach(tab => tab.classList.toggle('active', tab.dataset.settingsTab === name));
     document.querySelectorAll('.settings-panel').forEach(panel => {
@@ -18,6 +21,7 @@ async function activatePanel(name, updateHash = true) {
 	if (updateHash) history.pushState({ panel: name }, '', `#${name}`);
 	else if (!validName) history.replaceState({ panel: name }, '', `#${name}`);
 	try { await loader(); } catch (error) { notice(error.message, true); }
+	updateConfigDirtyUI();
 	return true;
 }
 
@@ -126,6 +130,14 @@ document.getElementById('importSubscriptionsFile').addEventListener('change', ev
 	event.target.value = '';
 });
 document.getElementById('refreshSettingsBtn').addEventListener('click', () => Promise.all([loadStatus(), activatePanel((location.hash || '#upstreams').slice(1), false)]).then(() => notice('Configuration refreshed')).catch(error => notice(error.message, true)));
+document.getElementById('configSaveBtn')?.addEventListener('click', () => {
+	const form = document.getElementById(document.getElementById('configEditBar').dataset.formId);
+	if (form) form.requestSubmit();
+});
+document.getElementById('configRevertBtn')?.addEventListener('click', () => {
+	const form = document.getElementById(document.getElementById('configEditBar').dataset.formId);
+	if (form) restoreCleanForm(form);
+});
 
 document.querySelectorAll('.settings-panel form.controller-edit').forEach(form => {
 	markFormClean(form);
@@ -148,4 +160,3 @@ window.addEventListener('hashchange', activatePanelFromLocation);
 
 resetRewriteForm(); resetSubscriptionForm(false); resetSubscriptionForm(true); resetClientForm();
 loadStatus().then(() => activatePanel((location.hash || '#upstreams').slice(1), false)).catch(error => notice(error.message, true));
-

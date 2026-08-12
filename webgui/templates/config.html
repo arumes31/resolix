@@ -81,6 +81,16 @@
             <span id="configRevision" class="revision-label">revision —</span>
         </div>
         <div id="settingsNotice" class="settings-notice is-hidden" role="status" aria-live="polite"></div>
+		{{if eq .Mode "controller"}}
+		<section id="configSyncProgress" class="config-sync-progress" aria-labelledby="configSyncProgressTitle" hidden>
+			<div class="config-sync-progress-heading">
+				<div><span class="config-sync-kicker">Cluster rollout</span><strong id="configSyncProgressTitle">Applying configuration</strong></div>
+				<span id="configSyncProgressCount" class="state-pill">0 / 0 current</span>
+			</div>
+			<progress id="configSyncProgressMeter" max="1" value="0">0%</progress>
+			<div id="configSyncProgressNodes" class="config-sync-nodes"></div>
+		</section>
+		{{end}}
 
         <nav class="settings-tabs top-settings-menu config-tabs" aria-label="Configuration sections">
             <button type="button" class="settings-tab active" data-settings-tab="upstreams">Upstreams</button>
@@ -354,6 +364,15 @@
                 <div id="clusterSummary" class="runtime-grid"></div>
             </section>
         </div>
+		{{if eq .Mode "controller"}}
+		<aside id="configEditBar" class="config-edit-bar" aria-live="polite" hidden>
+			<div class="config-edit-summary"><span>Unsaved draft</span><strong id="configEditSection">Configuration changes</strong></div>
+			<div class="config-edit-actions">
+				<button id="configRevertBtn" type="button" class="btn btn-secondary">Revert</button>
+				<button id="configSaveBtn" type="button" class="btn btn-primary">Save changes</button>
+			</div>
+		</aside>
+		{{end}}
         </main>
     </div>
     <dialog id="rewriteDeleteDialog" class="confirm-dialog" aria-labelledby="rewriteDeleteTitle" aria-describedby="rewriteDeleteMessage">

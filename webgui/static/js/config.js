@@ -14,11 +14,16 @@ const state = {
 	rewrites: [],
 	clients: [],
 	dnsSettings: null,
+    configSyncTimer: null,
+    configSyncTarget: '',
+    configSyncNode: '',
+    configSyncStartedAt: 0,
     editingRewrite: null,
     pendingRewriteDelete: null,
     rewriteDeleteTrigger: null,
     editingClient: null
 };
+const configFormSnapshots = new WeakMap();
 const tailscaleRewriteCIDRs = ['100.64.0.0/10', 'fd7a:115c:a1e0::/48'];
 
 function apiPath(path) { return apiBase + path; }
@@ -200,6 +205,7 @@ async function saveDNSSettings(event) {
 
 async function loadStatus() {
     const data = await apiJSON('/api/config/status');
+    const previousRevision = state.revision;
     state.mode = data.mode;
     state.revision = data.revision || '';
     setEditable(Boolean(data.editable));
@@ -223,15 +229,12 @@ async function loadStatus() {
         `<div class="runtime-item"><span>${escapeHtml(formatRuntimeKey(key))}</span><strong>${escapeHtml(runtimeValue(value))}</strong></div>`
     ).join('');
 	renderDNSSettings(data.dns_settings || {});
+	if (data.editable && previousRevision && state.revision && previousRevision !== state.revision) {
+		startConfigSyncMonitor(state.revision);
+	}
 }
 
-async function loadCluster() {
-    await loadStatus();
-    let nodes = [];
-    if (state.mode === 'controller') {
-        const data = await apiJSON('/api/nodes');
-        nodes = data.nodes || [];
-    }
+function renderClusterSummary(nodes) {
     const summary = [
         ['Role', state.mode],
         ['Authority', state.editable ? 'Controller-owned' : 'Mirrored / read only'],
@@ -255,7 +258,85 @@ async function loadCluster() {
     ).join('');
 }
 
+function configSyncState(node, targetRevision) {
+	if (!node.online) return { key: 'offline', label: 'Offline' };
+	if (node.config_revision === targetRevision) return { key: 'current', label: 'Current' };
+	if (node.config_apply_error || node.last_config_sync_error) return { key: 'failed', label: 'Failed' };
+	if (node.desired_config_revision === targetRevision) return { key: 'applying', label: 'Applying' };
+	return { key: 'scheduled', label: 'Scheduled' };
+}
+
+function renderConfigSyncProgress(nodes, targetRevision, requestedNode = '') {
+	const panel = document.getElementById('configSyncProgress');
+	if (!panel) return false;
+	const selected = requestedNode
+		? nodes.filter(node => node.id === requestedNode || node.name === requestedNode)
+		: nodes;
+	const statuses = selected.map(node => ({ node, status: configSyncState(node, targetRevision) }));
+	const current = statuses.filter(item => item.status.key === 'current').length;
+	const failed = statuses.filter(item => item.status.key === 'failed').length;
+	const offline = statuses.filter(item => item.status.key === 'offline').length;
+	const total = statuses.length;
+	panel.hidden = false;
+	document.getElementById('configSyncProgressCount').textContent = `${current} / ${total} current`;
+	const meter = document.getElementById('configSyncProgressMeter');
+	meter.max = Math.max(1, total);
+	meter.value = current;
+	const title = total === 0
+		? 'No agent nodes reported'
+		: failed
+		? `${failed} node${failed === 1 ? '' : 's'} failed to apply`
+		: offline
+			? `${offline} node${offline === 1 ? '' : 's'} offline during rollout`
+			: current === total && total > 0 ? 'Configuration rollout complete' : 'Applying configuration';
+	document.getElementById('configSyncProgressTitle').textContent = title;
+	document.getElementById('configSyncProgressNodes').innerHTML = statuses.map(({ node, status }) => `
+		<div class="config-sync-node" title="Target revision ${escapeHtml(targetRevision.slice(0, 12))}">
+			<span>${escapeHtml(node.name || node.id || 'Unnamed node')}</span>
+			<span class="config-sync-state is-${status.key}">${status.label}</span>
+		</div>`).join('') || '<div class="config-sync-node"><span>No agent nodes reported</span><span class="config-sync-state">Waiting</span></div>';
+	return statuses.some(item => ['scheduled', 'applying', 'offline'].includes(item.status.key));
+}
+
+async function refreshConfigSyncProgress() {
+	if (!state.configSyncTarget || state.mode !== 'controller') return;
+	try {
+		const data = await apiJSON('/api/nodes');
+		const nodes = data.nodes || [];
+		const active = renderConfigSyncProgress(nodes, state.configSyncTarget, state.configSyncNode);
+		if (document.querySelector('.settings-panel.active')?.dataset.panel === 'cluster') renderClusterSummary(nodes);
+		if (active && Date.now() - state.configSyncStartedAt < 60000) {
+			state.configSyncTimer = setTimeout(refreshConfigSyncProgress, 2000);
+		} else {
+			state.configSyncTimer = null;
+		}
+	} catch (error) {
+		state.configSyncTimer = null;
+		notice(`Cluster rollout status unavailable: ${error.message}`, true);
+	}
+}
+
+function startConfigSyncMonitor(targetRevision, node = '') {
+	if (!targetRevision || state.mode !== 'controller' || !document.getElementById('configSyncProgress')) return;
+	if (state.configSyncTimer) clearTimeout(state.configSyncTimer);
+	state.configSyncTarget = targetRevision;
+	state.configSyncNode = node;
+	state.configSyncStartedAt = Date.now();
+	void refreshConfigSyncProgress();
+}
+
+async function loadCluster() {
+    await loadStatus();
+    let nodes = [];
+    if (state.mode === 'controller') {
+        const data = await apiJSON('/api/nodes');
+        nodes = data.nodes || [];
+    }
+	renderClusterSummary(nodes);
+}
+
 async function requestConfigSync(node = '') {
 	await apiJSON(`/api/config/sync-now${node ? `?node=${encodeURIComponent(node)}` : ''}`, { method: 'POST' });
 	notice(node ? 'Agent synchronization scheduled' : 'Synchronization scheduled for all agents');
+	startConfigSyncMonitor(state.revision, node);
 }

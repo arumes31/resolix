@@ -90,15 +90,61 @@ function formFingerprint(form) {
 	}));
 }
 
+function captureFormState(form) {
+	return [...form.elements].flatMap(control => {
+		const key = control.id || control.name;
+		if (!key || ['button', 'submit', 'reset', 'file'].includes(control.type)) return [];
+		return [{ key, checked: Boolean(control.checked), value: control.value }];
+	});
+}
+
+function updateConfigDirtyUI() {
+	document.querySelectorAll('.settings-tab').forEach(tab => {
+		const panel = document.querySelector(`.settings-panel[data-panel="${tab.dataset.settingsTab}"]`);
+		const dirtyCount = panel ? panel.querySelectorAll('form[data-dirty="true"]').length : 0;
+		if (!tab.dataset.baseLabel) tab.dataset.baseLabel = tab.textContent.trim();
+		tab.dataset.dirtyCount = String(dirtyCount);
+		tab.setAttribute('aria-label', dirtyCount ? `${tab.dataset.baseLabel}, unsaved changes` : tab.dataset.baseLabel);
+	});
+
+	const bar = document.getElementById('configEditBar');
+	if (!bar) return;
+	const panel = document.querySelector('.settings-panel.active');
+	const form = panel?.querySelector('form.controller-edit[data-dirty="true"]');
+	bar.hidden = !form;
+	bar.dataset.formId = form?.id || '';
+	if (form) document.getElementById('configEditSection').textContent = panel.querySelector('h2')?.textContent?.trim() || 'Configuration changes';
+}
+
 function markFormClean(form) {
 	if (!form) return;
+	configFormSnapshots.set(form, captureFormState(form));
 	form.dataset.cleanFingerprint = formFingerprint(form);
 	form.dataset.dirty = 'false';
+	updateConfigDirtyUI();
 }
 
 function refreshFormDirty(form) {
 	if (!form) return;
 	form.dataset.dirty = String(formFingerprint(form) !== (form.dataset.cleanFingerprint || ''));
+	updateConfigDirtyUI();
+}
+
+function restoreCleanForm(form, showNotice = true) {
+	const snapshot = configFormSnapshots.get(form);
+	if (!snapshot) return;
+	const controls = new Map([...form.elements].map(control => [control.id || control.name, control]));
+	snapshot.forEach(item => {
+		const control = controls.get(item.key);
+		if (!control) return;
+		if (control.type === 'checkbox' || control.type === 'radio') control.checked = item.checked;
+		else control.value = item.value;
+	});
+	if (form.id === 'clientForm') setClientPolicyState();
+	if (form.id === 'rewriteForm') { rewriteValueState(); rewriteScopeState(); }
+	if (form.id === 'dnsSettingsForm') updateDNSBlockingFields();
+	markFormClean(form);
+	if (showNotice) notice('Unsaved configuration changes reverted');
 }
 
 function hasUnsavedChanges(panel = null) {
@@ -111,4 +157,3 @@ function confirmDiscardChanges(panel) {
 	const title = panel.querySelector('h2')?.textContent?.trim() || 'this panel';
 	return window.confirm(`Discard unsaved changes in ${title}?`);
 }
-

@@ -1,7 +1,7 @@
 // Package dnsserver implements the in-process DNS server that replaces
 // dnsmasq. It serves UDP and TCP listeners and answers queries through an
-// ordered pipeline: refuse-ANY/AAAA-disable → typed rewrites → private PTR →
-// safe-search → filter → cache → client upstreams →
+// ordered pipeline: refuse-ANY/AAAA-disable → typed rewrites → MagicDNS →
+// private PTR → safe-search → filter → cache → client upstreams →
 // domain route → global pool → bogus-NXDOMAIN → cache store → respond.
 // Every answered query is emitted as a models.QueryEvent into the existing
 // Store/SSE pipeline.
@@ -20,6 +20,7 @@ import (
 	"github.com/arumes31/resolix/webgui/internal/clients"
 	"github.com/arumes31/resolix/webgui/internal/dnsroutes"
 	"github.com/arumes31/resolix/webgui/internal/filter"
+	"github.com/arumes31/resolix/webgui/internal/magicdns"
 	"github.com/arumes31/resolix/webgui/internal/models"
 	"github.com/arumes31/resolix/webgui/internal/policy"
 	"github.com/arumes31/resolix/webgui/internal/resolver"
@@ -80,6 +81,10 @@ type Config struct {
 	BlockedResponseTTL uint32
 	// Rewrites is the typed-rewrite store (nil = fall back to StaticHosts).
 	Rewrites *rewrites.Store
+	// MagicDNS is the read-only, controller-synchronized Tailscale record store.
+	MagicDNS *magicdns.Store
+	// MagicDNSTTL is applied to generated MagicDNS A and AAAA answers.
+	MagicDNSTTL uint32
 	// Policy holds safe-search / bogus-NXDOMAIN / AAAA / ANY policy (nil = off).
 	Policy *policy.Policy
 	// Pool is the upstream pool (nil = legacy strict-order Upstreams path).

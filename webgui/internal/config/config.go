@@ -81,6 +81,13 @@ const (
 	DefaultDoHPath = "/dns-query"
 	// DefaultDoTPort is the default DNS-over-TLS listen port.
 	DefaultDoTPort = 853
+	// DefaultMagicDNSStateFile persists the last successful Tailscale inventory.
+	DefaultMagicDNSStateFile = "magicdns.json"
+	// DefaultMagicDNSSyncInterval is intentionally infrequent to avoid needless
+	// Tailscale API traffic while still reconciling routine device changes.
+	DefaultMagicDNSSyncInterval = 4 * time.Hour
+	// DefaultMagicDNSTTL is the TTL used for generated A and AAAA answers.
+	DefaultMagicDNSTTL = 60
 
 	// minCacheTTLDefault/maxCacheTTLDefault are the default cache TTL bounds
 	// in seconds (dnsmasq local-ttl=60 / max-ttl=600).
@@ -321,6 +328,17 @@ type Config struct {
 	SyncUpstreamHealthInterval time.Duration
 	// NodeOfflineThreshold is the time after which a node is considered offline.
 	NodeOfflineThreshold time.Duration
+
+	// MagicDNSEnabled allows the controller to import the Tailscale device
+	// inventory. OAuth credentials stay environment-owned and never enter
+	// controller snapshots or agent configuration.
+	MagicDNSEnabled      bool
+	MagicDNSTailnet      string
+	MagicDNSClientID     string
+	MagicDNSClientSecret string
+	MagicDNSSyncInterval time.Duration
+	MagicDNSStateFile    string
+	MagicDNSTTL          uint32
 }
 
 // LoadConfig reads configuration from environment variables.
@@ -520,6 +538,18 @@ func LoadConfig() *Config {
 	syncDNSRoutesInterval := parseDurationEnv("SYNC_DNSROUTES_INTERVAL", DefaultSyncDNSRoutesInterval)
 	syncUpstreamHealthInterval := parseDurationEnv("SYNC_UPSTREAM_HEALTH_INTERVAL", DefaultSyncUpstreamHealthInterval)
 	nodeOfflineThreshold := parseDurationEnv("NODE_OFFLINE_THRESHOLD", DefaultNodeOfflineThreshold)
+	magicDNSSyncInterval := parseDurationEnv("MAGICDNS_SYNC_INTERVAL", DefaultMagicDNSSyncInterval)
+	if magicDNSSyncInterval <= 0 {
+		magicDNSSyncInterval = DefaultMagicDNSSyncInterval
+	}
+	magicDNSStateFile := strings.TrimSpace(os.Getenv("MAGICDNS_STATE_FILE"))
+	if magicDNSStateFile == "" {
+		magicDNSStateFile = DefaultMagicDNSStateFile
+	}
+	magicDNSTTL := parseUint32Env("MAGICDNS_TTL", DefaultMagicDNSTTL)
+	if magicDNSTTL == 0 || magicDNSTTL > 86400 {
+		magicDNSTTL = DefaultMagicDNSTTL
+	}
 
 	cfg := &Config{
 		Mode:                       mode,
@@ -623,6 +653,13 @@ func LoadConfig() *Config {
 		SyncDNSRoutesInterval:      syncDNSRoutesInterval,
 		SyncUpstreamHealthInterval: syncUpstreamHealthInterval,
 		NodeOfflineThreshold:       nodeOfflineThreshold,
+		MagicDNSEnabled:            strings.EqualFold(strings.TrimSpace(os.Getenv("MAGICDNS_ENABLED")), "true"),
+		MagicDNSTailnet:            strings.TrimSpace(os.Getenv("MAGICDNS_TAILNET")),
+		MagicDNSClientID:           strings.TrimSpace(os.Getenv("MAGICDNS_CLIENT_ID")),
+		MagicDNSClientSecret:       strings.TrimSpace(os.Getenv("MAGICDNS_CLIENT_SECRET")),
+		MagicDNSSyncInterval:       magicDNSSyncInterval,
+		MagicDNSStateFile:          magicDNSStateFile,
+		MagicDNSTTL:                magicDNSTTL,
 	}
 
 	if cfg.Mode == ModeAgent && cfg.ControllerURL == "" {

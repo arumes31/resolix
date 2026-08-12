@@ -19,6 +19,7 @@ import (
 
 	"github.com/arumes31/resolix/webgui/internal/config"
 	"github.com/arumes31/resolix/webgui/internal/configsync"
+	"github.com/arumes31/resolix/webgui/internal/magicdns"
 	"github.com/arumes31/resolix/webgui/internal/models"
 )
 
@@ -387,6 +388,39 @@ func (f *Forwarder) syncAliases(client *http.Client) {
 	f.recordEndpoint("sync:aliases", started, nil)
 
 	log.Printf("[INFO] Synced %d client aliases from controller", len(result))
+}
+
+// syncMagicDNS fetches and atomically applies controller-generated Tailscale records.
+func (f *Forwarder) syncMagicDNS(client *http.Client) {
+	started := time.Now()
+	data, err := f.syncFromController(client, "/api/sync/magicdns")
+	if err != nil {
+		f.recordEndpoint("sync:magicdns", started, err)
+		log.Printf("[WARN] Failed to sync MagicDNS records from controller: %v", err)
+		return
+	}
+	var snapshot magicdns.Snapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		f.recordEndpoint("sync:magicdns", started, err)
+		log.Printf("[WARN] Failed to parse MagicDNS sync response: %v", err)
+		return
+	}
+	f.syncMu.RLock()
+	fn := f.setMagicDNSFn
+	f.syncMu.RUnlock()
+	if fn == nil {
+		err := errors.New("magicdns apply callback is not configured")
+		f.recordEndpoint("sync:magicdns", started, err)
+		log.Printf("[WARN] Failed to apply MagicDNS records: %v", err)
+		return
+	}
+	if err := fn(snapshot); err != nil {
+		f.recordEndpoint("sync:magicdns", started, err)
+		log.Printf("[WARN] Failed to apply MagicDNS records: %v", err)
+		return
+	}
+	f.recordEndpoint("sync:magicdns", started, nil)
+	log.Printf("[INFO] Synced %d MagicDNS records from controller", len(snapshot.Records))
 }
 
 // syncDNSRoutes fetches and applies DNS routes from controller (Item 91).

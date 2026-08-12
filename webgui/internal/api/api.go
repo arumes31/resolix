@@ -23,6 +23,7 @@ import (
 	"github.com/arumes31/resolix/webgui/internal/dnssettings"
 	"github.com/arumes31/resolix/webgui/internal/filter"
 	"github.com/arumes31/resolix/webgui/internal/forwarder"
+	"github.com/arumes31/resolix/webgui/internal/magicdns"
 	"github.com/arumes31/resolix/webgui/internal/models"
 	"github.com/arumes31/resolix/webgui/internal/parser"
 	"github.com/arumes31/resolix/webgui/internal/resolver"
@@ -83,6 +84,8 @@ type Server struct {
 	// Typed rewrites store (Step 3) and DNS server (pipeline metrics)
 	rewritesStore *rewrites.Store
 	dnsServer     *dnsserver.Server
+	magicDNSStore *magicdns.Store
+	magicDNSSync  *magicdns.Syncer
 
 	// Per-client registry (Step 5)
 	clientsRegistry *clients.Registry
@@ -234,6 +237,14 @@ func (s *Server) SetDNSServer(srv *dnsserver.Server) {
 	s.fieldsMu.Lock()
 	defer s.fieldsMu.Unlock()
 	s.dnsServer = srv
+}
+
+// SetMagicDNS configures the synchronized record store and optional controller syncer.
+func (s *Server) SetMagicDNS(store *magicdns.Store, syncer *magicdns.Syncer) {
+	s.fieldsMu.Lock()
+	s.magicDNSStore = store
+	s.magicDNSSync = syncer
+	s.fieldsMu.Unlock()
 }
 
 // SetDNSSettingsStore configures persistent controller-managed DNS policy.

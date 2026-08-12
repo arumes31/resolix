@@ -101,6 +101,7 @@
 			<button type="button" class="settings-tab" data-settings-tab="rewrites">Rewrites</button>
 			<button type="button" class="settings-tab" data-settings-tab="clients">Clients</button>
 			<button type="button" class="settings-tab" data-settings-tab="runtime">DNS & cache</button>
+			<button type="button" class="settings-tab" data-settings-tab="magicdns">MagicDNS</button>
             <button type="button" class="settings-tab" data-settings-tab="cluster">Cluster</button>
         </nav>
 
@@ -357,8 +358,16 @@
 				<details class="runtime-details field-wide"><summary>Restart-owned listener and protocol settings</summary><div id="runtimeSettings" class="runtime-grid"></div></details>
 			</section>
 
+			<section id="settings-magicdns" class="settings-panel" data-panel="magicdns" hidden>
+				<div class="panel-heading"><div><span class="panel-index">09</span><h2>Tailscale MagicDNS</h2></div><span id="magicDNSState" class="state-pill">Loading</span></div>
+				<p class="panel-copy">Resolix imports exact MagicDNS FQDN records from the controller's read-only Tailscale device inventory. Credentials remain restart-owned environment secrets and are never sent to agents or returned by this page.</p>
+				<div class="inline-actions"><button type="button" id="syncMagicDNSBtn" class="btn btn-primary controller-edit">Sync from Tailscale now</button></div>
+				<div id="magicDNSSummary" class="runtime-grid" aria-live="polite"></div>
+				<details class="runtime-details field-wide" open><summary>Imported address records</summary><div id="magicDNSRecords" class="runtime-grid"></div></details>
+			</section>
+
 			<section id="settings-cluster" class="settings-panel" data-panel="cluster" hidden>
-                <div class="panel-heading"><div><span class="panel-index">09</span><h2>Cluster synchronization</h2></div><span id="clusterMode" class="state-pill">Loading</span></div>
+                <div class="panel-heading"><div><span class="panel-index">10</span><h2>Cluster synchronization</h2></div><span id="clusterMode" class="state-pill">Loading</span></div>
                 <p class="panel-copy">The controller is authoritative. Agent nodes verify and apply content-addressed snapshots containing upstreams, routes, subscriptions, custom rules, rewrites, and clients.</p>
 				<div class="inline-actions"><button type="button" id="syncAllNodesBtn" class="btn btn-primary controller-edit">Sync all agents now</button></div>
                 <div id="clusterSummary" class="runtime-grid"></div>

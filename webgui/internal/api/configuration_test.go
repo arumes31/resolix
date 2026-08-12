@@ -47,6 +47,8 @@ func TestDedicatedPagesAndRootRejectsUnknownPaths(t *testing.T) {
 		!strings.Contains(body, `id="filterTestClient"`) ||
 		!strings.Contains(body, `id="filterTestType"`) ||
 		!strings.Contains(body, `id="dnsSettingsForm"`) ||
+		!strings.Contains(body, `id="magicDNSSummary"`) ||
+		!strings.Contains(body, `id="syncMagicDNSBtn"`) ||
 		!strings.Contains(body, `id="syncAllNodesBtn"`) ||
 		!strings.Contains(body, `id="configSyncProgress"`) ||
 		!strings.Contains(body, `id="configEditBar"`) ||

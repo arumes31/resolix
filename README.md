@@ -327,6 +327,13 @@ The **Allowlists** panel accepts hosted Adblock, hosts-file, and plain-domain li
 | `CLIENTS_FILE` | Per-client policy registry, relative to `CONFIG_DIR` unless absolute | `clients.json` |
 | `CLIENT_ALIASES` | Inline `IP:Alias` mappings | unset |
 | `CLIENT_ALIASES_FILE` | Hot-reloaded `IP=Alias` file | unset |
+| `MAGICDNS_ENABLED` | Import Tailscale MagicDNS records on the controller | `false` |
+| `MAGICDNS_TAILNET` | Tailnet ID used by the Tailscale devices API | unset |
+| `MAGICDNS_CLIENT_ID` | OAuth client ID with `devices:core:read` | unset |
+| `MAGICDNS_CLIENT_SECRET` | OAuth client secret; never synchronized to agents | unset |
+| `MAGICDNS_SYNC_INTERVAL` | Tailscale refresh and agent-record sync interval | `4h` |
+| `MAGICDNS_TTL` | TTL for imported A and AAAA answers | `60` |
+| `MAGICDNS_STATE_FILE` | Last-good imported record snapshot under `CONFIG_DIR` | `magicdns.json` |
 
 Rewrites created in `/config` can apply to every client, only Tailscale address space (`100.64.0.0/10` and `fd7a:115c:a1e0::/48`), or custom IPv4/IPv6 CIDRs. Queries from other sources skip the rewrite and continue through normal filtering, cache, and upstream resolution. These restrictions are included in controller snapshots and synchronized to agents.
 

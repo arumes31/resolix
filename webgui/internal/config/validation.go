@@ -79,6 +79,26 @@ func (c *Config) VerifyConfig() ([]string, []string) {
 	if c.Mode == ModeAgent && strings.TrimSpace(c.IngestSecret) == "" {
 		errs = append(errs, "INGEST_SECRET is required in agent mode for authenticated controller communication")
 	}
+	if c.MagicDNSEnabled {
+		if c.Mode != ModeController {
+			errs = append(errs, "MAGICDNS_ENABLED is supported only in controller mode")
+		}
+		if strings.TrimSpace(c.MagicDNSTailnet) == "" {
+			errs = append(errs, "MAGICDNS_TAILNET is required when MagicDNS synchronization is enabled")
+		}
+		if strings.TrimSpace(c.MagicDNSClientID) == "" || strings.TrimSpace(c.MagicDNSClientSecret) == "" {
+			errs = append(errs, "MAGICDNS_CLIENT_ID and MAGICDNS_CLIENT_SECRET are required when MagicDNS synchronization is enabled")
+		}
+		if c.MagicDNSSyncInterval <= 0 {
+			errs = append(errs, "MAGICDNS_SYNC_INTERVAL must be positive")
+		}
+		if c.MagicDNSTTL == 0 || c.MagicDNSTTL > 86400 {
+			errs = append(errs, "MAGICDNS_TTL must be between 1 and 86400")
+		}
+	}
+	if strings.ContainsAny(c.MagicDNSTailnet, "\r\n\x00") {
+		errs = append(errs, "MAGICDNS_TAILNET contains invalid characters")
+	}
 
 	// 4. Port number validation
 	if p, err := strconv.Atoi(c.Port); err != nil || p < 1 || p > 65535 {

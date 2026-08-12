@@ -155,6 +155,29 @@ func TestClientAliasesAreCopied(t *testing.T) {
 	}
 }
 
+func TestLoadConfigMagicDNS(t *testing.T) {
+	t.Setenv("MODE", ModeController)
+	t.Setenv("CONTROLLER_URL", "")
+	t.Setenv("MAGICDNS_ENABLED", "true")
+	t.Setenv("MAGICDNS_TAILNET", "tailnet-id")
+	t.Setenv("MAGICDNS_CLIENT_ID", "client-id")
+	t.Setenv("MAGICDNS_CLIENT_SECRET", "client-secret")
+	t.Setenv("MAGICDNS_SYNC_INTERVAL", "6h")
+	t.Setenv("MAGICDNS_TTL", "120")
+	t.Setenv("MAGICDNS_STATE_FILE", "tailscale-records.json")
+	t.Setenv("CONFIG_DIR", t.TempDir())
+
+	cfg := LoadConfig()
+	if !cfg.MagicDNSEnabled || cfg.MagicDNSTailnet != "tailnet-id" ||
+		cfg.MagicDNSClientID != "client-id" || cfg.MagicDNSClientSecret != "client-secret" ||
+		cfg.MagicDNSSyncInterval != 6*time.Hour || cfg.MagicDNSTTL != 120 {
+		t.Fatalf("MagicDNS config = %+v", cfg)
+	}
+	if filepath.Base(cfg.FullMagicDNSStatePath()) != "tailscale-records.json" {
+		t.Fatalf("MagicDNS state path = %q", cfg.FullMagicDNSStatePath())
+	}
+}
+
 func TestClientAliasesProviderLoadsAndOverridesEnvironment(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "aliases.txt")
 	contents := "# comment\n192.0.2.1 = file-router\ninvalid\n=empty\n192.0.2.2= workstation \n"

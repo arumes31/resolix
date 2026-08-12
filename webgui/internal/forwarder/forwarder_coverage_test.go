@@ -7,6 +7,7 @@ import (
 
 	"github.com/arumes31/resolix/webgui/internal/config"
 	"github.com/arumes31/resolix/webgui/internal/configsync"
+	"github.com/arumes31/resolix/webgui/internal/magicdns"
 	"github.com/arumes31/resolix/webgui/internal/models"
 )
 
@@ -17,8 +18,10 @@ func TestForwarderCallbacksAndSynchronizedSnapshots(t *testing.T) {
 	forwarder.SetAliasesFn(func(map[string]string) {})
 	forwarder.SetUpstreamHealthFn(func(string, map[string]float64) {})
 	forwarder.SetDNSConfigFn(func(configsync.Snapshot) error { return nil })
+	forwarder.SetMagicDNSFn(func(magicdns.Snapshot) error { return nil })
 	if forwarder.setDNSRoutesFn == nil || forwarder.setAliasesFn == nil ||
-		forwarder.setUpstreamHealthFn == nil || forwarder.setDNSConfigFn == nil {
+		forwarder.setUpstreamHealthFn == nil || forwarder.setDNSConfigFn == nil ||
+		forwarder.setMagicDNSFn == nil {
 		t.Fatal("one or more synchronization callbacks were not retained")
 	}
 

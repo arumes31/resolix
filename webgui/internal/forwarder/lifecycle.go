@@ -186,7 +186,7 @@ func (f *Forwarder) startHeartbeat(client *http.Client) {
 }
 
 // startSyncLoops runs periodic sync operations for aliases, DNS routes,
-// controller-owned DNS configuration, and upstream health.
+// controller-owned DNS configuration, MagicDNS records, and upstream health.
 func (f *Forwarder) startSyncLoops(client *http.Client) {
 	// Item 90: Sync client aliases
 	aliasesInterval := safeInterval(f.cfg.SyncAliasesInterval, config.DefaultSyncAliasesInterval)
@@ -203,6 +203,10 @@ func (f *Forwarder) startSyncLoops(client *http.Client) {
 	healthTicker := time.NewTicker(healthInterval)
 	defer healthTicker.Stop()
 
+	magicDNSInterval := safeInterval(f.cfg.MagicDNSSyncInterval, config.DefaultMagicDNSSyncInterval)
+	magicDNSTicker := time.NewTicker(magicDNSInterval)
+	defer magicDNSTicker.Stop()
+
 	// Initial sync.
 	f.syncAll(client)
 
@@ -217,6 +221,8 @@ func (f *Forwarder) startSyncLoops(client *http.Client) {
 		case <-routesTicker.C:
 			f.syncDNSRoutes(client)
 			f.syncDNSConfig(client)
+		case <-magicDNSTicker.C:
+			f.syncMagicDNS(client)
 		case <-healthTicker.C:
 			f.syncUpstreamHealth(client)
 		}
@@ -228,6 +234,7 @@ func (f *Forwarder) syncAll(client *http.Client) {
 	f.syncDNSRoutes(client)
 	f.syncUpstreamHealth(client)
 	f.syncDNSConfig(client)
+	f.syncMagicDNS(client)
 }
 
 // ReportHealth sends a health update to the controller.

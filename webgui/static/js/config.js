@@ -335,6 +335,59 @@ async function loadCluster() {
 	renderClusterSummary(nodes);
 }
 
+function magicDNSRuntimeItems(data) {
+	const status = data.status || {};
+	return [
+		['Source', data.mode === 'controller' ? 'Tailscale API · controller owned' : 'Controller mirror'],
+		['Tailnet', data.tailnet || 'Not configured'],
+		['OAuth credentials', data.mode === 'controller'
+			? (data.credentials_configured ? 'Configured · secret hidden' : 'Not configured')
+			: 'Held only by controller'],
+		['Refresh interval', data.sync_interval || '4h'],
+		['Answer TTL', `${data.ttl || 60} seconds`],
+		['Devices imported', status.device_count || 0],
+		['Address records', status.record_count || 0],
+		['Last successful sync', status.last_success || data.synced_at || 'Not yet synchronized'],
+		['Last attempt', status.last_attempt || 'Not yet attempted'],
+		['Generation', data.generation ? data.generation.slice(0, 16) : 'No snapshot'],
+		['Last error', status.last_error || 'None']
+	];
+}
+
+function renderMagicDNS(data) {
+	const statePill = document.getElementById('magicDNSState');
+	document.getElementById('syncMagicDNSBtn').disabled = !state.editable || !data.enabled;
+	const hasRecords = Number(data.status?.record_count || 0) > 0;
+	statePill.textContent = data.enabled || data.mode === 'agent' ? (hasRecords ? 'Synchronized' : 'Waiting') : 'Disabled';
+	statePill.classList.toggle('online', hasRecords);
+	statePill.classList.toggle('paused', !hasRecords);
+	document.getElementById('magicDNSSummary').innerHTML = magicDNSRuntimeItems(data).map(([key, value]) =>
+		`<div class="runtime-item"><span>${escapeHtml(key)}</span><strong>${escapeHtml(value)}</strong></div>`
+	).join('');
+	const records = data.records || [];
+	document.getElementById('magicDNSRecords').innerHTML = records.length ? records.map(record =>
+		`<div class="runtime-item"><span>${escapeHtml(record.name)}</span><strong>${escapeHtml(record.type)} · ${escapeHtml(record.value)}</strong></div>`
+	).join('') + (data.records_truncated ? '<div class="empty-settings">Showing the first 200 records.</div>' : '')
+		: emptyState(data.enabled || data.mode === 'agent' ? 'No MagicDNS records have been synchronized yet.' : 'Enable MAGICDNS_ENABLED on the controller to import records.');
+}
+
+async function loadMagicDNS() {
+	const data = await apiJSON('/api/magicdns/status');
+	renderMagicDNS(data);
+}
+
+async function syncMagicDNS() {
+	const button = document.getElementById('syncMagicDNSBtn');
+	button.disabled = true;
+	try {
+		const data = await apiJSON('/api/magicdns/sync', { method: 'POST' });
+		renderMagicDNS(data);
+		notice('MagicDNS records synchronized from Tailscale');
+	} finally {
+		button.disabled = !state.editable;
+	}
+}
+
 async function requestConfigSync(node = '') {
 	await apiJSON(`/api/config/sync-now${node ? `?node=${encodeURIComponent(node)}` : ''}`, { method: 'POST' });
 	notice(node ? 'Agent synchronization scheduled' : 'Synchronization scheduled for all agents');

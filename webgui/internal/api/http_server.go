@@ -79,6 +79,8 @@ func (s *Server) SetupMux() http.Handler {
 	mux.Handle("/api/config/snapshot", s.authMiddleware(http.HandlerFunc(s.handleConfigSnapshot)))
 	mux.Handle("/api/config/diff", s.authMiddleware(http.HandlerFunc(s.handleConfigDiff)))
 	mux.Handle("/api/config/sync-now", s.authMiddleware(http.HandlerFunc(s.handleConfigSyncNow)))
+	mux.Handle("/api/magicdns/status", s.authMiddleware(http.HandlerFunc(s.handleMagicDNSStatus)))
+	mux.Handle("/api/magicdns/sync", s.authMiddleware(http.HandlerFunc(s.handleMagicDNSSync)))
 	mux.Handle("/api/config/subscriptions", s.authMiddleware(http.HandlerFunc(s.handleFilterSubscriptions)))
 	mux.Handle("/api/config/subscriptions/export", s.authMiddleware(http.HandlerFunc(s.handleFilterSubscriptionsExport)))
 	mux.Handle("/api/config/subscriptions/import", s.authMiddleware(http.HandlerFunc(s.handleFilterSubscriptionsImport)))
@@ -130,6 +132,7 @@ func (s *Server) SetupMux() http.Handler {
 	mux.Handle("/api/sync/dns-routes", s.internalAuth(http.HandlerFunc(s.handleSyncDNSRoutes)))
 	mux.Handle("/api/sync/upstream-health", s.internalAuth(http.HandlerFunc(s.handleSyncUpstreamHealth)))
 	mux.Handle("/api/sync/dns-config", s.internalAuth(http.HandlerFunc(s.handleSyncDNSConfig)))
+	mux.Handle("/api/sync/magicdns", s.internalAuth(http.HandlerFunc(s.handleSyncMagicDNS)))
 
 	// Item 89: Node discovery and status endpoint
 	mux.Handle("/api/nodes", s.authMiddleware(http.HandlerFunc(s.handleNodes)))

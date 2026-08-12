@@ -30,6 +30,7 @@ import (
 	"github.com/arumes31/resolix/webgui/internal/forwarder"
 	"github.com/arumes31/resolix/webgui/internal/health"
 	"github.com/arumes31/resolix/webgui/internal/logger"
+	"github.com/arumes31/resolix/webgui/internal/magicdns"
 	"github.com/arumes31/resolix/webgui/internal/models"
 	"github.com/arumes31/resolix/webgui/internal/parser"
 	"github.com/arumes31/resolix/webgui/internal/policy"
@@ -220,6 +221,40 @@ func runApplication(cfg *config.Config, sigChan <-chan os.Signal) {
 	srv.SetDNSSettingsStore(dnsSettingsStore)
 	managedDNS := dnsSettingsStore.Get()
 
+	magicDNSStore := magicdns.NewStore(cfg.FullMagicDNSStatePath())
+	if cfg.Mode == config.ModeAgent || cfg.MagicDNSEnabled {
+		magicDNSStore, err = magicdns.Load(cfg.FullMagicDNSStatePath())
+		if err != nil {
+			logger.Fatal("Failed to load MagicDNS state: %v", err)
+		}
+	}
+	var magicDNSSyncer *magicdns.Syncer
+	if cfg.Mode == config.ModeController && cfg.MagicDNSEnabled {
+		if snapshot := magicDNSStore.Snapshot(); snapshot.Tailnet != "" && snapshot.Tailnet != cfg.MagicDNSTailnet {
+			if err := magicDNSStore.Replace(cfg.MagicDNSTailnet, []magicdns.Record{}, time.Time{}); err != nil {
+				logger.Fatal("Failed to reset MagicDNS state for the configured tailnet: %v", err)
+			}
+		}
+		magicDNSClient, clientErr := magicdns.NewClient(
+			cfg.MagicDNSClientID,
+			cfg.MagicDNSClientSecret,
+			cfg.MagicDNSTailnet,
+		)
+		if clientErr != nil {
+			logger.Fatal("Failed to configure MagicDNS client: %v", clientErr)
+		}
+		magicDNSSyncer, err = magicdns.NewSyncer(
+			magicDNSClient,
+			magicDNSStore,
+			cfg.MagicDNSTailnet,
+			cfg.MagicDNSSyncInterval,
+		)
+		if err != nil {
+			logger.Fatal("Failed to configure MagicDNS synchronization: %v", err)
+		}
+	}
+	srv.SetMagicDNS(magicDNSStore, magicDNSSyncer)
+
 	// Item 59: Initialize and start reverse DNS resolver
 	res := resolver.New()
 	srv.SetResolver(res)
@@ -257,6 +292,7 @@ func runApplication(cfg *config.Config, sigChan <-chan os.Signal) {
 	fwd.SetAliasesFn(func(aliases map[string]string) {
 		cfg.SetClientAliases(aliases)
 	})
+	fwd.SetMagicDNSFn(magicDNSStore.Apply)
 	fwd.SetUpstreamHealthFn(func(node string, health map[string]float64) {
 		store.SetUpstreamHealth(node, health)
 	})
@@ -308,7 +344,7 @@ func runApplication(cfg *config.Config, sigChan <-chan os.Signal) {
 	errChan := make(chan error, 2)
 
 	// Embedded DNS server (replaces dnsmasq). Pipeline: refuse-ANY/AAAA-disable
-	// → typed rewrites → private PTR → safe-search → filter
+	// → typed rewrites → MagicDNS → private PTR → safe-search → filter
 	// → cache → client upstreams → route → global pool → bogus-NXDOMAIN →
 	// cache store → respond.
 	// Each answered query becomes a QueryEvent fed into Store + SSE (and the
@@ -368,6 +404,8 @@ func runApplication(cfg *config.Config, sigChan <-chan os.Signal) {
 		Port:                cfg.DNSListenPort,
 		Upstreams:           upstreamSpecs,
 		Rewrites:            rwStore,
+		MagicDNS:            magicDNSStore,
+		MagicDNSTTL:         cfg.MagicDNSTTL,
 		Policy:              pol,
 		Pool:                pool,
 		Routes:              dr,
@@ -420,6 +458,17 @@ func runApplication(cfg *config.Config, sigChan <-chan os.Signal) {
 	})
 	dnsDone := make(chan struct{})
 	srv.SetDNSServer(dnsSrv)
+	magicDNSStore.SetOnChange(func() { dnsSrv.ClearCache() })
+	if magicDNSSyncer != nil {
+		go magicDNSSyncer.Run(ctx, func(syncErr error) {
+			if syncErr != nil {
+				logger.Warning("MagicDNS synchronization failed; retaining last-good records: %v", syncErr)
+				return
+			}
+			snapshot := magicDNSStore.Snapshot()
+			logger.Info("MagicDNS synchronized %d records; next refresh in %s", len(snapshot.Records), cfg.MagicDNSSyncInterval)
+		})
+	}
 	srv.SetDNSSettingsApplyFunc(func(settings dnssettings.Settings) {
 		pool.SetRuntimeSettings(settings.UpstreamMode, settings.FallbackDNS, settings.ECSClientSubnet)
 		dnsSrv.ApplySettings(settings)

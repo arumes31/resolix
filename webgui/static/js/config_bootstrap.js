@@ -1,6 +1,6 @@
 const loaders = {
 	upstreams: loadUpstreams, routes: loadRoutes, blocklists: loadSubscriptions, allowlists: loadSubscriptions, rules: loadRules,
-	rewrites: loadRewrites, clients: loadClients, runtime: loadStatus, cluster: loadCluster
+	rewrites: loadRewrites, clients: loadClients, runtime: loadStatus, magicdns: loadMagicDNS, cluster: loadCluster
 };
 
 async function activatePanel(name, updateHash = true) {
@@ -116,6 +116,7 @@ document.getElementById('resumeBtn').addEventListener('click', () => apiJSON('/a
 document.getElementById('refreshBlocklistsBtn').addEventListener('click', () => requestSubscriptionUpdate().catch(error => notice(error.message, true)));
 document.getElementById('refreshAllowlistsBtn').addEventListener('click', () => requestSubscriptionUpdate().catch(error => notice(error.message, true)));
 document.getElementById('syncAllNodesBtn').addEventListener('click', () => requestConfigSync().catch(error => notice(error.message, true)));
+document.getElementById('syncMagicDNSBtn').addEventListener('click', () => syncMagicDNS().catch(error => notice(error.message, true)));
 document.getElementById('clusterSummary').addEventListener('click', event => {
 	const button = event.target.closest('.sync-node');
 	if (button) requestConfigSync(button.dataset.node).catch(error => notice(error.message, true));

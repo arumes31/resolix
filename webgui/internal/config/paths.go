@@ -98,6 +98,17 @@ func (c *Config) FullDNSSettingsPath() string {
 	return filepath.Join(c.FullConfigDir(), "dns-settings.json")
 }
 
+// FullMagicDNSStatePath returns the persisted last-good MagicDNS snapshot path.
+func (c *Config) FullMagicDNSStatePath() string {
+	if c.MagicDNSStateFile == "" {
+		return ""
+	}
+	if filepath.IsAbs(c.MagicDNSStateFile) {
+		return c.MagicDNSStateFile
+	}
+	return filepath.Join(c.FullConfigDir(), c.MagicDNSStateFile)
+}
+
 // FullTLSStateDir returns the generated TLS state directory. The history/tls
 // fallback preserves manually constructed Config values and older embedders.
 func (c *Config) FullTLSStateDir() string {

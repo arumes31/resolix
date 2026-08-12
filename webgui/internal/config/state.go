@@ -71,6 +71,7 @@ func managedConfigFiles(cfg *Config) ([]string, error) {
 		cfg.RewritesFile,
 		cfg.ClientsFile,
 		cfg.BlocklistFile,
+		cfg.MagicDNSStateFile,
 	} {
 		configured = strings.TrimSpace(configured)
 		if configured == "" || filepath.IsAbs(configured) {

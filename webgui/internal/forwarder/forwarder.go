@@ -13,6 +13,7 @@ import (
 	"github.com/arumes31/resolix/webgui/internal/config"
 	"github.com/arumes31/resolix/webgui/internal/configsync"
 	"github.com/arumes31/resolix/webgui/internal/controllertls"
+	"github.com/arumes31/resolix/webgui/internal/magicdns"
 	"github.com/arumes31/resolix/webgui/internal/models"
 )
 
@@ -107,6 +108,7 @@ type Forwarder struct {
 	setAliasesFn        func(aliases map[string]string)
 	setUpstreamHealthFn func(node string, health map[string]float64)
 	setDNSConfigFn      func(snapshot configsync.Snapshot) error
+	setMagicDNSFn       func(snapshot magicdns.Snapshot) error
 	configRevision      string
 	desiredRevision     string
 	appliedSnapshot     *configsync.Snapshot
@@ -243,6 +245,13 @@ func (f *Forwarder) SetDNSConfigFn(fn func(snapshot configsync.Snapshot) error) 
 	f.syncMu.Lock()
 	defer f.syncMu.Unlock()
 	f.setDNSConfigFn = fn
+}
+
+// SetMagicDNSFn sets the callback that applies controller-generated MagicDNS records.
+func (f *Forwarder) SetMagicDNSFn(fn func(snapshot magicdns.Snapshot) error) {
+	f.syncMu.Lock()
+	defer f.syncMu.Unlock()
+	f.setMagicDNSFn = fn
 }
 
 // ConfigRevision returns the last successfully applied controller revision.

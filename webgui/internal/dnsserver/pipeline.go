@@ -148,8 +148,8 @@ func isUDPNetwork(addr net.Addr) bool {
 
 // resolve runs the request pipeline and fills resp.
 //
-// Order: refuse-ANY / AAAA-disable short-circuits → typed rewrites → private
-// PTR → safe-search (per-client aware) → filter (unless the client disabled
+// Order: refuse-ANY / AAAA-disable short-circuits → typed rewrites → MagicDNS
+// → private PTR → safe-search (per-client aware) → filter (unless the client disabled
 // filtering) → cache →
 // forward (client upstreams → per-domain route → global pool) →
 // bogus-NXDOMAIN conversion → cache store. depth bounds chase chains.
@@ -195,7 +195,12 @@ func (s *Server) resolve(
 		return res
 	}
 
-	// Stage 1b: automatic private PTR, below explicit user rewrites.
+	// Stage 1b: imported MagicDNS records, below explicit user rewrites.
+	if res, handled := s.stageMagicDNS(q, resp); handled {
+		return res
+	}
+
+	// Stage 1c: automatic private PTR, below explicit user rewrites.
 	if res, handled := s.stagePrivatePTR(q, resp); handled {
 		return res
 	}
@@ -231,6 +236,59 @@ func (s *Server) resolve(
 	}
 	key := s.makeCacheKey(r, q, domain, group, cl)
 	return s.resolveViaCacheOrUpstream(r, resp, key, specs)
+}
+
+// stageMagicDNS answers exact FQDN A and AAAA queries from the synchronized
+// Tailscale inventory. Manual rewrites have already had the opportunity to
+// answer, preserving their explicit override semantics.
+func (s *Server) stageMagicDNS(q dns.Question, resp *dns.Msg) (resolution, bool) {
+	if s.cfg.MagicDNS == nil {
+		return resolution{}, false
+	}
+	recordType := ""
+	switch q.Qtype {
+	case dns.TypeA:
+		recordType = "A"
+	case dns.TypeAAAA:
+		recordType = "AAAA"
+	default:
+		return resolution{}, false
+	}
+	records := s.cfg.MagicDNS.Lookup(q.Name, recordType)
+	if len(records) == 0 {
+		return resolution{}, false
+	}
+	ttl := s.cfg.MagicDNSTTL
+	if ttl == 0 {
+		ttl = staticTTL
+	}
+	answers := make([]dns.RR, 0, len(records))
+	for _, record := range records {
+		ip := net.ParseIP(record.Value)
+		if ip == nil {
+			continue
+		}
+		header := dns.RR_Header{Name: q.Name, Class: dns.ClassINET, Ttl: ttl}
+		if q.Qtype == dns.TypeA {
+			if ip = ip.To4(); ip == nil {
+				continue
+			}
+			header.Rrtype = dns.TypeA
+			answers = append(answers, &dns.A{Hdr: header, A: ip})
+			continue
+		}
+		if ip.To4() != nil {
+			continue
+		}
+		header.Rrtype = dns.TypeAAAA
+		answers = append(answers, &dns.AAAA{Hdr: header, AAAA: ip})
+	}
+	if len(answers) == 0 {
+		return resolution{}, false
+	}
+	resp.Answer = answers
+	matchedRule := fmt.Sprintf("%s %s", normalizeName(q.Name), recordType)
+	return resolution{upstream: "MagicDNS", matchedRule: matchedRule}, true
 }
 
 // filteringEnabledFor reports whether the filter engine applies to a client.

@@ -9,6 +9,7 @@ import (
 
 	"github.com/miekg/dns"
 
+	"github.com/arumes31/resolix/webgui/internal/magicdns"
 	"github.com/arumes31/resolix/webgui/internal/models"
 	"github.com/arumes31/resolix/webgui/internal/policy"
 	"github.com/arumes31/resolix/webgui/internal/rewrites"
@@ -20,6 +21,59 @@ type policyHarness struct {
 	query    func(name string, qtype uint16) *dns.Msg
 	events   chan models.QueryEvent
 	upstream *atomic.Int32
+}
+
+func TestMagicDNSWireAndRewritePrecedence(t *testing.T) {
+	var hits atomic.Int32
+	upstreamAddr := startFakeUpstream(t, &hits)
+	rewriteStore, err := rewrites.Load("", "host.tailnet.ts.net:192.0.2.9")
+	if err != nil {
+		t.Fatalf("load rewrites: %v", err)
+	}
+	magicStore := magicdns.NewStore("")
+	if err := magicStore.Replace("tailnet", []magicdns.Record{
+		{NodeID: "node-1", Name: "host.tailnet.ts.net", Type: "A", Value: "100.64.0.10"},
+		{NodeID: "node-2", Name: "other.tailnet.ts.net", Type: "A", Value: "100.64.0.11"},
+	}, time.Now()); err != nil {
+		t.Fatalf("replace MagicDNS records: %v", err)
+	}
+
+	events := make(chan models.QueryEvent, 2)
+	server := New(Config{
+		Addr:        "127.0.0.1",
+		Upstreams:   []string{upstreamAddr},
+		NodeName:    "test-node",
+		Rewrites:    rewriteStore,
+		MagicDNS:    magicStore,
+		MagicDNSTTL: 120,
+	}, func(event models.QueryEvent, _ bool) { events <- event })
+	serverAddr := startTestServer(t, server)
+	client := &dns.Client{Timeout: 2 * time.Second}
+
+	query := func(name string) (*dns.Msg, models.QueryEvent) {
+		t.Helper()
+		request := new(dns.Msg)
+		request.SetQuestion(dns.Fqdn(name), dns.TypeA)
+		response, _, err := client.Exchange(request, serverAddr)
+		if err != nil {
+			t.Fatalf("query %s: %v", name, err)
+		}
+		return response, <-events
+	}
+
+	response, event := query("host.tailnet.ts.net")
+	answer, ok := response.Answer[0].(*dns.A)
+	if !ok || answer.A.String() != "192.0.2.9" || event.Upstream != "Rewrite" {
+		t.Fatalf("manual precedence response/event = %v / %#v", response.Answer, event)
+	}
+	response, event = query("other.tailnet.ts.net")
+	answer, ok = response.Answer[0].(*dns.A)
+	if !ok || answer.A.String() != "100.64.0.11" || answer.Hdr.Ttl != 120 || event.Upstream != "MagicDNS" {
+		t.Fatalf("MagicDNS response/event = %v / %#v", response.Answer, event)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("upstream received %d queries", hits.Load())
+	}
 }
 
 func startPolicyServer(t *testing.T, store *rewrites.Store, pol *policy.Policy, upstreamAddr string, hits *atomic.Int32) *policyHarness {

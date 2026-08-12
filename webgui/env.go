@@ -107,6 +107,16 @@ DB_PATH=dns.db
 # Comma-separated client IP:Alias mappings (alternative to file-based aliases)
 # CLIENT_ALIASES=192.168.1.1:Gateway,100.64.0.1:Router
 
+# ===== Tailscale MagicDNS import (controller only) =====
+# OAuth client requires the read-only devices:core:read scope.
+# MAGICDNS_ENABLED=false
+# MAGICDNS_TAILNET=tailnet-id
+# MAGICDNS_CLIENT_ID=
+# MAGICDNS_CLIENT_SECRET=
+# MAGICDNS_SYNC_INTERVAL=4h
+# MAGICDNS_TTL=60
+# MAGICDNS_STATE_FILE=magicdns.json
+
 # Path to a hosts-format blocklist file (Item 61)
 # BLOCKLIST_FILE=/etc/resolix/blocklist.hosts
 

@@ -9,6 +9,10 @@
     <title>DNS Configuration · Resolix</title>
     <link rel="icon" type="image/svg+xml" href="static/favicon.svg">
     <link rel="stylesheet" href="static/css/style.css">
+    <link rel="stylesheet" href="static/css/querylog.css">
+    <link rel="stylesheet" href="static/css/control_plane.css">
+    <link rel="stylesheet" href="static/css/operations.css">
+    <link rel="stylesheet" href="static/css/querylog_workbench.css">
 </head>
 
 <body class="app-page config-page compact" data-page="config" data-base-url="{{.BaseURL}}" data-csrf-token="{{.CSRFToken}}" data-mode="{{.Mode}}">
@@ -368,6 +372,11 @@
     </dialog>
     <script nonce="{{.Nonce}}" src="static/js/shell.js"></script>
     <script nonce="{{.Nonce}}" src="static/js/config.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/config_upstreams.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/config_subscriptions.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/config_rules.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/config_clients.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/config_bootstrap.js"></script>
 </body>
 
 </html>

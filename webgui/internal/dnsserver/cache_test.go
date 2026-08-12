@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+
+	"github.com/arumes31/resolix/webgui/internal/dnssettings"
 )
 
 func aRecord(name, ip string, ttl uint32) dns.RR {
@@ -246,6 +248,42 @@ func TestStoreInCachePositiveTTLClamp(t *testing.T) {
 		if ent.ttl != tt.wantTTL {
 			t.Errorf("%s: cached TTL = %d, want %d", tt.name, ent.ttl, tt.wantTTL)
 		}
+	}
+}
+
+func TestSERVFAILCacheUsesConfiguredLifetime(t *testing.T) {
+	server := New(Config{CacheSERVFAILTTL: 20 * time.Millisecond}, nil)
+	key := cacheKey{name: "servfail.test", qtype: dns.TypeA}
+	response := new(dns.Msg)
+	response.Rcode = dns.RcodeServerFailure
+	server.storeInCache(key, response)
+	if _, _, ok := server.cache.get(key); !ok {
+		t.Fatal("configured SERVFAIL entry was not cached")
+	}
+	time.Sleep(30 * time.Millisecond)
+	if _, _, ok := server.cache.get(key); ok {
+		t.Fatal("SERVFAIL entry outlived its configured duration")
+	}
+}
+
+func TestApplySettingsInvalidatesEarlierCacheGeneration(t *testing.T) {
+	server := New(Config{}, nil)
+	generation := server.cacheGeneration.Load()
+	server.ApplySettings(dnssettings.Settings{
+		CacheSize: 10, CacheMinTTL: 1, CacheMaxTTL: 60,
+	})
+	if server.cacheGeneration.Load() == generation {
+		t.Fatal("cache settings did not advance the generation")
+	}
+
+	query := new(dns.Msg)
+	query.SetQuestion("stale-generation.test.", dns.TypeA)
+	response := new(dns.Msg)
+	response.SetReply(query)
+	response.Answer = []dns.RR{aRecord(query.Question[0].Name, "192.0.2.20", 60)}
+	key := server.makeCacheKey(query, query.Question[0], "stale-generation.test", "", nil)
+	if server.storeInCacheIfGeneration(key, response, false, generation) {
+		t.Fatal("response from the previous cache generation was published")
 	}
 }
 

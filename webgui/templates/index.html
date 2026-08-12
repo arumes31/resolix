@@ -9,6 +9,10 @@
     <title>Resolix</title>
     <link rel="icon" type="image/svg+xml" href="static/favicon.svg">
     <link rel="stylesheet" href="static/css/style.css">
+    <link rel="stylesheet" href="static/css/querylog.css">
+    <link rel="stylesheet" href="static/css/control_plane.css">
+    <link rel="stylesheet" href="static/css/operations.css">
+    <link rel="stylesheet" href="static/css/querylog_workbench.css">
 </head>
 
 <body class="app-page dashboard-page compact" data-page="dashboard" data-base-url="{{.BaseURL}}" data-csrf-token="{{.CSRFToken}}" data-mode="{{.Mode}}">
@@ -101,6 +105,10 @@
     </div>
     <script nonce="{{.Nonce}}" src="static/js/shell.js"></script>
     <script nonce="{{.Nonce}}" src="static/js/index.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/dashboard.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/querylog.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/settings.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/interactions.js"></script>
 </body>
 
 </html>

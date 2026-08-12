@@ -116,6 +116,18 @@ func TestLoadConfigOperationalLimits(t *testing.T) {
 	}
 }
 
+func TestLoadConfigClampsSERVFAILCacheTTL(t *testing.T) {
+	t.Setenv("CACHE_SERVFAIL_TTL", "5s")
+	if got := LoadConfig().CacheSERVFAILTTL; got != time.Second {
+		t.Fatalf("CACHE_SERVFAIL_TTL above bound = %s, want 1s", got)
+	}
+
+	t.Setenv("CACHE_SERVFAIL_TTL", "-1s")
+	if got := LoadConfig().CacheSERVFAILTTL; got != 0 {
+		t.Fatalf("negative CACHE_SERVFAIL_TTL = %s, want disabled", got)
+	}
+}
+
 func TestLoadConfigDefaultsDNSRoutesToConfigDir(t *testing.T) {
 	configDir := t.TempDir()
 	t.Setenv("CONFIG_DIR", configDir)

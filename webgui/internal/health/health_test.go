@@ -72,6 +72,9 @@ func TestUpdateUpstreamsRemovesStaleHealthyServers(t *testing.T) {
 	if got := checker.upstreams; len(got) != 2 || got[0] != "retained" || got[1] != "new" {
 		t.Fatalf("replacement upstreams = %v", got)
 	}
+	if latency := checker.Status()["new"].LatencyMS; latency != -1 {
+		t.Fatalf("new upstream latency = %v, want unknown (-1)", latency)
+	}
 }
 
 func TestUpdateUpstreamsFallsBackWhenNoHealthyServersRemain(t *testing.T) {

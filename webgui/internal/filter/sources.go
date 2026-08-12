@@ -234,6 +234,17 @@ func (e *Engine) updateScheduledSources(ctx context.Context, now time.Time) {
 	e.updateSourceList(ctx, urls)
 }
 
+func (e *Engine) seedScheduledSourcesCheckedToday(now time.Time) {
+	day := now.UTC().Format(time.DateOnly)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, src := range e.sources {
+		if src.Kind == "url" && src.refreshAtMinute >= 0 && src.LastChecked.UTC().Format(time.DateOnly) == day {
+			src.lastScheduledDay = day
+		}
+	}
+}
+
 func sourceIDSelected(ids map[string]struct{}, id string) bool {
 	_, selected := ids[id]
 	return selected
@@ -531,6 +542,7 @@ func (e *Engine) StartUpdateLoop(ctx context.Context, interval time.Duration) {
 		default:
 		}
 		e.UpdateAll(ctx)
+		e.seedScheduledSourcesCheckedToday(time.Now())
 
 		ticker := time.NewTicker(interval)
 		scheduleTicker := time.NewTicker(time.Minute)

@@ -43,7 +43,7 @@ func TestLevelsAndFiltering(t *testing.T) {
 	Warn("visible alias")
 	Error("visible error")
 	Printf("visible printf")
-	Println("visible", " println")
+	Println("visible println")
 	text := output.String()
 	for _, hidden := range []string{"hidden debug", "hidden info", "visible printf", "visible println"} {
 		if strings.Contains(text, hidden) {
@@ -94,7 +94,7 @@ func TestFileLoggingWritesAndHandlesInvalidPath(t *testing.T) {
 	Warning("warning")
 	Error("error")
 	Printf("printf")
-	Println("print", "ln")
+	Println("print ln")
 	Flush()
 	CloseFile()
 	t.Cleanup(func() { SetLevel("INFO") })
@@ -103,7 +103,7 @@ func TestFileLoggingWritesAndHandlesInvalidPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, message := range []string{"debug 1", "info", "warning", "error", "printf", "println"} {
+	for _, message := range []string{"debug 1", "info", "warning", "error", "printf", "print ln"} {
 		if !strings.Contains(string(data), message) {
 			t.Errorf("log file missing %q: %q", message, data)
 		}

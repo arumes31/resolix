@@ -144,6 +144,28 @@ func TestSyncDNSConfigAppliesOnlyValidNewRevision(t *testing.T) {
 		}
 	})
 
+	t.Run("malformed payload preserves apply state", func(t *testing.T) {
+		controller := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"revision":`))
+		}))
+		defer controller.Close()
+
+		forwarder := NewForwarder(&config.Config{Mode: config.ModeAgent, ControllerURL: controller.URL, MaxRequestSize: 1 << 20})
+		forwarder.desiredRevision = "existing"
+		forwarder.configSchemaVersion = 7
+		forwarder.configCompatible = true
+		forwarder.lastConfigApplyErr = "previous apply error"
+		forwarder.syncDNSConfig(controller.Client())
+		status := forwarder.SnapshotStatus(time.Now())
+		if status.DesiredRevision != "existing" || status.SchemaVersion != 7 || !status.SchemaCompatible ||
+			status.LastApplyError != "previous apply error" {
+			t.Fatalf("malformed snapshot changed apply state: %+v", status)
+		}
+		if status.Endpoints["sync:dns-config"].LastError == "" {
+			t.Fatal("malformed snapshot did not record the endpoint error")
+		}
+	})
+
 	t.Run("apply error", func(t *testing.T) {
 		controller := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode(snapshot)

@@ -322,7 +322,11 @@ func (c *Checker) Status() map[string]UpstreamStatus {
 	status := make(map[string]UpstreamStatus, len(c.upstreams))
 	for _, server := range c.upstreams {
 		state := c.states[server]
-		entry := UpstreamStatus{LatencyMS: c.latencies[server]}
+		latency, ok := c.latencies[server]
+		if !ok {
+			latency = -1
+		}
+		entry := UpstreamStatus{LatencyMS: latency}
 		_, entry.Healthy = healthy[server]
 		if state != nil {
 			entry.ConsecutiveFailures = state.consecutiveFailures

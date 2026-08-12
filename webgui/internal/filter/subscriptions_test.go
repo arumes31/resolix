@@ -126,6 +126,16 @@ func TestSubscriptionStoreRefreshesOnlyRequestedSource(t *testing.T) {
 	}
 }
 
+func TestSubscriptionStoreRejectsMissingRefreshInEmptyStore(t *testing.T) {
+	store, err := LoadSubscriptionStore(filepath.Join(t.TempDir(), "filter-subscriptions.json"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RequestSourceRefresh("missing"); !errors.Is(err, ErrSubscriptionNotFound) {
+		t.Fatalf("missing refresh error = %v", err)
+	}
+}
+
 func TestSubscriptionStoreBulkIsAtomic(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "filter-subscriptions.json")
 	store, err := LoadSubscriptionStore(path, []Subscription{
@@ -197,9 +207,9 @@ func TestAllowOnlySubscriptionOverridesBlocklist(t *testing.T) {
 }
 
 func TestReplaceURLSourcesPreservesRulesForRefreshGeneration(t *testing.T) {
-	var requests int
+	var requests atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		requests++
+		requests.Add(1)
 		_, _ = w.Write([]byte("||stable.example^\n"))
 	}))
 	t.Cleanup(server.Close)
@@ -219,7 +229,7 @@ func TestReplaceURLSourcesPreservesRulesForRefreshGeneration(t *testing.T) {
 	if !engine.Match("stable.example").Blocked {
 		t.Fatal("refresh-only replacement dropped the last good rules")
 	}
-	if requests != 1 {
-		t.Fatalf("replacement performed %d requests, want 1 before scheduled update", requests)
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("replacement performed %d requests, want 1 before scheduled update", got)
 	}
 }

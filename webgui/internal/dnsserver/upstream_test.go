@@ -238,10 +238,11 @@ func TestConcurrentCacheMissesAreCoalesced(t *testing.T) {
 
 func TestInvalidationPreventsInFlightRepopulation(t *testing.T) {
 	started := make(chan struct{})
+	var startedOnce sync.Once
 	release := make(chan struct{})
 	pc := mustListenPacket(t)
 	fake := &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
-		close(started)
+		startedOnce.Do(func() { close(started) })
 		<-release
 		response := new(dns.Msg)
 		response.SetReply(r)

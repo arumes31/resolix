@@ -60,6 +60,9 @@ func ValidateRuleText(text string) (accepted int, diagnostics []RuleDiagnostic) 
 			accepted++
 			continue
 		}
+		if i := strings.Index(body, "$"); i >= 0 {
+			body = body[:i]
+		}
 		if strings.Contains(body, "*") {
 			appendDiagnostic(RuleDiagnostic{Line: lineNumber, Severity: "error", Message: "wildcards are unsupported; use a domain suffix or /RE2/ expression"})
 			continue

@@ -223,6 +223,13 @@ func TestValidateRuleTextBoundsDiagnostics(t *testing.T) {
 	}
 }
 
+func TestValidateRuleTextIgnoresWildcardsInOptions(t *testing.T) {
+	accepted, diagnostics := ValidateRuleText("||foo.example.com^$*")
+	if accepted != 1 || len(diagnostics) != 0 {
+		t.Fatalf("option wildcard validation = %d, %+v", accepted, diagnostics)
+	}
+}
+
 func TestEngineExplainReportsAllowlistOverride(t *testing.T) {
 	engine := New()
 	engine.AddFileSource(writeTempList(t, "||ads.example^\n"), false)

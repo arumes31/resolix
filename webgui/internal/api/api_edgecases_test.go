@@ -269,6 +269,57 @@ func TestIngestLegacyPayloadValidationAndHealth(t *testing.T) {
 	}
 }
 
+func TestIngestRejectsTombstonedNodeBeforeEventsAndHealth(t *testing.T) {
+	server, cleanup := newHistoryTestServer(t)
+	defer cleanup()
+	server.store.SetNodeStatusIdentity("stable-agent", "agent-one", models.NodeStatus{})
+	removed, err := server.store.DecommissionNode("stable-agent")
+	if err != nil || !removed {
+		t.Fatalf("decommission node = %t, %v", removed, err)
+	}
+
+	legacy := `{"node":"agent-one","line":"query[A] blocked.test from 192.0.2.1","health":{"1.1.1.1":5}}`
+	request := httptest.NewRequest(http.MethodPost, "/api/ingest", strings.NewReader(legacy))
+	request.Header.Set("X-Node-ID", "stable-agent")
+	recorder := httptest.NewRecorder()
+	server.handleIngest(recorder, request)
+	if recorder.Code != http.StatusGone {
+		t.Fatalf("legacy tombstone status = %d", recorder.Code)
+	}
+
+	events, err := json.Marshal([]models.QueryEvent{{Node: "agent-one", Domain: "blocked.test", UnixTime: time.Now().Unix()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request = httptest.NewRequest(http.MethodPost, "/api/ingest", bytes.NewReader(events))
+	request.Header.Set("X-Node-ID", "stable-agent")
+	recorder = httptest.NewRecorder()
+	server.handleIngest(recorder, request)
+	if recorder.Code != http.StatusGone {
+		t.Fatalf("structured tombstone status = %d", recorder.Code)
+	}
+	if got := server.store.GetOrderedEvents(10); len(got) != 0 {
+		t.Fatalf("tombstoned ingest stored events: %+v", got)
+	}
+	if health := server.store.GetUpstreamHealth(); len(health) != 0 {
+		t.Fatalf("tombstoned ingest stored health: %+v", health)
+	}
+}
+
+func TestIngestRejectsOverlongFallbackIdentity(t *testing.T) {
+	server := newAPIStateTestServer(t)
+	node := strings.Repeat("n", maxNodeIdentityLength+1)
+	body, err := json.Marshal([]models.QueryEvent{{Node: node, Domain: "identity.test", UnixTime: time.Now().Unix()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	server.handleIngest(recorder, httptest.NewRequest(http.MethodPost, "/api/ingest", bytes.NewReader(body)))
+	if recorder.Code != http.StatusBadRequest || len(server.store.GetOrderedEvents(10)) != 0 {
+		t.Fatalf("overlong fallback ingest = %d, events=%v", recorder.Code, server.store.GetOrderedEvents(10))
+	}
+}
+
 func TestStatusAndSimpleHandlerResponses(t *testing.T) {
 	server := newAPIStateTestServer(t)
 	server.SetBuildInfo("2.4.25", "abc123")

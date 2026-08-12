@@ -9,6 +9,10 @@
     <title>Query Log · Resolix</title>
     <link rel="icon" type="image/svg+xml" href="static/favicon.svg">
     <link rel="stylesheet" href="static/css/style.css">
+    <link rel="stylesheet" href="static/css/querylog.css">
+    <link rel="stylesheet" href="static/css/control_plane.css">
+    <link rel="stylesheet" href="static/css/operations.css">
+    <link rel="stylesheet" href="static/css/querylog_workbench.css">
 </head>
 
 <body class="app-page querylog-page compact" data-page="querylog" data-base-url="{{.BaseURL}}" data-csrf-token="{{.CSRFToken}}" data-mode="{{.Mode}}">
@@ -110,9 +114,9 @@
             <div id="simulatorResult"></div>
 
             <section class="console-section query-log-section">
-                <div class="section-heading"><div><span class="page-kicker">Live stream</span><h2>DNS queries</h2></div><span id="queryResultCount" class="section-chip healthy"><i class="metric-dot green"></i>Newest first</span></div>
+                <div class="section-heading"><div><span class="page-kicker">Live stream</span><h2>DNS queries</h2></div><span id="queryResultCount" class="section-chip healthy" role="status" aria-live="polite" aria-atomic="true"><i class="metric-dot green"></i>Newest first</span></div>
                 <div id="queryScroll" class="table-container query-virtual-scroll" tabindex="0" aria-label="Virtualized DNS query log">
-                    <div id="viewClearedBanner" class="view-cleared-banner is-hidden">View cleared — new events will appear as they arrive</div>
+                    <div id="viewClearedBanner" class="view-cleared-banner is-hidden" role="status" aria-live="polite" aria-atomic="true">View cleared — new events will appear as they arrive</div>
                     <table>
                         <thead><tr id="queryTableHead"></tr></thead>
                         <tbody id="eventTable"></tbody>
@@ -133,7 +137,7 @@
             <button id="modalCloseBtn" class="btn btn-primary modal-close">Close</button>
         </div>
     </div>
-    <aside id="queryDetailDrawer" class="query-detail-drawer" role="dialog" aria-modal="true" aria-labelledby="queryDetailTitle" aria-hidden="true" tabindex="-1">
+    <aside id="queryDetailDrawer" class="query-detail-drawer" role="dialog" aria-modal="true" aria-labelledby="queryDetailTitle" aria-hidden="true" tabindex="-1" inert>
         <div class="query-detail-header">
             <div><span class="page-kicker">Resolution trace</span><h2 id="queryDetailTitle">Query decision</h2></div>
             <button id="queryDetailClose" type="button" class="btn-icon" aria-label="Close query details">×</button>
@@ -141,12 +145,16 @@
         <div id="queryDetailBody" class="query-detail-body"></div>
     </aside>
     <div id="queryDrawerScrim" class="query-drawer-scrim" aria-hidden="true"></div>
-    <div id="queryUndoToast" class="query-undo-toast" role="status" aria-live="polite" aria-hidden="true">
+    <div id="queryUndoToast" class="query-undo-toast" role="status" aria-live="polite" aria-hidden="true" inert>
         <span id="queryUndoMessage"></span>
         <button id="queryUndoBtn" type="button" class="mini-action">Undo</button>
     </div>
     <script nonce="{{.Nonce}}" src="static/js/shell.js"></script>
     <script nonce="{{.Nonce}}" src="static/js/index.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/dashboard.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/querylog.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/settings.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/interactions.js"></script>
 </body>
 
 </html>

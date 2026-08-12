@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,7 +17,10 @@ func TestDecommissionNodeRequiresStableIdentity(t *testing.T) {
 	server.cfg.Mode = config.ModeController
 	server.store.SetNodeStatusIdentity("stable-a", "shared-name", models.NodeStatus{})
 	status := server.store.GetNodeStatusByID("stable-a")
-	status.LastSeen = time.Now().Add(-2 * server.cfg.NodeOfflineThreshold)
+	if status == nil {
+		t.Fatal("seeded node status was not found")
+	}
+	status.LastSeen = time.Now().Add(-time.Hour)
 	server.store.SetNodeStatusIdentity("stable-a", "shared-name", *status)
 	server.cfg.NodeOfflineThreshold = -time.Second
 
@@ -35,5 +39,33 @@ func TestDecommissionNodeRequiresStableIdentity(t *testing.T) {
 	}
 	if server.store.GetNodeStatusByID("stable-a") != nil || !server.store.IsNodeTombstoned("stable-a") {
 		t.Fatal("stable identity was not decommissioned")
+	}
+}
+
+func TestNodeIdentityLengthBoundIsConsistent(t *testing.T) {
+	valid := strings.Repeat("a", maxNodeIdentityLength)
+	invalid := valid + "a"
+	if got := normalizeNodeIdentity("", valid); got != valid {
+		t.Fatalf("maximum-length fallback identity = %q", got)
+	}
+	if got := normalizeNodeIdentity("", invalid); got != "" {
+		t.Fatalf("overlong fallback identity = %q, want rejected", got)
+	}
+
+	server, cleanup := newHistoryTestServer(t)
+	defer cleanup()
+	server.cfg.Mode = config.ModeController
+	for _, test := range []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodDelete, path: "/api/nodes?id=" + invalid},
+		{method: http.MethodPost, path: "/api/nodes?action=restore&id=" + invalid},
+	} {
+		recorder := httptest.NewRecorder()
+		server.handleNodes(recorder, httptest.NewRequest(test.method, test.path, nil))
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("%s overlong identity status = %d", test.method, recorder.Code)
+		}
 	}
 }

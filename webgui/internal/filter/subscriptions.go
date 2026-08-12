@@ -205,6 +205,18 @@ func (s *SubscriptionStore) RequestSourceRefresh(id string) error {
 func (s *SubscriptionStore) requestRefresh(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if id != "" {
+		found := false
+		for _, item := range s.items {
+			if item.ID == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("%w: %s", ErrSubscriptionNotFound, id)
+		}
+	}
 	if len(s.items) == 0 {
 		return nil
 	}

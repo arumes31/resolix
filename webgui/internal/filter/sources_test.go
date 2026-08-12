@@ -278,6 +278,47 @@ func TestStartUpdateLoopInitialLoad(t *testing.T) {
 	}
 }
 
+func TestStartUpdateLoopSeedsTodaysScheduledRefresh(t *testing.T) {
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		_, _ = fmt.Fprintln(w, "||scheduled-startup.example.com^")
+	}))
+	t.Cleanup(server.Close)
+
+	engine := New()
+	engine.AddURLSourceWithOptions(Subscription{
+		ID: "scheduled-startup", URL: server.URL, Enabled: true, AllowPrivate: true, RefreshAtUTC: "00:00",
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	engine.StartUpdateLoop(ctx, time.Hour)
+
+	deadline := time.Now().Add(2 * time.Second)
+	seededDay := ""
+	for {
+		engine.mu.RLock()
+		seededDay = engine.sources[0].lastScheduledDay
+		engine.mu.RUnlock()
+		if seededDay != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("initial scheduled source was not marked checked today")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	seededDate, err := time.Parse(time.DateOnly, seededDay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.updateScheduledSources(context.Background(), seededDate.Add(12*time.Hour))
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("scheduled source fetched %d times on startup day, want 1", got)
+	}
+}
+
 func TestStartUpdateLoopHandlesRequestedUpdate(t *testing.T) {
 	var requests atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

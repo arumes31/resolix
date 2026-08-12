@@ -1,0 +1,1157 @@
+/* ===== Item 32: Clickable Filter Elements ===== */
+.clickable-filter {
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, text-decoration 0.2s ease;
+  border-radius: 3px;
+  padding: 0.05rem 0.2rem;
+  margin: -0.05rem -0.2rem;
+}
+
+.clickable-filter:hover {
+  background: var(--clickable-hover);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.clickable-filter:active {
+  opacity: 0.7;
+}
+
+/* ===== Item 33: Copy Button ===== */
+.cell-with-copy {
+  position: relative;
+  padding-right: 1.5rem;
+}
+
+.copy-btn {
+  position: absolute;
+  top: 50%;
+  right: 0.25rem;
+  transform: translateY(-50%);
+  background: var(--copy-btn-bg);
+  color: var(--copy-btn-color);
+  border: none;
+  border-radius: 4px;
+  padding: 0.2rem;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.2s ease, background 0.15s ease, color 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
+.copy-btn svg {
+  width: 14px;
+  height: 14px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+tr:hover .copy-btn {
+  opacity: 1;
+}
+
+.copy-btn:hover {
+  background: var(--copy-btn-hover-bg);
+  color: var(--accent);
+}
+
+.copy-btn.copied {
+  color: var(--status-online);
+}
+
+.copy-tooltip {
+  position: absolute;
+  top: -1.6rem;
+  right: -0.5rem;
+  background: var(--bg-secondary);
+  color: var(--status-online);
+  font-size: 0.65rem;
+  padding: 0.15rem 0.4rem;
+  border-radius: 3px;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+  border: 1px solid var(--border-color);
+}
+
+.copy-tooltip.visible {
+  opacity: 1;
+}
+
+/* ===== Item 34: Latency Chart ===== */
+.latency-chart {
+  width: 100%;
+  height: 120px;
+  position: relative;
+  margin-top: 0.5rem;
+}
+
+.latency-chart svg {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.latency-chart .chart-line {
+  fill: none;
+  stroke: var(--chart-line);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.latency-chart .chart-area {
+  stroke: none;
+}
+
+.latency-chart .chart-grid-line {
+  stroke: var(--chart-grid);
+  stroke-width: 1;
+  stroke-dasharray: 4 3;
+}
+
+.latency-chart .chart-grid-text {
+  fill: var(--chart-text);
+  font-size: 9px;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+.latency-chart .chart-value-text {
+  fill: var(--text-primary);
+  font-size: 11px;
+  font-weight: 600;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+/* ===== Item 35: Query Type Pills ===== */
+.query-type-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  align-items: center;
+  padding: 0.5rem 1rem;
+  background: var(--th-bg);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.query-type-pill {
+  background: var(--pill-bg);
+  color: var(--pill-color);
+  border: 1px solid var(--pill-border);
+  border-radius: 9999px;
+  padding: 0.2rem 0.6rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  letter-spacing: 0.02em;
+  user-select: none;
+}
+
+.query-type-pill:hover {
+  background: var(--pill-active-bg);
+  color: var(--pill-active-color);
+  border-color: var(--pill-active-border);
+}
+
+.query-type-pill.active {
+  background: var(--pill-active-bg);
+  color: var(--pill-active-color);
+  border-color: var(--pill-active-border);
+  box-shadow: 0 0 0 1px var(--pill-active-border);
+}
+
+.query-type-pill-clear {
+  background: none;
+  border: 1px solid var(--pill-border);
+  color: var(--text-muted);
+  border-radius: 9999px;
+  padding: 0.2rem 0.6rem;
+  font-size: 0.7rem;
+  cursor: pointer;
+  transition: color 0.2s ease, border-color 0.2s ease;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+.query-type-pill-clear:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* ===== Item 36: Cache Gauge ===== */
+.cache-gauge {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25rem;
+}
+
+.cache-gauge-svg {
+  width: 80px;
+  height: 80px;
+  transform: rotate(-90deg);
+}
+
+.cache-gauge-track {
+  fill: none;
+  stroke: var(--gauge-track);
+  stroke-width: 6;
+}
+
+.cache-gauge-ring {
+  fill: none;
+  stroke-width: 6;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 0.6s ease, stroke 0.4s ease;
+}
+
+.cache-gauge-text {
+  font-size: 1rem;
+  font-weight: 700;
+  fill: var(--text-primary);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  text-anchor: middle;
+  dominant-baseline: central;
+  transform: rotate(90deg);
+  transform-origin: center;
+}
+
+.cache-gauge-label {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* ===== Item 37: Grouped Log View ===== */
+.group-header {
+  background: var(--group-header-bg);
+  cursor: pointer;
+  transition: background 0.15s ease;
+  user-select: none;
+}
+
+.group-header:hover {
+  background: var(--group-header-hover);
+}
+
+.group-header td {
+  font-weight: 600;
+  font-size: 0.85rem;
+  padding: 0.6rem 1rem;
+  border-top: 1px solid var(--border-color);
+}
+
+.group-header .chevron-icon {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 0.5rem;
+  transition: transform 0.25s ease;
+}
+
+.group-header .chevron-icon svg {
+  width: 16px;
+  height: 16px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.group-header.collapsed .chevron-icon {
+  transform: rotate(-90deg);
+}
+
+.group-header .group-count {
+  font-size: 0.7rem;
+  font-weight: 400;
+  color: var(--text-muted);
+  margin-left: 0.5rem;
+  background: var(--badge-bg);
+  padding: 0.1rem 0.4rem;
+  border-radius: 9999px;
+}
+
+.group-row.collapsed {
+  display: none;
+}
+
+.group-by-toggle {
+  background: var(--pill-bg);
+  color: var(--pill-color);
+  border: 1px solid var(--pill-border);
+  border-radius: 0.5rem;
+  padding: 0.3rem 0.7rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  user-select: none;
+}
+
+.group-by-toggle:hover {
+  background: var(--pill-active-bg);
+  color: var(--pill-active-color);
+  border-color: var(--pill-active-border);
+}
+
+.group-by-toggle.active {
+  background: var(--pill-active-bg);
+  color: var(--pill-active-color);
+  border-color: var(--pill-active-border);
+}
+
+.group-by-toggle svg {
+  width: 14px;
+  height: 14px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* ===== Table toolbar (above table) ===== */
+.table-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 1rem;
+  background: var(--th-bg);
+  border-bottom: 1px solid var(--border-color);
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.table-toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+/* ===== Compact mode overrides for new elements ===== */
+body.compact .query-type-pills {
+  padding: 0.3rem 0.5rem;
+  gap: 0.25rem;
+}
+
+body.compact .query-type-pill,
+body.compact .query-type-pill-clear {
+  font-size: 0.6rem;
+  padding: 0.1rem 0.4rem;
+}
+
+body.compact .table-toolbar {
+  padding: 0.3rem 0.5rem;
+}
+
+body.compact .group-header td {
+  padding: 0.4rem 0.5rem;
+  font-size: 0.8rem;
+}
+
+body.compact .copy-btn svg {
+  width: 12px;
+  height: 12px;
+}
+
+body.compact .latency-chart {
+  height: 80px;
+}
+
+body.compact .cache-gauge-svg {
+  width: 60px;
+  height: 60px;
+}
+
+/* ===== Responsive overrides for new elements ===== */
+@media (max-width: 1024px) {
+  .latency-chart {
+    height: 100px;
+  }
+
+  .cache-gauge-svg {
+    width: 70px;
+    height: 70px;
+  }
+}
+
+@media (max-width: 600px) {
+  .query-type-pills {
+    padding: 0.4rem 0.5rem;
+    gap: 0.25rem;
+  }
+
+  .table-toolbar {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .cell-with-copy {
+    padding-right: 1.2rem;
+  }
+}
+
+/* ===== Item 38: Export Button & Dropdown ===== */
+.toolbar-dropdown-wrap {
+  position: relative;
+  display: inline-block;
+}
+
+.toolbar-btn {
+  background: var(--pill-bg);
+  color: var(--pill-color);
+  border: 1px solid var(--pill-border);
+  border-radius: 0.5rem;
+  padding: 0.3rem 0.7rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  user-select: none;
+}
+
+.toolbar-btn:hover {
+  background: var(--pill-active-bg);
+  color: var(--pill-active-color);
+  border-color: var(--pill-active-border);
+}
+
+.toolbar-btn svg {
+  width: 14px;
+  height: 14px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.toolbar-dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  background: var(--dropdown-bg);
+  border: 1px solid var(--dropdown-border);
+  border-radius: 0.5rem;
+  min-width: 160px;
+  z-index: 200;
+  box-shadow: 0 8px 24px var(--shadow-color);
+  display: none;
+  overflow: hidden;
+}
+
+.toolbar-dropdown.open {
+  display: block;
+}
+
+.toolbar-dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.8rem;
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: background 0.15s ease;
+  border: none;
+  background: none;
+  width: 100%;
+  text-align: left;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+.toolbar-dropdown-item:hover {
+  background: var(--dropdown-hover);
+}
+
+.toolbar-dropdown-item svg {
+  width: 14px;
+  height: 14px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex-shrink: 0;
+}
+
+/* ===== Item 39: Column Visibility Panel ===== */
+.columns-panel {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  background: var(--dropdown-bg);
+  border: 1px solid var(--dropdown-border);
+  border-radius: 0.5rem;
+  min-width: 180px;
+  z-index: 200;
+  box-shadow: 0 8px 24px var(--shadow-color);
+  display: none;
+  padding: 0.5rem 0;
+}
+
+.columns-panel.open {
+  display: block;
+}
+
+.columns-panel-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.75rem;
+  font-size: 0.8rem;
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.columns-panel-item:hover {
+  background: var(--dropdown-hover);
+}
+
+.columns-panel-item input[type="checkbox"] {
+  accent-color: var(--accent);
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+}
+
+/* Column hiding via data-col attribute */
+th[data-col].col-hidden,
+td[data-col].col-hidden {
+  display: none;
+}
+
+/* ===== Item 40: Pagination ===== */
+.pagination-container {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 1rem;
+  background: var(--th-bg);
+  border-top: 1px solid var(--border-color);
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.pagination-info {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
+.pagination-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.pagination-btn {
+  background: var(--pagination-bg);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 0.375rem;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  min-width: 28px;
+  text-align: center;
+}
+
+.pagination-btn:hover:not(:disabled) {
+  background: var(--dropdown-hover);
+  color: var(--text-primary);
+}
+
+.pagination-btn.active {
+  background: var(--pagination-active-bg);
+  color: var(--pagination-active-color);
+  border-color: var(--pagination-active-bg);
+  font-weight: 600;
+}
+
+.pagination-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.pagination-size-select {
+  background: var(--pagination-bg);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 0.375rem;
+  padding: 0.2rem 0.4rem;
+  font-size: 0.75rem;
+  cursor: pointer;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+.new-events-indicator {
+  display: none;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.3rem 0.7rem;
+  background: hsla(199, 89%, 48%, 0.15);
+  color: var(--accent);
+  border-radius: 9999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s ease;
+  border: none;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+.new-events-indicator.visible {
+  display: inline-flex;
+}
+
+.new-events-indicator:hover {
+  background: hsla(199, 89%, 48%, 0.25);
+}
+
+/* ===== Item 41: Skeleton Loading ===== */
+.skeleton-row td {
+  padding: 0.75rem 1rem;
+  border-top: 1px solid var(--border-color);
+}
+
+.skeleton-bar {
+  height: 12px;
+  background: var(--skeleton-bg);
+  border-radius: 4px;
+  position: relative;
+  overflow: hidden;
+}
+
+.skeleton-bar::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, var(--skeleton-shine), transparent);
+  animation: shimmer 1.5s ease-in-out infinite;
+}
+
+@keyframes shimmer {
+  0% {
+    left: -100%;
+  }
+
+  100% {
+    left: 100%;
+  }
+}
+
+.skeleton-card .stat-header,
+.skeleton-card .stats-row,
+.skeleton-card .top-list,
+.skeleton-card .type-breakdown-list,
+.skeleton-card .latency-chart,
+.skeleton-card .heatmap-container {
+  visibility: hidden;
+}
+
+.skeleton-card .stat-header::after,
+.skeleton-card .stats-row::after {
+  content: '';
+  visibility: visible;
+  display: block;
+  height: 12px;
+  background: var(--skeleton-bg);
+  border-radius: 4px;
+  position: relative;
+  overflow: hidden;
+}
+
+.skeleton-card .stat-header::after {
+  width: 40%;
+  margin-bottom: 1rem;
+}
+
+.skeleton-card .stats-row::after {
+  width: 80%;
+}
+
+/* ===== Item 42: Row Slide-In Animation ===== */
+@keyframes slideInRow {
+  0% {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.row-new {
+  animation: slideInRow 0.4s ease-out;
+  background: var(--new-row-bg);
+}
+
+/* ===== Item 43: Notification Button ===== */
+.notification-btn {
+  position: relative;
+}
+
+.notification-btn.active {
+  color: var(--notification-active);
+}
+
+.notification-btn:not(.active) {
+  color: var(--notification-inactive);
+}
+
+.notification-btn .notif-dot {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  display: none;
+}
+
+.notification-btn.active .notif-dot {
+  display: block;
+}
+
+/* ===== Item 45: Timezone indicator ===== */
+.timezone-label {
+  font-size: 0.6rem;
+  color: var(--text-muted);
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  display: block;
+  margin-top: 2px;
+}
+
+/* ===== Compact mode overrides for new elements ===== */
+body.compact .pagination-container {
+  padding: 0.3rem 0.5rem;
+}
+
+body.compact .pagination-btn {
+  padding: 0.15rem 0.35rem;
+  font-size: 0.65rem;
+  min-width: 24px;
+}
+
+body.compact .pagination-info {
+  font-size: 0.65rem;
+}
+
+body.compact .toolbar-btn {
+  font-size: 0.65rem;
+  padding: 0.2rem 0.5rem;
+}
+
+body.compact .skeleton-row td {
+  padding: 0.4rem 0.5rem;
+}
+
+body.compact .skeleton-bar {
+  height: 10px;
+}
+
+/* ===== Responsive overrides for new elements ===== */
+@media (max-width: 600px) {
+  .pagination-container {
+    flex-direction: column;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .toolbar-dropdown-wrap {
+    width: 100%;
+  }
+
+  .toolbar-dropdown {
+    left: 0;
+    right: 0;
+    min-width: auto;
+  }
+
+  .columns-panel {
+    left: 0;
+    right: 0;
+    min-width: auto;
+  }
+}
+
+/* ===== Node Status Panel (Items 89, 92, 93) ===== */
+
+.node-status-panel {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 0.75rem;
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+.node-status-panel h3 {
+  margin: 0 0 0.75rem 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.node-status-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 0.75rem;
+}
+
+.node-card {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 0.5rem;
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  transition: border-color 0.3s ease;
+}
+
+.node-card:hover {
+  border-color: var(--accent);
+}
+
+.node-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.node-name {
+  font-weight: 600;
+  font-size: 0.8rem;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-online-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.65rem;
+  font-weight: 500;
+  padding: 0.15rem 0.5rem;
+  border-radius: 1rem;
+  white-space: nowrap;
+}
+
+.node-online-indicator.online {
+  background: hsla(142, 71%, 45%, 0.15);
+  color: var(--status-online);
+}
+
+.node-online-indicator.offline {
+  background: hsla(0, 72%, 51%, 0.15);
+  color: var(--status-error);
+}
+
+.node-online-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.node-online-dot.online {
+  background: var(--status-online);
+  box-shadow: 0 0 4px var(--status-online);
+  animation: pulse 2.5s ease-in-out infinite;
+}
+
+.node-online-dot.offline {
+  background: var(--status-error);
+  box-shadow: 0 0 4px var(--status-error);
+}
+
+.node-details {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+}
+
+.node-detail-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.node-detail-label {
+  color: var(--text-muted);
+  font-size: 0.65rem;
+}
+
+.node-detail-value {
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.node-version {
+  font-size: 0.6rem;
+  color: var(--text-muted);
+  font-family: var(--font-mono, monospace);
+  margin-top: 0.2rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Compact mode for node cards */
+body.compact .node-card {
+  padding: 0.5rem;
+  gap: 0.25rem;
+}
+
+body.compact .node-name {
+  font-size: 0.7rem;
+}
+
+body.compact .node-details {
+  font-size: 0.6rem;
+}
+
+body.compact .node-detail-label {
+  font-size: 0.55rem;
+}
+
+/* ===== Item 98: Test Domain Button (in table rows) ===== */
+.test-domain-btn {
+  background: var(--copy-btn-bg);
+  color: var(--copy-btn-color);
+  border: none;
+  border-radius: 4px;
+  padding: 0.2rem;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.2s ease, background 0.15s ease, color 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  margin-left: 0.3rem;
+  vertical-align: middle;
+}
+
+.test-domain-btn svg {
+  width: 14px;
+  height: 14px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+tr:hover .test-domain-btn {
+  opacity: 1;
+}
+
+.test-domain-btn:hover {
+  background: var(--copy-btn-hover-bg);
+  color: var(--accent);
+}
+
+/* ===== Item 99: View Cleared Banner ===== */
+.view-cleared-banner {
+  padding: 0.5rem 1rem;
+  background: hsla(199, 89%, 48%, 0.1);
+  color: var(--accent);
+  font-size: 0.75rem;
+  text-align: center;
+  border-bottom: 1px solid var(--border-color);
+  font-weight: 500;
+}
+
+/* Responsive */
+@media (max-width: 600px) {
+  .node-status-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ===== Item 97: Improved Mobile Responsiveness ===== */
+
+/* Tablet: 768px and below */
+@media (max-width: 768px) {
+  .header-controls {
+    flex-wrap: wrap;
+    width: 100%;
+  }
+
+  .search-container {
+    max-width: 100%;
+    order: 10;
+    flex-basis: 100%;
+  }
+
+  .simulator-box {
+    flex-basis: 100%;
+    order: 11;
+  }
+
+  header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  header>div:first-child {
+    width: 100%;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .table-container {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  table {
+    min-width: 600px;
+  }
+
+  .modal-content {
+    width: 95%;
+    max-height: 90vh;
+    overflow-y: auto;
+    padding: 1.25rem;
+  }
+
+  .modal-stats-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Small mobile: 600px and below */
+@media (max-width: 600px) {
+  body {
+    padding: 0.5rem;
+    font-size: 0.875rem;
+  }
+
+  h1 {
+    font-size: 1.25rem;
+  }
+
+  .card {
+    padding: 1rem;
+  }
+
+  .stat-header {
+    font-size: 0.75rem;
+  }
+
+  .btn-icon {
+    width: 36px;
+    height: 36px;
+    font-size: 0.875rem;
+  }
+
+  .search-input {
+    padding: 0.5rem 0.75rem 0.5rem 2rem;
+    font-size: 0.875rem;
+  }
+
+  .simulator-input {
+    font-size: 0.875rem;
+  }
+
+  .simulator-box {
+    padding: 0.5rem;
+  }
+
+  /* Hide non-essential table columns on mobile */
+  th:nth-child(2),
+  td:nth-child(2),
+  th:nth-child(6),
+  td:nth-child(6),
+  th:nth-child(7),
+  td:nth-child(7) {
+    display: none;
+  }
+
+  table {
+    min-width: auto;
+  }
+
+  th,
+  td {
+    padding: 0.5rem 0.5rem;
+    font-size: 0.8rem;
+  }
+
+  .badge {
+    font-size: 0.65rem;
+  }
+
+  .domain {
+    max-width: 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .modal-content {
+    width: 98%;
+    padding: 1rem;
+    border-radius: 1rem;
+  }
+
+  .modal-charts {
+    height: 120px;
+  }
+
+  .view-cleared-banner {
+    font-size: 0.7rem;
+    padding: 0.4rem 0.75rem;
+  }
+
+  .top-item {
+    font-size: 0.8rem;
+  }
+
+  .node-card {
+    padding: 0.75rem;
+  }
+}
+

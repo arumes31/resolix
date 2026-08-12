@@ -94,7 +94,16 @@ func TestDedicatedPagesAndRootRejectsUnknownPaths(t *testing.T) {
 func TestFrontendAssetsRespectStyleCSP(t *testing.T) {
 	for _, path := range []string{
 		"../../static/js/index.js",
+		"../../static/js/dashboard.js",
+		"../../static/js/querylog.js",
+		"../../static/js/settings.js",
+		"../../static/js/interactions.js",
 		"../../static/js/config.js",
+		"../../static/js/config_upstreams.js",
+		"../../static/js/config_subscriptions.js",
+		"../../static/js/config_rules.js",
+		"../../static/js/config_clients.js",
+		"../../static/js/config_bootstrap.js",
 		"../../static/js/shell.js",
 		"../../templates/index.html",
 		"../../templates/querylog.html",
@@ -109,7 +118,14 @@ func TestFrontendAssetsRespectStyleCSP(t *testing.T) {
 			t.Fatalf("%s contains an inline style that style-src blocks", path)
 		}
 	}
-	for _, path := range []string{"../../static/css/style.css", "../../static/css/login.css"} {
+	for _, path := range []string{
+		"../../static/css/style.css",
+		"../../static/css/querylog.css",
+		"../../static/css/control_plane.css",
+		"../../static/css/operations.css",
+		"../../static/css/querylog_workbench.css",
+		"../../static/css/login.css",
+	} {
 		content, err := os.ReadFile(path) // #nosec G304 -- paths are fixed test fixtures listed above
 		if err != nil {
 			t.Fatal(err)
@@ -117,6 +133,117 @@ func TestFrontendAssetsRespectStyleCSP(t *testing.T) {
 		if bytes.Contains(content, []byte("'Inter'")) || bytes.Contains(content, []byte("'Outfit'")) {
 			t.Fatalf("%s references the repository's incomplete webfont bundle", path)
 		}
+	}
+}
+
+func TestFrontendStatusAndVirtualizationMarkers(t *testing.T) {
+	cluster, err := os.ReadFile("../../templates/cluster.html") // #nosec G304 -- fixed test fixture
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{
+		"storageWALSize", "storageCheckpointAge", "storageQueueDepth",
+		"storageQueueCapacity", "storageDroppedEvents", "storageVacuumState",
+	} {
+		if count := bytes.Count(cluster, []byte(`id="`+id+`"`)); count != 1 {
+			t.Fatalf("cluster metric id %s appears %d times, want 1", id, count)
+		}
+	}
+
+	queryTemplate, err := os.ReadFile("../../templates/querylog.html") // #nosec G304 -- fixed test fixture
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{
+		`id="queryResultCount" class="section-chip healthy" role="status" aria-live="polite" aria-atomic="true"`,
+		`id="viewClearedBanner" class="view-cleared-banner is-hidden" role="status" aria-live="polite" aria-atomic="true"`,
+		`id="queryDetailDrawer" class="query-detail-drawer"`,
+		`id="queryUndoToast" class="query-undo-toast"`,
+		`aria-hidden="true" inert`,
+	} {
+		if !bytes.Contains(queryTemplate, []byte(marker)) {
+			t.Fatalf("query-log template is missing accessibility marker %q", marker)
+		}
+	}
+
+	queryScripts := bytes.Buffer{}
+	for _, path := range []string{
+		"../../static/js/index.js",
+		"../../static/js/dashboard.js",
+		"../../static/js/querylog.js",
+		"../../static/js/settings.js",
+		"../../static/js/interactions.js",
+	} {
+		content, err := os.ReadFile(path) // #nosec G304 -- fixed test fixtures listed above
+		if err != nil {
+			t.Fatal(err)
+		}
+		queryScripts.Write(content)
+	}
+	for _, marker := range []string{`aria-rowindex=`, `headers="query-column-`, `focus({ preventScroll: true })`, `drawer.inert = true`} {
+		if !bytes.Contains(queryScripts.Bytes(), []byte(marker)) {
+			t.Fatalf("query-log script is missing virtualization marker %q", marker)
+		}
+	}
+}
+
+func TestFrontendAssetsKeepDependencyOrder(t *testing.T) {
+	styleAssets := []string{
+		"static/css/style.css",
+		"static/css/querylog.css",
+		"static/css/control_plane.css",
+		"static/css/operations.css",
+		"static/css/querylog_workbench.css",
+	}
+	for _, path := range []string{
+		"../../templates/index.html",
+		"../../templates/querylog.html",
+		"../../templates/cluster.html",
+		"../../templates/config.html",
+	} {
+		assertAssetOrder(t, path, styleAssets)
+	}
+
+	pageScripts := []string{
+		"static/js/index.js",
+		"static/js/dashboard.js",
+		"static/js/querylog.js",
+		"static/js/settings.js",
+		"static/js/interactions.js",
+	}
+	for _, path := range []string{
+		"../../templates/index.html",
+		"../../templates/querylog.html",
+		"../../templates/cluster.html",
+	} {
+		assertAssetOrder(t, path, pageScripts)
+	}
+	assertAssetOrder(t, "../../templates/config.html", []string{
+		"static/js/config.js",
+		"static/js/config_upstreams.js",
+		"static/js/config_subscriptions.js",
+		"static/js/config_rules.js",
+		"static/js/config_clients.js",
+		"static/js/config_bootstrap.js",
+	})
+}
+
+func assertAssetOrder(t *testing.T, path string, assets []string) {
+	t.Helper()
+	content, err := os.ReadFile(path) // #nosec G304 -- callers pass fixed repository fixtures
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := -1
+	for _, asset := range assets {
+		index := bytes.Index(content, []byte(asset))
+		if index < 0 {
+			t.Fatalf("%s does not load %s", path, asset)
+		}
+		if index <= previous {
+			t.Fatalf("%s loads %s out of dependency order", path, asset)
+		}
+		previous = index
 	}
 }
 

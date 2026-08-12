@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -68,7 +69,7 @@ func TestResolverQueueDeduplicatesAndDropsWhenFull(t *testing.T) {
 	}
 
 	for i := 2; i <= queueSize; i++ {
-		r.Queue(net.IPv4(192, 0, 2, byte(i)).String())
+		r.Queue(fmt.Sprintf("2001:db8::%x", i))
 	}
 	dropped := "198.51.100.1"
 	r.Queue(dropped)

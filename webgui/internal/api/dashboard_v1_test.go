@@ -43,8 +43,11 @@ func TestHandleDashboardV1Stats(t *testing.T) {
 	})
 	server.SetFilter(filter.New())
 	server.SetBuildInfo("2.5.0", "test")
-	server.store.SetNodeStatus("edge-a", models.NodeStatus{ID: "edge-a", Version: "2.5.0"})
+	if !server.store.SetNodeStatusIdentity("edge-a", "friendly-edge-a", models.NodeStatus{Version: "2.5.0"}) {
+		t.Fatal("failed to store edge-a status")
+	}
 	server.store.SetNodeStatus("edge-b", models.NodeStatus{ID: "edge-b", Version: "2.4.9"})
+	server.store.SetUpstreamHealth("edge-a", map[string]float64{"1.1.1.1": 12.5})
 
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/api/dashboard/v1/stats?range=1h", nil)
@@ -91,6 +94,9 @@ func assertDashboardV1Response(t *testing.T, response dashboardV1Response) {
 	}
 	if len(response.Series) == 0 {
 		t.Fatal("server-generated series is empty")
+	}
+	if response.UpstreamNodeNames["edge-a"] != "friendly-edge-a" {
+		t.Fatalf("upstream node names = %v", response.UpstreamNodeNames)
 	}
 }
 

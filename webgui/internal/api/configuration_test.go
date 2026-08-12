@@ -111,6 +111,8 @@ func TestFrontendAssetsRespectStyleCSP(t *testing.T) {
 	for _, path := range []string{
 		"../../static/js/index.js",
 		"../../static/js/dashboard.js",
+		"../../static/js/traffic_intensity.js",
+		"../../static/js/traffic_intensity_ui.js",
 		"../../static/js/querylog.js",
 		"../../static/js/settings.js",
 		"../../static/js/interactions.js",
@@ -139,6 +141,7 @@ func TestFrontendAssetsRespectStyleCSP(t *testing.T) {
 		"../../static/css/querylog.css",
 		"../../static/css/control_plane.css",
 		"../../static/css/operations.css",
+		"../../static/css/traffic_intensity.css",
 		"../../static/css/querylog_workbench.css",
 		"../../static/css/login.css",
 	} {
@@ -220,6 +223,13 @@ func TestDashboardQuickWinMarkers(t *testing.T) {
 		`data-outcome-mode="percentage"`,
 		`id="filterResumeBtn"`,
 		`id="dashboardSyncAllBtn"`,
+		`id="trafficIntensityPeak"`,
+		`id="trafficIntensityScale"`,
+		`id="trafficIntensityInspect"`,
+		`id="trafficIntensityAxis"`,
+		`href="static/css/traffic_intensity.css"`,
+		`src="static/js/traffic_intensity.js"`,
+		`src="static/js/traffic_intensity_ui.js"`,
 	} {
 		if !bytes.Contains(templateContent, []byte(marker)) {
 			t.Fatalf("dashboard template is missing quick-win marker %q", marker)
@@ -230,6 +240,13 @@ func TestDashboardQuickWinMarkers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	for _, path := range []string{"../../static/js/traffic_intensity.js", "../../static/js/traffic_intensity_ui.js"} {
+		componentContent, readErr := os.ReadFile(path) // #nosec G304 -- fixed test fixtures listed above
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		scriptContent = append(scriptContent, componentContent...)
+	}
 	for _, marker := range []string{
 		"renderDashboardComparison",
 		"renderDashboardRuntime",
@@ -239,6 +256,11 @@ func TestDashboardQuickWinMarkers(t *testing.T) {
 		"dashboardWarningCount",
 		"updateDashboardAttention",
 		"syncAllDashboardNodes",
+		"stats.upstream_node_names || {}",
+		"nodeNames[node] || node",
+		"percentileCeiling",
+		"renderTrafficIntensityAxis",
+		"No traffic data is available for this window.",
 	} {
 		if !bytes.Contains(scriptContent, []byte(marker)) {
 			t.Fatalf("dashboard script is missing quick-win behavior %q", marker)
@@ -313,6 +335,11 @@ func TestFrontendAssetsKeepDependencyOrder(t *testing.T) {
 	} {
 		assertAssetOrder(t, path, styleAssets)
 	}
+	assertAssetOrder(t, "../../templates/index.html", []string{
+		"static/css/operations.css",
+		"static/css/traffic_intensity.css",
+		"static/css/querylog_workbench.css",
+	})
 
 	pageScripts := []string{
 		"static/js/index.js",
@@ -328,6 +355,12 @@ func TestFrontendAssetsKeepDependencyOrder(t *testing.T) {
 	} {
 		assertAssetOrder(t, path, pageScripts)
 	}
+	assertAssetOrder(t, "../../templates/index.html", []string{
+		"static/js/index.js",
+		"static/js/traffic_intensity.js",
+		"static/js/traffic_intensity_ui.js",
+		"static/js/dashboard.js",
+	})
 	assertAssetOrder(t, "../../templates/config.html", []string{
 		"static/js/config.js",
 		"static/js/config_upstreams.js",

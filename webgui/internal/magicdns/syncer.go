@@ -126,7 +126,7 @@ func RecordsFromDevices(devices []Device, now time.Time) ([]Record, int) {
 	records := make([]Record, 0, len(devices)*2)
 	includedDevices := 0
 	for _, device := range devices {
-		if !device.Authorized || deviceExpired(device.Expires, now) {
+		if !device.Authorized || (!device.KeyExpiryDisabled && deviceExpired(device.Expires, now)) {
 			continue
 		}
 		name := normalizeName(device.Name)

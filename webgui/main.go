@@ -403,7 +403,7 @@ func runApplication(cfg *config.Config, sigChan <-chan os.Signal) {
 	}, func(ev models.QueryEvent, excludeFromStats bool) {
 		// exclude_from_stats clients emit to SSE only (no store/forwarder).
 		if !excludeFromStats {
-			store.AddEvent(ev)
+			ev = store.AddEvent(ev)
 			if cfg.Mode == config.ModeAgent {
 				fwd.EnqueueEvent(ev)
 			}

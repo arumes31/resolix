@@ -186,6 +186,48 @@ func TestRewritesWire(t *testing.T) {
 	}
 }
 
+func TestRewriteWildcardAndSpecificityWire(t *testing.T) {
+	var hits atomic.Int32
+	upstreamAddr := startFakeUpstream(t, &hits)
+	store, err := rewrites.Load("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []rewrites.Rewrite{
+		{Domain: "*.example.test", Type: rewrites.TypeA, Value: "192.0.2.10"},
+		{Domain: "home.example.test", Type: rewrites.TypeA, Value: "192.0.2.20"},
+		{Domain: "home.example.test", Type: rewrites.TypeA, Value: "192.0.2.21"},
+	} {
+		if _, err := store.Add(item.Domain, item.Type, item.Value); err != nil {
+			t.Fatalf("add %q: %v", item.Domain, err)
+		}
+	}
+	h := startPolicyServer(t, store, nil, upstreamAddr, &hits)
+
+	assertAnswers := func(domain string, want ...string) {
+		t.Helper()
+		resp := h.query(domain, dns.TypeA)
+		if len(resp.Answer) != len(want) {
+			t.Fatalf("%s answers = %v, want %v", domain, resp.Answer, want)
+		}
+		for i, record := range resp.Answer {
+			answer, ok := record.(*dns.A)
+			if !ok || answer.A.String() != want[i] {
+				t.Errorf("%s answer %d = %v, want A %s", domain, i, record, want[i])
+			}
+		}
+		_ = h.nextEvent(t)
+	}
+
+	assertAnswers("printer.example.test", "192.0.2.10")
+	assertAnswers("deep.printer.example.test", "192.0.2.10")
+	assertAnswers("home.example.test", "192.0.2.20", "192.0.2.21")
+	assertAnswers("example.test", "93.184.216.34")
+	if hits.Load() != 1 {
+		t.Fatalf("upstream hits = %d, want 1 for wildcard apex", hits.Load())
+	}
+}
+
 func TestRewriteLiveUpdate(t *testing.T) {
 	var hits atomic.Int32
 	upstreamAddr := startFakeUpstream(t, &hits)

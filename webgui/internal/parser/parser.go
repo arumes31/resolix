@@ -140,7 +140,7 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 		}
 
 		p.store.SetPending(node, domain, parsedTime)
-		p.store.AddEvent(event)
+		event = p.store.AddEvent(event)
 		return &event
 	}
 

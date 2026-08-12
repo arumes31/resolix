@@ -164,7 +164,7 @@ func (s *Server) handleIngestEvents(w http.ResponseWriter, r *http.Request, body
 		if events[i].UnixTime <= 0 || events[i].UnixTime > maxUnixTime {
 			events[i].UnixTime = now.Unix()
 		}
-		s.store.AddEvent(events[i])
+		events[i] = s.store.AddEvent(events[i])
 		s.BroadcastEvent(events[i])
 	}
 

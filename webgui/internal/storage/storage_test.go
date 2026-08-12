@@ -87,7 +87,7 @@ func TestAddEvent_SingleEvent(t *testing.T) {
 	defer cleanup()
 
 	now := time.Now().Unix()
-	s.AddEvent(models.QueryEvent{
+	stored := s.AddEvent(models.QueryEvent{
 		UnixTime: now,
 		Type:     "A",
 		Domain:   "example.com",
@@ -107,6 +107,22 @@ func TestAddEvent_SingleEvent(t *testing.T) {
 	}
 	if events[0].ID == "" {
 		t.Error("expected non-empty ID")
+	}
+	if stored.ID != events[0].ID {
+		t.Errorf("returned ID = %q, stored ID = %q", stored.ID, events[0].ID)
+	}
+}
+
+func TestAssignEventIDDoesNotStoreEvent(t *testing.T) {
+	s, cleanup := newTestStore(t)
+	defer cleanup()
+
+	event := s.AssignEventID(models.QueryEvent{Domain: "stream-only.example"})
+	if event.ID == "" {
+		t.Fatal("AssignEventID returned an empty ID")
+	}
+	if events := s.GetOrderedEvents(10); len(events) != 0 {
+		t.Fatalf("AssignEventID stored events: %+v", events)
 	}
 }
 

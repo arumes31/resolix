@@ -39,7 +39,7 @@ type persistedBacklog struct {
 const (
 	initialForwardBatchSize = 100
 	minForwardBatchSize     = 10
-	maxForwardBatchSize     = 500
+	maxForwardBatchSize     = 100
 	maxRetryAfter           = 10 * time.Minute
 	backlogStateFile        = "forwarder-backlog.json"
 	backlogStateVersion     = 1

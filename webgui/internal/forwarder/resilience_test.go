@@ -208,6 +208,70 @@ func TestAdaptiveBatchShrinksAfterPayloadRejection(t *testing.T) {
 	}
 }
 
+func TestAdaptiveBatchNeverExceedsControllerLimit(t *testing.T) {
+	const eventCount = 225
+
+	var mu sync.Mutex
+	batchSizes := make([]int, 0, 3)
+	delivered := make(chan struct{})
+	var deliveredOnce sync.Once
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost || request.URL.Path != "/api/ingest" {
+			writer.WriteHeader(http.StatusNoContent)
+			return
+		}
+		var events []models.QueryEvent
+		if err := decodeJSONBody(request, &events); err != nil {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		batchSizes = append(batchSizes, len(events))
+		total := 0
+		for _, size := range batchSizes {
+			total += size
+		}
+		mu.Unlock()
+		writer.WriteHeader(http.StatusNoContent)
+		if total >= eventCount {
+			deliveredOnce.Do(func() { close(delivered) })
+		}
+	}))
+	defer server.Close()
+
+	forwarder := NewForwarder(resilienceConfig(server.URL, ""))
+	forwarder.httpClient = server.Client()
+	for range eventCount {
+		forwarder.EnqueueEvent(models.QueryEvent{Domain: "bounded.example", Node: "resilient-agent"})
+	}
+	done := make(chan error, 1)
+	go func() { done <- forwarder.Start() }()
+	select {
+	case <-delivered:
+	case <-time.After(5 * time.Second):
+		forwarder.Stop()
+		t.Fatal("events were not delivered")
+	}
+	forwarder.Stop()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("forwarder stopped with error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("forwarder did not stop")
+	}
+
+	mu.Lock()
+	got := append([]int(nil), batchSizes...)
+	mu.Unlock()
+	for _, size := range got {
+		if size > 100 {
+			t.Fatalf("batch sizes = %v, controller limit is 100", got)
+		}
+	}
+}
+
 func TestRetryAfterParsingAndResponse(t *testing.T) {
 	now := time.Date(2026, time.August, 11, 12, 0, 0, 0, time.UTC)
 	if got := parseRetryAfter("17", now); got != 17*time.Second {

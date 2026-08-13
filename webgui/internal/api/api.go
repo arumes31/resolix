@@ -33,14 +33,15 @@ import (
 )
 
 const (
-	sessionCookieName   = "ts_dns_session"
-	csrfCookieName      = "ts_dns_csrf"
-	csrfTokenBytes      = 32
-	sessionTokenBytes   = 32
-	sessionLifetime     = 7 * 24 * time.Hour
-	maxIngestFutureSkew = 5 * time.Minute
-	statsResponseTTL    = 5 * time.Second
-	staticAssetCaching  = "public, max-age=300"
+	sessionCookieName    = "ts_dns_session"
+	csrfCookieName       = "ts_dns_csrf"
+	csrfTokenBytes       = 32
+	sessionTokenBytes    = 32
+	sessionLifetime      = 7 * 24 * time.Hour
+	maxIngestFutureSkew  = 5 * time.Minute
+	statsResponseTTL     = 5 * time.Second
+	dashboardResponseTTL = 15 * time.Second
+	staticAssetCaching   = "public, max-age=300"
 )
 
 var userRulesMu sync.Mutex
@@ -118,10 +119,13 @@ type Server struct {
 
 	// Short-lived response cache coalesces expensive SQLite stats aggregation
 	// across dashboard clients while keeping live counters reasonably fresh.
-	statsCacheMu   sync.Mutex
-	statsCacheBody []byte
-	statsCacheAt   time.Time
-	dashboardCache map[string]statsCacheEntry
+	statsCacheMu        sync.Mutex
+	statsCacheBody      []byte
+	statsCacheAt        time.Time
+	dashboardCacheMu    sync.RWMutex
+	dashboardCache      map[string]statsCacheEntry
+	dashboardRangeLocks map[string]*sync.Mutex
+	dashboardCacheEpoch uint64
 
 	// Prometheus metrics (Item 77)
 	metrics   *Metrics
@@ -157,6 +161,7 @@ func NewServer(cfg *config.Config, store *storage.Store, prs *parser.Parser, tmp
 		metrics:             &Metrics{StartTime: time.Now()},
 		nodeSyncGenerations: make(map[string]uint64),
 		dashboardCache:      make(map[string]statsCacheEntry),
+		dashboardRangeLocks: make(map[string]*sync.Mutex),
 	}
 
 	// Hash the configured password at startup if auth is enabled

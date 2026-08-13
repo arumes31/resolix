@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/arumes31/resolix/webgui/internal/config"
@@ -140,18 +141,80 @@ func (s *Server) dashboardV1Response(
 	preset dashboardRangePreset,
 	now time.Time,
 ) ([]byte, error) {
-	s.statsCacheMu.Lock()
-	defer s.statsCacheMu.Unlock()
+	return s.cachedDashboardResponse(ctx, preset.key, now, func(ctx context.Context) ([]byte, error) {
+		return s.buildDashboardV1Response(ctx, preset, now)
+	})
+}
 
-	if s.dashboardCache == nil {
-		s.dashboardCache = make(map[string]statsCacheEntry)
+func (s *Server) cachedDashboardResponse(
+	ctx context.Context,
+	key string,
+	now time.Time,
+	build func(context.Context) ([]byte, error),
+) ([]byte, error) {
+	if body, ok := s.cachedDashboardBody(key, now); ok {
+		return body, nil
 	}
-	if cached, ok := s.dashboardCache[preset.key]; ok {
-		age := now.Sub(cached.at)
-		if len(cached.body) > 0 && age >= 0 && age < statsResponseTTL {
-			return cached.body, nil
+
+	rangeLock := s.dashboardRangeLock(key)
+	rangeLock.Lock()
+	defer rangeLock.Unlock()
+	if body, ok := s.cachedDashboardBody(key, now); ok {
+		return body, nil
+	}
+
+	s.dashboardCacheMu.RLock()
+	epoch := s.dashboardCacheEpoch
+	s.dashboardCacheMu.RUnlock()
+	body, err := build(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	s.dashboardCacheMu.Lock()
+	if epoch == s.dashboardCacheEpoch {
+		if s.dashboardCache == nil {
+			s.dashboardCache = make(map[string]statsCacheEntry)
 		}
+		s.dashboardCache[key] = statsCacheEntry{body: body, at: now}
 	}
+	s.dashboardCacheMu.Unlock()
+	return body, nil
+}
+
+func (s *Server) cachedDashboardBody(key string, now time.Time) ([]byte, bool) {
+	s.dashboardCacheMu.RLock()
+	defer s.dashboardCacheMu.RUnlock()
+	cached, ok := s.dashboardCache[key]
+	if !ok {
+		return nil, false
+	}
+	age := now.Sub(cached.at)
+	if len(cached.body) == 0 || age < 0 || age >= dashboardResponseTTL {
+		return nil, false
+	}
+	return cached.body, true
+}
+
+func (s *Server) dashboardRangeLock(key string) *sync.Mutex {
+	s.dashboardCacheMu.Lock()
+	defer s.dashboardCacheMu.Unlock()
+	if s.dashboardRangeLocks == nil {
+		s.dashboardRangeLocks = make(map[string]*sync.Mutex)
+	}
+	if rangeLock := s.dashboardRangeLocks[key]; rangeLock != nil {
+		return rangeLock
+	}
+	rangeLock := &sync.Mutex{}
+	s.dashboardRangeLocks[key] = rangeLock
+	return rangeLock
+}
+
+func (s *Server) buildDashboardV1Response(
+	ctx context.Context,
+	preset dashboardRangePreset,
+	now time.Time,
+) ([]byte, error) {
 	if s.store == nil {
 		return nil, fmt.Errorf("dashboard store is unavailable")
 	}
@@ -242,7 +305,6 @@ func (s *Server) dashboardV1Response(
 	if err != nil {
 		return nil, fmt.Errorf("encode dashboard v1 response: %w", err)
 	}
-	s.dashboardCache[preset.key] = statsCacheEntry{body: body, at: now}
 	return body, nil
 }
 
@@ -327,8 +389,12 @@ func appendUniqueString(values []string, target string) []string {
 }
 
 func (s *Server) invalidateDashboardStatsCache() {
-	s.statsCacheMu.Lock()
+	s.dashboardCacheMu.Lock()
 	s.dashboardCache = make(map[string]statsCacheEntry)
+	s.dashboardCacheEpoch++
+	s.dashboardCacheMu.Unlock()
+
+	s.statsCacheMu.Lock()
 	s.statsCacheBody = nil
 	s.statsCacheAt = time.Time{}
 	s.statsCacheMu.Unlock()

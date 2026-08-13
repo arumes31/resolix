@@ -13,6 +13,7 @@
     <link rel="stylesheet" href="static/css/querylog.css">
     <link rel="stylesheet" href="static/css/control_plane.css">
     <link rel="stylesheet" href="static/css/operations.css">
+    <link rel="stylesheet" href="static/css/dashboard_loading.css">
     <link rel="stylesheet" href="static/css/traffic_intensity.css">
     <link rel="stylesheet" href="static/css/querylog_workbench.css">
 </head>
@@ -101,35 +102,40 @@
             </div>
         </header>
 
-        <main class="app-content container">
+        <main id="dashboardContent" class="app-content container" aria-busy="true">
+            <div id="dashboardLoadingStatus" class="dashboard-loading-status" role="status" aria-live="polite" hidden>
+                <span class="dashboard-loading-spinner" aria-hidden="true"></span>
+                <span id="dashboardLoadingMessage">Loading dashboard…</span>
+                <button id="dashboardRetry" type="button" class="chart-action" hidden>Retry</button>
+            </div>
             <section id="dashboardDegraded" class="dashboard-degraded" role="alert" hidden>
                 <div><strong>Dashboard data needs attention</strong><span id="dashboardDegradedMessage">Some analytics are incomplete.</span></div>
             </section>
 
             <section class="metric-grid dashboard-metric-grid" aria-label="Traffic summary">
-                <article class="metric-card"><span>Queries in window</span><strong id="windowQueries">0</strong><small><i class="metric-dot blue"></i><span id="windowLabel">Last 24 hours</span></small><small id="queriesDelta" class="metric-delta">Awaiting comparison</small></article>
-                <article class="metric-card"><span>Average request rate</span><strong id="averageRPM">0 RPM</strong><small>Server-derived across selected window</small><small id="rpmDelta" class="metric-delta">Awaiting comparison</small></article>
-                <article class="metric-card metric-card-protection"><span>Blocked queries</span><strong id="blockedRatio">0%</strong><small><i class="metric-dot green"></i><b id="blockedCount">0</b> policy decisions</small><small id="blockedDelta" class="metric-delta">Awaiting comparison</small></article>
-                <article class="metric-card metric-card-errors"><span>DNS error rate</span><strong id="errorRatio">0%</strong><small><i class="metric-dot red"></i><b id="errorCount">0</b> operational failures</small><small id="errorDelta" class="metric-delta">Awaiting comparison</small></article>
-                <article class="metric-card"><span>Local response rate</span><strong id="localResponseRatio" class="stat-cache">0%</strong><small><i class="metric-dot amber"></i><b id="cacheHitCount">0</b> cached · <b id="rewriteHitCount">0</b> rewritten</small><small id="localResponseDelta" class="metric-delta">Awaiting comparison</small></article>
-                <article class="metric-card"><span>Bandwidth avoided</span><strong id="bandwidthSaved">0 B</strong><small>Estimated from cached responses</small><small id="bandwidthDelta" class="metric-delta">Awaiting comparison</small></article>
+                <article class="metric-card skeleton-card dashboard-skeleton dashboard-metric-skeleton"><span>Queries in window</span><strong id="windowQueries">0</strong><small><i class="metric-dot blue"></i><span id="windowLabel">Last 24 hours</span></small><small id="queriesDelta" class="metric-delta">Awaiting comparison</small></article>
+                <article class="metric-card skeleton-card dashboard-skeleton dashboard-metric-skeleton"><span>Average request rate</span><strong id="averageRPM">0 RPM</strong><small>Server-derived across selected window</small><small id="rpmDelta" class="metric-delta">Awaiting comparison</small></article>
+                <article class="metric-card metric-card-protection skeleton-card dashboard-skeleton dashboard-metric-skeleton"><span>Blocked queries</span><strong id="blockedRatio">0%</strong><small><i class="metric-dot green"></i><b id="blockedCount">0</b> policy decisions</small><small id="blockedDelta" class="metric-delta">Awaiting comparison</small></article>
+                <article class="metric-card metric-card-errors skeleton-card dashboard-skeleton dashboard-metric-skeleton"><span>DNS error rate</span><strong id="errorRatio">0%</strong><small><i class="metric-dot red"></i><b id="errorCount">0</b> operational failures</small><small id="errorDelta" class="metric-delta">Awaiting comparison</small></article>
+                <article class="metric-card skeleton-card dashboard-skeleton dashboard-metric-skeleton"><span>Local response rate</span><strong id="localResponseRatio" class="stat-cache">0%</strong><small><i class="metric-dot amber"></i><b id="cacheHitCount">0</b> cached · <b id="rewriteHitCount">0</b> rewritten</small><small id="localResponseDelta" class="metric-delta">Awaiting comparison</small></article>
+                <article class="metric-card skeleton-card dashboard-skeleton dashboard-metric-skeleton"><span>Bandwidth avoided</span><strong id="bandwidthSaved">0 B</strong><small>Estimated from cached responses</small><small id="bandwidthDelta" class="metric-delta">Awaiting comparison</small></article>
             </section>
 
             <div class="dashboard-grid ops-grid">
-                <div class="card traffic-card wide-card skeleton-card">
+                <div class="card traffic-card wide-card skeleton-card dashboard-skeleton dashboard-chart-skeleton">
                     <div class="stat-header"><span>Query activity</span><div class="chart-actions"><button id="dashboardZoomReset" type="button" class="chart-action" hidden>Reset zoom</button><span id="trafficBucketLabel" class="section-chip">Server timeline</span></div></div>
                     <div id="trafficInspect" class="chart-inspect" aria-live="polite">Hover or focus a bucket · drag across buckets to zoom</div>
                     <div class="dashboard-timeline" id="trafficSeries" role="group" aria-label="Query volume over time"></div>
                     <div class="chart-axis"><span id="trafficStartLabel">—</span><span id="trafficEndLabel">Now</span></div>
                 </div>
-                <div class="card outcome-card skeleton-card">
+                <div class="card outcome-card skeleton-card dashboard-skeleton dashboard-chart-skeleton">
                     <div class="stat-header"><span>Query outcomes</span><div class="chart-actions"><div class="chart-mode" role="group" aria-label="Outcome chart scale"><button type="button" class="chart-mode-btn is-active" data-outcome-mode="count" aria-pressed="true">Count</button><button type="button" class="chart-mode-btn" data-outcome-mode="percentage" aria-pressed="false">%</button></div><span class="section-chip">Mutually exclusive</span></div></div>
                     <div class="outcome-legend" aria-hidden="true"><span><i class="legend-swatch forwarded"></i>Forwarded</span><span><i class="legend-swatch cached"></i>Cached</span><span><i class="legend-swatch rewritten"></i>Rewritten</span><span><i class="legend-swatch blocked"></i>Blocked</span><span><i class="legend-swatch errors"></i>Failed</span></div>
                     <div id="outcomeInspect" class="chart-inspect" aria-live="polite">Showing absolute counts</div>
                     <div class="dashboard-timeline outcome-timeline" id="outcomeSeries" role="group" aria-label="Query outcomes over time"></div>
                 </div>
-                <div class="card node-comparison-card skeleton-card"><div class="stat-header"><span>Node comparison</span><span class="section-chip">Selected window</span></div><div id="nodeComparison" class="node-comparison"></div></div>
-                <div class="card filtering-card skeleton-card">
+                <div class="card node-comparison-card skeleton-card dashboard-skeleton"><div class="stat-header"><span>Node comparison</span><span class="section-chip">Selected window</span></div><div id="nodeComparison" class="node-comparison"></div></div>
+                <div class="card filtering-card skeleton-card dashboard-skeleton">
                     <div class="stat-header"><span>Filtering protection</span><span id="filteringChip" class="section-chip">Loading</span></div>
                     <div class="filtering-overview">
                         <div class="filtering-state-row"><span id="filteringBeacon" class="filtering-beacon"></span><div><strong id="filteringState">Checking protection</strong><span id="filteringDetail">Waiting for filter engine status</span></div><button id="filterResumeBtn" type="button" class="chart-action filter-resume" hidden>Resume</button></div>
@@ -137,15 +143,15 @@
                         <small id="filterLastUpdated">No filter update reported</small>
                     </div>
                 </div>
-                <div class="card skeleton-card"><div class="stat-header"><span>Top blocked domains</span><span class="section-chip alert-chip">Policy</span></div><ul class="top-list" id="topBlockedDomains"></ul></div>
-                <div class="card skeleton-card"><div class="stat-header">Top domains</div><ul class="top-list" id="topDomains"></ul></div>
-                <div class="card skeleton-card"><div class="stat-header">Top clients</div><ul class="top-list" id="topClients"></ul></div>
-                <div class="card skeleton-card">
+                <div class="card skeleton-card dashboard-skeleton"><div class="stat-header"><span>Top blocked domains</span><span class="section-chip alert-chip">Policy</span></div><ul class="top-list" id="topBlockedDomains"></ul></div>
+                <div class="card skeleton-card dashboard-skeleton"><div class="stat-header">Top domains</div><ul class="top-list" id="topDomains"></ul></div>
+                <div class="card skeleton-card dashboard-skeleton"><div class="stat-header">Top clients</div><ul class="top-list" id="topClients"></ul></div>
+                <div class="card skeleton-card dashboard-skeleton">
                     <div class="stat-header">Query type breakdown</div>
                     <div id="typeBreakdown" class="type-breakdown"></div>
                 </div>
-                <div class="card upstream-health-card skeleton-card"><div class="stat-header"><span>Upstream health</span><span class="section-chip healthy">Monitoring</span></div><ul class="top-list" id="upstreamHealth"><li class="top-item"><span>Loading…</span></li></ul></div>
-                <div class="card wide-card heatmap-card traffic-intensity-card skeleton-card" data-layout="strip">
+                <div class="card upstream-health-card skeleton-card dashboard-skeleton"><div class="stat-header"><span>Upstream health</span><span class="section-chip healthy">Monitoring</span></div><ul class="top-list" id="upstreamHealth"><li class="top-item"><span>Loading…</span></li></ul></div>
+                <div class="card wide-card heatmap-card traffic-intensity-card skeleton-card dashboard-skeleton dashboard-chart-skeleton" data-layout="strip">
                     <div class="stat-header"><span>Traffic intensity</span><span id="trafficIntensityPeak" class="traffic-intensity-peak">Waiting for data</span></div>
                     <div class="traffic-intensity-body">
                         <div class="traffic-intensity-meta">
@@ -169,6 +175,7 @@
     <script nonce="{{.Nonce}}" src="static/js/index.js"></script>
     <script nonce="{{.Nonce}}" src="static/js/traffic_intensity.js"></script>
     <script nonce="{{.Nonce}}" src="static/js/traffic_intensity_ui.js"></script>
+    <script nonce="{{.Nonce}}" src="static/js/dashboard_loader.js"></script>
     <script nonce="{{.Nonce}}" src="static/js/dashboard.js"></script>
     <script nonce="{{.Nonce}}" src="static/js/querylog.js"></script>
     <script nonce="{{.Nonce}}" src="static/js/settings.js"></script>

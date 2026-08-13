@@ -1,9 +1,11 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -179,6 +181,97 @@ func TestDashboardV1CacheIsScopedByRange(t *testing.T) {
 	if got := readQueries("6h"); got != 2 {
 		t.Fatalf("uncached 6h queries = %d, want 2", got)
 	}
+}
+
+func TestDashboardV1CacheCoalescesSameRange(t *testing.T) {
+	server := testServer(&config.Config{})
+	var builds atomic.Int32
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	build := func(ctx context.Context) ([]byte, error) {
+		builds.Add(1)
+		started <- struct{}{}
+		select {
+		case <-release:
+			return []byte(`{"range":"1h"}`), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	results := make(chan dashboardCacheTestResult, 2)
+	call := func() {
+		body, err := server.cachedDashboardResponse(t.Context(), "1h", time.Now(), build)
+		results <- dashboardCacheTestResult{body: body, err: err}
+	}
+	go call()
+	<-started
+	go call()
+	close(release)
+
+	for range 2 {
+		result := <-results
+		if result.err != nil || string(result.body) != `{"range":"1h"}` {
+			t.Fatalf("cached response = %q, %v", result.body, result.err)
+		}
+	}
+	if got := builds.Load(); got != 1 {
+		t.Fatalf("same-range builds = %d, want 1", got)
+	}
+}
+
+func TestDashboardV1CacheUsesIndependentRangeLocks(t *testing.T) {
+	server := testServer(&config.Config{})
+	if server.dashboardRangeLock("1h") == server.dashboardRangeLock("6h") {
+		t.Fatal("different dashboard ranges share one build lock")
+	}
+	if server.dashboardRangeLock("1h") != server.dashboardRangeLock("1h") {
+		t.Fatal("same dashboard range did not reuse its build lock")
+	}
+}
+
+func TestDashboardV1InvalidationDoesNotCacheInFlightBuild(t *testing.T) {
+	server := testServer(&config.Config{})
+	started := make(chan struct{})
+	release := make(chan struct{})
+	result := make(chan dashboardCacheTestResult, 1)
+	go func() {
+		body, err := server.cachedDashboardResponse(t.Context(), "1h", time.Now(), func(ctx context.Context) ([]byte, error) {
+			close(started)
+			select {
+			case <-release:
+				return []byte("stale"), nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		})
+		result <- dashboardCacheTestResult{body: body, err: err}
+	}()
+	<-started
+
+	invalidated := make(chan struct{})
+	go func() {
+		server.invalidateDashboardStatsCache()
+		close(invalidated)
+	}()
+	select {
+	case <-invalidated:
+	case <-time.After(time.Second):
+		t.Fatal("cache invalidation blocked behind dashboard aggregation")
+	}
+
+	close(release)
+	if response := <-result; response.err != nil || string(response.body) != "stale" {
+		t.Fatalf("in-flight response = %q, %v", response.body, response.err)
+	}
+	if _, ok := server.cachedDashboardBody("1h", time.Now()); ok {
+		t.Fatal("response built before invalidation was cached")
+	}
+}
+
+type dashboardCacheTestResult struct {
+	body []byte
+	err  error
 }
 
 func TestDashboardV1MarksRetentionLimitedRanges(t *testing.T) {

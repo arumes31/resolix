@@ -18,24 +18,37 @@ function selectedDashboardRange() {
     return document.getElementById('dashboardRange')?.value || '24h';
 }
 
+async function fetchDashboardRange(range, signal) {
+    const response = await fetch(apiPath(`/api/dashboard/v1/stats?range=${encodeURIComponent(range)}`), { signal });
+    if (!response.ok) throw new Error(`Dashboard API failed (${response.status})`);
+    const stats = await response.json();
+    if (stats.schema_version !== 1) throw new Error(`Unsupported dashboard schema ${stats.schema_version}`);
+    return stats;
+}
+
+const dashboardLoadingView = globalThis.ResolixDashboardLoader.createView({
+    getCurrentStats: () => currentDashboardStats,
+    announce
+});
+const dashboardDataLoader = globalThis.ResolixDashboardLoader.create({
+    fetchRange: fetchDashboardRange,
+    render: stats => {
+        renderDashboardStats(stats);
+        document.querySelectorAll('.skeleton-card').forEach(card => card.classList.remove('skeleton-card'));
+        setPollingStatus(true);
+    },
+    setLoading: dashboardLoadingView.setLoading,
+    onError: (error, detail) => {
+        console.error(error);
+        refreshDashboardFreshness(true);
+        updateDashboardAttention(currentDashboardStats, true);
+        setPollingStatus(false);
+        dashboardLoadingView.showError(detail);
+    }
+});
+
 function fetchStats() {
-    const range = selectedDashboardRange();
-    return coalesceRequest(`stats:${range}`, async () => {
-        try {
-            const response = await fetch(apiPath(`/api/dashboard/v1/stats?range=${encodeURIComponent(range)}`));
-            if (!response.ok) throw new Error(`Dashboard API failed (${response.status})`);
-            const stats = await response.json();
-            if (stats.schema_version !== 1) throw new Error(`Unsupported dashboard schema ${stats.schema_version}`);
-            renderDashboardStats(stats);
-            document.querySelectorAll('.skeleton-card').forEach(card => card.classList.remove('skeleton-card'));
-            setPollingStatus(true);
-        } catch (error) {
-            console.error(error);
-            refreshDashboardFreshness(true);
-            updateDashboardAttention(currentDashboardStats, true);
-            setPollingStatus(false);
-        }
-    });
+    return dashboardDataLoader.load(selectedDashboardRange());
 }
 
 function renderDashboardStats(stats) {
@@ -461,6 +474,8 @@ if (dashboardRangeElement) {
     });
     setInterval(() => refreshDashboardFreshness(false), 5000);
 }
+
+document.getElementById('dashboardRetry')?.addEventListener('click', () => { void fetchStats(); });
 
 ['trafficSeries', 'outcomeSeries'].forEach(id => {
     const chart = document.getElementById(id);

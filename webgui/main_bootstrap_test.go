@@ -260,6 +260,68 @@ func TestDashboardAssetsExposeLocalResponsesAndRewriteOutcome(t *testing.T) {
 	}
 }
 
+func TestDashboardAssetsExposeResponsiveLoadingState(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		required []string
+	}{
+		{
+			name: "template",
+			path: "templates/index.html",
+				required: []string{
+					`id="dashboardContent"`,
+					`id="dashboardLoadingStatus"`,
+					`id="dashboardRetry"`,
+					`href="static/css/dashboard_loading.css"`,
+					`src="static/js/dashboard_loader.js"`,
+				`dashboard-skeleton`,
+			},
+		},
+		{
+			name: "javascript",
+			path: "static/js/dashboard.js",
+			required: []string{
+				"ResolixDashboardLoader.create",
+				"ResolixDashboardLoader.createView",
+				"dashboardRetry",
+			},
+		},
+		{
+			name: "loader",
+			path: "static/js/dashboard_loader.js",
+			required: []string{
+				"AbortController",
+				"generation",
+				"cache = new Map",
+			},
+		},
+		{
+			name: "stylesheet",
+			path: "static/css/dashboard_loading.css",
+			required: []string{
+				".dashboard-loading-status",
+				".dashboard-skeleton.skeleton-card",
+				".is-dashboard-loading",
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			data, err := embedFS.ReadFile(test.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			content := string(data)
+			for _, required := range test.required {
+				if !strings.Contains(content, required) {
+					t.Errorf("%s is missing %q", test.path, required)
+				}
+			}
+		})
+	}
+}
+
 func TestSetupFilterEngineLoadsLocalRules(t *testing.T) {
 	cfg, store, _, srv := setupTest()
 	t.Cleanup(func() {

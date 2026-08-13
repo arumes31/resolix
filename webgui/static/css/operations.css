@@ -1074,6 +1074,8 @@ body.app-page .dashboard-range-control select {
 .outcome-segment.forwarded { background: #4d8eff; }
 .legend-swatch.cached,
 .outcome-segment.cached { background: #f6b94c; }
+.legend-swatch.rewritten,
+.outcome-segment.rewritten { background: #a78bfa; }
 .legend-swatch.blocked,
 .outcome-segment.blocked { background: #2dd4a4; }
 .legend-swatch.errors,

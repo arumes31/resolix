@@ -111,7 +111,7 @@
                 <article class="metric-card"><span>Average request rate</span><strong id="averageRPM">0 RPM</strong><small>Server-derived across selected window</small><small id="rpmDelta" class="metric-delta">Awaiting comparison</small></article>
                 <article class="metric-card metric-card-protection"><span>Blocked queries</span><strong id="blockedRatio">0%</strong><small><i class="metric-dot green"></i><b id="blockedCount">0</b> policy decisions</small><small id="blockedDelta" class="metric-delta">Awaiting comparison</small></article>
                 <article class="metric-card metric-card-errors"><span>DNS error rate</span><strong id="errorRatio">0%</strong><small><i class="metric-dot red"></i><b id="errorCount">0</b> operational failures</small><small id="errorDelta" class="metric-delta">Awaiting comparison</small></article>
-                <article class="metric-card"><span>Cache hit rate</span><strong id="cacheRatio" class="stat-cache">0%</strong><small><i class="metric-dot amber"></i><b id="cacheHitCount">0</b> cached answers</small><small id="cacheDelta" class="metric-delta">Awaiting comparison</small></article>
+                <article class="metric-card"><span>Local response rate</span><strong id="localResponseRatio" class="stat-cache">0%</strong><small><i class="metric-dot amber"></i><b id="cacheHitCount">0</b> cached · <b id="rewriteHitCount">0</b> rewritten</small><small id="localResponseDelta" class="metric-delta">Awaiting comparison</small></article>
                 <article class="metric-card"><span>Bandwidth avoided</span><strong id="bandwidthSaved">0 B</strong><small>Estimated from cached responses</small><small id="bandwidthDelta" class="metric-delta">Awaiting comparison</small></article>
             </section>
 
@@ -124,7 +124,7 @@
                 </div>
                 <div class="card outcome-card skeleton-card">
                     <div class="stat-header"><span>Query outcomes</span><div class="chart-actions"><div class="chart-mode" role="group" aria-label="Outcome chart scale"><button type="button" class="chart-mode-btn is-active" data-outcome-mode="count" aria-pressed="true">Count</button><button type="button" class="chart-mode-btn" data-outcome-mode="percentage" aria-pressed="false">%</button></div><span class="section-chip">Mutually exclusive</span></div></div>
-                    <div class="outcome-legend" aria-hidden="true"><span><i class="legend-swatch forwarded"></i>Answered</span><span><i class="legend-swatch cached"></i>Cached</span><span><i class="legend-swatch blocked"></i>Blocked</span><span><i class="legend-swatch errors"></i>Failed</span></div>
+                    <div class="outcome-legend" aria-hidden="true"><span><i class="legend-swatch forwarded"></i>Forwarded</span><span><i class="legend-swatch cached"></i>Cached</span><span><i class="legend-swatch rewritten"></i>Rewritten</span><span><i class="legend-swatch blocked"></i>Blocked</span><span><i class="legend-swatch errors"></i>Failed</span></div>
                     <div id="outcomeInspect" class="chart-inspect" aria-live="polite">Showing absolute counts</div>
                     <div class="dashboard-timeline outcome-timeline" id="outcomeSeries" role="group" aria-label="Query outcomes over time"></div>
                 </div>

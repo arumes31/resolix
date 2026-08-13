@@ -50,8 +50,9 @@ function renderDashboardStats(stats) {
     document.getElementById('blockedCount').textContent = formatNumber(summary.blocked || 0);
     document.getElementById('errorRatio').textContent = `${Number(summary.error_ratio || 0).toFixed(1)}%`;
     document.getElementById('errorCount').textContent = formatNumber(summary.errors || 0);
-    document.getElementById('cacheRatio').textContent = `${Number(summary.cache_hit_ratio || 0).toFixed(1)}%`;
+    document.getElementById('localResponseRatio').textContent = `${Number(summary.local_response_ratio || 0).toFixed(1)}%`;
     document.getElementById('cacheHitCount').textContent = formatNumber(summary.cache_hits || 0);
+    document.getElementById('rewriteHitCount').textContent = formatNumber(summary.rewrite_hits || 0);
     document.getElementById('bandwidthSaved').textContent = formatBytes(summary.bandwidth_saved_bytes || 0);
     document.getElementById('windowLabel').textContent = range.label || 'Selected window';
     document.getElementById('trafficBucketLabel').textContent = formatBucketDuration(range.bucket_seconds || 0);
@@ -81,7 +82,7 @@ function renderDashboardComparison(summary, comparison) {
     renderMetricDelta('rpmDelta', summary.queries_per_minute, previous?.queries_per_minute, false, unavailable);
     renderMetricDelta('blockedDelta', summary.blocked_ratio, previous?.blocked_ratio, true, unavailable);
     renderMetricDelta('errorDelta', summary.error_ratio, previous?.error_ratio, true, unavailable);
-    renderMetricDelta('cacheDelta', summary.cache_hit_ratio, previous?.cache_hit_ratio, true, unavailable);
+    renderMetricDelta('localResponseDelta', summary.local_response_ratio, previous?.local_response_ratio, true, unavailable);
     renderMetricDelta('bandwidthDelta', summary.bandwidth_saved_bytes, previous?.bandwidth_saved_bytes, false, unavailable);
 }
 
@@ -166,11 +167,11 @@ function renderOutcomeSeries(series, range) {
     const chart = document.getElementById('outcomeSeries');
     const maxQueries = Math.max(...series.map(point => point.queries || 0), 1);
     const html = series.map(point => {
-        const title = `Answered ${point.forwarded || 0}, cached ${point.cached || 0}, blocked ${point.blocked || 0}, failed ${point.errors || 0}`;
+        const title = `Forwarded ${point.forwarded || 0}, cached ${point.cached || 0}, rewritten ${point.rewritten || 0}, blocked ${point.blocked || 0}, failed ${point.errors || 0}`;
         const denominator = dashboardOutcomeMode === 'percentage' ? Math.max(point.queries || 0, 1) : maxQueries;
         const segment = (kind, count) => `<i class="outcome-segment ${kind} height-pct-${percentStep((count / denominator) * 100)}"></i>`;
         const label = formatBucketTime(point.start, range.bucket_seconds);
-        return `<button type="button" class="timeline-column outcome-column" data-bucket="${point.start}" title="${escapeHtml(label)}: ${title}" aria-label="${escapeHtml(label)}: ${title}">${segment('forwarded', point.forwarded || 0)}${segment('cached', point.cached || 0)}${segment('blocked', point.blocked || 0)}${segment('errors', point.errors || 0)}</button>`;
+        return `<button type="button" class="timeline-column outcome-column" data-bucket="${point.start}" title="${escapeHtml(label)}: ${title}" aria-label="${escapeHtml(label)}: ${title}">${segment('forwarded', point.forwarded || 0)}${segment('cached', point.cached || 0)}${segment('rewritten', point.rewritten || 0)}${segment('blocked', point.blocked || 0)}${segment('errors', point.errors || 0)}</button>`;
     }).join('');
     replaceHTMLIfChanged(chart, html || '<span class="empty-small">No outcomes in this window</span>');
     document.getElementById('outcomeInspect').textContent = dashboardOutcomeMode === 'percentage' ? 'Showing percentage composition' : 'Showing absolute counts';
@@ -185,7 +186,7 @@ function inspectDashboardBucket(bucket) {
     const point = (currentDashboardStats?.series || []).find(candidate => candidate.start === Number(bucket));
     if (!point) return;
     const label = formatBucketTime(point.start, currentDashboardStats.range?.bucket_seconds || 0);
-    const message = `${label} · ${formatNumber(point.queries || 0)} queries · ${formatNumber(point.forwarded || 0)} answered · ${formatNumber(point.cached || 0)} cached · ${formatNumber(point.blocked || 0)} blocked · ${formatNumber(point.errors || 0)} failed`;
+    const message = `${label} · ${formatNumber(point.queries || 0)} queries · ${formatNumber(point.forwarded || 0)} forwarded · ${formatNumber(point.cached || 0)} cached · ${formatNumber(point.rewritten || 0)} rewritten · ${formatNumber(point.blocked || 0)} blocked · ${formatNumber(point.errors || 0)} failed`;
     document.getElementById('trafficInspect').textContent = message;
     document.getElementById('outcomeInspect').textContent = message;
     document.querySelectorAll('[data-bucket]').forEach(column => column.classList.toggle('is-inspected', Number(column.dataset.bucket) === Number(bucket)));

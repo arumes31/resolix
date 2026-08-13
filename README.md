@@ -206,7 +206,7 @@ ACL/rate limit → refuse ANY / disable AAAA → rewrites → private PTR
 → domain route → global upstream pool → bogus-NXDOMAIN → cache store → response
 ```
 
-Cache hits are measured inside the DNS request lifecycle. Query events are emitted directly to the in-process store and SSE stream, then archived to SQLite asynchronously.
+Cache hits are measured inside the DNS request lifecycle. Query events are emitted directly to the in-process store and SSE stream, then archived to SQLite asynchronously. Pending events are archived every minute by default, sooner when 5,000 events accumulate, and at both the start and end of a graceful shutdown.
 
 ## Web interface
 
@@ -344,9 +344,9 @@ Rewrites created in `/config` can apply to every client, only Tailscale address 
 | `HISTORY_DIR` | SQLite query-history directory | `/var/lib/resolix` |
 | `CONFIG_DIR` | Managed upstreams, routes, subscriptions, rules, rewrites, and clients | `/var/lib/resolix-config` |
 | `DB_PATH` | SQLite file name or absolute path | `dns.db` |
-| `BATCH_ARCHIVE_INTERVAL` | Maximum time between archive passes | `30m` |
+| `BATCH_ARCHIVE_INTERVAL` | Maximum time between archive passes | `1m` |
 | `ARCHIVE_QUEUE_CAPACITY` | Maximum queued events during bursts/outages | `1000000` |
-| `ARCHIVE_TRIGGER_SIZE` | Pending events that wake the archiver | `20000` |
+| `ARCHIVE_TRIGGER_SIZE` | Pending events that wake the archiver | `5000` |
 | `ARCHIVE_WRITE_BATCH_SIZE` | Maximum rows per SQLite transaction | `20000` |
 | `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, or `ERROR` | `INFO` |
 | `LOG_FILE` | Optional file log destination; empty uses stderr | unset |

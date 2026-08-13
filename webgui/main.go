@@ -45,6 +45,11 @@ var (
 	BuildInfo = "local"
 )
 
+const (
+	shutdownArchiveRetryInitialDelay = 100 * time.Millisecond
+	shutdownArchiveRetryMaxDelay     = time.Second
+)
+
 //go:embed VERSION
 var embeddedVersion string
 
@@ -474,43 +479,102 @@ func runApplication(cfg *config.Config, sigChan <-chan os.Signal) {
 	logger.Info("Shutdown step 1: Stopping background goroutines...")
 	cancel()
 
-	// Step 2: Stop the log forwarder
-	logger.Info("Shutdown step 2: Stopping log forwarder...")
+	// Flush immediately so pending events become durable before the other
+	// shutdown waits consume the container's stop grace period.
+	logger.Info("Shutdown step 2: Flushing pending query events to SQLite...")
+	archived, err := flushArchiveForShutdown(cfg, store)
+	if err != nil {
+		logger.Error("Shutdown step 2: SQLite archive flush failed after archiving %d events: %v", archived, err)
+	} else {
+		logger.Info("Shutdown step 2: Archived %d events to SQLite", archived)
+	}
+
+	// Step 3: Stop the log forwarder
+	logger.Info("Shutdown step 3: Stopping log forwarder...")
 	fwd.Stop()
 	waitForForwarder(cfg, forwarderDone)
 
-	// Step 3: Stop DNS routes reload
-	logger.Info("Shutdown step 3: Stopping DNS routes reload...")
+	// Step 4: Stop DNS routes reload
+	logger.Info("Shutdown step 4: Stopping DNS routes reload...")
 	dr.Stop()
 
-	// Step 4: Stop blocklist reload
-	logger.Info("Shutdown step 4: Stopping blocklist reload...")
+	// Step 5: Stop blocklist reload
+	logger.Info("Shutdown step 5: Stopping blocklist reload...")
 	bl.Stop()
 
-	// Step 5: Wait for HTTP handlers to finish before closing storage.
-	logger.Info("Shutdown step 5: Waiting for HTTP server to finish...")
+	// Step 6: Wait for HTTP handlers to finish before closing storage.
+	logger.Info("Shutdown step 6: Waiting for HTTP server to finish...")
 	if !serverStopped {
 		waitForHTTPServer(cfg, serverDone)
 	}
 
-	// Step 6: Flush pending batch buffers to SQLite. Wait for the DNS
-	// listeners to stop first so no in-flight query races the archive.
-	logger.Info("Shutdown step 6: Waiting for DNS server to stop...")
+	// Step 7: Wait for DNS listeners so the final archive flush also captures
+	// queries that completed during the initial flush.
+	logger.Info("Shutdown step 7: Waiting for DNS server to stop...")
 	waitForDNSServer(cfg, dnsDone)
-	logger.Info("Shutdown step 6: Flushing pending batch buffers to SQLite...")
-	archived := store.ArchiveStep(time.Now())
-	logger.Info("Shutdown step 6: Archived %d events to SQLite", archived)
 
-	// Step 7: Close the database and release resources
-	logger.Info("Shutdown step 7: Closing storage (database, prepared statements, background goroutines)...")
+	// Step 8: Perform a final bounded flush after all query producers stop.
+	logger.Info("Shutdown step 8: Flushing final pending query events to SQLite...")
+	archived, err = flushArchiveForShutdown(cfg, store)
+	if err != nil {
+		logger.Error("Shutdown step 8: Final SQLite archive flush failed after archiving %d events: %v", archived, err)
+	} else {
+		logger.Info("Shutdown step 8: Archived %d events to SQLite", archived)
+	}
+
+	// Step 9: Close the database and release resources
+	logger.Info("Shutdown step 9: Closing storage (database, prepared statements, background goroutines)...")
 	store.Close()
 
-	// Step 8: Flush and close log file if file logging is enabled
-	logger.Info("Shutdown step 8: Flushing log file...")
+	// Step 10: Flush and close log file if file logging is enabled
+	logger.Info("Shutdown step 10: Flushing log file...")
 	logger.Flush()
 	logger.CloseFile()
 
 	logger.Info("Graceful shutdown complete")
+}
+
+func flushArchiveForShutdown(cfg *config.Config, store *storage.Store) (int, error) {
+	timeout := config.DefaultHTTPShutdownTimeout
+	if cfg != nil && cfg.HTTPShutdownTimeout > 0 {
+		timeout = cfg.HTTPShutdownTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return flushArchiveQueue(ctx, store)
+}
+
+func flushArchiveQueue(ctx context.Context, store *storage.Store) (int, error) {
+	if ctx == nil {
+		return 0, errors.New("flush archive queue: nil context")
+	}
+	if store == nil {
+		return 0, errors.New("flush archive queue: nil store")
+	}
+
+	total := 0
+	retryDelay := shutdownArchiveRetryInitialDelay
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, fmt.Errorf("flush archive queue: %w", err)
+		}
+		archived, err := store.FlushArchive(ctx, time.Now())
+		total += archived
+		if err == nil {
+			return total, nil
+		}
+
+		retryTimer := time.NewTimer(retryDelay)
+		select {
+		case <-ctx.Done():
+			if !retryTimer.Stop() {
+				<-retryTimer.C
+			}
+			return total, fmt.Errorf("flush archive queue: %w", errors.Join(err, ctx.Err()))
+		case <-retryTimer.C:
+		}
+		retryDelay = min(retryDelay*2, shutdownArchiveRetryMaxDelay)
+	}
 }
 
 func configureLogging(cfg *config.Config) {

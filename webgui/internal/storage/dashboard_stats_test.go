@@ -6,8 +6,50 @@ import (
 	"testing"
 	"time"
 
+	"github.com/arumes31/resolix/webgui/internal/config"
 	"github.com/arumes31/resolix/webgui/internal/models"
 )
+
+func TestDashboardStatsSurviveStoreRestartAfterFlush(t *testing.T) {
+	historyDir := t.TempDir()
+	cfg := &config.Config{
+		MaxEvents:                100,
+		HistoryDir:               historyDir,
+		DBPath:                   "restart.db",
+		HistoryRetention:         72 * time.Hour,
+		UpstreamLatencyThreshold: 200,
+	}
+	now := time.Now().UTC().Truncate(time.Minute)
+
+	first := NewStore(cfg)
+	first.Init()
+	first.AddEvent(models.QueryEvent{
+		UnixTime:     now.Add(-time.Minute).Unix(),
+		Domain:       "survives-restart.example",
+		ClientIP:     "192.0.2.50",
+		Type:         "A",
+		ResponseCode: "NOERROR",
+	})
+	if archived, err := first.FlushArchive(t.Context(), now); err != nil || archived != 1 {
+		first.Close()
+		t.Fatalf("FlushArchive() = %d, %v; want 1, nil", archived, err)
+	}
+	first.Close()
+
+	second := NewStore(cfg)
+	second.Init()
+	defer second.Close()
+	stats, err := second.GetDashboardStats(t.Context(), now.Add(-time.Hour), now, 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Summary.Queries != 1 {
+		t.Fatalf("queries after restart = %d, want 1", stats.Summary.Queries)
+	}
+	if len(stats.TopDomains) != 1 || stats.TopDomains[0].Key != "survives-restart.example" {
+		t.Fatalf("top domains after restart = %+v", stats.TopDomains)
+	}
+}
 
 func TestGetDashboardStatsMergesArchivedAndPendingEvents(t *testing.T) {
 	store, cleanup := newTestStore(t)
@@ -90,10 +132,131 @@ func TestGetDashboardStatsMergesArchivedAndPendingEvents(t *testing.T) {
 		if index > 0 && point.Start <= stats.Series[index-1].Start {
 			t.Fatalf("series is not ascending: %+v", stats.Series)
 		}
-		outcomeTotal += point.Blocked + point.Cached + point.Errors + point.Forwarded
+		outcomeTotal += point.Blocked + point.Cached + point.Rewritten + point.Errors + point.Forwarded
 	}
 	if outcomeTotal != stats.Summary.Queries {
 		t.Fatalf("stacked outcomes = %d, queries = %d", outcomeTotal, stats.Summary.Queries)
+	}
+}
+
+func TestGetDashboardStatsClassifiesRewritesAsLocalResponses(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+
+	now := time.Now().UTC().Truncate(time.Minute)
+	for _, event := range []models.QueryEvent{
+		{
+			UnixTime:     now.Add(-4 * time.Minute).Unix(),
+			Domain:       "cached.example",
+			Type:         "A",
+			Upstream:     "System Cache",
+			CacheStatus:  "fresh",
+			ResponseCode: "NOERROR",
+		},
+		{
+			UnixTime:     now.Add(-3 * time.Minute).Unix(),
+			Domain:       "rewrite.example",
+			Type:         "A",
+			Upstream:     "Rewrite",
+			ResponseCode: "NOERROR",
+		},
+	} {
+		store.AddEvent(event)
+	}
+	if archived := store.ArchiveStep(now); archived != 2 {
+		t.Fatalf("archived = %d, want 2", archived)
+	}
+	for _, event := range []models.QueryEvent{
+		{
+			UnixTime:     now.Add(-2 * time.Minute).Unix(),
+			Domain:       "intentional-nxdomain.example",
+			Type:         "A",
+			Upstream:     "Rewrite",
+			ResponseCode: "NXDOMAIN",
+		},
+		{
+			UnixTime:     now.Add(-time.Minute).Unix(),
+			Domain:       "failed.example",
+			Type:         "A",
+			Upstream:     "1.1.1.1",
+			ResponseCode: "SERVFAIL",
+		},
+	} {
+		store.AddEvent(event)
+	}
+
+	stats, err := store.GetDashboardStats(t.Context(), now.Add(-time.Hour), now, 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Summary.CacheHits != 1 || stats.Summary.RewriteHits != 2 || stats.Summary.LocalResponses != 3 {
+		t.Fatalf("local response summary = %+v, want 1 cache + 2 rewrite = 3 local", stats.Summary)
+	}
+	if stats.Summary.CacheHitRatio != 25 || stats.Summary.LocalResponseRatio != 75 {
+		t.Fatalf("response ratios = %+v, want 25%% cache and 75%% local", stats.Summary)
+	}
+	if stats.Summary.Errors != 1 || stats.Summary.BandwidthSaved != 100 {
+		t.Fatalf("error/bandwidth summary = %+v, want one operational error and cache-only bandwidth", stats.Summary)
+	}
+
+	var cached, rewritten, failed, total int
+	for _, point := range stats.Series {
+		cached += point.Cached
+		rewritten += point.Rewritten
+		failed += point.Errors
+		total += point.Blocked + point.Cached + point.Rewritten + point.Errors + point.Forwarded
+	}
+	if cached != 1 || rewritten != 2 || failed != 1 || total != 4 {
+		t.Fatalf("outcomes cached/rewritten/failed/total = %d/%d/%d/%d, want 1/2/1/4", cached, rewritten, failed, total)
+	}
+}
+
+func TestGetDashboardStatsDoesNotCountRewriteAsCacheHit(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+
+	now := time.Now().UTC().Truncate(time.Minute)
+	store.AddEvent(models.QueryEvent{
+		UnixTime:     now.Add(-time.Minute).Unix(),
+		Domain:       "rewritten-cache.example",
+		Type:         "A",
+		Upstream:     "Rewrite",
+		CacheStatus:  "fresh",
+		ResponseCode: "NOERROR",
+	})
+
+	stats, err := store.GetDashboardStats(t.Context(), now.Add(-time.Hour), now, 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Summary.CacheHits != 0 || stats.Summary.RewriteHits != 1 || stats.Summary.LocalResponses != 1 {
+		t.Fatalf("local response summary = %+v, want rewrite only", stats.Summary)
+	}
+	if stats.Summary.CacheHitRatio != 0 || stats.Summary.LocalResponseRatio != 100 || stats.Summary.BandwidthSaved != 0 {
+		t.Fatalf("cache-derived summary = %+v, want no cache contribution", stats.Summary)
+	}
+}
+
+func TestIsRewriteAnswer(t *testing.T) {
+	tests := []struct {
+		name     string
+		upstream string
+		expected bool
+	}{
+		{name: "typed rewrite", upstream: "Rewrite", expected: true},
+		{name: "legacy local override", upstream: "Local Override", expected: true},
+		{name: "case and whitespace", upstream: " rewrite ", expected: true},
+		{name: "cache", upstream: "System Cache"},
+		{name: "magic dns", upstream: "MagicDNS"},
+		{name: "empty"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			event := models.QueryEvent{Upstream: test.upstream}
+			if got := isRewriteAnswer(event); got != test.expected {
+				t.Fatalf("isRewriteAnswer(%q) = %t, want %t", test.upstream, got, test.expected)
+			}
+		})
 	}
 }
 

@@ -663,6 +663,18 @@ func TestBatchArchiveIntervalFeedsLegacyAndCurrentFields(t *testing.T) {
 	}
 }
 
+func TestArchiveDurabilityDefaults(t *testing.T) {
+	t.Setenv("BATCH_ARCHIVE_INTERVAL", "")
+	t.Setenv("ARCHIVE_TRIGGER_SIZE", "")
+	cfg := LoadConfig()
+	if cfg.BatchArchiveInterval != time.Minute || cfg.ArchiveInterval != time.Minute {
+		t.Fatalf("default archive intervals = %s/%s, want 1m/1m", cfg.BatchArchiveInterval, cfg.ArchiveInterval)
+	}
+	if cfg.ArchiveTriggerSize != 5000 {
+		t.Fatalf("default archive trigger = %d, want 5000", cfg.ArchiveTriggerSize)
+	}
+}
+
 func TestArchiveQueueSettings(t *testing.T) {
 	t.Run("explicit values", func(t *testing.T) {
 		t.Setenv("ARCHIVE_QUEUE_CAPACITY", "200000")

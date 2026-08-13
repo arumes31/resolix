@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -54,9 +55,21 @@ func (s *Store) RunArchiver(ctx context.Context, interval time.Duration) {
 	}
 }
 
+// FlushArchive persists all queued query events and reports any write failure.
+func (s *Store) FlushArchive(ctx context.Context, now time.Time) (int, error) {
+	if ctx == nil {
+		return 0, errors.New("flush archive: nil context")
+	}
+	archived, err := s.archiveStep(ctx, now)
+	if err != nil {
+		return archived, fmt.Errorf("flush archive: %w", err)
+	}
+	return archived, nil
+}
+
 // ArchiveStep performs a batch insert of recent queries into SQLite and deletes old ones.
 func (s *Store) ArchiveStep(now time.Time) int {
-	archived, err := s.archiveStep(context.Background(), now)
+	archived, err := s.FlushArchive(context.Background(), now)
 	if err != nil {
 		metrics := s.ArchiveMetrics()
 		log.Printf("SQLite archive failed; retaining %d events: %v", metrics.Pending, err)

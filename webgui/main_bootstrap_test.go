@@ -269,12 +269,12 @@ func TestDashboardAssetsExposeResponsiveLoadingState(t *testing.T) {
 		{
 			name: "template",
 			path: "templates/index.html",
-				required: []string{
-					`id="dashboardContent"`,
-					`id="dashboardLoadingStatus"`,
-					`id="dashboardRetry"`,
-					`href="static/css/dashboard_loading.css"`,
-					`src="static/js/dashboard_loader.js"`,
+			required: []string{
+				`id="dashboardContent"`,
+				`id="dashboardLoadingStatus"`,
+				`id="dashboardRetry"`,
+				`href="static/css/dashboard_loading.css"`,
+				`src="static/js/dashboard_loader.js"`,
 				`dashboard-skeleton`,
 			},
 		},

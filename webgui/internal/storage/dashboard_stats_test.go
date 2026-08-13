@@ -211,6 +211,32 @@ func TestGetDashboardStatsClassifiesRewritesAsLocalResponses(t *testing.T) {
 	}
 }
 
+func TestGetDashboardStatsDoesNotCountRewriteAsCacheHit(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+
+	now := time.Now().UTC().Truncate(time.Minute)
+	store.AddEvent(models.QueryEvent{
+		UnixTime:     now.Add(-time.Minute).Unix(),
+		Domain:       "rewritten-cache.example",
+		Type:         "A",
+		Upstream:     "Rewrite",
+		CacheStatus:  "fresh",
+		ResponseCode: "NOERROR",
+	})
+
+	stats, err := store.GetDashboardStats(t.Context(), now.Add(-time.Hour), now, 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Summary.CacheHits != 0 || stats.Summary.RewriteHits != 1 || stats.Summary.LocalResponses != 1 {
+		t.Fatalf("local response summary = %+v, want rewrite only", stats.Summary)
+	}
+	if stats.Summary.CacheHitRatio != 0 || stats.Summary.LocalResponseRatio != 100 || stats.Summary.BandwidthSaved != 0 {
+		t.Fatalf("cache-derived summary = %+v, want no cache contribution", stats.Summary)
+	}
+}
+
 func TestIsRewriteAnswer(t *testing.T) {
 	tests := []struct {
 		name     string

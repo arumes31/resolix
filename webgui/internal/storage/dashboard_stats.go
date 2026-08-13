@@ -313,6 +313,7 @@ func (a *dashboardAccumulator) queryStart() int64 {
 func mergeDashboardSummary(summary *DashboardSummary, replies *int, event models.QueryEvent) {
 	responseCode := strings.ToUpper(strings.TrimSpace(event.ResponseCode))
 	isRewritten := !event.Blocked && isRewriteAnswer(event)
+	isCached := !isRewritten && isCacheHit(event)
 	summary.Queries++
 	if event.Upstream != "" {
 		(*replies)++
@@ -323,7 +324,7 @@ func mergeDashboardSummary(summary *DashboardSummary, replies *int, event models
 	if !event.Blocked && !isRewritten && dashboardResponseIsError(responseCode) {
 		summary.Errors++
 	}
-	if isCacheHit(event) {
+	if isCached {
 		summary.CacheHits++
 	}
 	if isRewritten {

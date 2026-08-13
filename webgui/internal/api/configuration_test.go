@@ -276,6 +276,36 @@ func TestDashboardQuickWinMarkers(t *testing.T) {
 	}
 }
 
+func TestTrafficIntensityBaseStyleDoesNotOverrideLevels(t *testing.T) {
+	trafficStyles, err := os.ReadFile("../../static/css/traffic_intensity.css") // #nosec G304 -- fixed test fixture
+	if err != nil {
+		t.Fatal(err)
+	}
+	const selector = ".traffic-intensity-cell {"
+	start := strings.Index(string(trafficStyles), selector)
+	if start < 0 {
+		t.Fatalf("traffic intensity stylesheet is missing %q", selector)
+	}
+	declarations := string(trafficStyles[start+len(selector):])
+	end := strings.Index(declarations, "}")
+	if end < 0 {
+		t.Fatal("traffic intensity cell declaration is not closed")
+	}
+	if strings.Contains(declarations[:end], "background:") {
+		t.Fatal("traffic intensity base style overrides heatmap level backgrounds")
+	}
+
+	palette, err := os.ReadFile("../../static/css/control_plane.css") // #nosec G304 -- fixed test fixture
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, marker := range []string{".heatmap-level-1 { background:", ".heatmap-level-10 { background:"} {
+		if !bytes.Contains(palette, []byte(marker)) {
+			t.Fatalf("heatmap palette is missing %q", marker)
+		}
+	}
+}
+
 func TestConfigurationQuickWinMarkers(t *testing.T) {
 	templateContent, err := os.ReadFile("../../templates/config.html") // #nosec G304 -- fixed test fixture
 	if err != nil {

@@ -29,15 +29,18 @@ type DashboardStats struct {
 
 // DashboardSummary contains the headline values for a selected time range.
 type DashboardSummary struct {
-	Queries          int     `json:"queries"`
-	QueriesPerMinute float64 `json:"queries_per_minute"`
-	Blocked          int     `json:"blocked"`
-	BlockedRatio     float64 `json:"blocked_ratio"`
-	Errors           int     `json:"errors"`
-	ErrorRatio       float64 `json:"error_ratio"`
-	CacheHits        int     `json:"cache_hits"`
-	CacheHitRatio    float64 `json:"cache_hit_ratio"`
-	BandwidthSaved   int64   `json:"bandwidth_saved_bytes"`
+	Queries            int     `json:"queries"`
+	QueriesPerMinute   float64 `json:"queries_per_minute"`
+	Blocked            int     `json:"blocked"`
+	BlockedRatio       float64 `json:"blocked_ratio"`
+	Errors             int     `json:"errors"`
+	ErrorRatio         float64 `json:"error_ratio"`
+	CacheHits          int     `json:"cache_hits"`
+	CacheHitRatio      float64 `json:"cache_hit_ratio"`
+	RewriteHits        int     `json:"rewrite_hits"`
+	LocalResponses     int     `json:"local_responses"`
+	LocalResponseRatio float64 `json:"local_response_ratio"`
+	BandwidthSaved     int64   `json:"bandwidth_saved_bytes"`
 }
 
 // DashboardSeriesPoint is one server-generated bucket in the dashboard timeline.
@@ -46,6 +49,7 @@ type DashboardSeriesPoint struct {
 	Queries   int            `json:"queries"`
 	Blocked   int            `json:"blocked"`
 	Cached    int            `json:"cached"`
+	Rewritten int            `json:"rewritten"`
 	Errors    int            `json:"errors"`
 	Forwarded int            `json:"forwarded"`
 	Nodes     map[string]int `json:"nodes"`
@@ -249,7 +253,8 @@ func (a *dashboardAccumulator) mergeEvent(event models.QueryEvent) {
 		node = "local"
 	}
 	responseCode := strings.ToUpper(strings.TrimSpace(event.ResponseCode))
-	isError := !event.Blocked && dashboardResponseIsError(responseCode)
+	isRewritten := !event.Blocked && isRewriteAnswer(event)
+	isError := !event.Blocked && !isRewritten && dashboardResponseIsError(responseCode)
 	isCached := isCacheHit(event)
 
 	mergeDashboardSummary(&a.stats.Summary, &a.replies, event)
@@ -275,6 +280,8 @@ func (a *dashboardAccumulator) mergeEvent(event models.QueryEvent) {
 	switch {
 	case event.Blocked:
 		point.Blocked++
+	case isRewritten:
+		point.Rewritten++
 	case isError:
 		point.Errors++
 	case isCached:
@@ -305,6 +312,7 @@ func (a *dashboardAccumulator) queryStart() int64 {
 
 func mergeDashboardSummary(summary *DashboardSummary, replies *int, event models.QueryEvent) {
 	responseCode := strings.ToUpper(strings.TrimSpace(event.ResponseCode))
+	isRewritten := !event.Blocked && isRewriteAnswer(event)
 	summary.Queries++
 	if event.Upstream != "" {
 		(*replies)++
@@ -312,11 +320,14 @@ func mergeDashboardSummary(summary *DashboardSummary, replies *int, event models
 	if event.Blocked {
 		summary.Blocked++
 	}
-	if !event.Blocked && dashboardResponseIsError(responseCode) {
+	if !event.Blocked && !isRewritten && dashboardResponseIsError(responseCode) {
 		summary.Errors++
 	}
 	if isCacheHit(event) {
 		summary.CacheHits++
+	}
+	if isRewritten {
+		summary.RewriteHits++
 	}
 }
 
@@ -331,8 +342,15 @@ func finishDashboardSummary(summary *DashboardSummary, replies int, windowSecond
 	}
 	if replies > 0 {
 		summary.CacheHitRatio = float64(summary.CacheHits) / float64(replies) * 100
+		summary.LocalResponseRatio = float64(summary.CacheHits+summary.RewriteHits) / float64(replies) * 100
 	}
+	summary.LocalResponses = summary.CacheHits + summary.RewriteHits
 	summary.BandwidthSaved = int64(summary.CacheHits) * 100
+}
+
+func isRewriteAnswer(event models.QueryEvent) bool {
+	upstream := strings.TrimSpace(event.Upstream)
+	return strings.EqualFold(upstream, "Rewrite") || strings.EqualFold(upstream, "Local Override")
 }
 
 func (a *dashboardAccumulator) markDegraded(name string) {

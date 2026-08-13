@@ -212,6 +212,54 @@ func TestTemplateAndStaticBootstrap(t *testing.T) {
 	}
 }
 
+func TestDashboardAssetsExposeLocalResponsesAndRewriteOutcome(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		required []string
+	}{
+		{
+			name: "template",
+			path: "templates/index.html",
+			required: []string{
+				`id="localResponseRatio"`,
+				`id="rewriteHitCount"`,
+				`class="legend-swatch rewritten"`,
+				`>Forwarded<`,
+			},
+		},
+		{
+			name: "javascript",
+			path: "static/js/dashboard.js",
+			required: []string{
+				"summary.local_response_ratio",
+				"summary.rewrite_hits",
+				"point.rewritten",
+				"segment('rewritten'",
+			},
+		},
+		{
+			name:     "stylesheet",
+			path:     "static/css/operations.css",
+			required: []string{".legend-swatch.rewritten", ".outcome-segment.rewritten"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			data, err := embedFS.ReadFile(test.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			content := string(data)
+			for _, required := range test.required {
+				if !strings.Contains(content, required) {
+					t.Errorf("%s is missing %q", test.path, required)
+				}
+			}
+		})
+	}
+}
+
 func TestSetupFilterEngineLoadsLocalRules(t *testing.T) {
 	cfg, store, _, srv := setupTest()
 	t.Cleanup(func() {

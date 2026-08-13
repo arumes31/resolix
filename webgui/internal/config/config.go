@@ -34,7 +34,7 @@ const (
 	// DefaultCleanupInterval is the interval for cleaning up stale pending queries.
 	DefaultCleanupInterval = 10 * time.Second
 	// DefaultArchiveInterval is the interval for archiving memory buffer to disk.
-	DefaultArchiveInterval = 30 * time.Minute
+	DefaultArchiveInterval = time.Minute
 	// DefaultScanLimit is the limit for scanning the ring buffer for updates.
 	DefaultScanLimit = 1000
 	// DefaultMaxBacklogSize is the maximum size of the agent backlog before dropping.
@@ -109,11 +109,11 @@ const (
 	// DefaultSSEKeepaliveInterval is the default interval for SSE keepalive messages.
 	DefaultSSEKeepaliveInterval = 30 * time.Second
 	// DefaultBatchArchiveInterval is the default interval for batch archiving to SQLite.
-	DefaultBatchArchiveInterval = 30 * time.Minute
+	DefaultBatchArchiveInterval = time.Minute
 	// DefaultArchiveQueueCapacity is the maximum number of events waiting for SQLite.
 	DefaultArchiveQueueCapacity = 1000000
 	// DefaultArchiveTriggerSize starts an archive pass before the queue is full.
-	DefaultArchiveTriggerSize = 20000
+	DefaultArchiveTriggerSize = 5000
 	// DefaultArchiveWriteBatchSize bounds each SQLite transaction.
 	DefaultArchiveWriteBatchSize = 20000
 	// DefaultCleanupPendingInterval is the default interval for cleaning up stale pending queries.

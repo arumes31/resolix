@@ -54,4 +54,5 @@ services:
     sysctls:
       - net.core.somaxconn=1024
       - net.ipv4.tcp_fastopen=3
+    stop_grace_period: 1m
     restart: unless-stopped

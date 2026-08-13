@@ -34,6 +34,14 @@ func TestHandleDashboardV1Stats(t *testing.T) {
 		ResponseCode: "SERVFAIL",
 	})
 	server.store.AddEvent(models.QueryEvent{
+		UnixTime:     now - 30,
+		Domain:       "rewrite.example",
+		ClientIP:     "192.0.2.4",
+		Type:         "A",
+		Upstream:     "Rewrite",
+		ResponseCode: "NOERROR",
+	})
+	server.store.AddEvent(models.QueryEvent{
 		UnixTime:     now - int64((90 * time.Minute).Seconds()),
 		Domain:       "previous.example",
 		ClientIP:     "192.0.2.3",
@@ -74,9 +82,10 @@ func assertDashboardV1Response(t *testing.T, response dashboardV1Response) {
 	if response.Range.Key != "1h" || response.Range.BucketSeconds != int64((5*time.Minute).Seconds()) {
 		t.Fatalf("range = %+v", response.Range)
 	}
-	if response.Summary.Queries != 2 || response.Summary.Blocked != 1 || response.Summary.Errors != 1 {
+	if response.Summary.Queries != 3 || response.Summary.Blocked != 1 || response.Summary.Errors != 1 {
 		t.Fatalf("summary = %+v", response.Summary)
 	}
+	assertDashboardLocalResponses(t, response)
 	if !response.Comparison.Available || response.Comparison.Summary == nil || response.Comparison.Summary.Queries != 1 {
 		t.Fatalf("comparison = %+v", response.Comparison)
 	}
@@ -97,6 +106,20 @@ func assertDashboardV1Response(t *testing.T, response dashboardV1Response) {
 	}
 	if response.UpstreamNodeNames["edge-a"] != "friendly-edge-a" {
 		t.Fatalf("upstream node names = %v", response.UpstreamNodeNames)
+	}
+}
+
+func assertDashboardLocalResponses(t *testing.T, response dashboardV1Response) {
+	t.Helper()
+	if response.Summary.RewriteHits != 1 || response.Summary.LocalResponses != 1 || response.Summary.LocalResponseRatio != 50 {
+		t.Fatalf("local response summary = %+v", response.Summary)
+	}
+	var rewritten int
+	for _, point := range response.Series {
+		rewritten += point.Rewritten
+	}
+	if rewritten != 1 {
+		t.Fatalf("rewritten outcomes = %d, want 1", rewritten)
 	}
 }
 

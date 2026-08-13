@@ -44,6 +44,26 @@ func TestArchiveStepRetainsBatchOnDatabaseFailure(t *testing.T) {
 	}
 }
 
+func TestFlushArchiveReturnsDatabaseFailureAndRetainsBatch(t *testing.T) {
+	s, cleanup := newTestStore(t)
+	defer cleanup()
+	s.AddEvent(models.QueryEvent{UnixTime: time.Now().Unix(), Domain: "retry.test", Type: "A"})
+	if _, err := s.db.Exec("DROP TABLE queries"); err != nil {
+		t.Fatal(err)
+	}
+
+	archived, err := s.FlushArchive(t.Context(), time.Now())
+	if err == nil {
+		t.Fatal("FlushArchive() error = nil, want database failure")
+	}
+	if archived != 0 {
+		t.Fatalf("FlushArchive() archived = %d, want 0", archived)
+	}
+	if metrics := s.ArchiveMetrics(); metrics.Pending != 1 {
+		t.Fatalf("pending batch = %d, want 1", metrics.Pending)
+	}
+}
+
 func TestArchiveStepPrunesWithoutPendingBatch(t *testing.T) {
 	s, cleanup := newTestStore(t)
 	defer cleanup()

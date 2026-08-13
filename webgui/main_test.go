@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"net/http"
@@ -569,6 +571,85 @@ func TestArchiveStep(t *testing.T) {
 	stats := store.GetStats()
 	if total, ok := stats["total"].(int64); !ok || total < 1 {
 		t.Errorf("Expected > 0 total events in SQLite after archive, got %v", total)
+	}
+}
+
+func TestFlushArchiveQueuePersistsPendingEvents(t *testing.T) {
+	cfg := &config.Config{
+		MaxEvents:                100,
+		HistoryDir:               t.TempDir(),
+		DBPath:                   "shutdown-flush.db",
+		HistoryRetention:         72 * time.Hour,
+		UpstreamLatencyThreshold: 200,
+	}
+	store := storage.NewStore(cfg)
+	store.Init()
+	defer store.Close()
+	store.AddEvent(models.QueryEvent{
+		UnixTime: time.Now().Unix(),
+		Domain:   "shutdown-flush.example",
+		Type:     "A",
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	archived, err := flushArchiveQueue(ctx, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if archived != 1 {
+		t.Fatalf("archived = %d, want 1", archived)
+	}
+	if metrics := store.ArchiveMetrics(); metrics.Pending != 0 {
+		t.Fatalf("pending after shutdown flush = %d, want 0", metrics.Pending)
+	}
+	var rows int
+	if err := store.DB().QueryRow("SELECT COUNT(*) FROM queries WHERE domain = 'shutdown-flush.example'").Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Fatalf("persisted rows = %d, want 1", rows)
+	}
+}
+
+func TestFlushArchiveQueueStopsAtDeadlineAndRetainsPendingEvents(t *testing.T) {
+	cfg := &config.Config{
+		MaxEvents:                100,
+		HistoryDir:               t.TempDir(),
+		DBPath:                   "shutdown-flush-failure.db",
+		HistoryRetention:         72 * time.Hour,
+		UpstreamLatencyThreshold: 200,
+	}
+	store := storage.NewStore(cfg)
+	store.Init()
+	defer store.Close()
+	store.AddEvent(models.QueryEvent{
+		UnixTime: time.Now().Unix(),
+		Domain:   "retained-on-failure.example",
+		Type:     "A",
+	})
+	if _, err := store.DB().Exec("DROP TABLE queries"); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	archived, err := flushArchiveQueue(ctx, store)
+	if err == nil {
+		t.Fatal("flushArchiveQueue() error = nil, want database failure")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("flushArchiveQueue() error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("flushArchiveQueue() took %s, want a bounded retry", elapsed)
+	}
+	if archived != 0 {
+		t.Fatalf("archived = %d, want 0", archived)
+	}
+	if metrics := store.ArchiveMetrics(); metrics.Pending != 1 {
+		t.Fatalf("pending after failed shutdown flush = %d, want 1", metrics.Pending)
 	}
 }
 

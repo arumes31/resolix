@@ -222,10 +222,11 @@ func TestDashboardV1CacheCoalescesSameRange(t *testing.T) {
 
 func TestDashboardV1CacheUsesIndependentRangeLocks(t *testing.T) {
 	server := testServer(&config.Config{})
-	if server.dashboardRangeLock("1h") == server.dashboardRangeLock("6h") {
+	first := server.dashboardRangeLock("1h")
+	if first == server.dashboardRangeLock("6h") {
 		t.Fatal("different dashboard ranges share one build lock")
 	}
-	if server.dashboardRangeLock("1h") != server.dashboardRangeLock("1h") {
+	if first != server.dashboardRangeLock("1h") {
 		t.Fatal("same dashboard range did not reuse its build lock")
 	}
 }

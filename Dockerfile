@@ -1,7 +1,7 @@
 ARG VERSION=2.4.28
 
 # Stage 1: Build
-FROM golang:1.26.5-alpine AS builder
+FROM golang:1.26.6-alpine AS builder
 
 ARG VERSION
 ARG BUILD_INFO=local

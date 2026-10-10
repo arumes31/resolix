@@ -3,7 +3,7 @@
 ARG VERSION=2.4.28
 
 # Stage 1: Build
-FROM golang:1.27-alpine3.24@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS builder
+FROM golang:1.27.2-alpine3.24@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d AS builder
 
 ARG VERSION
 ARG BUILD_INFO=local
@@ -25,10 +25,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
     -ldflags="-s -w -X main.Version=${VERSION} -X main.BuildInfo=${BUILD_INFO}" -o resolix .
 
 # Rebuild Tailscale at the reviewed release commit with patched x/image and
-# x/crypto dependencies. The upstream v1.102.3 CLI binary embeds x/image v0.41.0
+# x/crypto, x/net and gRPC dependencies. The upstream CLI embeds x/image v0.41.0
 # (CVE-2026-46602), and its source selects x/crypto v0.54.0, affected by
-# CVE-2026-78662 and CVE-2026-56855 in SSH. Patch both in this separate module.
-FROM golang:1.27-alpine3.24@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS tailscale-builder
+# CVE-2026-78662 and CVE-2026-56855 in SSH. Patch this separate module as well.
+FROM golang:1.27.2-alpine3.24@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d AS tailscale-builder
 
 RUN apk add --no-cache git
 RUN git clone --depth 1 --branch v1.102.3 https://github.com/tailscale/tailscale.git /src/tailscale \
@@ -38,7 +38,8 @@ RUN git clone --depth 1 --branch v1.102.3 https://github.com/tailscale/tailscale
 WORKDIR /src/tailscale
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    go get golang.org/x/image@v0.45.0 golang.org/x/crypto@v0.56.0 \
+    go get golang.org/x/image@v0.45.0 golang.org/x/crypto@v0.57.0 \
+      golang.org/x/net@v0.60.0 google.golang.org/grpc@v1.83.1 \
     && CGO_ENABLED=0 go build -trimpath \
       -ldflags="-s -w -X tailscale.com/version.longStamp=1.102.3 -X tailscale.com/version.shortStamp=1.102.3 -X tailscale.com/version.gitCommitStamp=53a0d659afa51835dd7a9283873cca44261454f8" \
       -o /out/tailscale ./cmd/tailscale \

@@ -4,8 +4,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tool_root="${RESOLIX_TOOL_DIR:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/resolix-quality-tools}"
 
-golangci_lint_version="v2.13.2"
-gosec_version="v2.29.0"
+golangci_lint_version="v2.14.0"
+gosec_version="7b1b5cebe007d62fb58eacb90fc571112939ec30"
 govulncheck_version="v1.7.0"
 go_licenses_version="v2.0.1"
 actionlint_version="v1.7.12"

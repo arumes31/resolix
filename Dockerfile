@@ -3,7 +3,7 @@
 ARG VERSION=2.4.28
 
 # Stage 1: Build
-FROM golang:1.27.2-alpine3.24@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d AS builder
+FROM golang:1.27.3-alpine3.24@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd AS builder
 
 ARG VERSION
 ARG BUILD_INFO=local
@@ -28,7 +28,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
 # x/crypto, x/net and gRPC dependencies. The upstream CLI embeds x/image v0.41.0
 # (CVE-2026-46602), and its source selects x/crypto v0.54.0, affected by
 # CVE-2026-78662 and CVE-2026-56855 in SSH. Patch this separate module as well.
-FROM golang:1.27.2-alpine3.24@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d AS tailscale-builder
+FROM golang:1.27.3-alpine3.24@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd AS tailscale-builder
 
 RUN apk add --no-cache git
 RUN git clone --depth 1 --branch v1.102.3 https://github.com/tailscale/tailscale.git /src/tailscale \

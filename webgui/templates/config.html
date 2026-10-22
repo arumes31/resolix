@@ -52,6 +52,13 @@
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 17v3H4V4h6v3H7v10h3Zm4.59-9.59L16 6l6 6-6 6-1.41-1.41L18.17 13H9v-2h9.17l-3.58-3.59Z"/></svg><span>Sign out</span>
                 </button>
             </form>
+            <form method="post" action="./logout" class="logout-form sidebar-logout">
+                <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+                <input type="hidden" name="scope" value="all">
+                <button type="submit" class="app-nav-link sidebar-button" aria-label="Sign out all sessions">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 17v3H4V4h6v3H7v10h3Zm4.59-9.59L16 6l6 6-6 6-1.41-1.41L18.17 13H9v-2h9.17l-3.58-3.59Z"/></svg><span>Sign out everywhere</span>
+                </button>
+            </form>
         </div>
     </aside>
 

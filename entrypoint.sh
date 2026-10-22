@@ -66,8 +66,14 @@ else
     # Run tailscale up if TS_AUTHKEY is provided
     if [ -n "$TS_AUTHKEY" ]; then
         echo "Running tailscale up with authkey"
-        /usr/bin/tailscale up --authkey="$TS_AUTHKEY" --hostname="$NODE_NAME" --accept-dns=false
-        if [ $? -eq 0 ]; then
+        # Pass the key through a private tmpfs file instead of argv so it is
+        # not visible in the process list (/proc/*/cmdline).
+        AUTHKEY_TMP=$(umask 077 && mktemp /tmp/ts-authkey.XXXXXX) || exit 1
+        printf '%s' "$TS_AUTHKEY" > "$AUTHKEY_TMP"
+        /usr/bin/tailscale up --auth-key="file:$AUTHKEY_TMP" --hostname="$NODE_NAME" --accept-dns=false
+        TS_UP_STATUS=$?
+        rm -f "$AUTHKEY_TMP"
+        if [ $TS_UP_STATUS -eq 0 ]; then
             echo "tailscale up completed successfully"
         else
             echo "Error: tailscale up failed"
@@ -103,7 +109,24 @@ fi
 # Start Resolix with the embedded DNS server (dnsmasq is no longer used)
 DNS_EFFECTIVE_ADDR=${DNS_LISTEN_ADDR:-${TAILSCALE_IP:-0.0.0.0}}
 echo "Starting Resolix (embedded DNS server on ${DNS_EFFECTIVE_ADDR}:${DNS_LISTEN_PORT:-53})..."
-/usr/bin/resolix &
+# The enrollment key is not needed after tailscale up; keep it out of the
+# Resolix process environment.
+unset TS_AUTHKEY TS_AUTHKEY_FILE
+if [ -n "${RESOLIX_UID:-}" ] && [ "$RESOLIX_UID" != "0" ]; then
+    # Opt-in privilege drop: tailscaled keeps root for kernel networking while
+    # Resolix runs unprivileged with only the capability to bind port 53.
+    RESOLIX_GID=${RESOLIX_GID:-$RESOLIX_UID}
+    case "$RESOLIX_UID$RESOLIX_GID" in
+        *[!0-9]*) echo "Error: RESOLIX_UID and RESOLIX_GID must be numeric"; exit 1 ;;
+    esac
+    chown -R "$RESOLIX_UID:$RESOLIX_GID" "$HISTORY_DIR" "${CONFIG_DIR:-/var/lib/resolix-config}" "${TLS_STATE_DIR:-/var/lib/resolix-tls}"
+    echo "Running Resolix as UID $RESOLIX_UID / GID $RESOLIX_GID"
+    setpriv --reuid="$RESOLIX_UID" --regid="$RESOLIX_GID" --clear-groups \
+        --inh-caps=-all,+net_bind_service --ambient-caps=-all,+net_bind_service \
+        --bounding-set=-all,+net_bind_service /usr/bin/resolix &
+else
+    /usr/bin/resolix &
+fi
 RESOLIX_PID=$!
 
 echo "Processes started: Resolix(PID:$RESOLIX_PID), tailscaled(PID:$TAILSCALED_PID)"

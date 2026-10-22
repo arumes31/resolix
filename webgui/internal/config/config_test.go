@@ -446,6 +446,29 @@ func TestVerifyConfigRejectsAuthenticationAndNetworkMisconfiguration(t *testing.
 	}
 
 	cfg = base()
+	errList, _ = cfg.VerifyConfig()
+	if !hasAuthRequiredError(errList) {
+		t.Fatalf("non-loopback bind without web credentials errors = %v", errList)
+	}
+	cfg.WebListenAddr = "127.0.0.1"
+	if errList, _ = cfg.VerifyConfig(); hasAuthRequiredError(errList) {
+		t.Fatalf("loopback bind without web credentials errors = %v", errList)
+	}
+	cfg.WebListenAddr = DefaultWebListenAddr
+	cfg.WebAuthDisabled = true
+	errList, warnings := cfg.VerifyConfig()
+	if hasAuthRequiredError(errList) || !strings.Contains(strings.Join(warnings, "\n"), "WEB_AUTH_DISABLED=true") {
+		t.Fatalf("explicit WEB_AUTH_DISABLED errors = %v warnings = %v", errList, warnings)
+	}
+	cfg.WebAuthDisabled = false
+	cfg.WebUsername = "admin"
+	cfg.WebPassword = "short"
+	errList, warnings = cfg.VerifyConfig()
+	if hasAuthRequiredError(errList) || !strings.Contains(strings.Join(warnings, "\n"), "WEB_PASSWORD is shorter") {
+		t.Fatalf("short password errors = %v warnings = %v", errList, warnings)
+	}
+
+	cfg = base()
 	cfg.DNSAllowedClients = "not-a-cidr"
 	errList, _ = cfg.VerifyConfig()
 	if len(errList) == 0 {
@@ -585,7 +608,7 @@ func TestVerifyConfigReportsMissingOptionalFiles(t *testing.T) {
 	cfg := &Config{
 		Mode: ModeController, Port: DefaultPort, WebListenAddr: DefaultWebListenAddr,
 		HistoryDir: t.TempDir(), ConfigDir: t.TempDir(), DBPath: DefaultDBPath,
-		IngestSecret: "test-secret", ClientAliasesFile: filepath.Join(t.TempDir(), "aliases.txt"),
+		IngestSecret: "test-secret", WebAuthDisabled: true, ClientAliasesFile: filepath.Join(t.TempDir(), "aliases.txt"),
 		BlocklistFile: "blocklist.txt", DNSRoutesFile: "routes.json",
 	}
 	errs, warnings := cfg.VerifyConfig()
@@ -701,4 +724,24 @@ func TestArchiveQueueSettings(t *testing.T) {
 			t.Fatalf("normalized archive limits = %d/%d, want 50/100", cfg.ArchiveTriggerSize, cfg.ArchiveWriteBatchSize)
 		}
 	})
+}
+
+func hasAuthRequiredError(errs []string) bool {
+	for _, err := range errs {
+		if strings.Contains(err, "WEB_AUTH_DISABLED=true") {
+			return true
+		}
+	}
+	return false
+}
+
+func TestIsLoopbackListenAddr(t *testing.T) {
+	for addr, want := range map[string]bool{
+		"127.0.0.1": true, "::1": true, "[::1]": true, "localhost": true, "127.0.0.1:35353": true,
+		"0.0.0.0": false, "": false, "::": false, "100.64.0.1": false, "192.168.1.10": false,
+	} {
+		if got := IsLoopbackListenAddr(addr); got != want {
+			t.Errorf("IsLoopbackListenAddr(%q) = %v, want %v", addr, got, want)
+		}
+	}
 }

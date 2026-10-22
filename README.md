@@ -27,7 +27,8 @@ Resolix is a self-hosted DNS control plane for Tailscale networks. One Go servic
 
 - Docker Engine with Compose v2
 - A Tailscale auth key for first enrollment, or an existing persisted `./tailscale` state
-- An `INGEST_SECRET`, or both `WEB_USERNAME` and `WEB_PASSWORD`
+- An `INGEST_SECRET`
+- Both `WEB_USERNAME` and `WEB_PASSWORD` (with HTTPS), or an explicit `WEB_AUTH_DISABLED=true` for a trusted test setup
 
 ```bash
 git clone https://github.com/arumes31/resolix.git
@@ -41,9 +42,13 @@ Set at least these values in `.env`:
 TS_AUTHKEY=tskey-auth-REPLACE_ME
 INGEST_SECRET=replace-with-a-long-random-secret
 NODE_NAME=resolix-1
-# Configure WEB_USERNAME and WEB_PASSWORD after placing an HTTPS reverse proxy
-# in front of Resolix.
+IMAGE_VERSION=vX.Y.Z
+# Production: configure WEB_USERNAME and WEB_PASSWORD with HTTPS
+# (WEB_TLS_MODE=auto or a reverse proxy). For a short trusted trial only:
+# WEB_AUTH_DISABLED=true
 ```
+
+The web server binds `0.0.0.0` inside the container, so it is reachable on the node's Tailscale IP regardless of the `127.0.0.1` host port mapping. Resolix therefore refuses to start without web credentials unless `WEB_LISTEN_ADDR` is a loopback address or `WEB_AUTH_DISABLED=true` is set explicitly. With authentication disabled, any client that can reach the web port can change upstreams, rewrites, and cluster configuration.
 
 Then start the published image:
 
@@ -54,7 +59,7 @@ curl --fail http://127.0.0.1:35353/readyz
 
 The dashboard is available at `http://127.0.0.1:35353/`. Persistent data remains in `./history`, generated TLS trust state in `./tls`, and Tailscale state in `./tailscale`.
 
-For production, pin an immutable release instead of relying on `latest`:
+`docker-compose.example.yaml` requires `IMAGE_VERSION`, so every deployment runs a pinned release:
 
 ```bash
 IMAGE_VERSION=vX.Y.Z docker compose -f docker-compose.example.yaml pull
@@ -165,10 +170,10 @@ DNS_LISTEN_ADDR=0.0.0.0
 DNS_LISTEN_PORT=53
 DNS_PUBLISH_ADDR=0.0.0.0
 DNS_PUBLISH_PORT=53
-DNS_ALLOWED_CLIENTS=127.0.0.0/8,10.0.0.0/8,100.64.0.0/10,172.16.0.0/12,192.168.0.0/16
+DNS_ALLOWED_CLIENTS=127.0.0.0/8,10.0.0.0/8,100.64.0.0/10,192.168.0.0/16
 ```
 
-These are the Compose defaults. They accept loopback, RFC1918 LAN, and Tailscale IPv4 clients while silently dropping other source networks without sending a DNS response. Rate-limit excess and explicit deny-list matches are also dropped silently. Set `DNS_PUBLISH_ADDR` to one specific LAN address to narrow host exposure, and extend `DNS_ALLOWED_CLIENTS` for additional routed private subnets. Never expose a recursive resolver to untrusted or public networks. Ensure Tailscale ACLs permit clients to reach UDP/TCP 53 on resolver nodes and agents to reach the controller's HTTPS port.
+These are the Compose defaults. They accept loopback, `10.0.0.0/8` and `192.168.0.0/16` LAN, and Tailscale IPv4 clients while silently dropping other source networks without sending a DNS response. `172.16.0.0/12` is not included by default: with Docker's userland proxy, rootless Docker, Docker Desktop, or other source NAT, Internet clients appear as the Docker bridge gateway (for example `172.17.0.1`), which would make the resolver open. Add your real LAN subnet explicitly if it lies in that range. When `DNS_ALLOWED_CLIENTS` is empty, the UDP/TCP/DoT listeners serve only loopback, private, link-local, and Tailscale clients; set `0.0.0.0/0,::/0` explicitly to serve public clients. Rate-limit excess and explicit deny-list matches are also dropped silently. Set `DNS_PUBLISH_ADDR` to one specific LAN address to narrow host exposure, and extend `DNS_ALLOWED_CLIENTS` for additional routed private subnets. Never expose a recursive resolver to untrusted or public networks. Ensure Tailscale ACLs permit clients to reach UDP/TCP 53 on resolver nodes and agents to reach the controller's HTTPS port.
 
 #### Reverse-proxy certificate instead of generated TLS
 
@@ -251,7 +256,9 @@ The **Allowlists** panel accepts hosted Adblock, hosts-file, and plain-domain li
 | `TS_AUTHKEY` | Tailscale auth key used for first enrollment | unset |
 | `TS_AUTHKEY_FILE` | File containing the auth key; used when `TS_AUTHKEY` is empty | unset |
 | `INGEST_SECRET` | Bearer secret for agent ingestion, heartbeat, and configuration sync | unset |
-| `WEB_USERNAME` / `WEB_PASSWORD` | Dashboard credentials; configure both or neither | unset |
+| `WEB_USERNAME` / `WEB_PASSWORD` | Dashboard credentials; configure both or neither. Required when `WEB_LISTEN_ADDR` is not loopback unless `WEB_AUTH_DISABLED=true` | unset |
+| `WEB_AUTH_DISABLED` | Explicit opt-in to an unauthenticated dashboard/API on a non-loopback address (cross-site browser requests are still rejected) | `false` |
+| `RESOLIX_UID` / `RESOLIX_GID` | Optional numeric UID/GID for the Resolix process; tailscaled stays root | unset (root) |
 | `PORT` | Web/API listen port | `35353` |
 | `WEB_LISTEN_ADDR` | Web/API bind address | `0.0.0.0` |
 | `WEB_TLS_MODE` | `off` for HTTP/reverse-proxy termination or `auto` for generated controller HTTPS | `off` |
@@ -275,7 +282,7 @@ The **Allowlists** panel accepts hosted Adblock, hosts-file, and plain-domain li
 | `DNS_TCP_MAX_CONNECTIONS` | Shared active TCP and DoT connection limit | `256` |
 | `DNS_PUBLISH_ADDR` | Docker host address used to publish UDP/TCP DNS | Compose `0.0.0.0` |
 | `DNS_PUBLISH_PORT` | Docker host UDP/TCP DNS port | Compose `53` |
-| `DNS_ALLOWED_CLIENTS` | IP/CIDR allow list; clients outside it are silently dropped | unset; Compose private/tailnet ranges |
+| `DNS_ALLOWED_CLIENTS` | IP/CIDR allow list; clients outside it are silently dropped. When unset, plain DNS/DoT serve only loopback, private, link-local, and Tailscale clients | unset; Compose private/tailnet ranges |
 | `DNS_DISALLOWED_CLIENTS` | IP/CIDR deny list; denied queries are silently dropped | unset |
 | `RATE_LIMIT_QPS` | Per-public-client-IP QPS limit; excess queries are silently dropped; `0` disables | `80` |
 | `RATE_LIMIT_INTERNAL_QPS` | Per-IP QPS limit for loopback, LAN, link-local, and Tailscale sources; `0` disables | `1000` |
@@ -386,7 +393,7 @@ To enroll a replacement controller CA, stop the agent, verify the new fingerprin
 
 ### External reverse proxy
 
-Leave `WEB_TLS_MODE=off` when a reverse proxy terminates TLS. When dashboard authentication is configured, Resolix accepts it only over HTTPS observed directly or through an explicitly trusted proxy. Session and CSRF cookies are always `Secure`, `HttpOnly`, and `SameSite=Strict`.
+Leave `WEB_TLS_MODE=off` when a reverse proxy terminates TLS. When dashboard authentication is configured, Resolix accepts it only over HTTPS observed directly or through an explicitly trusted proxy. Session and CSRF cookies are always `Secure`, `HttpOnly`, and `SameSite=Strict`. Sessions expire after 12 hours of inactivity and at most 24 hours after login; **Sign out everywhere** on the configuration page revokes all sessions. Failed logins are throttled per client address (exponential backoff up to 5 minutes) and by a global budget of 50 failures per 15 minutes.
 
 Bind Resolix to loopback when the proxy runs on the same host and trust only the proxy address:
 
@@ -515,6 +522,7 @@ Common startup failures:
 - `tofu-tailnet` configured with a hostname, non-Tailscale address, corrupt pin, or changed controller CA.
 - Partial web authentication: `WEB_USERNAME` and `WEB_PASSWORD` must be configured together.
 - No web credentials and no `INGEST_SECRET`.
+- No web credentials on a non-loopback `WEB_LISTEN_ADDR` without `WEB_AUTH_DISABLED=true`.
 - DoT enabled without a valid certificate/key pair.
 - Port 53 already bound on the selected Tailscale address.
 - CRLF line endings in `entrypoint.sh` on a custom build context.

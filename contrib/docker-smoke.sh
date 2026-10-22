@@ -41,7 +41,7 @@ chmod 0644 "${smoke_dir}/tls.key" "${smoke_dir}/tls.crt"
 compose_tls_dir='/var/lib/resolix-custom-tls'
 compose_config_dir='/var/lib/resolix-custom-config'
 for compose_file in docker-compose.yaml docker-compose.example.yaml; do
-  TS_AUTHKEY=compose-test INGEST_SECRET=compose-test CONFIG_DIR="${compose_config_dir}" TLS_STATE_DIR="${compose_tls_dir}" \
+  TS_AUTHKEY=compose-test INGEST_SECRET=compose-test IMAGE_VERSION=smoke CONFIG_DIR="${compose_config_dir}" TLS_STATE_DIR="${compose_tls_dir}" \
     docker compose -f "${compose_file}" config --format json \
     | python3 -c '
 import json
@@ -98,6 +98,7 @@ MSYS_NO_PATHCONV=1 docker run -d --name "${container_name}" \
   -v "${socket_volume}:/var/run/tailscale" \
   -e PORT=35353 \
   -e WEB_LISTEN_ADDR=0.0.0.0 \
+  -e WEB_AUTH_DISABLED=true \
   -e DNS_LISTEN_ADDR=0.0.0.0 \
   -e DNS_LISTEN_PORT=1053 \
   -e UPSTREAM_DNS=127.0.0.1#9 \
@@ -186,3 +187,43 @@ python3 contrib/smoke_dns.py doh 127.0.0.1 "${web_port}" smoke.test 0
 python3 contrib/smoke_dns.py doh 127.0.0.1 "${web_port}" blocked.test 3
 python3 contrib/smoke_dns.py dot 127.0.0.1 "${dot_port}" smoke.test 0 --ca-file "${smoke_dir}/tls.crt"
 python3 contrib/smoke_dns.py dot 127.0.0.1 "${dot_port}" blocked.test 3 --ca-file "${smoke_dir}/tls.crt"
+
+# Opt-in privilege drop: Resolix must run as RESOLIX_UID and still bind DNS.
+nonroot_container="${container_name}-nonroot"
+docker rm -f "${nonroot_container}" >/dev/null 2>&1 || true
+trap 'docker rm -f "${nonroot_container}" >/dev/null 2>&1 || true; cleanup' EXIT
+mkdir -p "${smoke_dir}/config-nonroot"
+MSYS_NO_PATHCONV=1 docker run -d --name "${nonroot_container}" \
+  -p 127.0.0.1:0:53/udp \
+  -p 127.0.0.1:0:35353/tcp \
+  -v "${smoke_mount}/config-nonroot:/var/lib/resolix-config" \
+  -v "${smoke_mount}/tailscale:/usr/bin/tailscale:ro" \
+  -v "${smoke_mount}/tailscaled:/usr/sbin/tailscaled:ro" \
+  -v "${socket_volume}:/var/run/tailscale" \
+  -e RESOLIX_UID=10001 \
+  -e WEB_AUTH_DISABLED=true \
+  -e DNS_LISTEN_ADDR=0.0.0.0 \
+  -e UPSTREAM_DNS=127.0.0.1#9 \
+  -e DOMAINS=smoke.test:192.0.2.10 \
+  -e INGEST_SECRET=smoke-secret \
+  resolix:smoke >/dev/null
+nonroot_web_port="$(docker port "${nonroot_container}" 35353/tcp | awk -F: 'NR == 1 { print $NF }')"
+nonroot_dns_port="$(docker port "${nonroot_container}" 53/udp | awk -F: 'NR == 1 { print $NF }')"
+for _ in $(seq 1 60); do
+  if curl --fail --silent "http://127.0.0.1:${nonroot_web_port}/readyz" >/dev/null; then
+    break
+  fi
+  sleep 1
+done
+if ! curl --fail --silent "http://127.0.0.1:${nonroot_web_port}/readyz" >/dev/null; then
+  echo 'Non-root Resolix smoke container did not become ready:' >&2
+  docker logs "${nonroot_container}" >&2
+  exit 1
+fi
+nonroot_pid="$(docker exec "${nonroot_container}" pidof resolix)"
+nonroot_uid="$(docker exec "${nonroot_container}" stat -c '%u' "/proc/${nonroot_pid}")"
+if [[ "${nonroot_uid}" != "10001" ]]; then
+  echo "Opt-in non-root Resolix runs as UID ${nonroot_uid}, want 10001" >&2
+  exit 1
+fi
+python3 contrib/smoke_dns.py udp 127.0.0.1 "${nonroot_dns_port}" smoke.test 0

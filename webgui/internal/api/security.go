@@ -9,6 +9,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -46,9 +47,14 @@ func generateCSRFToken() (string, error) {
 }
 
 // checkCSRF validates the double-submit token used by authenticated browser
-// sessions. CSRF protection is unnecessary when web authentication is off.
+// sessions. When web authentication is explicitly disabled there is no session
+// cookie to protect, so cross-site browser requests are rejected instead.
 func (s *Server) checkCSRF(w http.ResponseWriter, r *http.Request) bool {
 	if s.cfg.WebUsername == "" && s.cfg.WebPassword == "" {
+		if !s.sameOriginRequest(r) {
+			http.Error(w, apperr.NewErrCSRFMismatch("cross-site request rejected", nil).Error(), http.StatusForbidden)
+			return false
+		}
 		return true
 	}
 	cookie, err := r.Cookie(csrfCookieName)
@@ -65,6 +71,30 @@ func (s *Server) checkCSRF(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	return true
+}
+
+// sameOriginRequest reports whether a state-changing request may have come
+// from this application's own pages. Browsers send Sec-Fetch-Site and Origin
+// on cross-site requests; non-browser clients that send neither are allowed.
+func (s *Server) sameOriginRequest(r *http.Request) bool {
+	if site := strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))); site != "" {
+		return site == "same-origin" || site == "none"
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	host := r.Host
+	if s.isTrustedProxy(r) {
+		if forwarded := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Host"), ",")[0]); forwarded != "" {
+			host = forwarded
+		}
+	}
+	return strings.EqualFold(parsed.Host, host)
 }
 
 func remoteIP(r *http.Request) string {
@@ -152,6 +182,16 @@ func (s *Server) cookiePath() string {
 	return s.cfg.BaseURL
 }
 
+// sessionEntry tracks the absolute expiry and last activity of a session.
+type sessionEntry struct {
+	expires  time.Time
+	lastSeen time.Time
+}
+
+func (e sessionEntry) expired(now time.Time) bool {
+	return !e.expires.After(now) || now.Sub(e.lastSeen) >= sessionIdleTimeout
+}
+
 func (s *Server) newSession() (string, error) {
 	tokenBytes := make([]byte, sessionTokenBytes)
 	if _, err := rand.Read(tokenBytes); err != nil {
@@ -160,29 +200,49 @@ func (s *Server) newSession() (string, error) {
 	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
 	now := time.Now()
 	s.sessionMu.Lock()
-	for existing, expires := range s.sessions {
-		if !expires.After(now) {
+	for existing, entry := range s.sessions {
+		if entry.expired(now) {
 			delete(s.sessions, existing)
 		}
 	}
-	s.sessions[token] = now.Add(sessionLifetime)
+	// Bound memory: evict the least recently used session when full.
+	for len(s.sessions) >= maxSessions {
+		oldest := ""
+		for existing, entry := range s.sessions {
+			if oldest == "" || entry.lastSeen.Before(s.sessions[oldest].lastSeen) {
+				oldest = existing
+			}
+		}
+		delete(s.sessions, oldest)
+	}
+	s.sessions[token] = sessionEntry{expires: now.Add(sessionLifetime), lastSeen: now}
 	s.sessionMu.Unlock()
 	return token, nil
 }
 
+// validSession reports whether token names a live session and refreshes its
+// idle timer.
 func (s *Server) validSession(token string) bool {
 	now := time.Now()
-	valid := 0
+	matched := ""
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
-	for existing, expires := range s.sessions {
-		if !expires.After(now) {
+	for existing, entry := range s.sessions {
+		if entry.expired(now) {
 			delete(s.sessions, existing)
 			continue
 		}
-		valid |= subtle.ConstantTimeCompare([]byte(existing), []byte(token))
+		if subtle.ConstantTimeCompare([]byte(existing), []byte(token)) == 1 {
+			matched = existing
+		}
 	}
-	return valid == 1
+	if matched == "" {
+		return false
+	}
+	entry := s.sessions[matched]
+	entry.lastSeen = now
+	s.sessions[matched] = entry
+	return true
 }
 
 func (s *Server) deleteSession(token string) {
@@ -195,38 +255,78 @@ func (s *Server) deleteSession(token string) {
 	}
 }
 
-// getRateLimitBackoff returns the required backoff duration and whether the IP is rate-limited.
-// Exponential backoff: 1 failure = 0s, 2 = 1s, 3 = 2s, 4 = 4s, 5+ = 8s (capped).
+// deleteAllSessions revokes every active session.
+func (s *Server) deleteAllSessions() {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	clear(s.sessions)
+}
+
+const (
+	// loginBackoffCap bounds the per-IP delay between failed login attempts.
+	loginBackoffCap = 5 * time.Minute
+	// loginFailureMemory is how long per-IP failures are remembered.
+	loginFailureMemory = time.Hour
+	// globalLoginFailureWindow and globalLoginFailureLimit form a failure
+	// budget shared by all source addresses for the single admin account.
+	globalLoginFailureWindow = 15 * time.Minute
+	globalLoginFailureLimit  = 50
+	// maxRateLimitEntries bounds the per-IP tracking map.
+	maxRateLimitEntries = 10000
+)
+
+// getRateLimitBackoff returns the required backoff duration for a failure count.
+// Exponential backoff: 1 failure = 0s, 2 = 1s, 3 = 2s, 4 = 4s, ... capped at 5m.
 func getRateLimitBackoff(count int) time.Duration {
 	if count <= 1 {
 		return 0
 	}
 	seconds := math.Pow(2, float64(count-2))
-	if seconds > 8 {
-		seconds = 8
+	if seconds > loginBackoffCap.Seconds() {
+		return loginBackoffCap
 	}
 	return time.Duration(seconds) * time.Second
 }
 
+// pruneGlobalFailuresLocked drops global failures outside the window.
+// Callers must hold rateMu.
+func (s *Server) pruneGlobalFailuresLocked(now time.Time) {
+	cutoff := now.Add(-globalLoginFailureWindow)
+	kept := s.globalFailures[:0]
+	for _, at := range s.globalFailures {
+		if at.After(cutoff) {
+			kept = append(kept, at)
+		}
+	}
+	s.globalFailures = kept
+}
+
 // checkRateLimit checks if the given IP is rate-limited. Returns true if the request
-// should be rejected (429). It also enforces exponential backoff by checking elapsed time.
+// should be rejected (429). It enforces per-IP exponential backoff and a global
+// failure budget shared by all source addresses.
 func (s *Server) checkRateLimit(ip string) (bool, time.Duration) {
 	s.rateMu.Lock()
 	defer s.rateMu.Unlock()
+	now := time.Now()
+
+	s.pruneGlobalFailuresLocked(now)
+	if len(s.globalFailures) >= globalLoginFailureLimit {
+		return true, s.globalFailures[0].Add(globalLoginFailureWindow).Sub(now)
+	}
 
 	entry, exists := s.rateLimits[ip]
 	if !exists || entry.count == 0 {
 		return false, 0
 	}
 
-	// If the last attempt was more than 5 minutes ago, reset
-	if time.Since(entry.lastSeen) > 5*time.Minute {
+	// Forget failures after a long quiet period
+	if now.Sub(entry.lastSeen) > loginFailureMemory {
 		delete(s.rateLimits, ip)
 		return false, 0
 	}
 
 	backoff := getRateLimitBackoff(entry.count)
-	elapsed := time.Since(entry.lastSeen)
+	elapsed := now.Sub(entry.lastSeen)
 
 	if elapsed < backoff {
 		remaining := backoff - elapsed
@@ -236,18 +336,39 @@ func (s *Server) checkRateLimit(ip string) (bool, time.Duration) {
 	return false, 0
 }
 
-// recordFailedLogin increments the failed login counter for the given IP.
+// recordFailedLogin increments the failed login counters for the given IP and
+// the global budget.
 func (s *Server) recordFailedLogin(ip string) {
 	s.rateMu.Lock()
 	defer s.rateMu.Unlock()
+	now := time.Now()
+
+	s.globalFailures = append(s.globalFailures, now)
+	s.pruneGlobalFailuresLocked(now)
 
 	entry, exists := s.rateLimits[ip]
 	if !exists {
+		if len(s.rateLimits) >= maxRateLimitEntries {
+			s.evictOldestRateLimitLocked()
+		}
 		entry = &rateLimitEntry{}
 		s.rateLimits[ip] = entry
 	}
 	entry.count++
-	entry.lastSeen = time.Now()
+	entry.lastSeen = now
+}
+
+// evictOldestRateLimitLocked removes the least recently seen entry.
+// Callers must hold rateMu.
+func (s *Server) evictOldestRateLimitLocked() {
+	oldestIP := ""
+	var oldest time.Time
+	for ip, entry := range s.rateLimits {
+		if oldestIP == "" || entry.lastSeen.Before(oldest) {
+			oldestIP, oldest = ip, entry.lastSeen
+		}
+	}
+	delete(s.rateLimits, oldestIP)
 }
 
 // resetRateLimit clears the rate limit counter for the given IP (on successful login).
@@ -257,7 +378,7 @@ func (s *Server) resetRateLimit(ip string) {
 	delete(s.rateLimits, ip)
 }
 
-// cleanupRateLimits periodically removes stale entries older than 10 minutes.
+// cleanupRateLimits periodically removes stale entries.
 func (s *Server) cleanupRateLimits() {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
@@ -266,17 +387,33 @@ func (s *Server) cleanupRateLimits() {
 		s.rateMu.Lock()
 		now := time.Now()
 		for ip, entry := range s.rateLimits {
-			if now.Sub(entry.lastSeen) > 10*time.Minute {
+			if now.Sub(entry.lastSeen) > loginFailureMemory {
 				delete(s.rateLimits, ip)
 			}
 		}
+		s.pruneGlobalFailuresLocked(now)
 		s.rateMu.Unlock()
 	}
 }
 
+// validIngestAuth reports whether the request carries the shared agent bearer
+// secret. It must only be called when IngestSecret is configured.
+func (s *Server) validIngestAuth(r *http.Request) bool {
+	expected := "Bearer " + s.cfg.IngestSecret
+	return subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte(expected)) == 1
+}
+
+// internalAuth protects agent-facing endpoints. With an ingest secret the
+// bearer token is enforced centrally so no handler can accidentally fail open.
 func (s *Server) internalAuth(next http.Handler) http.Handler {
 	if s.cfg.IngestSecret != "" {
-		return next
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !s.validIngestAuth(r) {
+				http.Error(w, apperr.NewErrAuthFailed("invalid ingest secret", nil).Error(), http.StatusUnauthorized)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
 	}
 	if s.cfg.WebUsername == "" || s.cfg.WebPassword == "" {
 		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -427,7 +564,16 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, apperr.NewErrCSRFMismatch("invalid CSRF token", err).Error(), http.StatusForbidden)
 		return
 	}
-	if cookie, err := r.Cookie(sessionCookieName); err == nil {
+	if r.FormValue("scope") == "all" {
+		// Signing out everywhere requires a live session so an anonymous
+		// request cannot revoke other administrators' sessions.
+		cookie, err := r.Cookie(sessionCookieName)
+		if err != nil || !s.validSession(cookie.Value) {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		s.deleteAllSessions()
+	} else if cookie, err := r.Cookie(sessionCookieName); err == nil {
 		s.deleteSession(cookie.Value)
 	}
 	http.SetCookie(w, s.newSecureCookie(sessionCookieName, "", -1))

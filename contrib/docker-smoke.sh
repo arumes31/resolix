@@ -191,7 +191,14 @@ python3 contrib/smoke_dns.py dot 127.0.0.1 "${dot_port}" blocked.test 3 --ca-fil
 # Opt-in privilege drop: Resolix must run as RESOLIX_UID and still bind DNS.
 nonroot_container="${container_name}-nonroot"
 docker rm -f "${nonroot_container}" >/dev/null 2>&1 || true
-trap 'docker rm -f "${nonroot_container}" >/dev/null 2>&1 || true; cleanup' EXIT
+cleanup_nonroot() {
+  docker rm -f "${nonroot_container}" >/dev/null 2>&1 || true
+  # The entrypoint chowned this bind mount to UID 10001; hand it back to the
+  # runner so the temporary directory can be removed.
+  MSYS_NO_PATHCONV=1 docker run --rm --entrypoint chown     -v "${smoke_mount}/config-nonroot:/fixture" resolix:smoke     -R "$(id -u):$(id -g)" /fixture >/dev/null 2>&1 || true
+  cleanup
+}
+trap cleanup_nonroot EXIT
 mkdir -p "${smoke_dir}/config-nonroot"
 MSYS_NO_PATHCONV=1 docker run -d --name "${nonroot_container}" \
   -p 127.0.0.1:0:53/udp \
@@ -220,10 +227,15 @@ if ! curl --fail --silent "http://127.0.0.1:${nonroot_web_port}/readyz" >/dev/nu
   docker logs "${nonroot_container}" >&2
   exit 1
 fi
-nonroot_pid="$(docker exec "${nonroot_container}" pidof resolix)"
+nonroot_pid="$(docker exec "${nonroot_container}" pidof resolix)" || {
+  echo 'Non-root Resolix process not found:' >&2
+  docker logs "${nonroot_container}" >&2
+  exit 1
+}
 nonroot_uid="$(docker exec "${nonroot_container}" stat -c '%u' "/proc/${nonroot_pid}")"
 if [[ "${nonroot_uid}" != "10001" ]]; then
   echo "Opt-in non-root Resolix runs as UID ${nonroot_uid}, want 10001" >&2
   exit 1
 fi
 python3 contrib/smoke_dns.py udp 127.0.0.1 "${nonroot_dns_port}" smoke.test 0
+echo "Docker smoke tests passed"

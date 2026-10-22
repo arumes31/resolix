@@ -302,17 +302,19 @@ func (s *Server) pruneGlobalFailuresLocked(now time.Time) {
 }
 
 // checkRateLimit checks if the given IP is rate-limited. Returns true if the request
-// should be rejected (429). It enforces per-IP exponential backoff and a global
-// failure budget shared by all source addresses.
+// should be rejected (429). It enforces per-IP exponential backoff; an exhausted
+// global failure budget escalates that backoff to the maximum for any address
+// with recent failures.
 func (s *Server) checkRateLimit(ip string) (bool, time.Duration) {
 	s.rateMu.Lock()
 	defer s.rateMu.Unlock()
 	now := time.Now()
 
 	s.pruneGlobalFailuresLocked(now)
-	if len(s.globalFailures) >= globalLoginFailureLimit {
-		return true, s.globalFailures[0].Add(globalLoginFailureWindow).Sub(now)
-	}
+	// The shared budget never rejects a request on its own, otherwise any
+	// anonymous caller could lock the administrator out. Once it is exhausted,
+	// every address that has already failed waits the full cooldown.
+	globalOver := len(s.globalFailures) >= globalLoginFailureLimit
 
 	entry, exists := s.rateLimits[ip]
 	if !exists || entry.count == 0 {
@@ -326,6 +328,9 @@ func (s *Server) checkRateLimit(ip string) (bool, time.Duration) {
 	}
 
 	backoff := getRateLimitBackoff(entry.count)
+	if globalOver {
+		backoff = loginBackoffCap
+	}
 	elapsed := now.Sub(entry.lastSeen)
 
 	if elapsed < backoff {

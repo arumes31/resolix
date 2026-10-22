@@ -161,8 +161,12 @@ func TestLoginGlobalFailureBudgetAndBoundedEntries(t *testing.T) {
 	for i := 0; i < globalLoginFailureLimit; i++ {
 		s.recordFailedLogin("198.51.100." + string(rune('a'+i%26)))
 	}
-	if limited, remaining := s.checkRateLimit("203.0.113.99"); !limited || remaining <= 0 {
-		t.Fatalf("global failure budget not enforced: limited=%t remaining=%s", limited, remaining)
+	if limited, _ := s.checkRateLimit("203.0.113.99"); limited {
+		t.Fatal("exhausted global budget must not lock out addresses without failures")
+	}
+	s.recordFailedLogin("203.0.113.98")
+	if limited, remaining := s.checkRateLimit("203.0.113.98"); !limited || remaining <= loginBackoffCap-time.Minute {
+		t.Fatalf("exhausted global budget did not escalate backoff: limited=%t remaining=%s", limited, remaining)
 	}
 
 	s = testServer(&config.Config{})

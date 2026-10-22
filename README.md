@@ -393,7 +393,7 @@ To enroll a replacement controller CA, stop the agent, verify the new fingerprin
 
 ### External reverse proxy
 
-Leave `WEB_TLS_MODE=off` when a reverse proxy terminates TLS. When dashboard authentication is configured, Resolix accepts it only over HTTPS observed directly or through an explicitly trusted proxy. Session and CSRF cookies are always `Secure`, `HttpOnly`, and `SameSite=Strict`. Sessions expire after 12 hours of inactivity and at most 24 hours after login; **Sign out everywhere** on the configuration page revokes all sessions. Failed logins are throttled per client address (exponential backoff up to 5 minutes) and by a global budget of 50 failures per 15 minutes.
+Leave `WEB_TLS_MODE=off` when a reverse proxy terminates TLS. When dashboard authentication is configured, Resolix accepts it only over HTTPS observed directly or through an explicitly trusted proxy. Session and CSRF cookies are always `Secure`, `HttpOnly`, and `SameSite=Strict`. Sessions expire after 12 hours of inactivity and at most 24 hours after login; **Sign out everywhere** on the configuration page revokes all sessions. Failed logins are throttled per client address (exponential backoff up to 5 minutes) once more than 50 failures occur within 15 minutes across all addresses, every address with a recent failure waits the full 5 minutes between attempts (addresses without failures are never blocked, so the administrator cannot be locked out).
 
 Bind Resolix to loopback when the proxy runs on the same host and trust only the proxy address:
 

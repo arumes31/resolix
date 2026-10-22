@@ -65,6 +65,17 @@ func (s *Server) aclAllowlistDrop(clientIP string) bool {
 	return s.allowedConfigured && !cidrListContains(s.allowed, clientIP)
 }
 
+// defaultACLDrop applies the safe default when no allow list is configured:
+// plain DNS and DoT listeners serve only loopback, LAN, link-local, and
+// Tailscale clients so the resolver cannot become an open recursor. Set an
+// explicit allow list (for example 0.0.0.0/0,::/0) to serve other networks.
+func (s *Server) defaultACLDrop(clientIP string) bool {
+	s.runtimeMu.RLock()
+	configured := s.allowedConfigured
+	s.runtimeMu.RUnlock()
+	return !configured && !isInternalClientIP(clientIP)
+}
+
 // rateBucket is a per-client-IP token bucket.
 type rateBucket struct {
 	tokens  float64

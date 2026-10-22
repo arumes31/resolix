@@ -82,7 +82,7 @@ func TestAuthenticationHelpersAndRateLimit(t *testing.T) {
 	}
 
 	backoffs := map[int]time.Duration{
-		0: 0, 1: 0, 2: time.Second, 3: 2 * time.Second, 4: 4 * time.Second, 8: 8 * time.Second,
+		0: 0, 1: 0, 2: time.Second, 3: 2 * time.Second, 4: 4 * time.Second, 8: 64 * time.Second, 20: loginBackoffCap,
 	}
 	for count, want := range backoffs {
 		if got := getRateLimitBackoff(count); got != want {

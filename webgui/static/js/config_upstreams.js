@@ -82,10 +82,14 @@ function addStructuredUpstream() {
 
 async function testUpstream(spec) {
 	const bootstrapServers = document.getElementById('bootstrapList').value.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
-	const report = await apiJSON('/api/upstreams/test', {
+	const probe = allowPrivate => apiJSON('/api/upstreams/test', {
 		method: 'POST', headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ spec, bootstrap_servers: bootstrapServers })
+		body: JSON.stringify({ spec, bootstrap_servers: bootstrapServers, allow_private: allowPrivate })
 	});
+	let report = await probe(false);
+	if (report.private_blocked && window.confirm(`${spec} resolves to a private or local address. Test it anyway?`)) {
+		report = await probe(true);
+	}
 	const timing = Object.entries(report.timings_ms || {}).map(([phase, value]) => `${phase} ${Number(value).toFixed(1)} ms`).join(' · ');
 	const tls = report.tls_issuer ? `TLS ${report.tls_server_name} · ${report.tls_issuer} · expires ${new Date(report.tls_expires_at).toLocaleDateString()}` : '';
 	const bootstrap = (report.bootstrap_cache || []).map(item => `${item.hostname} → ${(item.addresses || []).join(', ')}${item.stale ? ' (stale)' : ''}`).join(' · ');

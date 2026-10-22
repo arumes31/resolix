@@ -13,6 +13,7 @@ import (
 
 	"github.com/arumes31/resolix/webgui/internal/dnsroutes"
 	"github.com/arumes31/resolix/webgui/internal/dnsserver"
+	"github.com/arumes31/resolix/webgui/internal/filter"
 	"github.com/arumes31/resolix/webgui/internal/upstream"
 )
 
@@ -113,6 +114,9 @@ func (s *Server) handleUpstreamTest(w http.ResponseWriter, r *http.Request) {
 		Spec             string   `json:"spec"`
 		Domain           string   `json:"domain"`
 		BootstrapServers []string `json:"bootstrap_servers"`
+		// AllowPrivate is an explicit opt-in to probe non-public endpoints
+		// such as LAN or tailnet resolvers.
+		AllowPrivate bool `json:"allow_private"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&request); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
@@ -134,7 +138,11 @@ func (s *Server) handleUpstreamTest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	report, err := upstream.ProbeDetailed(r.Context(), request.Spec, request.Domain, request.BootstrapServers)
+	var options upstream.ProbeOptions
+	if !request.AllowPrivate {
+		options.AllowAddress = filter.IsPublicAddress
+	}
+	report, err := upstream.ProbeDetailedWithOptions(r.Context(), request.Spec, request.Domain, request.BootstrapServers, options)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return

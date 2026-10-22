@@ -85,6 +85,15 @@ func (c *Config) VerifyConfig() ([]string, []string) {
 	if c.WebUsername == "" && c.WebPassword == "" && c.IngestSecret == "" {
 		errs = append(errs, "configure WEB_USERNAME/WEB_PASSWORD or INGEST_SECRET; internal endpoints may not run without authentication")
 	}
+	if c.WebUsername == "" && c.WebPassword == "" && !c.WebAuthDisabled && !IsLoopbackListenAddr(c.WebListenAddr) {
+		errs = append(errs, "WEB_USERNAME/WEB_PASSWORD are required when WEB_LISTEN_ADDR is not a loopback address; set WEB_AUTH_DISABLED=true to explicitly run the dashboard and API without authentication")
+	}
+	if c.WebAuthDisabled && c.WebUsername == "" && c.WebPassword == "" {
+		warnings = append(warnings, "WEB_AUTH_DISABLED=true: the dashboard and admin API are reachable without authentication by every client that can connect to WEB_LISTEN_ADDR")
+	}
+	if c.WebPassword != "" && !isBcryptHash(c.WebPassword) && len(c.WebPassword) < minWebPasswordLength {
+		warnings = append(warnings, fmt.Sprintf("WEB_PASSWORD is shorter than %d characters; use a long random password", minWebPasswordLength))
+	}
 	if c.Mode == ModeAgent && strings.TrimSpace(c.IngestSecret) == "" {
 		errs = append(errs, "INGEST_SECRET is required in agent mode for authenticated controller communication")
 	}
@@ -200,6 +209,28 @@ func (c *Config) VerifyConfig() ([]string, []string) {
 	}
 
 	return errs, warnings
+}
+
+// minWebPasswordLength is the recommended minimum plaintext WEB_PASSWORD length.
+const minWebPasswordLength = 12
+
+func isBcryptHash(s string) bool {
+	return strings.HasPrefix(s, "$2a$") || strings.HasPrefix(s, "$2b$") || strings.HasPrefix(s, "$2y$")
+}
+
+// IsLoopbackListenAddr reports whether a web bind address accepts only local
+// connections. Empty and wildcard addresses are not loopback.
+func IsLoopbackListenAddr(addr string) bool {
+	host := strings.TrimSpace(addr)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func splitConfigList(raw string) []string {

@@ -483,6 +483,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 		http.SetCookie(w, s.newSecureCookie(csrfCookieName, csrfToken, int(sessionLifetime.Seconds())))
 
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := s.tmpl.ExecuteTemplate(w, "login.html", map[string]interface{}{
 			"Nonce":     nonce,
 			"CSRFToken": csrfToken,
@@ -547,6 +548,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 		http.SetCookie(w, s.newSecureCookie(csrfCookieName, csrfToken, int(sessionLifetime.Seconds())))
 
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if err := s.tmpl.ExecuteTemplate(w, "login.html", map[string]interface{}{
 			"Error":     "Invalid username or password",
 			"Nonce":     nonce,

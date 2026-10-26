@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http/httptrace"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -37,12 +38,27 @@ type ProbeReport struct {
 	ConnectionReused bool               `json:"connection_reused"`
 	Bootstrap        []BootstrapStatus  `json:"bootstrap_cache,omitempty"`
 	Failure          *ProbeFailure      `json:"failure,omitempty"`
+	// PrivateBlocked is set when the endpoint was refused by the address
+	// policy; callers may retry with an explicit private-address opt-in.
+	PrivateBlocked bool `json:"private_blocked,omitempty"`
+}
+
+// ProbeOptions restricts which endpoints a probe may contact.
+type ProbeOptions struct {
+	// AllowAddress, when set, must approve every resolved endpoint address
+	// before any connection is made.
+	AllowAddress func(netip.Addr) bool
 }
 
 // ProbeDetailed checks an upstream while preserving the bootstrap boundary:
 // hostname resolution is performed only by the configured bootstrapper and
 // all subsequent connections dial the pinned literal endpoint.
 func ProbeDetailed(ctx context.Context, raw, domain string, bootstrapServers []string) (ProbeReport, error) {
+	return ProbeDetailedWithOptions(ctx, raw, domain, bootstrapServers, ProbeOptions{})
+}
+
+// ProbeDetailedWithOptions is ProbeDetailed with an endpoint address policy.
+func ProbeDetailedWithOptions(ctx context.Context, raw, domain string, bootstrapServers []string, options ProbeOptions) (ProbeReport, error) {
 	started := time.Now()
 	spec, err := Parse(raw)
 	if err != nil {
@@ -64,6 +80,21 @@ func ProbeDetailed(ctx context.Context, raw, domain string, bootstrapServers []s
 		return report, nil
 	}
 	report.Endpoint = addresses[0]
+	if options.AllowAddress != nil {
+		for _, address := range addresses {
+			host, _, splitErr := net.SplitHostPort(address)
+			if splitErr != nil {
+				host = address
+			}
+			literal, parseErr := netip.ParseAddr(host)
+			if parseErr != nil || !options.AllowAddress(literal.Unmap()) {
+				report.PrivateBlocked = true
+				report.fail("policy", fmt.Errorf("endpoint %s is not a public address; enable allow_private to test it", address))
+				report.TimingsMS["total"] = millisecondsSince(started)
+				return report, nil
+			}
+		}
+	}
 
 	query := new(dns.Msg)
 	query.SetQuestion(dns.Fqdn(domain), dns.TypeA)

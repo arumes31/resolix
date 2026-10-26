@@ -66,18 +66,44 @@ func TestACLAllowDenyDrop(t *testing.T) {
 	}
 }
 
-func TestACLDefaultAllowsAll(t *testing.T) {
+func TestACLDefaultAllowsOnlyInternalClients(t *testing.T) {
 	var hits atomic.Int32
 	upstreamAddr := startFakeUpstream(t, &hits)
 	pool := upstream.NewPool(upstream.PoolConfig{Mode: upstream.ModeStrict, PrimarySpecs: []string{upstreamAddr}})
 	h := startClientHarness(t, Config{Pool: pool})
+
+	query := func(ip string) *fakeResponseWriter {
+		w := &fakeResponseWriter{remote: &net.UDPAddr{IP: net.ParseIP(ip), Port: 53000}}
+		m := new(dns.Msg)
+		m.SetQuestion("example.org.", dns.TypeA)
+		h.srv.ServeDNS(w, m)
+		return w
+	}
+	for _, ip := range []string{"127.0.0.1", "192.168.1.20", "100.64.1.5", "fd7a:115c:a1e0::1"} {
+		if w := query(ip); w.last == nil || len(w.last.Answer) != 1 {
+			t.Errorf("empty ACL must allow internal client %s", ip)
+		}
+	}
+	if w := query("203.0.113.7"); w.last != nil {
+		t.Error("empty ACL must silently drop public clients")
+	}
+	if _, allowlistDropped, _ := h.srv.ACLStats(); allowlistDropped != 1 {
+		t.Errorf("allowlist drops = %d, want 1", allowlistDropped)
+	}
+}
+
+func TestACLExplicitAllowAllServesPublicClients(t *testing.T) {
+	var hits atomic.Int32
+	upstreamAddr := startFakeUpstream(t, &hits)
+	pool := upstream.NewPool(upstream.PoolConfig{Mode: upstream.ModeStrict, PrimarySpecs: []string{upstreamAddr}})
+	h := startClientHarness(t, Config{Pool: pool, AllowedClients: "0.0.0.0/0,::/0"})
 
 	w := &fakeResponseWriter{remote: &net.UDPAddr{IP: net.ParseIP("203.0.113.7"), Port: 53000}}
 	m := new(dns.Msg)
 	m.SetQuestion("example.org.", dns.TypeA)
 	h.srv.ServeDNS(w, m)
 	if w.last == nil || len(w.last.Answer) != 1 {
-		t.Error("empty ACL must allow any client")
+		t.Error("explicit allow-all ACL must serve public clients")
 	}
 }
 
@@ -233,7 +259,7 @@ func TestRateLimitEndToEnd(t *testing.T) {
 	var hits atomic.Int32
 	upstreamAddr := startFakeUpstream(t, &hits)
 	pool := upstream.NewPool(upstream.PoolConfig{Mode: upstream.ModeStrict, PrimarySpecs: []string{upstreamAddr}})
-	h := startClientHarness(t, Config{Pool: pool, RateLimitQPS: 1, InternalRateLimitQPS: 2})
+	h := startClientHarness(t, Config{Pool: pool, RateLimitQPS: 1, InternalRateLimitQPS: 2, AllowedClients: "0.0.0.0/0"})
 
 	m := func() *dns.Msg {
 		q := new(dns.Msg)

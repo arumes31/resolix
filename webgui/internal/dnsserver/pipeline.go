@@ -131,7 +131,12 @@ func stripIPv6Hints(records []dns.RR) {
 
 // ServeDNS implements the dns.Handler interface (UDP/TCP/DoT listeners).
 func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
-	resp, drop := s.Resolve(r, clientIPFromRemote(w.RemoteAddr()))
+	clientIP := clientIPFromRemote(w.RemoteAddr())
+	if s.defaultACLDrop(clientIP) {
+		s.aclAllowlistDropped.Add(1)
+		return
+	}
+	resp, drop := s.Resolve(r, clientIP)
 	if drop || resp == nil {
 		return
 	}

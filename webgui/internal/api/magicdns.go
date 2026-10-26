@@ -104,6 +104,10 @@ func (s *Server) handleSyncMagicDNS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if s.cfg.IngestSecret != "" && !s.validIngestAuth(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	s.fieldsMu.RLock()
 	store := s.magicDNSStore
 	s.fieldsMu.RUnlock()

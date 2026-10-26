@@ -37,7 +37,9 @@ const (
 	csrfCookieName       = "ts_dns_csrf"
 	csrfTokenBytes       = 32
 	sessionTokenBytes    = 32
-	sessionLifetime      = 7 * 24 * time.Hour
+	sessionLifetime      = 24 * time.Hour
+	sessionIdleTimeout   = 12 * time.Hour
+	maxSessions          = 1024
 	maxIngestFutureSkew  = 5 * time.Minute
 	statsResponseTTL     = 5 * time.Second
 	dashboardResponseTTL = 15 * time.Second
@@ -63,13 +65,14 @@ type Server struct {
 	cspMiddleware func(http.Handler) http.Handler
 	nonceFromCtx  func(context.Context) string
 
-	// Rate limiter for login attempts (per-IP)
-	rateLimits map[string]*rateLimitEntry
-	rateMu     sync.Mutex
+	// Rate limiter for login attempts (per-IP plus a global failure budget)
+	rateLimits     map[string]*rateLimitEntry
+	globalFailures []time.Time
+	rateMu         sync.Mutex
 
 	// Hashed password (bcrypt) — populated at startup
 	hashedPassword string
-	sessions       map[string]time.Time
+	sessions       map[string]sessionEntry
 	sessionMu      sync.Mutex
 
 	// Reverse DNS resolver (Item 59)
@@ -157,7 +160,7 @@ func NewServer(cfg *config.Config, store *storage.Store, prs *parser.Parser, tmp
 		tmpl:                tmpl,
 		subscribers:         make(map[chan models.QueryEvent]int),
 		rateLimits:          make(map[string]*rateLimitEntry),
-		sessions:            make(map[string]time.Time),
+		sessions:            make(map[string]sessionEntry),
 		metrics:             &Metrics{StartTime: time.Now()},
 		nodeSyncGenerations: make(map[string]uint64),
 		dashboardCache:      make(map[string]statsCacheEntry),

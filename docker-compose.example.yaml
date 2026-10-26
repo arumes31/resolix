@@ -1,6 +1,6 @@
 services:
   resolix:
-    image: ghcr.io/arumes31/resolix:${IMAGE_VERSION:-latest}
+    image: ghcr.io/arumes31/resolix:${IMAGE_VERSION:?set IMAGE_VERSION to a pinned release tag such as 2.3.7}
     container_name: resolix
     read_only: true
     tmpfs:
@@ -27,7 +27,8 @@ services:
       - INGEST_SECRET=${INGEST_SECRET:?INGEST_SECRET is required}
       - WEB_USERNAME=${WEB_USERNAME:-}
       - WEB_PASSWORD=${WEB_PASSWORD:-}
-      - DNS_ALLOWED_CLIENTS=${DNS_ALLOWED_CLIENTS:-127.0.0.0/8,10.0.0.0/8,100.64.0.0/10,172.16.0.0/12,192.168.0.0/16}
+      - WEB_AUTH_DISABLED=${WEB_AUTH_DISABLED:-false}
+      - DNS_ALLOWED_CLIENTS=${DNS_ALLOWED_CLIENTS:-127.0.0.0/8,10.0.0.0/8,100.64.0.0/10,192.168.0.0/16}
       - DNS_DISALLOWED_CLIENTS=${DNS_DISALLOWED_CLIENTS:-}
       - DNS_LISTEN_ADDR=0.0.0.0
       - DNS_LISTEN_PORT=${DNS_LISTEN_PORT:-53}

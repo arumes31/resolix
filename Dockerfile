@@ -3,7 +3,7 @@
 ARG VERSION=2.4.28
 
 # Stage 1: Build
-FROM golang:1.27.2-alpine3.24@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d AS builder
+FROM golang:1.27.3-alpine3.24@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd AS builder
 
 ARG VERSION
 ARG BUILD_INFO=local
@@ -28,7 +28,9 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
 # x/crypto, x/net and gRPC dependencies. The upstream CLI embeds x/image v0.41.0
 # (CVE-2026-46602), and its source selects x/crypto v0.54.0, affected by
 # CVE-2026-78662 and CVE-2026-56855 in SSH. Patch this separate module as well.
-FROM golang:1.27.2-alpine3.24@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d AS tailscale-builder
+# The upgraded x/crypto raises the required golang.org/x/term version; record
+# its go.sum entry explicitly so the build does not depend on a warm cache.
+FROM golang:1.27.3-alpine3.24@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd AS tailscale-builder
 
 RUN apk add --no-cache git
 RUN git clone --depth 1 --branch v1.102.3 https://github.com/tailscale/tailscale.git /src/tailscale \
@@ -40,6 +42,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     go get golang.org/x/image@v0.45.0 golang.org/x/crypto@v0.57.0 \
       golang.org/x/net@v0.60.0 google.golang.org/grpc@v1.83.1 \
+    && go mod download golang.org/x/term \
     && CGO_ENABLED=0 go build -trimpath \
       -ldflags="-s -w -X tailscale.com/version.longStamp=1.102.3 -X tailscale.com/version.shortStamp=1.102.3 -X tailscale.com/version.gitCommitStamp=53a0d659afa51835dd7a9283873cca44261454f8" \
       -o /out/tailscale ./cmd/tailscale \
@@ -62,7 +65,7 @@ LABEL org.opencontainers.image.title="Resolix" \
 
 # Install runtime dependencies (including those required by Tailscale)
 RUN apk upgrade --no-cache \
-    && apk add --no-cache bash bind-tools ca-certificates iptables iproute2 ip6tables
+    && apk add --no-cache bash bind-tools ca-certificates iptables iproute2 ip6tables setpriv
 
 # Copy the patched Tailscale binaries built above.
 COPY --from=tailscale-builder /out/tailscale /usr/bin/tailscale

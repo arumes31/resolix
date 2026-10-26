@@ -491,6 +491,13 @@ func resolveSubscriptionHost(ctx context.Context, host, port string, allowPrivat
 	return candidates, nil
 }
 
+// IsPublicAddress reports whether address is a globally routable unicast
+// address outside loopback, private, link-local, CGNAT and other special
+// ranges. It is the policy used for subscription fetches and upstream tests.
+func IsPublicAddress(address netip.Addr) bool {
+	return publicSubscriptionAddress(address)
+}
+
 func publicSubscriptionAddress(address netip.Addr) bool {
 	if !address.IsValid() || !address.IsGlobalUnicast() || address.IsPrivate() ||
 		address.IsLoopback() || address.IsLinkLocalUnicast() || address.IsMulticast() || address.IsUnspecified() {

@@ -171,15 +171,18 @@ type Config struct {
 	IngestSecret     string
 	WebUsername      string
 	WebPassword      string
-	ScanLimit        int
-	MaxBacklogSize   int64
-	UpstreamDNS      string
-	clientAliases    map[string]string
-	clientAliasesMu  sync.RWMutex
-	TrustedProxies   []string
-	Debug            bool
-	LogLevel         string
-	BaseURL          string
+	// WebAuthDisabled explicitly accepts an unauthenticated dashboard/API on a
+	// non-loopback WEB_LISTEN_ADDR. Without it, startup requires credentials.
+	WebAuthDisabled bool
+	ScanLimit       int
+	MaxBacklogSize  int64
+	UpstreamDNS     string
+	clientAliases   map[string]string
+	clientAliasesMu sync.RWMutex
+	TrustedProxies  []string
+	Debug           bool
+	LogLevel        string
+	BaseURL         string
 	// WebTLSMode controls direct web HTTPS: off for reverse-proxy termination,
 	// or auto for the generated controller CA and rotating leaf certificate.
 	WebTLSMode string
@@ -567,6 +570,7 @@ func LoadConfig() *Config {
 		IngestSecret:               os.Getenv("INGEST_SECRET"),
 		WebUsername:                os.Getenv("WEB_USERNAME"),
 		WebPassword:                os.Getenv("WEB_PASSWORD"),
+		WebAuthDisabled:            strings.EqualFold(strings.TrimSpace(os.Getenv("WEB_AUTH_DISABLED")), "true"),
 		ScanLimit:                  DefaultScanLimit,
 		MaxBacklogSize:             DefaultMaxBacklogSize,
 		UpstreamDNS:                os.Getenv("UPSTREAM_DNS"),

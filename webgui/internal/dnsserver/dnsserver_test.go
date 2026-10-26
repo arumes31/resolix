@@ -358,7 +358,7 @@ func TestServeDNSTruncatesToClientUDPSize(t *testing.T) {
 		}
 	}
 
-	server := New(Config{Rewrites: store}, nil)
+	server := New(Config{Rewrites: store, AllowedClients: "0.0.0.0/0"}, nil)
 	query := new(dns.Msg)
 	query.SetQuestion("large.test.", dns.TypeTXT)
 	query.SetEdns0(512, false)

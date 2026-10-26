@@ -80,9 +80,11 @@ NODE_NAME=resolix-1
 # INGEST_SECRET=your-secret-token
 
 # Web GUI authentication. Set both values together. INGEST_SECRET is required
-# when web authentication is disabled.
+# when web authentication is disabled. Credentials are required when
+# WEB_LISTEN_ADDR is not a loopback address unless WEB_AUTH_DISABLED=true.
 # WEB_USERNAME=admin
 # WEB_PASSWORD=
+# WEB_AUTH_DISABLED=false
 
 # Log level: DEBUG, INFO, WARNING, ERROR (default: INFO)
 LOG_LEVEL=INFO

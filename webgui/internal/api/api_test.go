@@ -38,7 +38,7 @@ import (
 func testServer(cfg *config.Config) *Server {
 	return &Server{
 		cfg:         cfg,
-		sessions:    make(map[string]time.Time),
+		sessions:    make(map[string]sessionEntry),
 		subscribers: make(map[chan models.QueryEvent]int),
 		rateLimits:  make(map[string]*rateLimitEntry),
 		metrics:     &Metrics{StartTime: time.Now()},

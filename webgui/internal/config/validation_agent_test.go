@@ -21,6 +21,7 @@ func TestVerifyConfigAgentIgnoresDatabasePath(t *testing.T) {
 		ControllerURL:      "https://100.64.0.1:35353",
 		ControllerTLSTrust: "system",
 		IngestSecret:       "test-secret",
+		WebAuthDisabled:    true,
 	}
 
 	errs, _ := cfg.VerifyConfig()

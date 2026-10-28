@@ -3,7 +3,7 @@
 ARG VERSION=2.4.28
 
 # Stage 1: Build
-FROM golang:1.27.3-alpine3.24@sha256:b8c9b82affbbb82a020bbcf998dad2ba9516944ac7e883524642a481a9505e9c AS builder
+FROM golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS builder
 
 ARG VERSION
 ARG BUILD_INFO=local
@@ -30,7 +30,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
 # CVE-2026-78662 and CVE-2026-56855 in SSH. Patch this separate module as well.
 # The upgraded x/crypto raises the required golang.org/x/term version; record
 # its go.sum entry explicitly so the build does not depend on a warm cache.
-FROM golang:1.27.3-alpine3.24@sha256:b8c9b82affbbb82a020bbcf998dad2ba9516944ac7e883524642a481a9505e9c AS tailscale-builder
+FROM golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS tailscale-builder
 
 RUN apk add --no-cache git
 RUN git clone --depth 1 --branch v1.102.3 https://github.com/tailscale/tailscale.git /src/tailscale \

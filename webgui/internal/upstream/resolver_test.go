@@ -574,3 +574,31 @@ func TestProbeClosesDoHIdleConnections(t *testing.T) {
 		t.Fatal("Probe left DoH transport idle connections open")
 	}
 }
+
+func TestDoHResolverRefusesRedirects(t *testing.T) {
+	var plaintextHits atomic.Int64
+	plaintext := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		plaintextHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer plaintext.Close()
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, plaintext.URL+"/dns-query", http.StatusTemporaryRedirect)
+	}))
+	defer server.Close()
+
+	testHTTPClient = server.Client()
+	t.Cleanup(func() { testHTTPClient = nil })
+
+	spec, err := Parse(server.URL + "/dns-query")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &dohResolver{spec: spec}
+	if _, err := r.Exchange(queryA()); err == nil || !strings.Contains(err.Error(), "redirect") {
+		t.Fatalf("Exchange error = %v, want redirect refusal", err)
+	}
+	if plaintextHits.Load() != 0 {
+		t.Fatalf("redirect target received %d plaintext requests", plaintextHits.Load())
+	}
+}

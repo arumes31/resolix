@@ -36,6 +36,10 @@ import (
 )
 
 func testServer(cfg *config.Config) *Server {
+	if cfg != nil && cfg.AllowedHosts == nil {
+		// httptest.NewRequest addresses example.com by default.
+		cfg.AllowedHosts = []string{"example.com"}
+	}
 	return &Server{
 		cfg:         cfg,
 		sessions:    make(map[string]sessionEntry),
@@ -43,6 +47,22 @@ func testServer(cfg *config.Config) *Server {
 		rateLimits:  make(map[string]*rateLimitEntry),
 		metrics:     &Metrics{StartTime: time.Now()},
 	}
+}
+
+// addSessionCSRF authenticates req with a fresh session and its bound CSRF
+// token, as the dashboard pages do.
+func addSessionCSRF(t *testing.T, s *Server, req *http.Request) {
+	t.Helper()
+	token, err := s.newSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrf, ok := s.sessionCSRFToken(token)
+	if !ok || csrf == "" {
+		t.Fatal("new session has no CSRF token")
+	}
+	req.AddCookie(s.newSecureCookie(sessionCookieName, token, 60))
+	req.Header.Set("X-CSRF-Token", csrf)
 }
 
 func TestServerStartGeneratedHTTPS(t *testing.T) {

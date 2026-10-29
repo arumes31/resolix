@@ -22,8 +22,11 @@ type persistedRuleSnapshot struct {
 }
 
 type persistedRuleHistory struct {
-	Version   int                     `json:"version"`
-	SourceID  string                  `json:"source_id"`
+	Version  int    `json:"version"`
+	SourceID string `json:"source_id"`
+	// AllowOnly binds the history to the policy its rules were classified
+	// under, so it is never restored into a source whose policy differs.
+	AllowOnly bool                    `json:"allow_only,omitempty"`
 	Snapshots []persistedRuleSnapshot `json:"snapshots"`
 }
 
@@ -37,23 +40,23 @@ func (e *Engine) SetHistoryDir(dir string) {
 	}
 	dir = filepath.Clean(dir)
 	e.mu.RLock()
-	ids := make([]string, 0, len(e.sources))
+	ids := make(map[string]bool, len(e.sources))
 	for _, src := range e.sources {
 		if src.Kind == "url" && src.ID != "" {
-			ids = append(ids, src.ID)
+			ids[src.ID] = src.AllowOnly
 		}
 	}
 	e.mu.RUnlock()
 	loaded := make(map[string][]ruleSnapshot, len(ids))
-	for _, id := range ids {
-		if history, ok := readSourceHistory(dir, id); ok {
+	for id, allowOnly := range ids {
+		if history, ok := readSourceHistory(dir, id, allowOnly); ok {
 			loaded[id] = history
 		}
 	}
 	e.mu.Lock()
 	e.historyDir = dir
 	for _, src := range e.sources {
-		if history, ok := loaded[src.ID]; ok && len(src.history) == 0 {
+		if history, ok := loaded[src.ID]; ok && len(src.history) == 0 && ids[src.ID] == src.AllowOnly {
 			src.history = history
 			src.RollbackCount = len(history)
 		}
@@ -73,9 +76,11 @@ func (e *Engine) persistSourceHistory(id string) {
 	e.mu.RLock()
 	dir := e.historyDir
 	var snapshots []ruleSnapshot
+	allowOnly := false
 	for _, src := range e.sources {
 		if src.ID == id {
 			snapshots = slices.Clone(src.history)
+			allowOnly = src.AllowOnly
 			break
 		}
 	}
@@ -83,7 +88,7 @@ func (e *Engine) persistSourceHistory(id string) {
 	if dir == "" {
 		return
 	}
-	document := persistedRuleHistory{Version: ruleHistoryVersion, SourceID: id}
+	document := persistedRuleHistory{Version: ruleHistoryVersion, SourceID: id, AllowOnly: allowOnly}
 	for _, snapshot := range snapshots {
 		item := persistedRuleSnapshot{Checksum: snapshot.checksum}
 		for _, rule := range snapshot.block {
@@ -111,17 +116,24 @@ func (e *Engine) persistSourceHistory(id string) {
 func (e *Engine) loadSourceHistory(id string) {
 	e.mu.RLock()
 	dir := e.historyDir
+	allowOnly := false
+	for _, src := range e.sources {
+		if src.Kind == "url" && src.ID == id {
+			allowOnly = src.AllowOnly
+			break
+		}
+	}
 	e.mu.RUnlock()
 	if dir == "" {
 		return
 	}
-	history, ok := readSourceHistory(dir, id)
+	history, ok := readSourceHistory(dir, id, allowOnly)
 	if !ok {
 		return
 	}
 	e.mu.Lock()
 	for _, src := range e.sources {
-		if src.Kind == "url" && src.ID == id {
+		if src.Kind == "url" && src.ID == id && src.AllowOnly == allowOnly {
 			src.history = history
 			src.RollbackCount = len(history)
 			break
@@ -130,7 +142,7 @@ func (e *Engine) loadSourceHistory(id string) {
 	e.mu.Unlock()
 }
 
-func readSourceHistory(dir, id string) ([]ruleSnapshot, bool) {
+func readSourceHistory(dir, id string, allowOnly bool) ([]ruleSnapshot, bool) {
 	file, err := os.Open(ruleHistoryPath(dir, id)) // #nosec G304 -- hashed filename below trusted state directory
 	if err != nil {
 		return nil, false
@@ -142,7 +154,8 @@ func readSourceHistory(dir, id string) ([]ruleSnapshot, bool) {
 	}
 	decoder := json.NewDecoder(file)
 	var document persistedRuleHistory
-	if err := decoder.Decode(&document); err != nil || document.Version != ruleHistoryVersion || document.SourceID != id {
+	if err := decoder.Decode(&document); err != nil || document.Version != ruleHistoryVersion || document.SourceID != id ||
+		document.AllowOnly != allowOnly {
 		return nil, false
 	}
 	if len(document.Snapshots) > 3 {
@@ -151,7 +164,11 @@ func readSourceHistory(dir, id string) ([]ruleSnapshot, bool) {
 	history := make([]ruleSnapshot, 0, len(document.Snapshots))
 	for _, item := range document.Snapshots {
 		snapshot := ruleSnapshot{checksum: item.Checksum}
-		if !decodeHistoryRules(item.Block, false, &snapshot.block) || !decodeHistoryRules(item.Allow, true, &snapshot.allow) {
+		if allowOnly && len(item.Block) > 0 {
+			return nil, false
+		}
+		if !decodeHistoryRules(item.Block, false, false, &snapshot.block) ||
+			!decodeHistoryRules(item.Allow, true, allowOnly, &snapshot.allow) {
 			return nil, false
 		}
 		history = append(history, snapshot)
@@ -159,10 +176,13 @@ func readSourceHistory(dir, id string) ([]ruleSnapshot, bool) {
 	return history, true
 }
 
-func decodeHistoryRules(rawRules []string, wantAllow bool, destination *[]Rule) bool {
+// decodeHistoryRules parses persisted rules for one bucket. Exception-only
+// sources classify every rule as an allow rule, so their allow bucket accepts
+// rules without the @@ prefix.
+func decodeHistoryRules(rawRules []string, wantAllow, allowOnly bool, destination *[]Rule) bool {
 	for _, raw := range rawRules {
 		rule, allow, ok := parseLine(raw)
-		if !ok || allow != wantAllow {
+		if !ok || (allow != wantAllow && (!wantAllow || !allowOnly)) {
 			return false
 		}
 		*destination = append(*destination, rule)

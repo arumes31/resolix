@@ -101,6 +101,9 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 			return nil
 		}
 		domain := normalize(string(parts[actionIdx+1]))
+		if !ValidDomain(domain) {
+			return nil
+		}
 		clientIP := string(parts[actionIdx+3])
 
 		var parsedTime time.Time
@@ -147,8 +150,9 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 	if bytes.Equal(action, []byte("forwarded")) {
 		if len(parts) >= actionIdx+4 && string(parts[actionIdx+2]) == "to" {
 			domain := normalize(string(parts[actionIdx+1]))
-			upstream := string(parts[actionIdx+3])
-			p.store.SetUpstream(node, domain, upstream)
+			if ValidDomain(domain) {
+				p.store.SetUpstream(node, domain, string(parts[actionIdx+3]))
+			}
 		}
 		return nil
 	}
@@ -156,6 +160,9 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 	if bytes.Equal(action, []byte("reply")) || bytes.Equal(action, []byte("cached")) || bytes.Equal(action, []byte("config")) {
 		if len(parts) >= actionIdx+2 {
 			domain := normalize(string(parts[actionIdx+1]))
+			if !ValidDomain(domain) {
+				return nil
+			}
 			startTime, pendingUpstream, ok := p.store.GetPending(node, domain)
 			upstream := ""
 			switch {
@@ -185,7 +192,7 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 			} else if bytes.Equal(action, []byte("reply")) {
 				// Debug: why was it not found?
 				if p.Debug {
-					log.Printf("[DEBUG] No pending query found for domain=%s node=%s", domain, node)
+					log.Printf("[DEBUG] No pending query found for domain=%q node=%q", domain, node)
 				}
 			}
 		}
@@ -203,6 +210,9 @@ func (p *Parser) parseDNSSEC(parts [][]byte, actionIdx int, node string) {
 		return
 	}
 	domain := strings.ToLower(strings.TrimSuffix(string(parts[actionIdx+1]), "."))
+	if !ValidDomain(domain) {
+		return
+	}
 	result := strings.ToLower(string(parts[actionIdx+3]))
 
 	// Validate DNSSEC result
@@ -211,7 +221,7 @@ func (p *Parser) parseDNSSEC(parts [][]byte, actionIdx int, node string) {
 		p.store.SetDNSSEC(node, domain, result)
 	default:
 		if p.Debug {
-			log.Printf("[DEBUG] Unknown DNSSEC result: %s for domain=%s", result, domain)
+			log.Printf("[DEBUG] Unknown DNSSEC result: %q for domain=%q", result, domain)
 		}
 	}
 }
@@ -230,6 +240,9 @@ func (p *Parser) parseDNSSECPipe(line []byte, node string) {
 		return
 	}
 	domain := strings.ToLower(strings.TrimSuffix(string(pipeParts[0]), "."))
+	if !ValidDomain(domain) {
+		return
+	}
 	result := strings.ToLower(string(pipeParts[2]))
 
 	switch result {
@@ -237,9 +250,36 @@ func (p *Parser) parseDNSSECPipe(line []byte, node string) {
 		p.store.SetDNSSEC(node, domain, result)
 	default:
 		if p.Debug {
-			log.Printf("[DEBUG] Unknown DNSSEC pipe result: %s for domain=%s", result, domain)
+			log.Printf("[DEBUG] Unknown DNSSEC pipe result: %q for domain=%q", result, domain)
 		}
 	}
+}
+
+// DNS presentation-form limits (RFC 1035).
+const (
+	maxDomainLength = 253
+	maxDomainLabels = 127
+	maxLabelLength  = 63
+)
+
+// ValidDomain reports whether domain fits DNS presentation-form limits: at most
+// 253 octets, 127 labels and 63 octets per label, with no empty labels. An
+// empty name (the root) is valid. Every ingest path applies it so per-suffix
+// lookups stay bounded and both ingest formats accept the same names.
+func ValidDomain(domain string) bool {
+	domain = strings.TrimSuffix(domain, ".")
+	if domain == "" {
+		return true
+	}
+	if len(domain) > maxDomainLength || strings.Count(domain, ".") >= maxDomainLabels {
+		return false
+	}
+	for label := range strings.SplitSeq(domain, ".") {
+		if label == "" || len(label) > maxLabelLength {
+			return false
+		}
+	}
+	return true
 }
 
 // parseResponseCode extracts DNS response codes from dnsmasq reply log lines.

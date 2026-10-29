@@ -191,8 +191,8 @@ func (s *Server) templateData(r *http.Request) map[string]interface{} {
 		nonce = s.nonceFromCtx(r.Context())
 	}
 	csrfToken := ""
-	if cookie, err := r.Cookie(csrfCookieName); err == nil {
-		csrfToken = cookie.Value
+	if cookie, err := r.Cookie(sessionCookieName); err == nil {
+		csrfToken, _ = s.sessionCSRFToken(cookie.Value)
 	}
 	return map[string]interface{}{
 		"Nonce":     nonce,

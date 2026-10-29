@@ -152,7 +152,8 @@ func (f *Forwarder) loadBacklog() {
 		if queuedAt.IsZero() || queuedAt.After(now.Add(time.Minute)) {
 			queuedAt = now
 		}
-		item := backlogItem{event: saved.Event, size: eventJSONSize(saved.Event), queuedAt: queuedAt}
+		f.backlogSeq++
+		item := backlogItem{event: saved.Event, size: backlogItemSize(saved.Event), queuedAt: queuedAt, seq: f.backlogSeq}
 		if f.cfg.MaxBacklogSize > 0 && f.backlogTotalSize+item.size > f.cfg.MaxBacklogSize {
 			f.dropped.Add(1)
 			continue
@@ -236,36 +237,22 @@ func (f *Forwarder) flushBacklog() error {
 	if path == "" {
 		return nil
 	}
+	// Copy a consistent snapshot under the queue mutex and serialize it
+	// outside, so forwarding and status calls never wait on JSON encoding.
 	f.backlogMu.Lock()
-	defer f.backlogMu.Unlock()
+	inFlightCount := len(f.inFlight)
 	items := make([]backlogItem, 0, len(f.inFlight)+len(f.backlog))
 	items = append(items, f.inFlight...)
 	items = append(items, f.backlog...)
-	persisted := make([]persistedBacklogItem, len(items))
-	for i, item := range items {
-		persisted[i] = persistedBacklogItem{Event: item.event, QueuedAt: item.queuedAt}
-	}
-	data, err := json.Marshal(persistedBacklog{Version: backlogStateVersion, Items: persisted})
-	if err != nil {
-		return fmt.Errorf("marshal forwarder backlog: %w", err)
-	}
+	f.backlogMu.Unlock()
+
 	maxBytes := f.cfg.MaxBacklogSize
 	if maxBytes <= 0 {
 		maxBytes = config.DefaultMaxBacklogSize
 	}
-	trimmed := 0
-	for int64(len(data)) > maxBytes && trimmed < len(f.backlog) {
-		trimmed++
-		bounded := make([]persistedBacklogItem, 0, len(persisted)-trimmed)
-		bounded = append(bounded, persisted[:len(f.inFlight)]...)
-		bounded = append(bounded, persisted[len(f.inFlight)+trimmed:]...)
-		data, err = json.Marshal(persistedBacklog{Version: backlogStateVersion, Items: bounded})
-		if err != nil {
-			return fmt.Errorf("marshal bounded forwarder backlog: %w", err)
-		}
-	}
-	if int64(len(data)) > maxBytes {
-		return fmt.Errorf("configured backlog limit %d is too small for state metadata", maxBytes)
+	data, trimmedSeqs, err := encodeBoundedBacklog(items, inFlightCount, maxBytes)
+	if err != nil {
+		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return fmt.Errorf("create forwarder backlog directory: %w", err)
@@ -297,15 +284,91 @@ func (f *Forwarder) flushBacklog() error {
 	if err := os.Chmod(path, 0o600); err != nil {
 		return fmt.Errorf("secure published forwarder backlog: %w", err)
 	}
-	if trimmed > 0 {
-		for _, item := range f.backlog[:trimmed] {
-			f.backlogTotalSize -= item.size
-		}
-		f.backlog = f.backlog[trimmed:]
-		f.dropped.Add(int64(trimmed))
-		log.Printf("[WARN] Dropped %d oldest queued event(s) to keep the persistent forwarder backlog within %d bytes", trimmed, maxBytes)
+	if len(trimmedSeqs) > 0 {
+		f.dropPersistTrimmed(trimmedSeqs, maxBytes)
 	}
 	return nil
+}
+
+// encodeBoundedBacklog serializes items as persisted backlog state no larger
+// than maxBytes. In-flight items (the first inFlightCount) are always kept;
+// the oldest queued items are omitted as needed and their sequence numbers
+// returned. Each item is encoded exactly once, so the work is linear in the
+// snapshot regardless of how many items must be trimmed.
+func encodeBoundedBacklog(items []backlogItem, inFlightCount int, maxBytes int64) ([]byte, map[uint64]struct{}, error) {
+	header := fmt.Appendf(nil, `{"version":%d,"items":[`, backlogStateVersion)
+	const footer = "]}"
+	encoded := make([][]byte, len(items))
+	total := int64(len(header) + len(footer))
+	for i, item := range items {
+		raw, err := json.Marshal(persistedBacklogItem{Event: item.event, QueuedAt: item.queuedAt})
+		if err != nil {
+			return nil, nil, fmt.Errorf("marshal forwarder backlog: %w", err)
+		}
+		encoded[i] = raw
+		total += int64(len(raw))
+		if i > 0 {
+			total++ // separating comma
+		}
+	}
+	// Drop the oldest queued items until the remainder fits.
+	trimmed := 0
+	for total > maxBytes && inFlightCount+trimmed < len(items) {
+		total -= int64(len(encoded[inFlightCount+trimmed]))
+		if len(items)-trimmed > 1 {
+			total--
+		}
+		trimmed++
+	}
+	if total > maxBytes {
+		return nil, nil, fmt.Errorf("configured backlog limit %d is too small for state metadata", maxBytes)
+	}
+	data := make([]byte, 0, total)
+	data = append(data, header...)
+	first := true
+	for i, raw := range encoded {
+		if i >= inFlightCount && i < inFlightCount+trimmed {
+			continue
+		}
+		if !first {
+			data = append(data, ',')
+		}
+		first = false
+		data = append(data, raw...)
+	}
+	data = append(data, footer...)
+	var trimmedSeqs map[uint64]struct{}
+	if trimmed > 0 {
+		trimmedSeqs = make(map[uint64]struct{}, trimmed)
+		for _, item := range items[inFlightCount : inFlightCount+trimmed] {
+			trimmedSeqs[item.seq] = struct{}{}
+		}
+	}
+	return data, trimmedSeqs, nil
+}
+
+// dropPersistTrimmed removes the queued items that persistence omitted so
+// memory matches the bounded on-disk state. Items that started sending since
+// the snapshot are left alone.
+func (f *Forwarder) dropPersistTrimmed(trimmedSeqs map[uint64]struct{}, maxBytes int64) {
+	f.backlogMu.Lock()
+	kept := f.backlog[:0]
+	dropped := 0
+	for _, item := range f.backlog {
+		if _, ok := trimmedSeqs[item.seq]; ok {
+			f.backlogTotalSize -= item.size
+			dropped++
+			continue
+		}
+		kept = append(kept, item)
+	}
+	clear(f.backlog[len(kept):])
+	f.backlog = kept
+	f.backlogMu.Unlock()
+	if dropped > 0 {
+		f.dropped.Add(int64(dropped))
+		log.Printf("[WARN] Dropped %d oldest queued event(s) to keep the persistent forwarder backlog within %d bytes", dropped, maxBytes)
+	}
 }
 
 // EnqueueEvent adds a query event to the forwarding queue without applying
@@ -323,11 +386,13 @@ func (f *Forwarder) EnqueueEvent(ev models.QueryEvent) {
 	if ev.Node == "" {
 		ev.Node = f.cfg.NodeName
 	}
-	item := backlogItem{event: ev, size: eventJSONSize(ev), queuedAt: time.Now()}
+	item := backlogItem{event: ev, size: backlogItemSize(ev), queuedAt: time.Now()}
 	if !f.backlogMu.TryLock() {
 		f.dropped.Add(1)
 		return
 	}
+	f.backlogSeq++
+	item.seq = f.backlogSeq
 
 	// Enforce a maximum backlog size in bytes to prevent OOM (only when limit is configured)
 	if f.cfg.MaxBacklogSize > 0 && f.backlogTotalSize+item.size > f.cfg.MaxBacklogSize {

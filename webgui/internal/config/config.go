@@ -180,9 +180,12 @@ type Config struct {
 	clientAliases   map[string]string
 	clientAliasesMu sync.RWMutex
 	TrustedProxies  []string
-	Debug           bool
-	LogLevel        string
-	BaseURL         string
+	// AllowedHosts lists extra hostnames accepted in the Host header when web
+	// authentication is disabled; IP literals and localhost are always allowed.
+	AllowedHosts []string
+	Debug        bool
+	LogLevel     string
+	BaseURL      string
 	// WebTLSMode controls direct web HTTPS: off for reverse-proxy termination,
 	// or auto for the generated controller CA and rotating leaf certificate.
 	WebTLSMode string
@@ -576,6 +579,7 @@ func LoadConfig() *Config {
 		UpstreamDNS:                os.Getenv("UPSTREAM_DNS"),
 		clientAliases:              aliases,
 		TrustedProxies:             trustedProxies,
+		AllowedHosts:               parseAllowedHosts(),
 		Debug:                      strings.ToLower(os.Getenv("DEBUG")) == "true",
 		LogLevel:                   logLevel,
 		BaseURL:                    baseURL,

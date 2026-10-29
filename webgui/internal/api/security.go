@@ -46,31 +46,77 @@ func generateCSRFToken() (string, error) {
 	return base64.StdEncoding.EncodeToString(b), nil
 }
 
-// checkCSRF validates the double-submit token used by authenticated browser
-// sessions. When web authentication is explicitly disabled there is no session
-// cookie to protect, so cross-site browser requests are rejected instead.
+// checkCSRF validates the CSRF token bound to the caller's live browser
+// session. A token planted through a cookie alone is not sufficient: it must
+// match the token issued with the session at login. Cross-site browser
+// requests are rejected first, which is the only protection when web
+// authentication is explicitly disabled and there is no session to bind to.
 func (s *Server) checkCSRF(w http.ResponseWriter, r *http.Request) bool {
-	if s.cfg.WebUsername == "" && s.cfg.WebPassword == "" {
-		if !s.sameOriginRequest(r) {
-			http.Error(w, apperr.NewErrCSRFMismatch("cross-site request rejected", nil).Error(), http.StatusForbidden)
-			return false
-		}
+	if !s.sameOriginRequest(r) {
+		http.Error(w, apperr.NewErrCSRFMismatch("cross-site request rejected", nil).Error(), http.StatusForbidden)
+		return false
+	}
+	if !s.webAuthEnabled() {
 		return true
 	}
-	cookie, err := r.Cookie(csrfCookieName)
-	if err != nil {
-		http.Error(w, apperr.NewErrCSRFMismatch("missing CSRF token", err).Error(), http.StatusForbidden)
+	expected := ""
+	if cookie, err := r.Cookie(sessionCookieName); err == nil {
+		expected, _ = s.sessionCSRFToken(cookie.Value)
+	}
+	if expected == "" {
+		http.Error(w, apperr.NewErrCSRFMismatch("missing CSRF session", nil).Error(), http.StatusForbidden)
 		return false
 	}
 	submitted := r.Header.Get("X-CSRF-Token")
 	if submitted == "" {
 		submitted = r.FormValue("csrf_token")
 	}
-	if subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(submitted)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(expected), []byte(submitted)) != 1 {
 		http.Error(w, apperr.NewErrCSRFMismatch("invalid CSRF token", nil).Error(), http.StatusForbidden)
 		return false
 	}
 	return true
+}
+
+// webAuthEnabled reports whether browser sessions protect the web interface.
+func (s *Server) webAuthEnabled() bool {
+	return s.cfg.WebUsername != "" || s.cfg.WebPassword != ""
+}
+
+// allowedHost reports whether the request's Host (and a trusted proxy's
+// X-Forwarded-Host) names this deployment. It defeats DNS rebinding against
+// credential-free dashboards: IP literals and localhost cannot be rebound, and
+// any other hostname must be listed in WEB_ALLOWED_HOSTS.
+func (s *Server) allowedHost(r *http.Request) bool {
+	if !s.hostNameAllowed(r.Host) {
+		return false
+	}
+	if s.isTrustedProxy(r) {
+		if forwarded := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Host"), ",")[0]); forwarded != "" {
+			return s.hostNameAllowed(forwarded)
+		}
+	}
+	return true
+}
+
+func (s *Server) hostNameAllowed(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if name, _, err := net.SplitHostPort(host); err == nil {
+		host = name
+	}
+	host = strings.TrimSuffix(strings.Trim(host, "[]"), ".")
+	if host == "" {
+		return false
+	}
+	if net.ParseIP(host) != nil || host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	for _, allowed := range s.cfg.AllowedHosts {
+		if host == strings.TrimSuffix(allowed, ".") {
+			return true
+		}
+	}
+	return false
 }
 
 // sameOriginRequest reports whether a state-changing request may have come
@@ -172,9 +218,6 @@ func (s *Server) newSecureCookie(name, value string, maxAge int) *http.Cookie {
 	}
 }
 
-// sanitizeLogValue strips CR/LF characters from an untrusted value before it
-// is written to the logs, preventing log injection (gosec G706).
-
 func (s *Server) cookiePath() string {
 	if s.cfg.BaseURL == "" {
 		return "/"
@@ -182,10 +225,12 @@ func (s *Server) cookiePath() string {
 	return s.cfg.BaseURL
 }
 
-// sessionEntry tracks the absolute expiry and last activity of a session.
+// sessionEntry tracks the absolute expiry and last activity of a session and
+// the CSRF token bound to it.
 type sessionEntry struct {
 	expires  time.Time
 	lastSeen time.Time
+	csrf     string
 }
 
 func (e sessionEntry) expired(now time.Time) bool {
@@ -198,6 +243,10 @@ func (s *Server) newSession() (string, error) {
 		return "", fmt.Errorf("generate session token: %w", err)
 	}
 	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
+	csrf, err := generateCSRFToken()
+	if err != nil {
+		return "", err
+	}
 	now := time.Now()
 	s.sessionMu.Lock()
 	for existing, entry := range s.sessions {
@@ -215,7 +264,7 @@ func (s *Server) newSession() (string, error) {
 		}
 		delete(s.sessions, oldest)
 	}
-	s.sessions[token] = sessionEntry{expires: now.Add(sessionLifetime), lastSeen: now}
+	s.sessions[token] = sessionEntry{expires: now.Add(sessionLifetime), lastSeen: now, csrf: csrf}
 	s.sessionMu.Unlock()
 	return token, nil
 }
@@ -243,6 +292,37 @@ func (s *Server) validSession(token string) bool {
 	entry.lastSeen = now
 	s.sessions[matched] = entry
 	return true
+}
+
+// lookupSessionLocked returns the live entry named by token without
+// refreshing its idle timer. Callers must hold sessionMu.
+func (s *Server) lookupSessionLocked(token string, now time.Time) (sessionEntry, bool) {
+	var found sessionEntry
+	ok := false
+	for existing, entry := range s.sessions {
+		if subtle.ConstantTimeCompare([]byte(existing), []byte(token)) == 1 && !entry.expired(now) {
+			found, ok = entry, true
+		}
+	}
+	return found, ok
+}
+
+// sessionCSRFToken returns the CSRF token bound to a live session.
+func (s *Server) sessionCSRFToken(token string) (string, bool) {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	entry, ok := s.lookupSessionLocked(token, time.Now())
+	return entry.csrf, ok
+}
+
+// sessionAlive reports whether token still names a live session without
+// extending its idle or absolute lifetime. Long-lived responses such as the
+// event stream use it to stop disclosing data once a session ends.
+func (s *Server) sessionAlive(token string) bool {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	_, ok := s.lookupSessionLocked(token, time.Now())
+	return ok
 }
 
 func (s *Server) deleteSession(token string) {
@@ -425,13 +505,25 @@ func (s *Server) internalAuth(next http.Handler) http.Handler {
 			http.Error(w, "Internal API authentication is not configured", http.StatusServiceUnavailable)
 		})
 	}
-	return s.authMiddleware(next)
+	// Without a bearer secret the endpoints fall back to browser sessions,
+	// which carry ambient cookies, so unsafe requests also need CSRF proof.
+	return s.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && !s.checkCSRF(w, r) {
+			return
+		}
+		next.ServeHTTP(w, r)
+	}))
 }
 
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// If no auth is configured, allow all
-		if s.cfg.WebUsername == "" && s.cfg.WebPassword == "" {
+		// Without credentials every request is trusted, so only accept Host
+		// names that cannot be rebound to an attacker's browser origin.
+		if !s.webAuthEnabled() {
+			if !s.allowedHost(r) {
+				http.Error(w, "Host not allowed; add it to WEB_ALLOWED_HOSTS", http.StatusMisdirectedRequest)
+				return
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -533,7 +625,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			// Successful login — reset rate limiter for this IP
 			s.resetRateLimit(ip)
 
+			// Rotate the CSRF cookie to the token bound to the new session so
+			// the logout form's double-submit check keeps working.
+			sessionCSRF, _ := s.sessionCSRFToken(sessionToken)
 			http.SetCookie(w, s.newSecureCookie(sessionCookieName, sessionToken, int(sessionLifetime.Seconds())))
+			http.SetCookie(w, s.newSecureCookie(csrfCookieName, sessionCSRF, int(sessionLifetime.Seconds())))
 			http.Redirect(w, r, s.cfg.BaseURL+"/", http.StatusSeeOther)
 			return
 		}

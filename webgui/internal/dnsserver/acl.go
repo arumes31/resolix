@@ -21,8 +21,10 @@ func parseCIDRList(raw string) []*net.IPNet {
 	}) {
 		if !strings.Contains(part, "/") {
 			if ip := net.ParseIP(part); ip != nil {
-				if ip.To4() != nil {
-					part += "/32"
+				if v4 := ip.To4(); v4 != nil {
+					// Canonicalize IPv4-mapped IPv6 spellings (::ffff:a.b.c.d)
+					// so the /32 host prefix applies to the IPv4 address.
+					part = v4.String() + "/32"
 				} else {
 					part += "/128"
 				}

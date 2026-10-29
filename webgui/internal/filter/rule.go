@@ -10,7 +10,18 @@ import (
 	"log"
 	"net"
 	"regexp"
+	"regexp/syntax"
 	"strings"
+)
+
+const (
+	// maxRegexProgramInsts bounds the compiled program of one regex rule.
+	// Counted repetitions expand at compile time, so a compact pattern can
+	// otherwise retain far more memory than its text suggests.
+	maxRegexProgramInsts = 2000
+	// maxRegexInstsPerSource bounds the aggregate compiled regex programs of
+	// one source update.
+	maxRegexInstsPerSource = 500000
 )
 
 // RuleDiagnostic identifies a custom-rule line that will not become an
@@ -94,6 +105,8 @@ type Rule struct {
 	kind   ruleKind
 	domain string
 	re     *regexp.Regexp
+	// insts is the compiled program size of a regex rule.
+	insts int
 }
 
 // matches reports whether the rule matches the given normalized domain
@@ -155,12 +168,12 @@ func parseLine(line string) (rule Rule, exception, ok bool) {
 		if pattern == "" {
 			return Rule{}, false, false
 		}
-		re, err := regexp.Compile(pattern)
+		re, insts, err := compileBoundedRegex(pattern)
 		if err != nil {
 			log.Printf("[DEBUG] filter: skipping invalid regex rule %q: %v", raw, err)
 			return Rule{}, false, false
 		}
-		return Rule{Raw: raw, kind: kindRegex, re: re}, exception, true
+		return Rule{Raw: raw, kind: kindRegex, re: re, insts: insts}, exception, true
 	}
 
 	// Adblock option list ($third-party etc.) — unsupported, ignored.
@@ -215,4 +228,25 @@ func validDomain(d string) bool {
 		}
 	}
 	return true
+}
+
+// compileBoundedRegex compiles pattern only after checking that its expanded
+// program stays within maxRegexProgramInsts, and returns that program size.
+func compileBoundedRegex(pattern string) (*regexp.Regexp, int, error) {
+	parsed, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil, 0, err
+	}
+	prog, err := syntax.Compile(parsed.Simplify())
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(prog.Inst) > maxRegexProgramInsts {
+		return nil, 0, fmt.Errorf("regex program has %d instructions, limit %d", len(prog.Inst), maxRegexProgramInsts)
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, 0, err
+	}
+	return re, len(prog.Inst), nil
 }

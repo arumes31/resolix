@@ -265,6 +265,7 @@ The **Allowlists** panel accepts hosted Adblock, hosts-file, and plain-domain li
 | `WEB_TLS_IP` | Exact Tailscale IPv4 SAN for generated HTTPS; falls back to `TAILSCALE_IP` | automatic |
 | `BASE_URL` | Reverse-proxy subpath such as `/dns` | `/` |
 | `TRUSTED_PROXIES` | Proxy IPs/CIDRs allowed to provide forwarded headers | unset |
+| `WEB_ALLOWED_HOSTS` | Comma-separated hostnames accepted in `Host` when web authentication is disabled (IP literals and `localhost` are always accepted; other names get `421` to block DNS rebinding) | unset |
 | `MAX_REQUEST_SIZE` | Maximum HTTP request body size in bytes | `1048576` |
 | `HTTP_READ_TIMEOUT` | HTTP read timeout | `10s` |
 | `HTTP_WRITE_TIMEOUT` | HTTP write timeout | `30s` |

@@ -135,6 +135,8 @@ func sortedEnvironmentValues(values map[string]struct{}) []string {
 func setupTest() (*config.Config, *storage.Store, *parser.Parser, *api.Server) {
 	cfg := config.LoadConfig()
 	cfg.MaxEvents = 1000
+	// httptest.NewRequest addresses example.com by default.
+	cfg.AllowedHosts = []string{"example.com"}
 	tmp, err := os.MkdirTemp("", "history-test")
 	if err != nil {
 		panic(fmt.Sprintf("failed to create temp dir: %v", err))

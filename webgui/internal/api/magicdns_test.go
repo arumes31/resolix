@@ -52,10 +52,7 @@ func TestMagicDNSStatusAndSyncEndpoints(t *testing.T) {
 	}
 
 	syncRequest := httptest.NewRequest(http.MethodPost, "/api/magicdns/sync", nil)
-	syncRequest.AddCookie(&http.Cookie{
-		Name: csrfCookieName, Value: "token", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
-	})
-	syncRequest.Header.Set("X-CSRF-Token", "token")
+	addSessionCSRF(t, server, syncRequest)
 	syncResponse := httptest.NewRecorder()
 	server.handleMagicDNSSync(syncResponse, syncRequest)
 	if syncResponse.Code != http.StatusOK {

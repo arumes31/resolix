@@ -433,10 +433,7 @@ func TestControllerRejectsEmptyUpstreamList(t *testing.T) {
 	server := testServer(&config.Config{Mode: config.ModeController, WebUsername: "admin", WebPassword: "password"})
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/api/upstreams", strings.NewReader("[]"))
-	request.AddCookie(&http.Cookie{
-		Name: csrfCookieName, Value: "token", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
-	})
-	request.Header.Set("X-CSRF-Token", "token")
+	addSessionCSRF(t, server, request)
 	server.handlePostUpstreams(recorder, request)
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("response = %d %q", recorder.Code, recorder.Body.String())

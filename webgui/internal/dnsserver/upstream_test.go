@@ -549,3 +549,83 @@ func startRouteUpstream(t *testing.T, hits *atomic.Int32, ip string) string {
 	t.Cleanup(func() { _ = fake.Shutdown() })
 	return pc.LocalAddr().String()
 }
+
+func TestForwardUsesFreshUpstreamTransactionID(t *testing.T) {
+	const clientID = 0x1234
+	seen := make(chan uint16, 8)
+	pc := mustListenPacket(t)
+	fake := &dns.Server{
+		PacketConn: pc,
+		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+			seen <- r.Id
+			m := new(dns.Msg)
+			m.SetReply(r)
+			m.Answer = []dns.RR{aRecord(r.Question[0].Name, "93.184.216.34", 120)}
+			_ = w.WriteMsg(m)
+		}),
+	}
+	go func() { _ = fake.ActivateAndServe() }()
+	t.Cleanup(func() { _ = fake.Shutdown() })
+
+	srv := New(Config{Addr: "127.0.0.1", Upstreams: []string{pc.LocalAddr().String()}, NodeName: "test-node"}, nil)
+	query := new(dns.Msg)
+	query.SetQuestion("example.org.", dns.TypeA)
+	query.Id = clientID
+
+	sawClientID := 0
+	for range 4 {
+		_, resp := srv.forward(query, nil)
+		if resp == nil {
+			t.Fatal("forward returned no response")
+		}
+		if resp.Id != clientID {
+			t.Fatalf("response ID = %#x, want client ID %#x", resp.Id, clientID)
+		}
+		if <-seen == clientID {
+			sawClientID++
+		}
+	}
+	if query.Id != clientID {
+		t.Fatalf("forward mutated caller query ID to %#x", query.Id)
+	}
+	// A 1-in-65536 collision per exchange is possible; four in a row is not.
+	if sawClientID == 4 {
+		t.Fatal("upstream always received the client-chosen transaction ID")
+	}
+}
+
+func TestAcceptUpstreamReplyValidatesIDAndQuestion(t *testing.T) {
+	query := new(dns.Msg)
+	query.SetQuestion("example.org.", dns.TypeA)
+	query.Id = 0xBEEF
+
+	reply := func(edit func(*dns.Msg)) *dns.Msg {
+		m := new(dns.Msg)
+		m.SetReply(query)
+		edit(m)
+		return m
+	}
+	tests := []struct {
+		name string
+		msg  *dns.Msg
+		want bool
+	}{
+		{"match", reply(func(*dns.Msg) {}), true},
+		{"case-insensitive name", reply(func(m *dns.Msg) { m.Question[0].Name = "EXAMPLE.org." }), true},
+		{"nil", nil, false},
+		{"wrong ID", reply(func(m *dns.Msg) { m.Id++ }), false},
+		{"wrong name", reply(func(m *dns.Msg) { m.Question[0].Name = "evil.org." }), false},
+		{"wrong type", reply(func(m *dns.Msg) { m.Question[0].Qtype = dns.TypeAAAA }), false},
+		{"no question", reply(func(m *dns.Msg) { m.Question = nil }), false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := acceptUpstreamReply(query, test.msg, 0x0101); got != test.want {
+				t.Fatalf("acceptUpstreamReply = %v, want %v", got, test.want)
+			}
+			if test.want && test.msg.Id != 0x0101 {
+				t.Fatalf("client ID not restored: %#x", test.msg.Id)
+			}
+		})
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/arumes31/resolix/webgui/internal/models"
+	"github.com/arumes31/resolix/webgui/internal/storage"
 )
 
 func sanitizeLogValue(s string) string {
@@ -61,11 +62,21 @@ func (s *Server) establishIngestNodeStatus(w http.ResponseWriter, r *http.Reques
 	if v := r.Header.Get("X-Node-Build"); v != "" {
 		status.BuildInfo = v
 	}
-	if !s.store.SetNodeStatusIdentity(identity, node, status) {
+	return s.writeNodeStatusError(w, s.store.UpdateNodeStatus(identity, node, status))
+}
+
+// writeNodeStatusError maps a node status update failure to its HTTP response
+// and reports whether the update succeeded.
+func (s *Server) writeNodeStatusError(w http.ResponseWriter, err error) bool {
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, storage.ErrNodeInventoryFull):
+		http.Error(w, "node inventory is full", http.StatusServiceUnavailable)
+	default:
 		http.Error(w, "node is decommissioned", http.StatusGone)
-		return false
 	}
-	return true
+	return false
 }
 
 func isAllowedNodeIdentityRune(char rune) bool {
@@ -74,39 +85,78 @@ func isAllowedNodeIdentityRune(char rune) bool {
 }
 
 // clientIP extracts the client IP from the request. Forwarded headers are
-// honored only when the immediate peer is explicitly trusted; the
-// X-Forwarded-For list is then walked right-to-left and the first address
-// that is not itself a trusted proxy is returned.
+// honored only when the immediate peer is explicitly trusted. Every field of
+// the header is joined in received order, so a proxy that appends its own
+// field after an attacker-supplied one is still read; the chain is then
+// walked right-to-left and the first address that is not itself a trusted
+// proxy is returned. A malformed hop ends the walk at the last trusted hop's
+// peer instead of trusting anything further left.
 func (s *Server) clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" && s.isTrustedProxy(r) {
-		parts := strings.Split(xff, ",")
-		for i := len(parts) - 1; i >= 0; i-- {
-			ip := strings.TrimSpace(parts[i])
-			if ip != "" && !s.isTrustedProxyIP(ip) {
-				return ip
-			}
+	if !s.isTrustedProxy(r) {
+		return remoteIP(r)
+	}
+	if hops := forwardedHops(r.Header.Values("X-Forwarded-For"), parseXFFHop); len(hops) > 0 {
+		return s.firstUntrustedHop(r, hops)
+	}
+	if hops := forwardedHops(r.Header.Values("Forwarded"), parseForwardedHop); len(hops) > 0 {
+		return s.firstUntrustedHop(r, hops)
+	}
+	return remoteIP(r)
+}
+
+// forwardedHops splits all header fields into per-hop addresses, preserving
+// order. Entries without a usable address become "" so they still stop the
+// right-to-left walk.
+func forwardedHops(fields []string, parse func(string) (string, bool)) []string {
+	var hops []string
+	for _, entry := range strings.Split(strings.Join(fields, ","), ",") {
+		if strings.TrimSpace(entry) == "" {
+			continue
+		}
+		if ip, ok := parse(entry); ok {
+			hops = append(hops, ip)
+		} else {
+			hops = append(hops, "")
 		}
 	}
-	if forwarded := r.Header.Get("Forwarded"); forwarded != "" && s.isTrustedProxy(r) {
-		entries := strings.Split(forwarded, ",")
-		for i := len(entries) - 1; i >= 0; i-- {
-			for _, parameter := range strings.Split(entries[i], ";") {
-				key, value, ok := strings.Cut(strings.TrimSpace(parameter), "=")
-				if !ok || !strings.EqualFold(key, "for") {
-					continue
-				}
-				ip := strings.Trim(strings.TrimSpace(value), `"`)
-				if host, _, err := net.SplitHostPort(ip); err == nil {
-					ip = host
-				}
-				ip = strings.Trim(ip, "[]")
-				if net.ParseIP(ip) != nil && !s.isTrustedProxyIP(ip) {
-					return ip
-				}
-			}
+	return hops
+}
+
+func (s *Server) firstUntrustedHop(r *http.Request, hops []string) string {
+	for i := len(hops) - 1; i >= 0; i-- {
+		if hops[i] == "" {
+			break
+		}
+		if !s.isTrustedProxyIP(hops[i]) {
+			return hops[i]
 		}
 	}
 	return remoteIP(r)
+}
+
+func parseXFFHop(entry string) (string, bool) {
+	return canonicalHopIP(strings.TrimSpace(entry))
+}
+
+func parseForwardedHop(entry string) (string, bool) {
+	for _, parameter := range strings.Split(entry, ";") {
+		key, value, ok := strings.Cut(strings.TrimSpace(parameter), "=")
+		if ok && strings.EqualFold(key, "for") {
+			return canonicalHopIP(strings.Trim(strings.TrimSpace(value), `"`))
+		}
+	}
+	return "", false
+}
+
+func canonicalHopIP(value string) (string, bool) {
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		value = host
+	}
+	ip := net.ParseIP(strings.Trim(value, "[]"))
+	if ip == nil {
+		return "", false
+	}
+	return ip.String(), true
 }
 
 func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -216,8 +266,7 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		LastConfigSyncError:     hb.LastConfigSyncError,
 		SourceAddress:           sourceAddress,
 	}
-	if !s.store.SetNodeStatusIdentity(identity, hb.Node, status) {
-		http.Error(w, "node is decommissioned", http.StatusGone)
+	if !s.writeNodeStatusError(w, s.store.UpdateNodeStatus(identity, hb.Node, status)) {
 		return
 	}
 

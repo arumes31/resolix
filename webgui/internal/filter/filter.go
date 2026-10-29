@@ -1,6 +1,7 @@
 package filter
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -191,28 +192,82 @@ func (e *Engine) Explain(domain string) Evaluation {
 	return evaluation
 }
 
+const (
+	// maxOverrideCandidates bounds how many exact allow domains one
+	// allowlist-override report examines.
+	maxOverrideCandidates = 20000
+	// maxOverrideRegexEvaluations bounds the total regex matches one report
+	// performs, so large subscription regex sets cannot make a status request
+	// quadratic in rule count.
+	maxOverrideRegexEvaluations = 500000
+	// overrideCancelCheckInterval is how many candidates are examined between
+	// cancellation checks.
+	overrideCancelCheckInterval = 256
+)
+
 // AllowlistOverrides reports exact allow-domain rules that currently
 // suppress a block rule. Regex-only allow rules remain visible through the
 // per-domain tester because they cannot be enumerated safely.
 func (e *Engine) AllowlistOverrides(limit int) []Evaluation {
+	return e.AllowlistOverridesContext(context.Background(), limit)
+}
+
+// AllowlistOverridesContext is AllowlistOverrides with cancellation. The work
+// is bounded by maxOverrideCandidates and maxOverrideRegexEvaluations; when a
+// budget is exhausted or ctx is done, the overrides found so far are returned.
+func (e *Engine) AllowlistOverridesContext(ctx context.Context, limit int) []Evaluation {
 	if limit <= 0 {
 		limit = 100
 	}
+	// Rule indexes are replaced, never mutated, so a snapshot of the current
+	// references can be evaluated without holding the engine lock.
 	e.mu.RLock()
 	domains := make([]string, 0, len(e.allowDomainIndex))
 	for domain := range e.allowDomainIndex {
 		domains = append(domains, domain)
 	}
+	allowDomains, allowRegex := e.allowDomainIndex, e.allowRegexRules
+	blockDomains, blockRegex := e.blockDomainIndex, e.blockRegexRules
 	e.mu.RUnlock()
 	sort.Strings(domains)
+	if len(domains) > maxOverrideCandidates {
+		domains = domains[:maxOverrideCandidates]
+	}
 	result := make([]Evaluation, 0)
-	for _, domain := range domains {
-		evaluation := e.Explain(domain)
-		if evaluation.Override {
-			result = append(result, evaluation)
-			if len(result) >= limit {
-				break
-			}
+	budget := maxOverrideRegexEvaluations
+	for index, domain := range domains {
+		if index%overrideCancelCheckInterval == 0 && ctx.Err() != nil {
+			break
+		}
+		// An override needs a block match, so evaluate block rules first and
+		// skip the allow-side regex scan for unblocked candidates.
+		if budget < len(blockRegex) {
+			break
+		}
+		budget -= len(blockRegex)
+		block, hasBlock := firstIndexedMatch(domain, blockDomains, blockRegex)
+		if !hasBlock {
+			continue
+		}
+		if budget < len(allowRegex) {
+			break
+		}
+		budget -= len(allowRegex)
+		allow, hasAllow := firstIndexedMatch(domain, allowDomains, allowRegex)
+		if !hasAllow {
+			continue
+		}
+		result = append(result, Evaluation{
+			Domain:      domain,
+			Result:      Result{Allowed: true, Rule: allow.rule.Raw, Source: allow.source.Name},
+			AllowRule:   allow.rule.Raw,
+			AllowSource: allow.source.Name,
+			BlockRule:   block.rule.Raw,
+			BlockSource: block.source.Name,
+			Override:    true,
+		})
+		if len(result) >= limit {
+			break
 		}
 	}
 	return result
@@ -509,13 +564,17 @@ func (e *Engine) RollbackSource(id string) error {
 		snapshot := src.history[index]
 		src.history = slices.Clone(src.history[:index])
 		previousCount := src.RuleCount + src.AllowRuleCount
-		e.blockRules[src] = slices.Clone(snapshot.block)
-		e.allowRules[src] = slices.Clone(snapshot.allow)
+		block, allow := snapshotRulesForPolicy(snapshot, src.AllowOnly)
+		e.blockRules[src] = block
+		e.allowRules[src] = allow
 		e.ruleGeneration++
-		src.RuleCount = len(snapshot.block)
-		src.AllowRuleCount = len(snapshot.allow)
+		src.RuleCount = len(block)
+		src.AllowRuleCount = len(allow)
 		src.RuleCountDelta = src.RuleCount + src.AllowRuleCount - previousCount
 		src.Checksum = snapshot.checksum
+		if src.AllowOnly && len(snapshot.block) > 0 {
+			src.Checksum = activeRulesChecksum(block, allow)
+		}
 		src.LastChanged = time.Now()
 		src.LastUpdate = src.LastChanged
 		src.LastChecked = src.LastChanged
@@ -532,6 +591,20 @@ func (e *Engine) RollbackSource(id string) error {
 	}
 	e.mu.Unlock()
 	return fmt.Errorf("subscription %q was not found", id)
+}
+
+// snapshotRulesForPolicy returns copies of a snapshot's rules classified under
+// the source's current policy. An exception-only source never restores block
+// rules, even from history captured before AllowOnly was enabled; those rules
+// become exceptions exactly as a fresh download would classify them.
+func snapshotRulesForPolicy(snapshot ruleSnapshot, allowOnly bool) (block, allow []Rule) {
+	if !allowOnly {
+		return slices.Clone(snapshot.block), slices.Clone(snapshot.allow)
+	}
+	allow = make([]Rule, 0, len(snapshot.allow)+len(snapshot.block))
+	allow = append(allow, snapshot.allow...)
+	allow = append(allow, snapshot.block...)
+	return nil, allow
 }
 
 func activeRulesChecksum(block, allow []Rule) string {

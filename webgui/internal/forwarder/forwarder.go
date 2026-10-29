@@ -24,6 +24,9 @@ type backlogItem struct {
 	event    models.QueryEvent
 	size     int64
 	queuedAt time.Time
+	// seq identifies the item across lock releases so persistence can trim
+	// exactly the entries it omitted from a snapshot.
+	seq uint64
 }
 
 type persistedBacklogItem struct {
@@ -85,6 +88,7 @@ type Forwarder struct {
 	backlog          []backlogItem
 	inFlight         []backlogItem
 	backlogTotalSize int64
+	backlogSeq       uint64 // protected by backlogMu
 	wakeChan         chan struct{}
 	persistWake      chan struct{}
 	persistMu        sync.Mutex

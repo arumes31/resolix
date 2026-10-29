@@ -15,6 +15,7 @@ import (
 	"github.com/arumes31/resolix/webgui/internal/config"
 	apperr "github.com/arumes31/resolix/webgui/internal/errors"
 	"github.com/arumes31/resolix/webgui/internal/models"
+	"github.com/arumes31/resolix/webgui/internal/parser"
 )
 
 func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
@@ -63,7 +64,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	identity := requestNodeIdentity(r, payload.Node)
-	if payload.Node != "" && s.store.IsNodeTombstoned(identity) {
+	if identity != "" && s.store.IsNodeTombstoned(identity) {
 		http.Error(w, "node is decommissioned", http.StatusGone)
 		return
 	}
@@ -139,6 +140,12 @@ func (s *Server) handleIngestEvents(w http.ResponseWriter, r *http.Request, body
 		http.Error(w, "Batch too large (max 100)", http.StatusRequestEntityTooLarge)
 		return
 	}
+	for i := range events {
+		if !parser.ValidDomain(events[i].Domain) {
+			http.Error(w, "invalid event domain", http.StatusBadRequest)
+			return
+		}
+	}
 
 	node := ""
 	if len(events) > 0 {
@@ -151,7 +158,7 @@ func (s *Server) handleIngestEvents(w http.ResponseWriter, r *http.Request, body
 		}
 	}
 	identity := requestNodeIdentity(r, node)
-	if node != "" && s.store.IsNodeTombstoned(identity) {
+	if identity != "" && s.store.IsNodeTombstoned(identity) {
 		http.Error(w, "node is decommissioned", http.StatusGone)
 		return
 	}

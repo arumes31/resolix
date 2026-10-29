@@ -590,3 +590,23 @@ func selfSignedCertForDoT(t *testing.T) tls.Certificate {
 	}
 	return cert
 }
+
+func TestParseCIDRListCanonicalizesIPv4MappedAddresses(t *testing.T) {
+	nets := parseCIDRList("::ffff:192.0.2.7, 2001:db8::1")
+	if len(nets) != 2 {
+		t.Fatalf("parsed %d networks, want 2", len(nets))
+	}
+	for _, ip := range []string{"192.0.2.7", "::ffff:192.0.2.7"} {
+		if !cidrListContains(nets, ip) {
+			t.Errorf("mapped deny entry does not cover %s", ip)
+		}
+	}
+	for _, ip := range []string{"192.0.2.8", "0.0.0.1"} {
+		if cidrListContains(nets, ip) {
+			t.Errorf("mapped deny entry unexpectedly covers %s", ip)
+		}
+	}
+	if !cidrListContains(nets, "2001:db8::1") {
+		t.Error("IPv6 host entry lost")
+	}
+}

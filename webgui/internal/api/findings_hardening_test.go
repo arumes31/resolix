@@ -255,3 +255,21 @@ func TestIngestRejectsOversizedEventDomains(t *testing.T) {
 		t.Fatalf("invalid domains stored: %+v", got)
 	}
 }
+
+func TestLegacyIngestRejectsOversizedDomains(t *testing.T) {
+	server, cleanup := newHistoryTestServer(t)
+	defer cleanup()
+	line := "query[A] " + strings.Repeat("a", 64) + ".example from 192.0.2.1"
+	body, err := json.Marshal(map[string]any{"node": "agent", "line": line})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	server.handleIngest(recorder, httptest.NewRequest(http.MethodPost, "/api/ingest", bytes.NewReader(body)))
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("legacy ingest status = %d", recorder.Code)
+	}
+	if got := server.store.GetOrderedEvents(10); len(got) != 0 {
+		t.Fatalf("legacy ingest stored an invalid domain: %+v", got)
+	}
+}

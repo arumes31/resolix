@@ -15,6 +15,7 @@ import (
 	"github.com/arumes31/resolix/webgui/internal/config"
 	apperr "github.com/arumes31/resolix/webgui/internal/errors"
 	"github.com/arumes31/resolix/webgui/internal/models"
+	"github.com/arumes31/resolix/webgui/internal/parser"
 )
 
 func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
@@ -100,34 +101,6 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// DNS presentation-form limits (RFC 1035).
-const (
-	maxIngestDomainLength = 253
-	maxIngestDomainLabels = 127
-)
-
-// validIngestDomain bounds structured event domains to DNS presentation-form
-// limits so later per-suffix lookups stay linear in a legal name's size.
-func validIngestDomain(domain string) bool {
-	domain = strings.TrimSuffix(domain, ".")
-	if len(domain) > maxIngestDomainLength {
-		return false
-	}
-	if domain == "" {
-		return true
-	}
-	labels := strings.Split(domain, ".")
-	if len(labels) > maxIngestDomainLabels {
-		return false
-	}
-	for _, label := range labels {
-		if label == "" || len(label) > 63 {
-			return false
-		}
-	}
-	return true
-}
-
 func readRequestBody(w http.ResponseWriter, r *http.Request, maxBytes int64) ([]byte, error) {
 	if maxBytes <= 0 {
 		maxBytes = config.DefaultMaxRequestSize
@@ -168,7 +141,7 @@ func (s *Server) handleIngestEvents(w http.ResponseWriter, r *http.Request, body
 		return
 	}
 	for i := range events {
-		if !validIngestDomain(events[i].Domain) {
+		if !parser.ValidDomain(events[i].Domain) {
 			http.Error(w, "invalid event domain", http.StatusBadRequest)
 			return
 		}

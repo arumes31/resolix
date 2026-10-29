@@ -74,7 +74,9 @@ func TestPersistentBacklogTruncationMatchesMemoryAndDropAccounting(t *testing.T)
 		})
 	}
 	before := forwarder.SnapshotStatus(time.Now())
-	cfg.MaxBacklogSize = before.BacklogBytes
+	// Admission accounts for the full persisted item size, so force trimming
+	// with a limit well below the queued total.
+	cfg.MaxBacklogSize = before.BacklogBytes / 2
 	if err := forwarder.flushBacklog(); err != nil {
 		t.Fatalf("flush bounded backlog: %v", err)
 	}

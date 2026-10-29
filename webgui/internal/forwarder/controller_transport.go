@@ -67,6 +67,17 @@ func eventJSONSize(ev models.QueryEvent) int64 {
 	return int64(len(data))
 }
 
+// persistedItemOverhead is the upper bound of the bytes a persisted backlog
+// entry adds around its event: the wrapping object, the RFC 3339 queued_at
+// timestamp and the separating comma.
+const persistedItemOverhead = int64(len(`{"event":,"queued_at":"2006-01-02T15:04:05.999999999-07:00"},`))
+
+// backlogItemSize returns the bytes an event occupies in the persisted
+// backlog, so admission accounts for the complete on-disk representation.
+func backlogItemSize(ev models.QueryEvent) int64 {
+	return eventJSONSize(ev) + persistedItemOverhead
+}
+
 // getResourceStats collects current resource usage statistics (Item 93).
 func getResourceStats() (memoryMB float64, goroutines int) {
 	var m runtime.MemStats

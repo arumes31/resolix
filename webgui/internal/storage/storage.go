@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -21,6 +22,12 @@ const (
 	archiveDropLogInterval   = time.Minute
 	archiveInsertRows        = 64
 	agentDatabasePath        = ":memory:"
+	// maxClientStats bounds how many distinct client identities keep
+	// per-client rolling counters. Admitting a new identity at capacity evicts
+	// the least recently seen clientStatsEvictFraction of identities at once
+	// so the sort cost is amortized across many admissions.
+	maxClientStats           = 8192
+	clientStatsEvictFraction = 8
 )
 
 // Store manages the in-memory event ring and controller SQLite persistence.
@@ -76,8 +83,9 @@ type Store struct {
 	lastTopStats              map[string][]models.StatEntry
 
 	// Node status tracking (Items 89, 92, 93)
-	nodeStatuses   map[string]*models.NodeStatus // stable node ID -> status
-	nodeTombstones map[string]time.Time          // stable node ID -> decommission time
+	nodeStatuses   map[string]*models.NodeStatus  // stable node ID -> status
+	nodeNameIndex  map[string]map[string]struct{} // display name -> stable node IDs
+	nodeTombstones map[string]time.Time           // stable node ID -> decommission time
 	nodeStatusMu   sync.RWMutex
 
 	// UX Addons
@@ -370,6 +378,9 @@ func (s *Store) AddEvent(e models.QueryEvent) models.QueryEvent {
 	// UX tracking
 	s.typeCounts[e.Type]++
 	if s.clientRPMBuckets[e.ClientIP] == nil {
+		if len(s.clientLastSeen) >= maxClientStats {
+			s.evictClientStatsLocked()
+		}
 		s.clientRPMBuckets[e.ClientIP] = &[60]int{}
 		s.clientRPMTimes[e.ClientIP] = &[60]int64{}
 		s.clientRPHBuckets[e.ClientIP] = &[60]int{}
@@ -619,4 +630,36 @@ func (s *Store) GetEventsAfter(cursor string, since int64, limit int) []models.Q
 		}
 	}
 	return result
+}
+
+// evictClientStatsLocked drops every per-client counter for the least recently
+// seen identities so a new identity can be admitted within maxClientStats.
+// Callers must hold statsMu.
+func (s *Store) evictClientStatsLocked() {
+	type seen struct {
+		client string
+		at     int64
+	}
+	all := make([]seen, 0, len(s.clientLastSeen))
+	for client, at := range s.clientLastSeen {
+		all = append(all, seen{client: client, at: at})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].at < all[j].at })
+	evict := max(1, len(all)/clientStatsEvictFraction)
+	if overflow := len(all) - maxClientStats + 1; overflow > evict {
+		evict = overflow
+	}
+	for _, entry := range all[:min(evict, len(all))] {
+		s.deleteClientStatsLocked(entry.client)
+	}
+}
+
+// deleteClientStatsLocked removes all per-client counters for one identity.
+// Callers must hold statsMu.
+func (s *Store) deleteClientStatsLocked(client string) {
+	delete(s.clientLastSeen, client)
+	delete(s.clientRPMBuckets, client)
+	delete(s.clientRPMTimes, client)
+	delete(s.clientRPHBuckets, client)
+	delete(s.clientRPHTimes, client)
 }

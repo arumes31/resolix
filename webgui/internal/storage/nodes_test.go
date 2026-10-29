@@ -1,7 +1,10 @@
 package storage
 
 import (
+	"errors"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/arumes31/resolix/webgui/internal/models"
 )
@@ -89,5 +92,55 @@ func TestRestoreDatabaseFailureLeavesTombstonePublished(t *testing.T) {
 	}
 	if !store.IsNodeTombstoned("stable-a") {
 		t.Fatal("failed restoration removed published tombstone")
+	}
+}
+
+func TestNodeInventoryIsBoundedAndEvictsOfflineNodesFirst(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+	store.cfg.NodeOfflineThreshold = time.Minute
+	for i := 0; i < MaxNodeStatuses; i++ {
+		if err := store.UpdateNodeStatus(fmt.Sprintf("node-%d", i), "resolver", models.NodeStatus{}); err != nil {
+			t.Fatalf("node %d rejected: %v", i, err)
+		}
+	}
+	if err := store.UpdateNodeStatus("overflow", "resolver", models.NodeStatus{}); !errors.Is(err, ErrNodeInventoryFull) {
+		t.Fatalf("overflow with only online nodes = %v", err)
+	}
+	if err := store.UpdateNodeStatus("node-0", "resolver", models.NodeStatus{}); err != nil {
+		t.Fatalf("existing identity refused at capacity: %v", err)
+	}
+
+	store.nodeStatusMu.Lock()
+	store.nodeStatuses["node-7"].LastSeen = time.Now().Add(-time.Hour)
+	store.nodeStatusMu.Unlock()
+	if err := store.UpdateNodeStatus("overflow", "edge", models.NodeStatus{}); err != nil {
+		t.Fatalf("overflow after a node went offline = %v", err)
+	}
+	if store.GetNodeStatusByID("node-7") != nil {
+		t.Fatal("offline node was not evicted")
+	}
+	if len(store.GetNodeStatuses()) != MaxNodeStatuses {
+		t.Fatalf("inventory size = %d", len(store.GetNodeStatuses()))
+	}
+}
+
+func TestNodeNameIndexTracksRenamesAndDuplicateWarnings(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+	store.SetNodeStatusIdentity("a", "shared", models.NodeStatus{})
+	store.SetNodeStatusIdentity("b", "shared", models.NodeStatus{})
+	if !store.GetNodeStatusByID("a").DuplicateNameWarning {
+		t.Fatal("duplicate name not flagged")
+	}
+	store.SetNodeStatusIdentity("b", "unique", models.NodeStatus{})
+	if store.GetNodeStatusByID("a").DuplicateNameWarning || store.GetNodeStatusByID("b").DuplicateNameWarning {
+		t.Fatal("duplicate warning survived a rename")
+	}
+	if got := store.GetNodeStatus("unique"); got == nil || got.ID != "b" {
+		t.Fatalf("name lookup after rename = %+v", got)
+	}
+	if got := store.GetNodeStatus("shared"); got == nil || got.ID != "a" {
+		t.Fatalf("name lookup for remaining member = %+v", got)
 	}
 }

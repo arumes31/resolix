@@ -205,7 +205,9 @@ func (r *dohResolver) ExchangeContext(ctx context.Context, m *dns.Msg) (*dns.Msg
 // The dial redirect maps the URL hostname to the literal/bootstrapped IPs.
 func (r *dohResolver) httpClient() *http.Client {
 	if testHTTPClient != nil {
-		return testHTTPClient
+		client := *testHTTPClient
+		client.CheckRedirect = rejectDoHRedirect
+		return &client
 	}
 	r.clientOnce.Do(func() {
 		transport := &http.Transport{
@@ -227,10 +229,17 @@ func (r *dohResolver) httpClient() *http.Client {
 				return nil, lastErr
 			},
 		}
-		r.client = &http.Client{Timeout: dohTimeout, Transport: transport}
+		r.client = &http.Client{Timeout: dohTimeout, Transport: transport, CheckRedirect: rejectDoHRedirect}
 		r.client.Timeout = r.spec.TimeoutDuration()
 	})
 	return r.client
+}
+
+// rejectDoHRedirect refuses to follow redirects from a DoH upstream. RFC 8484
+// does not require redirect support, and following one could replay the
+// query to an unintended (possibly plaintext http://) destination.
+func rejectDoHRedirect(req *http.Request, _ []*http.Request) error {
+	return fmt.Errorf("DoH upstream redirect to %s refused", req.URL.Redacted())
 }
 
 type resolverRuntime struct {

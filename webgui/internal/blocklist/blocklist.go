@@ -142,6 +142,9 @@ func (bl *Blocklist) Stop() {
 	}
 }
 
+// maxDomainLength is the longest DNS name in presentation form (RFC 1035).
+const maxDomainLength = 253
+
 // IsBlocked checks if a domain is in the blocklist. A domain is blocked when
 // it matches an entry exactly or any of its parent-domain suffixes is listed
 // (e.g. example.com also covers ads.example.com). Suffix checks respect
@@ -150,6 +153,11 @@ func (bl *Blocklist) IsBlocked(domain string) bool {
 	bl.mu.RLock()
 	defer bl.mu.RUnlock()
 	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
+	// No legal DNS name exceeds 253 octets; refusing longer input keeps the
+	// per-suffix hashing below bounded for every caller.
+	if len(domain) > maxDomainLength {
+		return false
+	}
 	for d := domain; d != ""; {
 		if bl.domains[d] {
 			return true

@@ -582,11 +582,13 @@ func parseRules(r io.Reader, allowOnly bool) (block, allow []Rule) {
 	return block, allow
 }
 
-// parseRulesCapped parses rule lines with a per-source rule cap.
+// parseRulesCapped parses rule lines with a per-source rule cap and an
+// aggregate compiled-regex budget.
 func parseRulesCapped(r io.Reader, allowOnly bool) (block, allow []Rule, ignored int, truncated bool, err error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // tolerate long lines up to 1MB
 	count := 0
+	regexInsts := 0
 	for scanner.Scan() {
 		rule, exception, ok := parseLine(scanner.Text())
 		if !ok {
@@ -598,6 +600,12 @@ func parseRulesCapped(r io.Reader, allowOnly bool) (block, allow []Rule, ignored
 			log.Printf("[WARN] filter: rule cap (%d) reached, ignoring remaining rules", maxRulesPerSource)
 			truncated = true
 			break
+		}
+		regexInsts += rule.insts
+		if regexInsts > maxRegexInstsPerSource {
+			// Callers that apply updates reject the source and keep the
+			// previous rules rather than retaining an unbounded regex set.
+			return block, allow, ignored, truncated, fmt.Errorf("compiled regex rules exceed the %d-instruction budget", maxRegexInstsPerSource)
 		}
 		if exception || allowOnly {
 			allow = append(allow, rule)

@@ -210,6 +210,16 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	_, _ = fmt.Fprint(w, "retry: 3000\n\n")
 
+	// Authorization is checked when the stream opens; keep honoring it so a
+	// revoked or expired session stops receiving telemetry.
+	sessionToken := ""
+	if cookie, err := r.Cookie(sessionCookieName); err == nil {
+		sessionToken = cookie.Value
+	}
+	sessionAlive := func() bool {
+		return !s.webAuthEnabled() || s.sessionAlive(sessionToken)
+	}
+
 	ch := s.Subscribe()
 
 	defer func() {
@@ -238,7 +248,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		case <-notify:
 			return
 		case ev, ok := <-ch:
-			if !ok {
+			if !ok || !sessionAlive() {
 				return
 			}
 			if lastID != "" {
@@ -260,6 +270,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			}
 			timer.Reset(keepalive)
 		case <-timer.C:
+			if !sessionAlive() {
+				return
+			}
 			// Keepalive comment
 			_, _ = fmt.Fprintf(w, ": keepalive\n\n")
 			flusher.Flush()

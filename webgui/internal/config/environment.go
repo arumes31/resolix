@@ -196,6 +196,22 @@ func parseTrustedProxies() []string {
 	return trustedProxies
 }
 
+// parseAllowedHosts parses WEB_ALLOWED_HOSTS (comma-separated hostnames) into
+// lower-case host names without ports.
+func parseAllowedHosts() []string {
+	var hosts []string
+	for _, host := range strings.Split(os.Getenv("WEB_ALLOWED_HOSTS"), ",") {
+		host = strings.ToLower(strings.TrimSpace(host))
+		if name, _, err := net.SplitHostPort(host); err == nil {
+			host = name
+		}
+		if host = strings.Trim(host, "[]"); host != "" {
+			hosts = append(hosts, host)
+		}
+	}
+	return hosts
+}
+
 // normalizeBaseURL reads BASE_URL and reduces it to a local, absolute path.
 func normalizeBaseURL() string {
 	raw := strings.TrimSpace(os.Getenv("BASE_URL"))

@@ -745,3 +745,12 @@ func TestIsLoopbackListenAddr(t *testing.T) {
 		}
 	}
 }
+
+func TestParseAllowedHosts(t *testing.T) {
+	t.Setenv("WEB_ALLOWED_HOSTS", " DNS.Example.test:443, [fd00::1]:35353,,resolver.lan ")
+	got := parseAllowedHosts()
+	want := []string{"dns.example.test", "fd00::1", "resolver.lan"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("parseAllowedHosts() = %v, want %v", got, want)
+	}
+}

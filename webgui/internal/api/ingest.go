@@ -63,7 +63,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	identity := requestNodeIdentity(r, payload.Node)
-	if payload.Node != "" && s.store.IsNodeTombstoned(identity) {
+	if identity != "" && s.store.IsNodeTombstoned(identity) {
 		http.Error(w, "node is decommissioned", http.StatusGone)
 		return
 	}
@@ -98,6 +98,34 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// DNS presentation-form limits (RFC 1035).
+const (
+	maxIngestDomainLength = 253
+	maxIngestDomainLabels = 127
+)
+
+// validIngestDomain bounds structured event domains to DNS presentation-form
+// limits so later per-suffix lookups stay linear in a legal name's size.
+func validIngestDomain(domain string) bool {
+	domain = strings.TrimSuffix(domain, ".")
+	if len(domain) > maxIngestDomainLength {
+		return false
+	}
+	if domain == "" {
+		return true
+	}
+	labels := strings.Split(domain, ".")
+	if len(labels) > maxIngestDomainLabels {
+		return false
+	}
+	for _, label := range labels {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+	}
+	return true
 }
 
 func readRequestBody(w http.ResponseWriter, r *http.Request, maxBytes int64) ([]byte, error) {
@@ -139,6 +167,12 @@ func (s *Server) handleIngestEvents(w http.ResponseWriter, r *http.Request, body
 		http.Error(w, "Batch too large (max 100)", http.StatusRequestEntityTooLarge)
 		return
 	}
+	for i := range events {
+		if !validIngestDomain(events[i].Domain) {
+			http.Error(w, "invalid event domain", http.StatusBadRequest)
+			return
+		}
+	}
 
 	node := ""
 	if len(events) > 0 {
@@ -151,7 +185,7 @@ func (s *Server) handleIngestEvents(w http.ResponseWriter, r *http.Request, body
 		}
 	}
 	identity := requestNodeIdentity(r, node)
-	if node != "" && s.store.IsNodeTombstoned(identity) {
+	if identity != "" && s.store.IsNodeTombstoned(identity) {
 		http.Error(w, "node is decommissioned", http.StatusGone)
 		return
 	}

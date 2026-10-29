@@ -185,7 +185,7 @@ func (p *Parser) ParseLogBytes(line []byte, node string) *models.QueryEvent {
 			} else if bytes.Equal(action, []byte("reply")) {
 				// Debug: why was it not found?
 				if p.Debug {
-					log.Printf("[DEBUG] No pending query found for domain=%s node=%s", domain, node)
+					log.Printf("[DEBUG] No pending query found for domain=%q node=%q", domain, node)
 				}
 			}
 		}
@@ -211,7 +211,7 @@ func (p *Parser) parseDNSSEC(parts [][]byte, actionIdx int, node string) {
 		p.store.SetDNSSEC(node, domain, result)
 	default:
 		if p.Debug {
-			log.Printf("[DEBUG] Unknown DNSSEC result: %s for domain=%s", result, domain)
+			log.Printf("[DEBUG] Unknown DNSSEC result: %q for domain=%q", result, domain)
 		}
 	}
 }
@@ -237,7 +237,7 @@ func (p *Parser) parseDNSSECPipe(line []byte, node string) {
 		p.store.SetDNSSEC(node, domain, result)
 	default:
 		if p.Debug {
-			log.Printf("[DEBUG] Unknown DNSSEC pipe result: %s for domain=%s", result, domain)
+			log.Printf("[DEBUG] Unknown DNSSEC pipe result: %q for domain=%q", result, domain)
 		}
 	}
 }

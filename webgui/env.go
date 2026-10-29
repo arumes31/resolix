@@ -94,6 +94,9 @@ LOG_LEVEL=INFO
 BASE_URL=/
 # Comma-separated proxy IPs/CIDRs allowed to supply Forwarded/X-Forwarded-*.
 # TRUSTED_PROXIES=127.0.0.1,10.0.0.0/8
+# Hostnames accepted in Host when web authentication is disabled; IP literals
+# and localhost are always accepted.
+# WEB_ALLOWED_HOSTS=dns.home.arpa
 
 # Controller-only database file name or absolute path (default: dns.db).
 # Agents keep live events in memory and persist only the bounded unsent backlog;

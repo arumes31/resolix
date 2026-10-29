@@ -64,10 +64,27 @@ func (s *Store) SetNodeStatus(name string, status models.NodeStatus) {
 	_ = s.SetNodeStatusIdentity(status.ID, name, status)
 }
 
+// MaxNodeStatuses bounds the retained node inventory so one ingestion
+// credential cannot grow it without limit by inventing fresh identities.
+const MaxNodeStatuses = 4096
+
+var (
+	// ErrNodeTombstoned reports an update for a decommissioned identity.
+	ErrNodeTombstoned = errors.New("node is decommissioned")
+	// ErrNodeInventoryFull reports that no slot is available for a new identity.
+	ErrNodeInventoryFull = errors.New("node inventory is full")
+)
+
 // SetNodeStatusIdentity updates a node keyed by its stable identity. It returns
 // false for a tombstoned identity, requiring an explicit restore before a
-// decommissioned node can silently rejoin.
+// decommissioned node can silently rejoin, or when the inventory is full.
 func (s *Store) SetNodeStatusIdentity(identity, name string, status models.NodeStatus) bool {
+	return s.UpdateNodeStatus(identity, name, status) == nil
+}
+
+// UpdateNodeStatus is SetNodeStatusIdentity with a typed failure reason:
+// ErrNodeTombstoned or ErrNodeInventoryFull.
+func (s *Store) UpdateNodeStatus(identity, name string, status models.NodeStatus) error {
 	if name == "" {
 		name = "unknown"
 	}
@@ -78,7 +95,11 @@ func (s *Store) SetNodeStatusIdentity(identity, name string, status models.NodeS
 	s.nodeStatusMu.Lock()
 	defer s.nodeStatusMu.Unlock()
 	if _, tombstoned := s.nodeTombstones[identity]; tombstoned {
-		return false
+		return ErrNodeTombstoned
+	}
+	previous, exists := s.nodeStatuses[identity]
+	if !exists && len(s.nodeStatuses) >= MaxNodeStatuses && !s.evictOfflineNodeLocked() {
+		return ErrNodeInventoryFull
 	}
 
 	status.ID = identity
@@ -88,7 +109,33 @@ func (s *Store) SetNodeStatusIdentity(identity, name string, status models.NodeS
 	status.UpstreamHealth = cloneFloatMap(status.UpstreamHealth)
 	status.ForwarderEndpointErrors = cloneStringMap(status.ForwarderEndpointErrors)
 	s.nodeStatuses[identity] = &status
-	s.refreshDuplicateNameWarningsLocked(name)
+	if exists && previous.Name != name {
+		s.unindexNodeNameLocked(previous.Name, identity)
+	}
+	s.indexNodeNameLocked(name, identity)
+	return nil
+}
+
+// evictOfflineNodeLocked drops the least recently seen offline node to make
+// room for a new identity. Online nodes are never evicted. Callers must hold
+// nodeStatusMu for writing.
+func (s *Store) evictOfflineNodeLocked() bool {
+	oldest := ""
+	var oldestSeen time.Time
+	for identity, status := range s.nodeStatuses {
+		if status.IsOnline(s.cfg.NodeOfflineThreshold) {
+			continue
+		}
+		if oldest == "" || status.LastSeen.Before(oldestSeen) {
+			oldest, oldestSeen = identity, status.LastSeen
+		}
+	}
+	if oldest == "" {
+		return false
+	}
+	name := s.nodeStatuses[oldest].Name
+	delete(s.nodeStatuses, oldest)
+	s.unindexNodeNameLocked(name, oldest)
 	return true
 }
 
@@ -100,10 +147,16 @@ func (s *Store) GetNodeStatus(name string) *models.NodeStatus {
 	if ns, ok := s.nodeStatuses[name]; ok {
 		return s.cloneNodeStatus(ns)
 	}
-	for _, ns := range s.nodeStatuses {
-		if ns.Name == name {
-			return s.cloneNodeStatus(ns)
+	// Equal display names are allowed; return the lowest identity so the
+	// result is deterministic.
+	match := ""
+	for identity := range s.nodeNameIndex[name] {
+		if match == "" || identity < match {
+			match = identity
 		}
+	}
+	if ns := s.nodeStatuses[match]; ns != nil {
+		return s.cloneNodeStatus(ns)
 	}
 	return nil
 }
@@ -166,7 +219,7 @@ func (s *Store) DecommissionNode(identity string) (bool, error) {
 	}
 	delete(s.nodeStatuses, identity)
 	s.nodeTombstones[identity] = decommissionedAt
-	s.refreshDuplicateNameWarningsLocked(status.Name)
+	s.unindexNodeNameLocked(status.Name, identity)
 	s.nodeStatusMu.Unlock()
 
 	s.healthMu.Lock()
@@ -230,16 +283,39 @@ func (s *Store) loadNodeTombstones() {
 	}
 }
 
-func (s *Store) refreshDuplicateNameWarningsLocked(name string) {
-	count := 0
-	for _, status := range s.nodeStatuses {
-		if status.Name == name {
-			count++
-		}
+// indexNodeNameLocked records identity under name and refreshes duplicate-name
+// warnings for that name group only. Callers must hold nodeStatusMu.
+func (s *Store) indexNodeNameLocked(name, identity string) {
+	if s.nodeNameIndex == nil {
+		s.nodeNameIndex = make(map[string]map[string]struct{})
 	}
-	for _, status := range s.nodeStatuses {
-		if status.Name == name {
-			status.DuplicateNameWarning = count > 1
+	group := s.nodeNameIndex[name]
+	if group == nil {
+		group = make(map[string]struct{})
+		s.nodeNameIndex[name] = group
+	}
+	group[identity] = struct{}{}
+	s.refreshDuplicateNameWarningsLocked(name)
+}
+
+// unindexNodeNameLocked removes identity from name's group. Callers must hold
+// nodeStatusMu.
+func (s *Store) unindexNodeNameLocked(name, identity string) {
+	group := s.nodeNameIndex[name]
+	delete(group, identity)
+	if len(group) == 0 {
+		delete(s.nodeNameIndex, name)
+		return
+	}
+	s.refreshDuplicateNameWarningsLocked(name)
+}
+
+func (s *Store) refreshDuplicateNameWarningsLocked(name string) {
+	group := s.nodeNameIndex[name]
+	duplicate := len(group) > 1
+	for identity := range group {
+		if status := s.nodeStatuses[identity]; status != nil {
+			status.DuplicateNameWarning = duplicate
 		}
 	}
 }

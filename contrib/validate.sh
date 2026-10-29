@@ -2,7 +2,11 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-tool_root="${RESOLIX_TOOL_DIR:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/resolix-quality-tools}"
+# Cached tools are executed, so they must live somewhere only this user can
+# write: an explicit RESOLIX_TOOL_DIR, the per-job runner temp directory in CI,
+# or the per-user cache directory. Never a shared temporary directory.
+tool_root="${RESOLIX_TOOL_DIR:-${RUNNER_TEMP:+${RUNNER_TEMP}/resolix-quality-tools}}"
+tool_root="${tool_root:-${XDG_CACHE_HOME:-${HOME:?HOME must be set}/.cache}/resolix-quality-tools}"
 
 golangci_lint_version="v2.14.0"
 gosec_version="7b1b5cebe007d62fb58eacb90fc571112939ec30"
@@ -13,6 +17,24 @@ actionlint_version="v1.7.12"
 usage() {
   echo "usage: $0 {all|core|lint|security|licenses|workflows|frontend}" >&2
   exit 2
+}
+
+# require_private_path fails unless path is a real (non-symlink) file or
+# directory owned by the current user and not writable by group or others.
+require_private_path() {
+  local path="$1"
+  if [[ -L "${path}" ]]; then
+    echo "refusing symlinked tool path: ${path}" >&2
+    return 1
+  fi
+  if [[ ! -O "${path}" ]]; then
+    echo "refusing tool path not owned by $(id -un): ${path}" >&2
+    return 1
+  fi
+  if [[ -n "$(find "${path}" -maxdepth 0 \( -perm -020 -o -perm -002 \) 2>/dev/null)" ]]; then
+    echo "refusing group/world-writable tool path: ${path}" >&2
+    return 1
+  fi
 }
 
 install_go_tool() {
@@ -26,11 +48,14 @@ install_go_tool() {
   go_exe="$(go env GOEXE)"
   binary="${install_dir}/${name}${go_exe}"
 
+  (umask 077 && mkdir -p "${install_dir}")
+  require_private_path "${tool_root}"
+  require_private_path "${install_dir}"
   if [[ ! -x "${binary}" ]]; then
-    mkdir -p "${install_dir}"
     echo "Installing ${package}@${version}" >&2
     GOBIN="${install_dir}" go install "${package}@${version}"
   fi
+  require_private_path "${binary}"
 
   printf '%s\n' "${binary}"
 }

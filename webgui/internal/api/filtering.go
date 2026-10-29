@@ -33,7 +33,7 @@ func (s *Server) handleBlocklistStatus(w http.ResponseWriter, _ *http.Request) {
 
 // handleFilteringStatus reports the filter engine state: enabled/paused,
 // per-source rule counts, and last update times.
-func (s *Server) handleFilteringStatus(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleFilteringStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	eng := s.getFilter()
 	if eng == nil {
@@ -48,7 +48,7 @@ func (s *Server) handleFilteringStatus(w http.ResponseWriter, _ *http.Request) {
 		"enabled":                 !eng.Paused(),
 		"sources":                 eng.Sources(),
 		"update_interval_seconds": int64(s.cfg.FilterUpdateInterval.Seconds()),
-		"allowlist_overrides":     eng.AllowlistOverrides(100),
+		"allowlist_overrides":     eng.AllowlistOverridesContext(r.Context(), 100),
 		"filter_blocked_total":    blocked,
 		"filter_allowed_total":    allowed,
 	}

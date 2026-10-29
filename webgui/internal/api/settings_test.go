@@ -19,10 +19,7 @@ import (
 func TestCheckCSRFRequiresMatchingCookieAndHeader(t *testing.T) {
 	server := testServer(&config.Config{WebUsername: "admin", WebPassword: "password"})
 	req := httptest.NewRequest(http.MethodPost, "/api/cache/clear", nil)
-	req.AddCookie(&http.Cookie{
-		Name: csrfCookieName, Value: "token", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
-	})
-	req.Header.Set("X-CSRF-Token", "token")
+	addSessionCSRF(t, server, req)
 	if rec := httptest.NewRecorder(); !server.checkCSRF(rec, req) {
 		t.Fatalf("matching CSRF token rejected: status=%d body=%q", rec.Code, rec.Body.String())
 	}
@@ -147,10 +144,7 @@ func TestFilteringUpdateEndpoint(t *testing.T) {
 	}
 
 	request := httptest.NewRequest(http.MethodPost, "/api/filtering/update", nil)
-	request.AddCookie(&http.Cookie{
-		Name: csrfCookieName, Value: "token", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
-	})
-	request.Header.Set("X-CSRF-Token", "token")
+	addSessionCSRF(t, controller, request)
 	recorder = httptest.NewRecorder()
 	controller.handleFilteringUpdate(recorder, request)
 	if recorder.Code != http.StatusAccepted || !strings.Contains(recorder.Body.String(), `"status":"scheduled"`) {
@@ -169,10 +163,7 @@ func TestFilteringUpdateEndpoint(t *testing.T) {
 		"/api/filtering/update?id="+url.QueryEscape(previous[0].ID),
 		nil,
 	)
-	targetedRequest.AddCookie(&http.Cookie{
-		Name: csrfCookieName, Value: "token", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
-	})
-	targetedRequest.Header.Set("X-CSRF-Token", "token")
+	addSessionCSRF(t, controller, targetedRequest)
 	recorder = httptest.NewRecorder()
 	controller.handleFilteringUpdate(recorder, targetedRequest)
 	if recorder.Code != http.StatusAccepted {

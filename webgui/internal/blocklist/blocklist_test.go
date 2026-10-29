@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -97,5 +98,19 @@ func TestIsBlockedParentDomainSuffix(t *testing.T) {
 		if bl.IsBlocked(d) {
 			t.Errorf("expected %q NOT to be blocked", d)
 		}
+	}
+}
+
+func TestIsBlockedRejectsOversizedNames(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blocklist.txt")
+	if err := os.WriteFile(path, []byte("test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	blocklist := New(path)
+	if !blocklist.IsBlocked("a.test") {
+		t.Fatal("suffix match failed")
+	}
+	if blocklist.IsBlocked(strings.Repeat("a.", 200) + "test") {
+		t.Fatal("name longer than 253 octets reached suffix lookups")
 	}
 }

@@ -458,6 +458,9 @@ Restore all four directories while the container is stopped, retain ownership an
 
 [`webgui/VERSION`](webgui/VERSION) is the canonical application version. The binary, API, node status, and container metadata report that version; CI rejects a mismatched Dockerfile default.
 
+> [!NOTE]
+> `webgui/VERSION` reflects the active development version on `main`, while Git release tags and GitHub releases correspond to formal releases produced by the manual **Create Release** workflow. Formal releases may therefore lag development commits on `main` between release cycles.
+
 Every code push to `main` builds and publishes a multi-platform GHCR image tagged `main` and with the immutable commit SHA. Version and `latest` tags are applied only to validated release builds. A main push does not create a Git tag or GitHub release. When a version is ready to become a formal release:
 
 1. Update `webgui/VERSION` and the matching `ARG VERSION` default in `Dockerfile`.

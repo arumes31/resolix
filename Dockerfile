@@ -49,7 +49,7 @@ WORKDIR /src/tailscale
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     go get golang.org/x/image@v0.45.0 golang.org/x/crypto@v0.57.0 \
-      golang.org/x/net@v0.60.0 google.golang.org/grpc@v1.83.1 \
+      golang.org/x/net@v0.62.0 google.golang.org/grpc@v1.83.1 \
     && go mod download golang.org/x/term \
     && CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath \
       -ldflags="-s -w -X tailscale.com/version.longStamp=1.102.3 -X tailscale.com/version.shortStamp=1.102.3 -X tailscale.com/version.gitCommitStamp=53a0d659afa51835dd7a9283873cca44261454f8" \

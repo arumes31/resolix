@@ -3,7 +3,12 @@
 ARG VERSION=2.4.28
 
 # Stage 1: Build
-FROM golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS builder
+# Build stages run natively on the build host and cross-compile for the target
+# platform, avoiding slow QEMU emulation in multi-arch image builds.
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS builder
+
+ARG TARGETOS
+ARG TARGETARCH
 
 ARG VERSION
 ARG BUILD_INFO=local
@@ -21,7 +26,7 @@ RUN go mod download
 COPY webgui/ .
 
 # Build the application (Improvement 45: Binary size reduction; inject release version)
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath \
     -ldflags="-s -w -X main.Version=${VERSION} -X main.BuildInfo=${BUILD_INFO}" -o resolix .
 
 # Rebuild Tailscale at the reviewed release commit with patched x/image and
@@ -30,7 +35,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
 # CVE-2026-78662 and CVE-2026-56855 in SSH. Patch this separate module as well.
 # The upgraded x/crypto raises the required golang.org/x/term version; record
 # its go.sum entry explicitly so the build does not depend on a warm cache.
-FROM golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS tailscale-builder
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS tailscale-builder
+
+ARG TARGETOS
+ARG TARGETARCH
 
 RUN apk add --no-cache git
 RUN git clone --depth 1 --branch v1.102.3 https://github.com/tailscale/tailscale.git /src/tailscale \
@@ -43,10 +51,10 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go get golang.org/x/image@v0.45.0 golang.org/x/crypto@v0.57.0 \
       golang.org/x/net@v0.60.0 google.golang.org/grpc@v1.83.1 \
     && go mod download golang.org/x/term \
-    && CGO_ENABLED=0 go build -trimpath \
+    && CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath \
       -ldflags="-s -w -X tailscale.com/version.longStamp=1.102.3 -X tailscale.com/version.shortStamp=1.102.3 -X tailscale.com/version.gitCommitStamp=53a0d659afa51835dd7a9283873cca44261454f8" \
       -o /out/tailscale ./cmd/tailscale \
-    && CGO_ENABLED=0 go build -trimpath \
+    && CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath \
       -ldflags="-s -w -X tailscale.com/version.longStamp=1.102.3 -X tailscale.com/version.shortStamp=1.102.3 -X tailscale.com/version.gitCommitStamp=53a0d659afa51835dd7a9283873cca44261454f8" \
       -o /out/tailscaled ./cmd/tailscaled
 

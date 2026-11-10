@@ -4,6 +4,11 @@ on:
   push:
     branches: [ "main" ]
     tags: [ "v*.*.*" ]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.github/ISSUE_TEMPLATE/**'
   workflow_dispatch:
 
 concurrency:
@@ -123,5 +128,7 @@ jobs:
             VERSION=${{ steps.build.outputs.version }}
             BUILD_INFO=${{ github.sha }}
             BUILD_DATE=${{ steps.build.outputs.date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           provenance: mode=max
           sbom: true

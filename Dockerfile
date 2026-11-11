@@ -5,7 +5,7 @@ ARG VERSION=2.4.28
 # Stage 1: Build
 # Build stages run natively on the build host and cross-compile for the target
 # platform, avoiding slow QEMU emulation in multi-arch image builds.
-FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.24@sha256:fa3d596898d9f126af7c01d14ee7597bab3f39cccf392ef36b69fe77cd681f18 AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -35,7 +35,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpat
 # CVE-2026-78662 and CVE-2026-56855 in SSH. Patch this separate module as well.
 # The upgraded x/crypto raises the required golang.org/x/term version; record
 # its go.sum entry explicitly so the build does not depend on a warm cache.
-FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS tailscale-builder
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.24@sha256:fa3d596898d9f126af7c01d14ee7597bab3f39cccf392ef36b69fe77cd681f18 AS tailscale-builder
 
 ARG TARGETOS
 ARG TARGETARCH

@@ -48,7 +48,7 @@ RUN git clone --depth 1 --branch v1.102.3 https://github.com/tailscale/tailscale
 WORKDIR /src/tailscale
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    go get golang.org/x/image@v0.45.0 golang.org/x/crypto@v0.57.0 \
+    go get golang.org/x/image@v0.45.0 golang.org/x/crypto@v0.58.1-0.20261009181718-2f1f834330b2 \
       golang.org/x/net@v0.62.0 google.golang.org/grpc@v1.83.1 \
     && go mod download golang.org/x/term \
     && CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath \

@@ -218,6 +218,14 @@ func (s *Server) newSecureCookie(name, value string, maxAge int) *http.Cookie {
 	}
 }
 
+// appPath joins an absolute route onto the configured base URL. The root
+// base URL "/" must not be concatenated directly, because "/" + "/login"
+// yields "//login", which browsers resolve as a protocol-relative URL to
+// the host "login".
+func (s *Server) appPath(route string) string {
+	return strings.TrimSuffix(s.cfg.BaseURL, "/") + route
+}
+
 func (s *Server) cookiePath() string {
 	if s.cfg.BaseURL == "" {
 		return "/"
@@ -545,8 +553,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 
 		// Redirect to login for HTML requests, return 401 for API
 		if strings.Contains(r.Header.Get("Accept"), "text/html") {
-			loginURL := s.cfg.BaseURL + "/login"
-			http.Redirect(w, r, loginURL, http.StatusSeeOther)
+			http.Redirect(w, r, s.appPath("/login"), http.StatusSeeOther)
 		} else {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		}
@@ -630,7 +637,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			sessionCSRF, _ := s.sessionCSRFToken(sessionToken)
 			http.SetCookie(w, s.newSecureCookie(sessionCookieName, sessionToken, int(sessionLifetime.Seconds())))
 			http.SetCookie(w, s.newSecureCookie(csrfCookieName, sessionCSRF, int(sessionLifetime.Seconds())))
-			http.Redirect(w, r, s.cfg.BaseURL+"/", http.StatusSeeOther)
+			http.Redirect(w, r, s.appPath("/"), http.StatusSeeOther)
 			return
 		}
 
@@ -682,5 +689,5 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, s.newSecureCookie(sessionCookieName, "", -1))
 	// Also clear the CSRF cookie
 	http.SetCookie(w, s.newSecureCookie(csrfCookieName, "", -1))
-	http.Redirect(w, r, s.cfg.BaseURL+"/login", http.StatusSeeOther)
+	http.Redirect(w, r, s.appPath("/login"), http.StatusSeeOther)
 }

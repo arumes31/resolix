@@ -50,6 +50,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     go get golang.org/x/image@v0.45.0 golang.org/x/crypto@v0.58.1-0.20261009181718-2f1f834330b2 \
       golang.org/x/net@v0.62.0 google.golang.org/grpc@v1.83.1 \
+      github.com/insomniacslk/dhcp@v0.0.0-20260719225207-c76316d4aa82 \
     && go mod download golang.org/x/term \
     && CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath \
       -ldflags="-s -w -X tailscale.com/version.longStamp=1.102.3 -X tailscale.com/version.shortStamp=1.102.3 -X tailscale.com/version.gitCommitStamp=53a0d659afa51835dd7a9283873cca44261454f8" \

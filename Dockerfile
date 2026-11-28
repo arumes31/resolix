@@ -74,7 +74,7 @@ LABEL org.opencontainers.image.title="Resolix" \
 
 # Install runtime dependencies (including those required by Tailscale)
 RUN apk upgrade --no-cache \
-    && apk add --no-cache bash bind-tools ca-certificates iptables iproute2 ip6tables setpriv
+    && apk add --no-cache bash bind-tools ca-certificates iptables iproute2 ip6tables setpriv 'libxml2>=2.13.9-r5'
 
 # Copy the patched Tailscale binaries built above.
 COPY --from=tailscale-builder /out/tailscale /usr/bin/tailscale
